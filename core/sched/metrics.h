@@ -190,6 +190,8 @@ struct SchedMetrics {
     int64_t suffix_steps = 0;
     int64_t suffix_rows = 0;
     int64_t suffix_accepted = 0;
+    /* Requests whose suffix index was taken over from an earlier turn's prompt (suffix stash). */
+    int64_t suffix_adopted = 0;
     /* Why Scheduler::step_next_locked did not issue the next step ahead of the commit (S-07): one
      * counter per reason, and only the first check that refuses counts. With steps_ahead they are
      * every step_next the engine made once a step was in flight, so /stats can say where the gap

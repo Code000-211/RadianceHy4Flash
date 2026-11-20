@@ -110,6 +110,8 @@ struct SchedReq {
     bool        draft_suffix = false;
     bool        suffix_hot = false;
     SuffixIndex suffix_ix;
+    /* The prompt's index has been copied to the scheduler's suffix stash (suffix_index). */
+    bool        suffix_stashed = false;
     /* Prompt lookup's index over prompt ++ output (ngram.h), built at the sequence's first lookup
      * and extended by each later one. It depends on the tokens alone, so preemption keeps it; it
      * is keyed by request id, so a recycled slot starts over, and a closed request frees it. */
@@ -741,6 +743,27 @@ private:
      * Called as each prefill chunk commits, so the first decode does not index the whole prompt
      * (suffix.h). */
     void suffix_index(SchedReq& s, const Request& r);
+    /* --draft-suffix: a long prompt's finished index is copied into a small stash; the next
+     * request whose prompt starts with those tokens (the conversation's next turn) takes it over
+     * at admission (suffix_adopt) and indexes only what it adds. Either way the index holds
+     * exactly what a build from nothing would (suffix_test). */
+    void suffix_adopt(SchedReq& s);
+    struct SuffixStash {
+        std::vector<int32_t> tokens;
+        SuffixIndex ix;
+        uint64_t used = 0;
+    };
+    std::vector<SuffixStash> suffix_stash_;
+    uint64_t suffix_stash_clock_ = 0;
+    /* Prompts shorter than this are cheap to index again; the stash holds at most this many
+     * copies and bytes. */
+    static constexpr int64_t kSuffixStashMin = 4096;
+    static constexpr size_t  kSuffixStashMax = 16;
+    static constexpr int64_t kSuffixStashBytes = (int64_t)512 << 20;
+public:
+    /* Tests: the stash's size. */
+    size_t suffix_stash_size() const { return suffix_stash_.size(); }
+private:
     /* Prompt lookup is the deployment's only drafter and --draft-window adaptive is on: its
      * proposals feed each sequence's estimate and are capped by its window, as a head's are. */
     bool lookup_adapt_ = false;

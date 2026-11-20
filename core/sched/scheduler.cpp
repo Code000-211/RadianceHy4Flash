@@ -806,6 +806,7 @@ void Scheduler::close_request(SchedReq& s, ReqState st, const char* reason, bool
     /* Prompt lookup's index is this text's alone. */
     s.ngram_ix.reset();
     s.suffix_ix.reset();
+    s.suffix_stashed = false;
     if (lookup_gate_on_ && s.look.started && s.look.proposed > 0)
         RAD_DEBUG("prompt lookup: request %llu made %lld proposals, held back %lld (%lld drafts, "
                   "%lld of those scored came true); a %d-draft verify costs %.2f plain steps",
@@ -1208,6 +1209,58 @@ void Scheduler::suffix_index(SchedReq& s, const Request& r) {
     seq.b = r.output.data();
     seq.nb = (int64_t)r.output.size();
     s.suffix_ix.index(seq, r.id, cfg_.draft_suffix_min_match, r.n_computed);
+    /* The prompt is indexed whole: a copy of the finished index waits in the stash for the next
+     * request whose sequence starts with the same tokens (the conversation's next turn), so a
+     * prefix-cache hit indexes only what it adds. SuffixIndex::index never shrinks, so the copy
+     * holds exactly what a build from nothing over those tokens would. */
+    const int64_t P = (int64_t)r.prompt.size();
+    if (r.n_computed < P || P < kSuffixStashMin || s.suffix_stashed || s.suffix_ix.indexed() != P)
+        return;
+    s.suffix_stashed = true;
+    /* One copy per prompt; the same prompt stashed again replaces the old one. */
+    for (size_t i = 0; i < suffix_stash_.size(); ++i)
+        if (suffix_stash_[i].tokens.size() == (size_t)P &&
+            std::equal(r.prompt.begin(), r.prompt.end(), suffix_stash_[i].tokens.begin())) {
+            suffix_stash_.erase(suffix_stash_.begin() + (long)i);
+            break;
+        }
+    SuffixStash st;
+    st.tokens = r.prompt;
+    st.ix = s.suffix_ix;
+    st.used = ++suffix_stash_clock_;
+    suffix_stash_.push_back(std::move(st));
+    auto bytes = [this]() {
+        int64_t b = 0;
+        for (const SuffixStash& x : suffix_stash_)
+            b += (int64_t)x.ix.bytes() + (int64_t)x.tokens.size() * 4;
+        return b;
+    };
+    while (suffix_stash_.size() > 1 &&
+           (suffix_stash_.size() > kSuffixStashMax || bytes() > kSuffixStashBytes)) {
+        size_t old = 0;
+        for (size_t i = 1; i < suffix_stash_.size(); ++i)
+            if (suffix_stash_[i].used < suffix_stash_[old].used) old = i;
+        suffix_stash_.erase(suffix_stash_.begin() + (long)old);
+    }
+}
+
+/* --draft-suffix: a stashed index built over a prompt this request's prompt starts with is taken
+ * over at admission, so the request indexes only the tokens it adds. */
+void Scheduler::suffix_adopt(SchedReq& s) {
+    if (!s.req || s.suffix_ix.indexed() > 0 || suffix_stash_.empty()) return;
+    const Request& r = *s.req;
+    size_t best = SIZE_MAX;
+    for (size_t i = 0; i < suffix_stash_.size(); ++i) {
+        const SuffixStash& x = suffix_stash_[i];
+        if (x.tokens.size() > r.prompt.size() || x.ix.k() != cfg_.draft_suffix_min_match) continue;
+        if (best != SIZE_MAX && x.tokens.size() <= suffix_stash_[best].tokens.size()) continue;
+        if (std::equal(x.tokens.begin(), x.tokens.end(), r.prompt.begin())) best = i;
+    }
+    if (best == SIZE_MAX) return;
+    s.suffix_ix = std::move(suffix_stash_[best].ix);
+    s.suffix_ix.set_owner(r.id);
+    suffix_stash_.erase(suffix_stash_.begin() + (long)best);
+    ++m_.suffix_adopted;
 }
 
 /* ------------------------------------------------------------------ chunking */
@@ -2027,6 +2080,7 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve,
 
         r.n_computed = reuse;
         r.n_cached = reuse;
+        if (cfg_.draft_suffix && r.may_speculate) suffix_adopt(s);
         s.ckpt_src = (reuse > 0 && reuse == h.n_linear_tokens &&
                       (has_linear_state_ || win_hit)) ? h.checkpoint_slot : -1;
         s.hit_attn = h.n_attn_tokens;
