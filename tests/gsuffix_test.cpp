@@ -67,7 +67,7 @@ GlobalSuffix::Out brute(const std::vector<Resp>& held, int kmin, int kmax, std::
         if (!total) break;
         int32_t tok = 0; uint32_t c = 0;
         for (const auto& f : fol) if (f.second > c) { tok = f.first; c = f.second; }
-        const float p = (float)c / (float)total;
+        const float p = (float)c / (float)(total + 1);
         if (d * p < min_score) break;
         d *= p; sum += d;
         out[m] = tok;

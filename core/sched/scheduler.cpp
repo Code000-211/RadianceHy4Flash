@@ -1214,7 +1214,10 @@ int Scheduler::suffix_propose(SchedReq& s, int32_t* out, int* match) {
         int32_t g[RAD_SCHED_MAX_SPEC];
         const GlobalSuffix::Out go = gsuffix_.propose(seq, rows, cfg_.draft_suffix_min_score, g);
         if (go.busy) ++m_.suffix_global_busy;
-        if (go.n > 0 && go.expect > o.expect) {
+        /* And only when it expects more than the head's own chain accepts on average: a chain
+         * that replaces a better draft, and holds back the step issued ahead, costs speed. */
+        if (go.n > 0 && go.expect > o.expect &&
+            (head_verifies_ < 64 || (double)go.expect > head_accept_ewma_)) {
             std::copy(g, g + go.n, out);
             if (match) *match = go.match;
             ++m_.suffix_global;
@@ -3973,6 +3976,12 @@ int Scheduler::commit(StepResult& res) {
                                   (unsigned long long)r.id, now, was, draft_.yield(s.adapt, was),
                                   draft_.yield(s.adapt, now), est);
                     }
+                }
+                if (!e.suffix && !e.ngram) {
+                    /* The head's accepted drafts a verify, for the global suffix gate. */
+                    head_accept_ewma_ = head_verifies_ == 0 ? (double)a
+                                                            : 0.97 * head_accept_ewma_ + 0.03 * (double)a;
+                    ++head_verifies_;
                 }
                 if (e.suffix) {
                     ++m_.suffix_steps;

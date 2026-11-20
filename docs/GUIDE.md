@@ -1997,6 +1997,35 @@ nodes, grown over the block the drafter was trained at. A request with a grammar
 tools) speculates on a tree too: each row is masked against the grammar after its own ancestors.
 `draft-coupling: on` samples one path, so a coupled drafter proposes the chain.
 
+**The suffix index, built as the prompt is.** The index a suffix lookup reads covers the whole history
+(prompt and output). It is built a prefill chunk at a time, at each chunk's commit, rather than all at once
+at the first token under the scheduler's lock (0.19 us a token: 37-44 ms at 200K tokens, a stall for every
+sequence once a turn). A prompt of 4096 tokens or more leaves a copy of its finished index behind (2.2 ms at
+200K tokens, at most 16 copies and 512 MiB); the next request whose prompt starts with the same tokens (the
+conversation's next turn, typically a prefix-cache hit) takes it over at admission and indexes only what it
+adds. The contents are exactly a build from nothing (`tests/suffix_test.cpp`); the costs on the host, 200K
+tokens of code-like text: 43.9 ms at the first token before, now at most 5.3 ms in any one chunk of 8192
+(1.4 ms the first). `radiance:suffix_adopted_total` counts take-overs.
+
+**A global suffix cache: `draft-suffix-global-mib: N`.** SuffixDecoding's second tree: earlier responses
+across requests (default 0, off). For every context of `draft-suffix-min-match` to three more tokens it
+counts how often each token followed in the responses held; a proposal follows the most frequent follower of
+the longest context seen and is scored by the same frequency rule (`count(context, token) / (count(context) +
+1)`, the +1 so a context seen once is not a certainty). The step verifies the global chain instead of the
+request's own when it expects more accepted tokens than that chain and than the head's verifies accept on
+average. Responses join after their request ends: copied into a queue, indexed by a worker thread a few
+hundred positions per hold of its lock; a lookup only tries the lock, so it never waits. Past N MiB the
+oldest responses come out again. With `draft-suffix-dir: DIR` (or `prefix-cache-dir`) the responses are
+saved at a stop and when idle (`prefix-cache-flush-s`), keyed by the vocabulary and context lengths,
+checksummed and renamed into place, and re-indexed in the background after a restart. Lossless as the
+per-request chain is. Measured on Flash-Next at TP2 (`num-speculative-tokens: 7`, coupled chain, adaptive
+depth), eight code-writing chat prompts a round: sampled at T=1.0 with a new seed each round, the responses
+share too little and the head's own chain is better (neutral after the gate: 357.5 vs 358.6 tok/s); the same
+prompts again at T=0 (an agent's retry), +3.2% (343.6 vs 332.9), the global chains' rows accepted 84%. The
+verify window (7 rows on Flash-Next) bounds what a recurring response can save. `/metrics`:
+`radiance:suffix_global_total`, `suffix_global_busy_total`.
+
+
 **A shorter block under load: `draft-short-from: N`.** A block drafter's block is paid for by
 every drafting sequence, whatever each one verifies. At one sequence a long block pays; at many, its
 drafter rows and its weaker first positions cost more than the extra drafts bring. A drafter that also
@@ -2187,7 +2216,8 @@ VRAM copy. Its VRAM can then be given up at no cost, and is, as soon as somethin
 expert slab's loan, or a request the pool cannot otherwise serve). A conversation that returns
 before that resumes from VRAM; one that returns after is restored from host memory and keeps its host
 copy, so its next turn copies only what that turn added. A full host tier drops its least recently
-used conversations. Nothing is written to a drive.
+used conversations. Nothing is written to a drive at runtime; `prefix-cache-dir` (below) writes the
+cache at a stop and reads it back after a restart.
 
 A restore is one of the requests VRAM is given up for. The cache keeps a quarter of the pool free
 after each turn, and a returning conversation larger than that takes the VRAM copies of other
@@ -2250,6 +2280,55 @@ models:
   conversation's block ids and cannot move to a host slot (`docs/KV-STREAMING.md` §3.8).
 - `prefix-cache-ttl: S`: seconds an unused conversation is kept (default 3600); `0` keeps it until
   the memory is wanted.
+- `prefix-cache-dir: DIR` keeps the cache across restarts (off by default; needs `prefix-cache-mib`).
+  At runtime nothing changes: the cache lives in VRAM, the host tier and the snapshot store as above.
+  On a clean stop (SIGTERM, `stopping: draining in-flight requests`) every entry with a host copy and
+  every committed snapshot is written to `DIR/<served-model-name>.<key>/`; with
+  `prefix-cache-flush-s: S` (default 60, `0` only at a stop) what is new is also written whenever
+  the server is idle and S seconds have passed, so a crash loses little. At the next start only
+  the index is read (tens of milliseconds); an entry's bytes and the snapshot a hit resumes from are
+  read into host memory when a request's chain reaches them, just before the restore, and the turn
+  then resumes without a prefill. `prefix-cache-dir-mib: N` bounds the directory (default: the host
+  tier plus the snapshot store), least recently used first out. A host copy or snapshot the
+  directory also holds is given up for room before anything else, and read back on a hit.
+  **The directory holds conversation content (KV and token ids) unencrypted**; startup says so.
+
+  Safety: the files are only read by an engine that would compute the same bytes. The key is a
+  hash of a text listing the container (path, size, mtime, the hash of its first and last MiB),
+  every executable file mapped into the process (binary, plugins, ROCm, libm: path, size, mtime,
+  inode), the tuning files, the `RADIANCE_*`/`R4D_*`/`RAD_*`/`HSA_*`/`HIP_*` environment, the
+  options that change what a step computes (KV dtype, `tp`, `tp-wire`, placement, rotary scaling,
+  chunk size, checkpoint interval, `prefix-resume`, control vectors, adapters, ...), the cards, and
+  the KV, slot and snapshot geometry of every rank. A directory of this model under another key
+  (a rebuild, another option) is discarded at startup, naming the first line that differs:
+
+  ```
+  prefix store: /srv/kv/pcache/flashnext.b4d4... was written under another key and is discarded:
+  'code .../bin/radiance size=264880552 ...' was 'code .../bin/radiance size=264879736 ...'
+  ```
+
+  Every payload carries a 64-bit checksum checked on every read (a mismatch drops the entry: a
+  miss, never a wrong hit); segments and the index are written to a temporary file, synced and
+  renamed, the index last, so a crash or a full disk at any point leaves the previous store; a
+  short or foreign segment loses its items only; leftover temporary files and unreferenced
+  segments are removed at startup. A restored hit is bit-identical to an in-memory one: Flash-Next
+  at TP2, a follow-up turn after a restart answered with the same text and the same top-5
+  logprobs as the same follow-up in the process that computed the history.
+
+  Flash-Next at TP2 (i8 KV, 14.7 KiB a token plus 115.7 MiB a snapshot), a code conversation's
+  follow-up turn:
+
+  | history | cold prefill | from disk after a restart | in memory |
+  |---|---|---|---|
+  | 16K tokens | 2.03 s | see below | 0.09 s |
+  | 64K tokens | 7.64 s | 0.37 s | 0.13 s |
+  | 120K tokens | 14.55 s | 0.62 s | 0.14 s |
+
+  Writing 5.65 GiB (the three histories) took 5.9 s at the stop; the index of 50K entries loads in
+  0.03 s at startup. Limits: an entry still only in VRAM at the stop (the host tier full) is not
+  written; the `/sessions` rows of restored conversations reappear on their next turn; a model
+  whose KV group streams (`kv-resident`) has no host copy and is not persisted. Sliding-window
+  snapshot models (Flint) persist the same way: the window rides in the snapshot slot.
 
 **What a slot holds under tensor parallelism.** One host slot holds the whole engine's entry: each
 rank's shard of every cached group, end to end, so a slot is as many entries wide as there are
@@ -2267,7 +2346,8 @@ compares, logging `kv tiers: the replicated groups of ... differ between rank 0 
 a rank holds other bytes. Sharded groups (a GQA model's K/V heads) are unaffected and still take a
 window per rank.
 
-Restoring a 200K-token turn costs a copy over PCIe; recomputing it costs minutes.
+Restoring a 200K-token turn costs a copy over PCIe; recomputing it costs minutes. With
+`prefix-cache-dir` it survives a restart too (above).
 
 On a hybrid model the recurrent state matters as much as the attention blocks: restoring the blocks
 alone re-runs every linear layer over the whole transcript, which hit-rate counters still report as a

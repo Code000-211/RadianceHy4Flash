@@ -209,7 +209,9 @@ GlobalSuffix::Out GlobalSuffix::propose(const TokenSeq& seq, int max_rows, float
         uint32_t c = 0;
         for (const auto& f : best->f)
             if (f.second > c || (f.second == c && f.first < tok)) { tok = f.first; c = f.second; }
-        const float p = (float)c / (float)best->total;
+        /* One more in the denominator: a context seen once is a guess, not a certainty, and a
+         * small cache would otherwise propose every one-off continuation at full confidence. */
+        const float p = (float)c / (float)(best->total + 1);
         if (d * p < min_score) break;
         d *= p;
         sum += d;

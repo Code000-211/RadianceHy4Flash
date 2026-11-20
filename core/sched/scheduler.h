@@ -757,6 +757,9 @@ private:
     std::vector<SuffixStash> suffix_stash_;
     /* --draft-suffix-global-mib: earlier responses across requests (gsuffix.h). */
     GlobalSuffix gsuffix_;
+    /* Drafts the head's verifies accept, a moving average (the global chain's gate). */
+    double  head_accept_ewma_ = 0;
+    int64_t head_verifies_ = 0;
     uint64_t suffix_stash_clock_ = 0;
     /* Prompts shorter than this are cheap to index again; the stash holds at most this many
      * copies and bytes. */

@@ -9,8 +9,11 @@
  *     kmin + 3), how often each token followed it in the responses held, and in all;
  *   - a proposal follows, from the sequence's end, the most frequent follower of the longest
  *     context that occurred (ties to the lower token id), and goes on over its own tokens. Token j
- *     scores C_j = count(context, token) / count(context), the path D_j = prod C_i, and the chain
- *     stops where D_j falls under --draft-suffix-min-score: the paper's frequency rule.
+ *     scores C_j = count(context, token) / (count(context) + 1), the path D_j = prod C_i, and the
+ *     chain stops where D_j falls under --draft-suffix-min-score: the paper's frequency rule, with
+ *     one unseen follower in the denominator so a context seen once is not a certainty.
+ *   - the scheduler verifies it instead of the request's own chain when it expects more accepted
+ *     tokens (sum of D) than that chain and than the head's verifies accept on average.
  *
  * Responses go in whole after their request ends, with the last kmax tokens of the prompt in front
  * as context (counted only where the follower is a response token). They are held oldest first;
