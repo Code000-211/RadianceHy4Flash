@@ -642,6 +642,7 @@ const std::map<std::string, std::vector<std::string>>& legal_values() {
         { "--prefix-cache-mib", { "256" } }, { "--prefix-cache-ttl", { "60" } },
         { "--prefix-cache-dir", { "/srv/kv" } }, { "--prefix-cache-dir-mib", { "1024" } },
         { "--prefix-cache-flush-s", { "30" } },
+        { "--draft-suffix-global-mib", { "64" } }, { "--draft-suffix-dir", { "/srv/kv" } },
         { "--placement", { "all_vram" } }, { "--checkpoint-interval", { "256" } },
         { "--prefill-span", { "2" } },
         { "--prefill-span-pass", { "step", "--prefill-span", "2" } },

@@ -74,6 +74,15 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
     if (geo) geo_ = *geo;
     else RAD_TRY(chunk_geometry_resolve(prog, cfg, &geo_));
 
+    if (cfg_.draft_suffix && cfg_.draft_suffix_global_mib > 0) {
+        GlobalSuffix::Config gc;
+        gc.kmin = cfg_.draft_suffix_min_match;
+        gc.kmax = std::min(cfg_.draft_suffix_min_match + (int)SuffixIndex::kExtra, (int)SuffixIndex::kMaxK);
+        gc.cap_bytes = cfg_.draft_suffix_global_mib << 20;
+        gsuffix_.configure(gc);
+        gsuffix_.start();
+    }
+
     kvgeom_ = KVGeom::of(prog.kv_groups);
     for (size_t i = 0; i < kvgeom_.g.size(); ++i) {
         const int64_t w = kv->state_index_width((int32_t)i);
@@ -803,6 +812,10 @@ void Scheduler::close_request(SchedReq& s, ReqState st, const char* reason, bool
     if (publish) (void)publish_prefix(s);
 
     if (cfg_.prefix_cache && pc_) pc_->release(*s.req);
+    /* The response joins the global suffix cache (a copy; the worker indexes it). */
+    if (gsuffix_.enabled() && !s.req->embed && !s.req->output.empty())
+        gsuffix_.submit(s.req->prompt.data(), (int64_t)s.req->prompt.size(),
+                        s.req->output.data(), (int64_t)s.req->output.size());
     /* Prompt lookup's index is this text's alone. */
     s.ngram_ix.reset();
     s.suffix_ix.reset();
@@ -1191,10 +1204,23 @@ int Scheduler::suffix_propose(SchedReq& s, int32_t* out, int* match) {
     seq.na = (int64_t)r.prompt.size();
     seq.b = r.output.data();
     seq.nb = (int64_t)r.output.size();
+    const int rows = std::min(cfg_.draft_suffix_max, (int)RAD_SCHED_MAX_SPEC);
     const SuffixIndex::Out o =
-        s.suffix_ix.propose(seq, r.id, cfg_.draft_suffix_min_match,
-                            std::min(cfg_.draft_suffix_max, (int)RAD_SCHED_MAX_SPEC),
+        s.suffix_ix.propose(seq, r.id, cfg_.draft_suffix_min_match, rows,
                             cfg_.draft_suffix_min_score, out);
+    if (gsuffix_.enabled()) {
+        /* The global cache's chain, verified instead when it expects more accepted tokens
+         * (SuffixDecoding scores both trees by their followers' frequencies). */
+        int32_t g[RAD_SCHED_MAX_SPEC];
+        const GlobalSuffix::Out go = gsuffix_.propose(seq, rows, cfg_.draft_suffix_min_score, g);
+        if (go.busy) ++m_.suffix_global_busy;
+        if (go.n > 0 && go.expect > o.expect) {
+            std::copy(g, g + go.n, out);
+            if (match) *match = go.match;
+            ++m_.suffix_global;
+            return go.n;
+        }
+    }
     if (match && o.n > 0) *match = o.match;
     return o.n;
 }

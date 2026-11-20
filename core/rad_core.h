@@ -1164,6 +1164,12 @@ struct Config {
     int         draft_suffix_min_match = 6;
     int         draft_suffix_max = 7;
     float       draft_suffix_min_score = 0.3f;
+    /* --draft-suffix-global-mib N (core/sched/gsuffix.h): also propose from a cache of earlier
+     * responses across requests, up to N MiB, and verify whichever chain expects more accepted
+     * tokens. 0 (default) is off. --draft-suffix-dir keeps it across restarts (default: the
+     * --prefix-cache-dir, if set). */
+    int64_t     draft_suffix_global_mib = 0;
+    std::string draft_suffix_dir;
     /* The head's own rounds when --draft-suffix raised `n_spec` (the verify window) past them; 0 =
      * `n_spec` (set by the engine, not a flag). */
     int         n_spec_head = 0;

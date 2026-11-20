@@ -3023,6 +3023,7 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
     done_.reserve((size_t)cfg_.max_seqs);
 
     RAD_TRY(pcache_open());
+    gsuffix_open();
 
     rank_threads_.clear();
     for (int i = 0; i < cfg_.tp; ++i)
@@ -3065,6 +3066,7 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
     rank_threads_.clear();
     /* --prefix-cache-dir: the cache goes to disk now that nothing runs. */
     pcache_flush(/*final=*/true);
+    gsuffix_save(/*final=*/true);
     xstats_close();
     if (rtrace_) rtrace_->close();
     /* A step-loop error takes precedence over the transport's status. */

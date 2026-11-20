@@ -927,6 +927,12 @@ private:
     void pcache_page_in(const Request& req);
     void pcache_flush(bool final);
     void pcache_tick(uint64_t now_ns);
+    /* --draft-suffix-global-mib's file (--draft-suffix-dir, or --prefix-cache-dir). */
+    std::string gsuffix_path_, gsuffix_key_;
+    uint64_t gsuffix_saved_gen_ = 0;
+    uint64_t gsuffix_last_ns_ = 0;
+    void gsuffix_open();
+    void gsuffix_save(bool final);
     std::atomic<bool> ck_released_{ false };   /* release_host_spare closed it; unpark opens it */
     int64_t           ck_slot_ = 0, ck_cap_ = 0;
     int  repin_host_spare(std::string* why);

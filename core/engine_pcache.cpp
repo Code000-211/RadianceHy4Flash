@@ -9,6 +9,8 @@
 #include "runtime/tierexec.h"
 
 #include <algorithm>
+#include <cctype>
+#include <cerrno>
 #include <cstdlib>
 #include <cstring>
 #include <dirent.h>
@@ -288,7 +290,63 @@ void Engine::pcache_flush(bool final) {
                  f.dropped ? fmt(", %lld left out by the cap", (long long)f.dropped).c_str() : "");
 }
 
+void Engine::gsuffix_open() {
+    GlobalSuffix& g = sched_.global_suffix();
+    if (!g.enabled()) return;
+    const std::string dir = !cfg_.draft_suffix_dir.empty() ? cfg_.draft_suffix_dir : cfg_.prefix_cache_dir;
+    RAD_INFO("draft-suffix: a global cache of earlier responses, up to %lld MiB, beside each "
+             "request's own index%s", (long long)cfg_.draft_suffix_global_mib,
+             dir.empty() ? " (not kept across restarts: no --draft-suffix-dir)" : "");
+    if (dir.empty() || !vocab_) return;
+    if (::mkdir(dir.c_str(), 0700) != 0 && errno != EEXIST) {
+        RAD_WARN("draft-suffix: cannot create %s: %s", dir.c_str(), std::strerror(errno));
+        return;
+    }
+    /* Token ids mean something only under one vocabulary: the key is every piece. */
+    const uint64_t t0 = rad_mono_ns();
+    std::string pieces;
+    const int32_t nv = vocab_->n_tokens();
+    for (int32_t i = 0; i < nv; ++i) { pieces += vocab_->text(i); pieces += '\0'; }
+    gsuffix_key_ = fmt("radiance suffix cache 1\nvocab kind=%u n=%d pieces=%016llx\nk=%d..%d\n", vocab_->kind(), nv,
+                       (unsigned long long)pc_checksum(pieces.data(), (int64_t)pieces.size()),
+                       cfg_.draft_suffix_min_match,
+                       std::min(cfg_.draft_suffix_min_match + (int)SuffixIndex::kExtra, (int)SuffixIndex::kMaxK));
+    std::string name;
+    for (char c : cfg_.served_model_name) name += std::isalnum((unsigned char)c) || c == '-' || c == '_' || c == '.' ? c : '_';
+    gsuffix_path_ = dir + "/" + (name.empty() ? std::string("model") : name) + ".suffix";
+    int64_t n = 0;
+    const int rc = g.load(gsuffix_path_, gsuffix_key_, &n);
+    if (rc == RAD_OK)
+        RAD_INFO("draft-suffix: %lld earlier response(s) read from %s in %.3f s, indexed in the "
+                 "background", (long long)n, gsuffix_path_.c_str(), (double)(rad_mono_ns() - t0) * 1e-9);
+    else if (rc != RAD_E_NOTFOUND)
+        RAD_WARN("draft-suffix: %s does not match this tokenizer or is damaged; starting empty",
+                 gsuffix_path_.c_str());
+    gsuffix_saved_gen_ = g.generation();
+    gsuffix_last_ns_ = rad_mono_ns();
+}
+
+void Engine::gsuffix_save(bool final) {
+    GlobalSuffix& g = sched_.global_suffix();
+    if (gsuffix_path_.empty() || !g.enabled()) return;
+    if (!final) {
+        const uint64_t now = rad_mono_ns();
+        if (cfg_.prefix_cache_flush_s <= 0 ||
+            now - gsuffix_last_ns_ < (uint64_t)cfg_.prefix_cache_flush_s * 1000000000ull) return;
+        gsuffix_last_ns_ = now;
+    }
+    if (g.generation() == gsuffix_saved_gen_ && g.stats().queued == 0) return;
+    const uint64_t t0 = rad_mono_ns();
+    if (g.save(gsuffix_path_, gsuffix_key_) != RAD_OK) return;
+    gsuffix_saved_gen_ = g.generation();
+    const GlobalSuffix::Stats st = g.stats();
+    RAD_INFO("draft-suffix: %lld response(s), %lld tokens, saved to %s in %.3f s%s",
+             (long long)st.seqs, (long long)st.tokens, gsuffix_path_.c_str(),
+             (double)(rad_mono_ns() - t0) * 1e-9, final ? " at stop" : "");
+}
+
 void Engine::pcache_tick(uint64_t now_ns) {
+    gsuffix_save(false);
     if (!pstore_ || cfg_.prefix_cache_flush_s <= 0) return;
     if (now_ns - pstore_last_ns_ < (uint64_t)cfg_.prefix_cache_flush_s * 1000000000ull) return;
     if (pcache_activity() == pstore_seen_) { pstore_last_ns_ = now_ns; return; }
