@@ -154,6 +154,16 @@ static const Flag g_flags[] = {
     { "--prefix-cache-ttl",   "S",      "seconds a cached conversation no request uses is kept, in VRAM\n"
     "                                    or host memory (default 3600). 0 keeps it until the memory\n"
     "                                    is wanted" },
+    { "--prefix-cache-dir",   "DIR",    "keep the prefix cache across restarts: written to DIR at a\n"
+    "                                    clean stop (and when idle, --prefix-cache-flush-s), read\n"
+    "                                    back lazily at the next start. Holds conversation content\n"
+    "                                    unencrypted. Needs --prefix-cache-mib. Off by default" },
+    { "--prefix-cache-dir-mib", "N",    "the most --prefix-cache-dir holds, in MiB; least recently\n"
+    "                                    used first out. 0 (default): --prefix-cache-mib plus the\n"
+    "                                    checkpoint store" },
+    { "--prefix-cache-flush-s", "S",    "write what is new to --prefix-cache-dir once the server has\n"
+    "                                    been idle and S seconds have passed since the last write\n"
+    "                                    (default 60), so a crash loses little. 0: only at a stop" },
 
     { "--lora",               "ADAPTER", "NAME=PATH: serve a LoRA adapter beside the base model\n"
     "                                    (repeatable). A text model takes a PEFT directory and\n"
@@ -913,11 +923,15 @@ int config_parse(int argc, char** argv, Config* c) {
             RAD_ERR("--prefix-cache-host-mib was renamed: use --prefix-cache-mib");
             return RAD_E_INVAL;
         }
-        else if (S("--prefix-cache-dir") || S("--prefix-cache-disk-mib")) {
-            RAD_ERR("%s was removed: the prefix cache is kept in VRAM and host memory only "
-                    "(--prefix-cache-mib), and --prefix-cache-ttl says how long", a.c_str());
+        else if (S("--prefix-cache-disk-mib")) {
+            RAD_ERR("--prefix-cache-disk-mib was removed: the prefix cache runs in VRAM and host "
+                    "memory (--prefix-cache-mib); --prefix-cache-dir keeps it across restarts, "
+                    "--prefix-cache-dir-mib bounds it");
             return RAD_E_INVAL;
         }
+        else if (S("--prefix-cache-dir"))      { if (!(v = need(i))) return RAD_E_INVAL; c->prefix_cache_dir = v; }
+        else if (S("--prefix-cache-dir-mib"))  { if (!num(0, INT32_MAX, &c->prefix_cache_dir_mib)) return RAD_E_INVAL; }
+        else if (S("--prefix-cache-flush-s"))  { if (!num(0, INT32_MAX, &c->prefix_cache_flush_s)) return RAD_E_INVAL; }
         else if (S("--placement")) {
             if (!(v = need(i))) return RAD_E_INVAL;
             /* The planner's names, checked here so a typo stops the parse rather than startup
@@ -1817,6 +1831,11 @@ const ShowRow kShow[] = {
           return c.prefix_cache_mib ? num(c.prefix_cache_mib) : std::string("0 (off)"); } },
     { "--prefix-cache-ttl",   [](const Config& c) {
           return c.prefix_cache_ttl ? num(c.prefix_cache_ttl) + " s" : std::string("0 (never)"); } },
+    { "--prefix-cache-dir",   [](const Config& c) { return or_none(c.prefix_cache_dir, "none (off)"); } },
+    { "--prefix-cache-dir-mib", [](const Config& c) {
+          return c.prefix_cache_dir_mib ? num(c.prefix_cache_dir_mib) : std::string("0 (the host tier and the checkpoint store)"); } },
+    { "--prefix-cache-flush-s", [](const Config& c) {
+          return c.prefix_cache_flush_s ? num(c.prefix_cache_flush_s) + " s" : std::string("0 (only at a stop)"); } },
     { "--lora",               [](const Config& c) {
           std::string o;
           for (const auto& [n, p] : c.lora.adapters) o += (o.empty() ? "" : ", ") + n + "=" + p;

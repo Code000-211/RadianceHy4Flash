@@ -477,6 +477,57 @@ public:
      * left with none is erased from the index. */
     int64_t retain(uint64_t session);
 
+    /* ---------------- the store on disk (core/mem/pcstore.h, --prefix-cache-dir) ----------------
+     *
+     * At startup the engine imports what the store holds: an entry becomes an off-device entry
+     * whose tier record is a disk record (IdleTiers::add_disk), a snapshot a valid snapshot with
+     * no slot (`disk`, slot -1). Neither is a hit until paged in: before a request's restore the
+     * engine asks plan_page_in for the chain's disk entries and the deepest snapshot it would
+     * resume from, reads them, and reports back. A snapshot the store also holds is demoted to
+     * disk rather than retired when the store's slots are wanted. Needs the tiers. */
+    int  import_entry(const BlockHash& key, const std::vector<int32_t>& tokens, int64_t depth,
+                      uint8_t n_children, uint64_t used_ns);
+    int  import_snapshot(const BlockHash& key, int64_t pos, uint64_t session, uint64_t used_ns);
+    struct PageIn {
+        std::vector<BlockHash> entries;   /* disk records on the chain, in chain order */
+        BlockHash snap;                   /* the snapshot to read, when `has_snap` */
+        int64_t   snap_pos = 0;
+        bool      has_snap = false;
+    };
+    void plan_page_in(const std::vector<int32_t>& tokens, const std::vector<MMContentKey>& mm,
+                      PageIn* out) const;
+    /* A store slot for a disk snapshot (the same eviction as reserve_checkpoint), then the read's
+     * outcome: ok makes it a snapshot like any other, a failure retires it. */
+    int  snap_page_in_slot(const BlockHash& key, int32_t* slot);
+    void snap_page_in_done(const BlockHash& key, int32_t slot, bool ok);
+
+    struct PersistEntry {
+        BlockHash key;
+        const int32_t* tokens = nullptr;
+        uint8_t  n_children = 0;
+        uint64_t used_ns = 0;
+        int64_t  depth = 0;
+        int32_t  host_slot = -1;   /* the bytes in the tiers' arena, or -1 */
+        bool     disk = false;     /* the store holds the same bytes */
+    };
+    struct PersistSnap {
+        BlockHash key;
+        int64_t  pos = 0;
+        uint64_t session = 0;
+        uint64_t used_ns = 0;
+        int32_t  slot = -1;        /* the snapshot store slot, or -1 on disk only */
+        bool     disk = false;
+    };
+    /* Everything a flush can write: entries with a host copy or a disk record, and committed
+     * snapshots. VRAM-only entries (no host copy yet) are left out. */
+    void persist_export(std::vector<PersistEntry>* ents, std::vector<PersistSnap>* snaps) const;
+    /* After a flush: the store now holds these (flags set), or no longer holds these (flags
+     * cleared; one held only on disk is forgotten). */
+    void persist_stored(const std::vector<BlockHash>& ents, const std::vector<BlockHash>& snaps);
+    void persist_gone(const std::vector<BlockHash>& ents, const std::vector<BlockHash>& snaps);
+    /* Snapshots committed so far: the periodic flush's "anything new" test. */
+    int64_t ckpt_commits() const { return ckpt_commits_; }
+
     /* Sessions in the checkpoint index. Invariant: since a session is a request id, this tracks
      * sessions holding a live snapshot, not every request served. */
     int64_t sessions_tracked() const { return (int64_t)ck_by_session_.size(); }
@@ -533,6 +584,8 @@ private:
          * planned and the copy after the step that computes it; in between the slot still holds
          * the previous tenant's state and must not be handed out. */
         bool      valid = false;
+        /* The store on disk holds these bytes; with slot -1 they are only there. */
+        bool      disk = false;
     };
 
     std::vector<BlockHash> chain_all(const std::vector<int32_t>& tokens,
@@ -580,6 +633,10 @@ private:
     std::unordered_map<BlockHash, Ckpt, BlockHashHash>::iterator
     deepest_ckpt(const std::vector<BlockHash>& hs, int64_t limit) const;
     static double idle_s(uint64_t used_ns);
+    /* A free snapshot slot, by retention and then the least recently used snapshot not handed
+     * out or reserved this step (a disk-held one is demoted, not lost). RAD_E_FULL if none. */
+    int  alloc_ck_slot(uint64_t session, int64_t pos, int32_t* slot);
+    int64_t ckpt_commits_ = 0;
 
     KVManager*  kv_ = nullptr;
     IdleTiers*  tiers_ = nullptr;

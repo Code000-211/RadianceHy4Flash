@@ -14,6 +14,7 @@
 #include "mem/prefix.h"
 #include "mem/vram_budget.h"
 #include "mem/kvtier.h"
+#include "mem/pcstore.h"
 #include "device/device.h"
 #include "plugin/registry.h"
 #include "runtime/tierexec.h"
@@ -8378,6 +8379,141 @@ TEST(an_entry_with_a_streamed_group_is_never_demoted) {
     CHECK_EQ(f.kv.block_refcount(cg[0], 0), 0);
     CHECK_EQ(f.kv.block_refcount(cg[1], 0), 0);
     f.pc.set_tiers(nullptr);
+}
+
+
+/* ================================================================== the store on disk */
+
+/* A conversation's entries and snapshot go to disk at a stop and come back, byte for byte, into
+ * a fresh cache: lazily, only when a prompt's chain reaches them. */
+TEST(a_restarted_cache_pages_a_conversation_back_byte_for_byte) {
+    const std::string dir = radtest::tmp_path("pcache_restart");
+    (void)std::system(("rm -rf '" + dir + "'").c_str());
+    const auto prompt = tok_run(7600, 336);
+    auto keys = chain_of(prompt);
+    keys.resize(20);                                    /* the published blocks */
+    std::vector<std::vector<unsigned char>> want_e;
+    std::vector<unsigned char> want_s;
+    PrefixStore::Config sc;
+    {
+        TierFixture x;
+        CHECK_OK(x.build(/*with_linear=*/true, /*ckpt_slots=*/4));
+        publish(x.f, 1, prompt, 320);
+        const int32_t snap = ckpt_at(x.f, 1, keys, 320);
+        x.f.kv.free_sequence(1);
+        const auto jobs = copy_now(x.t);
+        REQUIRE_EQ(jobs.size(), 20u);
+        /* The host copies and the snapshot, as distinct patterns. */
+        for (const TierJob& j : jobs) {
+            unsigned char* p = static_cast<unsigned char*>(x.t.host_ptr(j.host_slot));
+            for (int i = 0; i < 1024; ++i) p[i] = (unsigned char)(j.key.lo * 7 + (uint64_t)i);
+        }
+        for (const BlockHash& k : keys) {
+            IdleTiers::PersistView v;
+            REQUIRE(x.t.persist_view(k, &v));
+            const unsigned char* p = static_cast<unsigned char*>(x.t.host_ptr(v.host_slot));
+            want_e.emplace_back(p, p + 1024);
+        }
+        unsigned char* sp = static_cast<unsigned char*>(x.f.ck.at(snap));
+        for (int64_t i = 0; i < x.f.ck.slot_bytes(); ++i) sp[i] = (unsigned char)(i * 13 + 5);
+        want_s.assign(sp, sp + x.f.ck.slot_bytes());
+        sc.dir = dir;
+        sc.name = "m";
+        sc.key_text = "test key\n";
+        sc.entry_bytes = 1024;
+        sc.snap_bytes = x.f.ck.slot_bytes();
+        sc.block_tokens = 16;
+        PrefixStore st;
+        CHECK_OK(st.open(sc));
+        PcFlush f;
+        CHECK_OK(pc_flush_cache(x.f.pc, x.t, &x.f.ck, st, 0, &f));
+        CHECK_EQ(f.written_items, 21ll);
+        /* A second flush with nothing new writes nothing. */
+        PcFlush g;
+        CHECK_OK(pc_flush_cache(x.f.pc, x.t, &x.f.ck, st, 0, &g));
+        CHECK_EQ(g.written_items, 0ll);
+        CHECK_EQ(g.kept_items, 21ll);
+    }
+    TierFixture y;
+    CHECK_OK(y.build(true, 4));
+    PrefixStore st;
+    CHECK_OK(st.open(sc));
+    int64_t ns = 0;
+    CHECK_EQ(pc_import(y.f.pc, st, &ns), 20ll);
+    CHECK_EQ(ns, 1ll);
+    CHECK_EQ(y.t.arena().used_slots(), 0ll);             /* nothing read yet */
+    CHECK_EQ(y.f.pc.lookup(prompt, {}).n_attn_tokens, 0);
+    /* Another prompt's chain reads nothing. */
+    PcPageIn none;
+    CHECK_OK(pc_page_in(y.f.pc, y.t, &y.f.ck, st, tok_run(100, 64), {}, &none));
+    CHECK_EQ(none.entries, 0ll);
+    PcPageIn r;
+    CHECK_OK(pc_page_in(y.f.pc, y.t, &y.f.ck, st, prompt, {}, &r));
+    CHECK_EQ(r.entries, 20ll);
+    CHECK(r.snap);
+    CHECK_EQ(y.f.pc.restorable_from(prompt, {}).size(), 20u);
+    for (size_t b = 0; b < keys.size(); ++b) {
+        IdleTiers::PersistView v;
+        REQUIRE(y.t.persist_view(keys[b], &v));
+        REQUIRE(v.host_slot >= 0);
+        CHECK(std::memcmp(y.t.host_ptr(v.host_slot), want_e[b].data(), 1024) == 0);
+    }
+    /* Promote the chain as the engine does, then the lookup resumes at the snapshot. */
+    for (const BlockHash& k : keys) {
+        TierJob j;
+        REQUIRE(y.t.plan_promote(k, &j));
+        for (int32_t g : y.f.pc.entry_groups()) {
+            int32_t blk = -1;
+            REQUIRE(y.f.kv.reserve_block(g, &blk) == RAD_OK);
+            j.blocks.push_back(blk);
+        }
+        j.started = true;
+        y.t.report(j, true);
+        CHECK_OK(y.f.pc.rebind(k, j.blocks));
+    }
+    const CacheHit h = y.f.pc.lookup(prompt, {});
+    CHECK_EQ(h.n_attn_tokens, 320);
+    CHECK_EQ(h.n_linear_tokens, 320);
+    REQUIRE(h.checkpoint_slot >= 0);
+    CHECK(std::memcmp(y.f.ck.at(h.checkpoint_slot), want_s.data(), want_s.size()) == 0);
+    /* Paged-in records are known to be on disk: the next flush writes nothing. */
+    PcFlush f;
+    CHECK_OK(pc_flush_cache(y.f.pc, y.t, &y.f.ck, st, 0, &f));
+    CHECK_EQ(f.written_items, 0ll);
+    CHECK_EQ(f.kept_items, 21ll);
+}
+
+/* A snapshot the store holds gives up its slot to a newer one without being lost, and a host
+ * copy the store holds gives up its arena slot the same way. */
+TEST(store_held_copies_are_demoted_to_disk_not_lost) {
+    const std::string dir = radtest::tmp_path("pcache_demote");
+    (void)std::system(("rm -rf '" + dir + "'").c_str());
+    TierFixture x;
+    CHECK_OK(x.build(true, /*ckpt_slots=*/1));
+    const auto a = tok_run(1000, 336);
+    const auto ka = chain_of(a);
+    publish(x.f, 1, a, 320);
+    (void)ckpt_at(x.f, 1, ka, 320);
+    x.f.kv.free_sequence(1);
+    (void)copy_now(x.t);
+    PrefixStore::Config sc;
+    sc.dir = dir; sc.name = "m"; sc.key_text = "k\n"; sc.entry_bytes = 1024;
+    sc.snap_bytes = x.f.ck.slot_bytes(); sc.block_tokens = 16;
+    PrefixStore st;
+    CHECK_OK(st.open(sc));
+    CHECK_OK(pc_flush_cache(x.f.pc, x.t, &x.f.ck, st, 0, nullptr));
+    /* A second conversation needs the only snapshot slot. */
+    x.f.pc.begin_step();
+    const auto b = tok_run(5000, 336);
+    const auto kb = chain_of(b);
+    int32_t s = -1;
+    CHECK_OK(x.f.pc.reserve_checkpoint(2, 320, kb[19], &s));
+    x.f.pc.commit_checkpoint(kb[19]);
+    /* The first snapshot is on disk only now, and a page-in brings it back. */
+    PrefixCache::PageIn plan;
+    x.f.pc.plan_page_in(a, {}, &plan);
+    CHECK(plan.has_snap);
+    CHECK_EQ(plan.snap_pos, 320ll);
 }
 
 RAD_TEST_MAIN()

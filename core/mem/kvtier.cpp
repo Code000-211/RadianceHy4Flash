@@ -189,6 +189,7 @@ void IdleTiers::rebound(const BlockHash& key, const std::vector<int32_t>& blocks
     if (r.pending) return;
     unlist(r);
     free_host(r);
+    r.disk = false;
     r.tier = KVTier::Device;
     r.blocks = blocks;
     r.used_ns = now_ns;
@@ -448,7 +449,7 @@ bool IdleTiers::plan_promote(const BlockHash& key, TierJob* out) {
     auto it = recs_.find(key);
     if (it == recs_.end()) return false;
     Rec& r = it->second;
-    if (r.pending || r.doomed || r.tier != KVTier::Host) return false;
+    if (r.pending || r.doomed || r.tier != KVTier::Host || r.host_slot < 0) return false;
 
     *out = TierJob{};
     out->kind = TierJob::Kind::ToDevice;
@@ -489,6 +490,7 @@ void IdleTiers::report(const TierJob& job, bool ok, uint64_t now_ns) {
             if (job.host_slot >= 0) {
                 if (ok && r.tier == KVTier::Device && r.host_slot < 0) {
                     r.host_slot = job.host_slot;
+                    r.disk = false;
                     ++stats_.to_host;
                 } else {
                     give_slot(job.host_slot);
@@ -531,6 +533,11 @@ void IdleTiers::report(const TierJob& job, bool ok, uint64_t now_ns) {
 
         case TierJob::Kind::DropHost:
             free_host(r);
+            if (r.disk) {
+                /* The store holds the same bytes: the record stays, read back on a hit. */
+                ++stats_.to_disk_only;
+                return;
+            }
             ++stats_.host_drops;
             recs_.erase(it);
             drop_rooted(job.key);
@@ -539,6 +546,110 @@ void IdleTiers::report(const TierJob& job, bool ok, uint64_t now_ns) {
     }
 }
 
+
+/* ------------------------------------------------------------------ the store on disk */
+
+void IdleTiers::add_disk(const BlockHash& key, uint64_t used_ns, int64_t depth) {
+    if (!host_on()) return;
+    std::lock_guard lk(mu_);
+    auto it = recs_.find(key);
+    if (it != recs_.end()) { it->second.disk = it->second.disk || it->second.tier == KVTier::Host; return; }
+    Rec& r = recs_[key];
+    r.tier = KVTier::Host;
+    r.host_slot = -1;
+    r.disk = true;
+    r.used_ns = used_ns;
+    r.depth = depth;
+}
+
+bool IdleTiers::disk_only(const BlockHash& key) const {
+    std::lock_guard lk(mu_);
+    auto it = recs_.find(key);
+    if (it == recs_.end()) return false;
+    const Rec& r = it->second;
+    return !r.pending && !r.doomed && r.tier == KVTier::Host && r.host_slot < 0 && r.disk;
+}
+
+int IdleTiers::page_in_slot(const BlockHash& key, int32_t* slot) {
+    *slot = -1;
+    std::lock_guard lk(mu_);
+    auto it = recs_.find(key);
+    if (it == recs_.end()) return RAD_E_NOTFOUND;
+    Rec& r = it->second;
+    if (r.pending || r.doomed || r.tier != KVTier::Host || r.host_slot >= 0 || !r.disk)
+        return RAD_E_STATE;
+    int32_t s = arena_.alloc();
+    if (s < 0) {
+        /* Room from the oldest host copy the store also holds: losing it loses nothing. */
+        for (auto v = host_lru_.begin(); v != host_lru_.end(); ++v) {
+            auto vi = recs_.find(v->second);
+            if (vi == recs_.end()) continue;
+            Rec& vr = vi->second;
+            if (!vr.disk || vr.pending || vr.host_slot < 0) continue;
+            unlist(vr);
+            give_slot(vr.host_slot);
+            vr.host_slot = -1;
+            ++stats_.to_disk_only;
+            break;
+        }
+        s = arena_.alloc();
+    }
+    if (s < 0) return RAD_E_FULL;
+    r.pending = true;
+    *slot = s;
+    return RAD_OK;
+}
+
+void IdleTiers::page_in_done(const BlockHash& key, int32_t slot, bool ok, uint64_t now_ns) {
+    std::lock_guard lk(mu_);
+    auto it = recs_.find(key);
+    if (it == recs_.end()) { give_slot(slot); return; }
+    Rec& r = it->second;
+    r.pending = false;
+    if (!ok || r.doomed) {
+        give_slot(slot);
+        recs_.erase(it);
+        drop_rooted(key);
+        return;
+    }
+    r.host_slot = slot;
+    ++stats_.paged_in;
+    r.used_ns = now_ns;
+    relist(key, r);
+}
+
+bool IdleTiers::persist_view(const BlockHash& key, PersistView* v) const {
+    std::lock_guard lk(mu_);
+    auto it = recs_.find(key);
+    if (it == recs_.end()) return false;
+    const Rec& r = it->second;
+    v->host_slot = r.host_slot;
+    v->disk = r.disk;
+    v->pending = r.pending || r.doomed;
+    v->used_ns = r.used_ns;
+    v->depth = r.depth;
+    v->tier = r.tier;
+    return true;
+}
+
+void IdleTiers::set_disk(const BlockHash& key) {
+    std::lock_guard lk(mu_);
+    auto it = recs_.find(key);
+    if (it != recs_.end() && !it->second.pending) it->second.disk = true;
+}
+
+bool IdleTiers::clear_disk(const BlockHash& key) {
+    std::lock_guard lk(mu_);
+    auto it = recs_.find(key);
+    if (it == recs_.end()) return false;
+    Rec& r = it->second;
+    r.disk = false;
+    if (r.pending || r.tier != KVTier::Host || r.host_slot >= 0) return false;
+    unlist(r);
+    recs_.erase(it);
+    drop_rooted(key);
+    return true;
+}
 
 /* ------------------------------------------------------------------ the session view */
 
@@ -734,7 +845,9 @@ std::vector<IdleTiers::SessionInfo> IdleTiers::sessions(Occupancy* occ) const {
                 if (rr.pending) si.moving = true;
                 switch (rr.tier) {
                     case KVTier::Device: ++si.on_device; break;
-                    case KVTier::Host:   ++si.on_host;   break;
+                    case KVTier::Host:
+                        if (rr.host_slot < 0 && rr.disk) ++si.on_disk; else ++si.on_host;
+                        break;
                 }
                 /* Snapshots are in host memory whatever tier the blocks are on. */
                 if (rr.ck_slot >= 0) {

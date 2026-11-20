@@ -1056,6 +1056,14 @@ struct Config {
     /* Seconds an unused conversation is kept in any tier (VRAM, host memory, its snapshots). 0
      * keeps everything until the memory is needed. */
     int64_t prefix_cache_ttl = 3600;
+    /* --prefix-cache-dir: keep the cache across restarts (core/mem/pcstore.h). Written on a clean
+     * stop and, every --prefix-cache-flush-s seconds the server is idle with something new, read
+     * back lazily at the next start. Empty is off. Needs the host tier (--prefix-cache-mib). */
+    std::string prefix_cache_dir;
+    /* The store's size in MiB; 0 is the host tier plus the snapshot store. */
+    int64_t prefix_cache_dir_mib = 0;
+    /* Seconds between idle flushes; 0 writes only at a clean stop. */
+    int64_t prefix_cache_flush_s = 60;
 
     /* The cache always lends; there is no flag. It keeps the blocks in use plus a derived buffer
      * and lends the rest to the expert plane at addresses it already owns (core/mem/kv.h). The

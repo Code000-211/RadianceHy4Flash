@@ -311,13 +311,26 @@ TEST(the_pool_size_flags_are_gone_and_say_what_replaced_them) {
     CHECK_EQ(parse({ "--vram-kv-mib", "6144" }, &k), RAD_E_INVAL);
 }
 
-TEST(the_prefix_cache_disk_flags_are_gone_and_the_host_size_was_renamed) {
+TEST(the_prefix_cache_disk_tier_flag_is_gone_the_host_size_was_renamed_and_the_dir_persists) {
     /* The prefix cache has no disk tier. A launch line naming the disk tier, or the host tier's
      * old flag name, is refused. */
-    for (const char* f : { "--prefix-cache-host-mib", "--prefix-cache-disk-mib", "--prefix-cache-dir" }) {
+    for (const char* f : { "--prefix-cache-host-mib", "--prefix-cache-disk-mib" }) {
         Config c;
         CHECK_EQ(parse({ f, "4096" }, &c), RAD_E_INVAL);
     }
+    /* The store across restarts: off by default, a directory and its bounds when given. */
+    Config p;
+    CHECK_EQ(parse({}, &p), RAD_OK);
+    CHECK(p.prefix_cache_dir.empty());
+    CHECK_EQ(p.prefix_cache_flush_s, 60ll);
+    Config q;
+    CHECK_EQ(parse({ "--prefix-cache-dir", "/srv/kv", "--prefix-cache-dir-mib", "8192",
+                     "--prefix-cache-flush-s", "0" }, &q), RAD_OK);
+    CHECK_EQ(q.prefix_cache_dir, std::string("/srv/kv"));
+    CHECK_EQ(q.prefix_cache_dir_mib, 8192ll);
+    CHECK_EQ(q.prefix_cache_flush_s, 0ll);
+    Config bad;
+    CHECK_EQ(parse({ "--prefix-cache-flush-s", "-1" }, &bad), RAD_E_INVAL);
     Config d;
     CHECK_EQ(parse({}, &d), RAD_OK);
     CHECK_EQ(d.prefix_cache_mib, 0ll);
@@ -627,6 +640,8 @@ const std::map<std::string, std::vector<std::string>>& legal_values() {
         { "--vision-tower-placement", { "ram" } }, { "--ngram-placement", { "disk" } },
         { "--debug-draft-oracle", { "/o.txt", "--spec-ngram", "4" } },
         { "--prefix-cache-mib", { "256" } }, { "--prefix-cache-ttl", { "60" } },
+        { "--prefix-cache-dir", { "/srv/kv" } }, { "--prefix-cache-dir-mib", { "1024" } },
+        { "--prefix-cache-flush-s", { "30" } },
         { "--placement", { "all_vram" } }, { "--checkpoint-interval", { "256" } },
         { "--prefill-span", { "2" } },
         { "--prefill-span-pass", { "step", "--prefill-span", "2" } },
@@ -754,7 +769,8 @@ TEST(every_listed_option_parses_and_is_reported_as_given) {
 /* A whole-number option refuses what is not one, and a number option a word: "8x" read as 8, ""
  * as 0 or "12k" as 12 would each be served as a decision. Seconds are whole numbers too. */
 TEST(every_numeric_option_refuses_what_is_not_its_kind) {
-    const std::vector<std::string> seconds = { "--prefix-cache-ttl", "--read-timeout",
+    const std::vector<std::string> seconds = { "--prefix-cache-ttl", "--prefix-cache-flush-s",
+                                               "--read-timeout",
                                                "--write-timeout", "--keep-alive-timeout",
                                                "--retry-after" };
     int n_int = 0, n_num = 0;

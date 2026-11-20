@@ -1025,6 +1025,19 @@ int PrefixCache::reserve_checkpoint(uint64_t session, int64_t pos, const BlockHa
         return RAD_E_INVAL;
     }
     auto existing = ck_by_prefix_.find(prefix);
+    if (existing != ck_by_prefix_.end() && existing->second.slot < 0) {
+        /* Held only on disk: the save writes it afresh into a slot of its own. */
+        int32_t s2 = -1;
+        if (const int a = alloc_ck_slot(session, pos, &s2); a < 0) return a;
+        existing = ck_by_prefix_.find(prefix);   /* retention may have retired it */
+        if (existing == ck_by_prefix_.end()) {
+            kv_->free_checkpoint(s2);
+            return reserve_checkpoint(session, pos, prefix, slot_out);
+        }
+        existing->second.slot = s2;
+        existing->second.valid = false;
+        existing->second.disk = false;
+    }
     if (existing != ck_by_prefix_.end()) {
         existing->second.used = ++clock_;
         existing->second.used_ns = rad_mono_ns();
@@ -1037,45 +1050,7 @@ int PrefixCache::reserve_checkpoint(uint64_t session, int64_t pos, const BlockHa
     }
 
     int32_t slot = -1;
-    if (kv_->alloc_checkpoint(&slot) < 0) {
-        /* Run retention over every session. Iterate a copy of the keys: retain() erases sessions
-         * it empties. */
-        std::vector<uint64_t> sessions;
-        sessions.reserve(ck_by_session_.size());
-        for (const auto& s : ck_by_session_) sessions.push_back(s.first);
-        for (uint64_t s : sessions) retain(s);
-        if (kv_->alloc_checkpoint(&slot) < 0) {
-            /* Evict the least recently used snapshot, where a use is its reservation or a lookup
-             * resuming from it, and never one handed out or reserved this step (its admission
-             * restores from the slot ahead of the step; the save lands in it after). A tip gets
-             * no protection beyond its recency: sessions are request ids, and a client that
-             * rewrites its last message leaves one tip per turn that no later turn reaches, while
-             * the anchor every turn resumes from is used each turn. */
-            const Ckpt* victim = nullptr;
-            for (const auto& kvp : ck_by_prefix_) {
-                if (handed(kvp.first) || reserved(kvp.first)) continue;
-                if (!victim || kvp.second.used < victim->used) victim = &kvp.second;
-            }
-            if (!victim) {
-                ++stats_.ckpt_refused;
-                RAD_DEBUG("prefix cache: no snapshot at %lld for session %llu: every one of the "
-                          "%lld slots was handed out this step or awaits its save", (long long)pos,
-                          (unsigned long long)session, (long long)ck_by_prefix_.size());
-                return RAD_E_FULL;
-            }
-            RAD_DEBUG("prefix cache: store full, snapshot at %lld of session %llu (%s) evicted "
-                      "as the least recently used, unused for %.1f s", (long long)victim->pos,
-                      (unsigned long long)victim->session,
-                      is_tip(*victim) ? "its tip" : "below its tip", idle_s(victim->used_ns));
-            const BlockHash vh = victim->prefix;
-            const uint64_t vs = victim->session;
-            retire_ckpt(ck_by_prefix_.find(vh));
-            ++stats_.ckpt_evictions;
-            ++stats_.ckpt_lru;
-            unindex_ckpt(vs, vh);
-            if (kv_->alloc_checkpoint(&slot) < 0) { ++stats_.ckpt_refused; return RAD_E_FULL; }
-        }
-    }
+    if (const int a = alloc_ck_slot(session, pos, &slot); a < 0) return a;
 
     Ckpt c;
     c.session = session; c.pos = pos; c.prefix = prefix; c.slot = slot;
@@ -1092,6 +1067,60 @@ int PrefixCache::reserve_checkpoint(uint64_t session, int64_t pos, const BlockHa
     return RAD_OK;
 }
 
+int PrefixCache::alloc_ck_slot(uint64_t session, int64_t pos, int32_t* slot) {
+    *slot = -1;
+    if (kv_->alloc_checkpoint(slot) < 0) {
+        /* Run retention over every session. Iterate a copy of the keys: retain() erases sessions
+         * it empties. */
+        std::vector<uint64_t> sessions;
+        sessions.reserve(ck_by_session_.size());
+        for (const auto& s : ck_by_session_) sessions.push_back(s.first);
+        for (uint64_t s : sessions) retain(s);
+        if (kv_->alloc_checkpoint(slot) < 0) {
+            /* Evict the least recently used snapshot, where a use is its reservation or a lookup
+             * resuming from it, and never one handed out or reserved this step (its admission
+             * restores from the slot ahead of the step; the save lands in it after). A tip gets
+             * no protection beyond its recency: sessions are request ids, and a client that
+             * rewrites its last message leaves one tip per turn that no later turn reaches, while
+             * the anchor every turn resumes from is used each turn. */
+            const Ckpt* victim = nullptr;
+            for (const auto& kvp : ck_by_prefix_) {
+                if (handed(kvp.first) || reserved(kvp.first)) continue;
+                if (kvp.second.slot < 0) continue;      /* on disk only: holds no slot */
+                if (!victim || kvp.second.used < victim->used) victim = &kvp.second;
+            }
+            if (!victim) {
+                ++stats_.ckpt_refused;
+                RAD_DEBUG("prefix cache: no snapshot at %lld for session %llu: every one of the "
+                          "%lld slots was handed out this step or awaits its save", (long long)pos,
+                          (unsigned long long)session, (long long)ck_by_prefix_.size());
+                return RAD_E_FULL;
+            }
+            RAD_DEBUG("prefix cache: store full, snapshot at %lld of session %llu (%s) evicted "
+                      "as the least recently used, unused for %.1f s", (long long)victim->pos,
+                      (unsigned long long)victim->session,
+                      is_tip(*victim) ? "its tip" : "below its tip", idle_s(victim->used_ns));
+            const BlockHash vh = victim->prefix;
+            const uint64_t vs = victim->session;
+            ++stats_.ckpt_evictions;
+            ++stats_.ckpt_lru;
+            auto vit = ck_by_prefix_.find(vh);
+            if (vit->second.disk && vit->second.valid) {
+                /* The store on disk holds it: give up the slot only. */
+                if (tiers_) tiers_->release_snapshot(vh);
+                kv_->free_checkpoint(vit->second.slot);
+                vit->second.slot = -1;
+            } else {
+                retire_ckpt(vit);
+                unindex_ckpt(vs, vh);
+            }
+            if (kv_->alloc_checkpoint(slot) < 0) { ++stats_.ckpt_refused; return RAD_E_FULL; }
+        }
+    }
+    if (*slot < 0 && kv_->alloc_checkpoint(slot) < 0) { ++stats_.ckpt_refused; return RAD_E_FULL; }
+    return RAD_OK;
+}
+
 void PrefixCache::commit_checkpoint(const BlockHash& prefix) {
     /* The save has landed: the slot is a snapshot like any other from here. */
     reserved_.erase(std::remove(reserved_.begin(), reserved_.end(), prefix), reserved_.end());
@@ -1100,6 +1129,8 @@ void PrefixCache::commit_checkpoint(const BlockHash& prefix) {
     /* One that lost its slot since the reservation holds nothing to serve. */
     if (it->second.slot < 0) return;
     it->second.valid = true;
+    it->second.disk = false;
+    ++ckpt_commits_;
     /* Tell the tiers (for the session view) only now that the slot holds this state. */
     if (tiers_) tiers_->note_snapshot(prefix, it->second.slot, it->second.pos);
 }
@@ -1301,4 +1332,172 @@ int PrefixCache::release_session(const std::string& label, uint64_t id, int64_t 
     stats_.ckpt_released += out->snapshots;
     return RAD_OK;
 }
+
+/* ------------------------------------------------------------------ the store on disk */
+
+int PrefixCache::import_entry(const BlockHash& key, const std::vector<int32_t>& tokens,
+                              int64_t depth, uint8_t n_children, uint64_t used_ns) {
+    if (!enabled_ || !tiers_ || !tiers_->host_on() || !demotable_) return RAD_E_UNSUPPORTED;
+    if ((int64_t)tokens.size() != block_size_) return RAD_E_INVAL;
+    if (map_.count(key)) return RAD_OK;
+    Entry e;
+    e.tokens = tokens;
+    e.n_children = n_children;
+    e.used_ns = used_ns;
+    e.in_lru = false;
+    map_.emplace(key, std::move(e));
+    tiers_->add_disk(key, used_ns, depth);
+    return RAD_OK;
+}
+
+int PrefixCache::import_snapshot(const BlockHash& key, int64_t pos, uint64_t session,
+                                 uint64_t used_ns) {
+    if (!enabled_ || !has_linear_) return RAD_E_UNSUPPORTED;
+    if (pos <= 0 || pos % block_size_ != 0) return RAD_E_INVAL;
+    if (ck_by_prefix_.count(key)) return RAD_OK;
+    Ckpt c;
+    c.session = session;
+    c.pos = pos;
+    c.prefix = key;
+    c.slot = -1;
+    c.used = c.made = ++clock_;
+    c.used_ns = used_ns;
+    c.valid = true;
+    c.disk = true;
+    ck_by_prefix_.emplace(key, c);
+    ++ck_positions_[pos];
+    ck_by_session_[session].push_back(key);
+    return RAD_OK;
+}
+
+void PrefixCache::plan_page_in(const std::vector<int32_t>& tokens,
+                               const std::vector<MMContentKey>& mm, PageIn* out) const {
+    *out = PageIn{};
+    if (!enabled_ || !tiers_ || tokens.empty()) return;
+    /* The blocks a hit can use (one token must remain), as restorable_from walks them. */
+    const int64_t n_full = ((int64_t)tokens.size() - 1) / block_size_;
+    const std::vector<BlockHash> hs = chain_all(tokens, mm, n_full);
+    int64_t reach = 0;
+    for (int64_t b = 0; b < n_full; ++b) {
+        auto it = map_.find(hs[(size_t)b]);
+        if (it == map_.end() || !same_tokens(it->second, tokens.data() + b * block_size_)) break;
+        if (tiers_->disk_only(hs[(size_t)b])) out->entries.push_back(hs[(size_t)b]);
+        reach = b + 1;
+    }
+    if (!has_linear_ || reach == 0) return;
+    /* The snapshot a hit would resume from: the deepest on the chain, wherever it is held. Only
+     * one on disk alone needs reading; one in a slot is served as it is. */
+    const int64_t max_pos = reach * block_size_;
+    for (auto pit = ck_positions_.upper_bound(max_pos); pit != ck_positions_.begin();) {
+        --pit;
+        const int64_t pos = pit->first;
+        if (pos <= 0 || pos % block_size_ != 0) continue;
+        auto it = ck_by_prefix_.find(hs[(size_t)(pos / block_size_ - 1)]);
+        if (it == ck_by_prefix_.end() || it->second.pos != pos || !it->second.valid) continue;
+        if (it->second.slot < 0 && it->second.disk) {
+            out->snap = it->first;
+            out->snap_pos = pos;
+            out->has_snap = true;
+        }
+        return;
+    }
+}
+
+int PrefixCache::snap_page_in_slot(const BlockHash& key, int32_t* slot) {
+    *slot = -1;
+    auto it = ck_by_prefix_.find(key);
+    if (it == ck_by_prefix_.end() || it->second.slot >= 0 || !it->second.disk) return RAD_E_STATE;
+    const uint64_t session = it->second.session;
+    const int64_t pos = it->second.pos;
+    /* Retention must not retire the snapshot being read in: hold it as this step's. */
+    handed_.push_back(key);
+    const int a = alloc_ck_slot(session, pos, slot);
+    return a;
+}
+
+void PrefixCache::snap_page_in_done(const BlockHash& key, int32_t slot, bool ok) {
+    auto it = ck_by_prefix_.find(key);
+    if (it == ck_by_prefix_.end()) { if (slot >= 0) kv_->free_checkpoint(slot); return; }
+    if (!ok) {
+        if (slot >= 0) kv_->free_checkpoint(slot);
+        const uint64_t session = it->second.session;
+        retire_ckpt(it);
+        unindex_ckpt(session, key);
+        return;
+    }
+    it->second.slot = slot;
+    it->second.used = ++clock_;
+    it->second.used_ns = rad_mono_ns();
+    if (tiers_) tiers_->note_snapshot(key, slot, it->second.pos);
+}
+
+void PrefixCache::persist_export(std::vector<PersistEntry>* ents,
+                                 std::vector<PersistSnap>* snaps) const {
+    ents->clear();
+    snaps->clear();
+    if (!enabled_ || !tiers_) return;
+    /* The depth tiers record is set only with a host tier; the chain is rebuilt from the
+     * tokens on load, so the depth only orders what a cap keeps. */
+    ents->reserve(map_.size());
+    for (const auto& kv : map_) {
+        IdleTiers::PersistView v;
+        if (!tiers_->persist_view(kv.first, &v) || v.pending) continue;
+        if (v.host_slot < 0 && !(v.tier == KVTier::Host && v.disk)) continue;
+        PersistEntry p;
+        p.key = kv.first;
+        p.tokens = kv.second.tokens.data();
+        p.n_children = kv.second.n_children;
+        p.used_ns = std::max(v.used_ns, kv.second.used_ns);
+        p.depth = v.depth;
+        p.host_slot = v.host_slot;
+        p.disk = v.disk;
+        ents->push_back(p);
+    }
+    for (const auto& kv : ck_by_prefix_) {
+        const Ckpt& c = kv.second;
+        if (!c.valid || reserved(kv.first)) continue;
+        if (c.slot < 0 && !c.disk) continue;
+        PersistSnap p;
+        p.key = kv.first;
+        p.pos = c.pos;
+        p.session = c.session;
+        p.used_ns = c.used_ns;
+        p.slot = c.slot;
+        p.disk = c.disk;
+        snaps->push_back(p);
+    }
+}
+
+void PrefixCache::persist_stored(const std::vector<BlockHash>& ents,
+                                 const std::vector<BlockHash>& snaps) {
+    if (tiers_) for (const BlockHash& h : ents) tiers_->set_disk(h);
+    for (const BlockHash& h : snaps) {
+        auto it = ck_by_prefix_.find(h);
+        if (it != ck_by_prefix_.end() && it->second.valid) it->second.disk = true;
+    }
+}
+
+void PrefixCache::persist_gone(const std::vector<BlockHash>& ents,
+                               const std::vector<BlockHash>& snaps) {
+    if (tiers_)
+        for (const BlockHash& h : ents) {
+            auto it = map_.find(h);
+            if (it == map_.end()) { (void)tiers_->clear_disk(h); continue; }
+            if (tiers_->clear_disk(h) && !it->second.in_lru) {
+                map_.erase(it);
+                ++stats_.evictions;
+            }
+        }
+    for (const BlockHash& h : snaps) {
+        auto it = ck_by_prefix_.find(h);
+        if (it == ck_by_prefix_.end()) continue;
+        it->second.disk = false;
+        if (it->second.slot < 0) {
+            const uint64_t session = it->second.session;
+            retire_ckpt(it);
+            unindex_ckpt(session, h);
+        }
+    }
+}
+
 }  /* namespace rad */
