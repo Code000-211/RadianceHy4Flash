@@ -2316,19 +2316,22 @@ models:
   logprobs as the same follow-up in the process that computed the history.
 
   Flash-Next at TP2 (i8 KV, 14.7 KiB a token plus 115.7 MiB a snapshot), a code conversation's
-  follow-up turn:
+  follow-up turn, time to first token:
 
-  | history | cold prefill | from disk after a restart | in memory |
+  | history | cold prefill | after a restart, from disk (cold / page cache) | in memory |
   |---|---|---|---|
-  | 16K tokens | 2.03 s | see below | 0.09 s |
-  | 64K tokens | 7.64 s | 0.37 s | 0.13 s |
-  | 120K tokens | 14.55 s | 0.62 s | 0.14 s |
+  | 16K tokens | 2.03 s | 0.31 s | 0.09 s |
+  | 64K tokens | 7.64 s | 0.63 s / 0.37 s | 0.13 s |
+  | 120K tokens | 14.55 s | 1.30 s / 0.62 s | 0.19 s |
 
-  Writing 5.65 GiB (the three histories) took 5.9 s at the stop; the index of 50K entries loads in
-  0.03 s at startup. Limits: an entry still only in VRAM at the stop (the host tier full) is not
+  The disk read is most of it (1.81 GiB for 120K tokens in 0.84 s from a cold cache). Writing the
+  three histories (5.65 GiB) took 4.7 s; the index of 50K entries loads in 0.02 s, the key in
+  0.02 s. Flint (sliding-window snapshots, 16-token entries) persists the same way, the window
+  riding in its snapshot: 48K tokens 3.94 s cold, 0.74 s from disk, 0.08 s in memory, the same
+  text and logprobs. Limits: an entry still only in VRAM at the stop (the host tier full) is not
   written; the `/sessions` rows of restored conversations reappear on their next turn; a model
-  whose KV group streams (`kv-resident`) has no host copy and is not persisted. Sliding-window
-  snapshot models (Flint) persist the same way: the window rides in the snapshot slot.
+  whose KV group streams (`kv-resident`) has no host copy and is not persisted; a page-in runs on
+  the step thread under the scheduler's lock, so a running batch waits for it.
 
 **What a slot holds under tensor parallelism.** One host slot holds the whole engine's entry: each
 rank's shard of every cached group, end to end, so a slot is as many entries wide as there are
