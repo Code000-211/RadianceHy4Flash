@@ -189,4 +189,50 @@ TEST(lookups_beside_the_worker_never_wait_and_never_crash) {
     CHECK(g.stats().bytes <= ((int64_t)1 << 20));
 }
 
+/* LRFU: a response whose chains were accepted outlives newer ones nobody's chain came from; and
+ * an idle save keeps only credited responses, a stop also the recent ones. */
+TEST(credited_responses_survive_eviction_and_are_the_ones_saved) {
+    const auto rs = responses(40, 5);
+    GlobalSuffix big;
+    big.configure({ 3, 6, (int64_t)1 << 30 });
+    for (const Resp& r : rs) big.submit(r.ctx.data(), (int64_t)r.ctx.size(), r.out.data(), (int64_t)r.out.size());
+    big.drain();
+    const int64_t all = big.stats().bytes;
+    GlobalSuffix g;
+    g.configure({ 3, 6, all / 2 });
+    /* The first response goes in and earns credits before the rest arrive. */
+    g.submit(rs[0].ctx.data(), (int64_t)rs[0].ctx.size(), rs[0].out.data(), (int64_t)rs[0].out.size());
+    g.drain();
+    int32_t o[8];
+    std::vector<int32_t> q(rs[0].out.begin(), rs[0].out.begin() + 20);
+    const auto p = g.propose(seq_of(q), 7, 0.0f, o);
+    REQUIRE(p.n > 0);
+    CHECK_EQ(p.src, 1ull);
+    for (int i = 0; i < 3; ++i) g.credit(p.src);
+    for (size_t i = 1; i < rs.size(); ++i)
+        g.submit(rs[i].ctx.data(), (int64_t)rs[i].ctx.size(), rs[i].out.data(), (int64_t)rs[i].out.size());
+    g.drain();
+    const auto st = g.stats();
+    CHECK(st.evicted > 0);
+    CHECK_EQ(st.credits, 3ll);
+    /* Plain FIFO would have evicted it first; it is still there, the next oldest are not. */
+    CHECK(g.holds(1));
+    CHECK(!g.holds(2));
+    const std::string path = radtest::tmp_path("gsuffix_lrfu.bin");
+    int64_t n = -1;
+    CHECK_OK(g.save(path, "v\n", /*final=*/false, 3600, &n));
+    CHECK_EQ(n, 1ll);                                   /* only the credited one */
+    CHECK_OK(g.save(path, "v\n", /*final=*/true, 3600, &n));
+    CHECK_EQ(n, st.seqs);                               /* at a stop, the recent ones too */
+    CHECK_OK(g.save(path, "v\n", /*final=*/true, 0, &n));
+    CHECK_EQ(n, 1ll);
+    GlobalSuffix h;
+    h.configure({ 3, 6, (int64_t)1 << 30 });
+    CHECK_OK(h.load(path, "v\n", &n));
+    h.drain();
+    CHECK_EQ(h.stats().seqs, 1ll);
+    const auto p3 = h.propose(seq_of(q), 7, 0.0f, o);
+    CHECK(p3.n > 0);
+}
+
 RAD_TEST_MAIN()

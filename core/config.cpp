@@ -163,7 +163,15 @@ static const Flag g_flags[] = {
     "                                    checkpoint store" },
     { "--prefix-cache-flush-s", "S",    "write what is new to --prefix-cache-dir once the server has\n"
     "                                    been idle and S seconds have passed since the last write\n"
-    "                                    (default 60), so a crash loses little. 0: only at a stop" },
+    "                                    (default 600), so a crash loses little. 0: only at a stop" },
+    { "--prefix-cache-dir-write-mib-per-hour", "N", "what idle flushes may write to --prefix-cache-dir\n"
+    "                                    in an hour (default 4096; 0 unbounded); the rest waits" },
+    { "--prefix-cache-lrfu-half-life-s", "S", "half-life of the LRFU score that orders and admits\n"
+    "                                    --prefix-cache-dir and the global suffix cache (default 21600)" },
+    { "--prefix-cache-dir-long-tokens", "N", "a conversation this long goes to disk without a reuse\n"
+    "                                    (default 32768; 0: only reused items)" },
+    { "--prefix-cache-dir-active-s", "S", "at a clean stop, also write what was used in the last S\n"
+    "                                    seconds (default 3600; 0: only what earned it)" },
 
     { "--lora",               "ADAPTER", "NAME=PATH: serve a LoRA adapter beside the base model\n"
     "                                    (repeatable). A text model takes a PEFT directory and\n"
@@ -328,10 +336,8 @@ static const Flag g_flags[] = {
                                         "follower frequencies along it, SuffixDecoding's D) falls under D\n"
                                         "(default 0.3)" },
     { "--draft-suffix-global-mib", "N", "also propose from a cache of earlier responses across requests\n"
-                                        "(SuffixDecoding's global tree), up to N MiB; the step verifies\n"
-                                        "whichever chain expects more accepted tokens. 0 is off (default)" },
-    { "--draft-suffix-dir", "DIR",      "keep the global suffix cache across restarts in DIR (default:\n"
-                                        "--prefix-cache-dir when set)" },
+                                        "(SuffixDecoding's global tree), up to N MiB (default 256; 0 off),\n"
+                                        "kept by LRFU score and across restarts in --prefix-cache-dir" },
     { "--draft-model",        "PATH",   "NOT IMPLEMENTED -- merge the drafter at convert time" },
 
     { "--host",               "ADDR",   "listen address" },
@@ -937,6 +943,10 @@ int config_parse(int argc, char** argv, Config* c) {
         else if (S("--prefix-cache-dir"))      { if (!(v = need(i))) return RAD_E_INVAL; c->prefix_cache_dir = v; }
         else if (S("--prefix-cache-dir-mib"))  { if (!num(0, INT32_MAX, &c->prefix_cache_dir_mib)) return RAD_E_INVAL; }
         else if (S("--prefix-cache-flush-s"))  { if (!num(0, INT32_MAX, &c->prefix_cache_flush_s)) return RAD_E_INVAL; }
+        else if (S("--prefix-cache-dir-write-mib-per-hour")) { if (!num(0, INT32_MAX, &c->prefix_cache_dir_write_mib_per_hour)) return RAD_E_INVAL; }
+        else if (S("--prefix-cache-lrfu-half-life-s")) { if (!num(1, INT32_MAX, &c->prefix_cache_lrfu_half_life_s)) return RAD_E_INVAL; }
+        else if (S("--prefix-cache-dir-long-tokens")) { if (!num(0, INT32_MAX, &c->prefix_cache_dir_long_tokens)) return RAD_E_INVAL; }
+        else if (S("--prefix-cache-dir-active-s")) { if (!num(0, INT32_MAX, &c->prefix_cache_dir_active_s)) return RAD_E_INVAL; }
         else if (S("--placement")) {
             if (!(v = need(i))) return RAD_E_INVAL;
             /* The planner's names, checked here so a typo stops the parse rather than startup
@@ -1163,7 +1173,7 @@ int config_parse(int argc, char** argv, Config* c) {
         else if (S("--draft-suffix-min-match")) { if (!num(1, 12, &c->draft_suffix_min_match)) return RAD_E_INVAL; }
         else if (S("--draft-suffix-max"))       { if (!num(1, 32, &c->draft_suffix_max)) return RAD_E_INVAL; }
         else if (S("--draft-suffix-global-mib")) { if (!num(0, INT32_MAX, &c->draft_suffix_global_mib)) return RAD_E_INVAL; }
-        else if (S("--draft-suffix-dir"))       { if (!(v = need(i))) return RAD_E_INVAL; c->draft_suffix_dir = v; }
+
         else if (S("--draft-suffix-min-score")) {
             if (!(v = need(i))) return RAD_E_INVAL;
             char* end = nullptr;
@@ -1843,6 +1853,11 @@ const ShowRow kShow[] = {
           return c.prefix_cache_dir_mib ? num(c.prefix_cache_dir_mib) : std::string("0 (the host tier and the checkpoint store)"); } },
     { "--prefix-cache-flush-s", [](const Config& c) {
           return c.prefix_cache_flush_s ? num(c.prefix_cache_flush_s) + " s" : std::string("0 (only at a stop)"); } },
+    { "--prefix-cache-dir-write-mib-per-hour", [](const Config& c) {
+          return c.prefix_cache_dir_write_mib_per_hour ? num(c.prefix_cache_dir_write_mib_per_hour) : std::string("0 (unbounded)"); } },
+    { "--prefix-cache-lrfu-half-life-s", [](const Config& c) { return num(c.prefix_cache_lrfu_half_life_s) + " s"; } },
+    { "--prefix-cache-dir-long-tokens", [](const Config& c) { return num(c.prefix_cache_dir_long_tokens); } },
+    { "--prefix-cache-dir-active-s", [](const Config& c) { return num(c.prefix_cache_dir_active_s) + " s"; } },
     { "--lora",               [](const Config& c) {
           std::string o;
           for (const auto& [n, p] : c.lora.adapters) o += (o.empty() ? "" : ", ") + n + "=" + p;
@@ -1912,8 +1927,6 @@ const ShowRow kShow[] = {
     { "--draft-suffix-min-score", [](const Config& c) { return fnum(c.draft_suffix_min_score); } },
     { "--draft-suffix-global-mib", [](const Config& c) {
           return c.draft_suffix_global_mib ? num(c.draft_suffix_global_mib) : std::string("0 (off)"); } },
-    { "--draft-suffix-dir", [](const Config& c) {
-          return or_none(c.draft_suffix_dir, c.prefix_cache_dir.empty() ? "none" : "--prefix-cache-dir"); } },
     { "--draft-model",        [](const Config&) { return std::string("not implemented (the container's own drafter)"); } },
     { "--host",               [](const Config& c) { return c.host; } },
     { "--port",               [](const Config& c) { return num(c.port); } },

@@ -2008,16 +2008,20 @@ tokens of code-like text: 43.9 ms at the first token before, now at most 5.3 ms 
 (1.4 ms the first). `radiance:suffix_adopted_total` counts take-overs.
 
 **A global suffix cache: `draft-suffix-global-mib: N`.** SuffixDecoding's second tree: earlier responses
-across requests (default 0, off). For every context of `draft-suffix-min-match` to three more tokens it
+across requests (default 256 MiB with `draft-suffix: on`; 0 off). For every context of `draft-suffix-min-match` to three more tokens it
 counts how often each token followed in the responses held; a proposal follows the most frequent follower of
 the longest context seen and is scored by the same frequency rule (`count(context, token) / (count(context) +
 1)`, the +1 so a context seen once is not a certainty). The step verifies the global chain instead of the
 request's own when it expects more accepted tokens than that chain and than the head's verifies accept on
 average. Responses join after their request ends: copied into a queue, indexed by a worker thread a few
 hundred positions per hold of its lock; a lookup only tries the lock, so it never waits. Past N MiB the
-oldest responses come out again. With `draft-suffix-dir: DIR` (or `prefix-cache-dir`) the responses are
-saved at a stop and when idle (`prefix-cache-flush-s`), keyed by the vocabulary and context lengths,
-checksummed and renamed into place, and re-indexed in the background after a restart. Lossless as the
+responses with the lowest LRFU score come out again: a response's score is its insertion plus one for
+every verify that accepted rows of a chain it led to (the context's latest response), halving every
+`prefix-cache-lrfu-half-life-s`; uncredited, that is the oldest. With `prefix-cache-dir` set the credited
+responses are saved when idle (`prefix-cache-flush-s`), and at a stop also those of the last
+`prefix-cache-dir-active-s`, to `DIR/<served-model-name>.suffix`, keyed by the vocabulary and context
+lengths, checksummed and renamed into place, and re-indexed in the background after a restart.
+`radiance:suffix_global_credited_total` counts the credits. Lossless as the
 per-request chain is. Measured on Flash-Next at TP2 (`num-speculative-tokens: 7`, coupled chain, adaptive
 depth), eight code-writing chat prompts a round: sampled at T=1.0 with a new seed each round, the responses
 share too little and the head's own chain is better (neutral after the gate: 357.5 vs 358.6 tok/s); the same
@@ -2283,14 +2287,39 @@ models:
 - `prefix-cache-dir: DIR` keeps the cache across restarts (off by default; needs `prefix-cache-mib`).
   At runtime nothing changes: the cache lives in VRAM, the host tier and the snapshot store as above.
   On a clean stop (SIGTERM, `stopping: draining in-flight requests`) every entry with a host copy and
-  every committed snapshot is written to `DIR/<served-model-name>.<key>/`; with
-  `prefix-cache-flush-s: S` (default 60, `0` only at a stop) what is new is also written whenever
-  the server is idle and S seconds have passed, so a crash loses little. At the next start only
+  every committed snapshot that earned it (below) is written to `DIR/<served-model-name>.<key>/`;
+  with `prefix-cache-flush-s: S` (default 600, `0` only at a stop) what is new is also written
+  whenever the server is idle and S seconds have passed, so a crash loses little. At the next start only
   the index is read (tens of milliseconds); an entry's bytes and the snapshot a hit resumes from are
   read into host memory when a request's chain reaches them, just before the restore, and the turn
   then resumes without a prefill. `prefix-cache-dir-mib: N` bounds the directory (default: the host
-  tier plus the snapshot store), least recently used first out. A host copy or snapshot the
-  directory also holds is given up for room before anything else, and read back on a hit.
+  tier plus the snapshot store). A host copy or snapshot the directory also holds is given up for
+  room before anything else, and read back on a hit.
+
+  What goes to disk is chosen by an LRFU score (combined recency and frequency: every reference
+  adds one, and the sum halves every `prefix-cache-lrfu-half-life-s`, default 21600). An entry's
+  references are its publish and every lookup that reuses it; a snapshot's, its save and every
+  hit that resumes from it. The cap keeps the highest scores, so a conversation reused all day
+  outlives a newer one used once. *Admission*: a new entry or snapshot is written only once it
+  was reused, or when it belongs to a conversation of `prefix-cache-dir-long-tokens` or more
+  (default 32768; a snapshot at or past that depth), or, at a clean stop, when it was used in the
+  last `prefix-cache-dir-active-s` seconds (default 3600; `0` writes only what earned it), so the
+  conversations in progress resume. Single questions and benchmarks never reach the disk.
+  Nothing on disk is rewritten unless its bytes changed; segments are append-only and compaction
+  (one rewrite of everything) runs only when dead bytes are over half (and 256 MiB), at most once
+  an hour, never at a stop, and only within the budget. *Write budget*:
+  `prefix-cache-dir-write-mib-per-hour` (default 4096, `0` unbounded) is a token bucket of one hour
+  for the idle flushes; what does not fit waits for a later flush (counted as deferred), the
+  chain's start first. The write at a clean stop is not held to it but counts against it.
+  `/metrics`: `radiance:prefix_store_written_bytes_total`, `prefix_store_written_bytes_last_hour`,
+  `prefix_store_admitted_total`, `prefix_store_rejected_total`, `prefix_store_deferred_total`,
+  `prefix_store_paged_in_total`, `prefix_store_hit_rate` (entries read back over entries indexed
+  at startup), `prefix_store_entries`, `prefix_store_snapshots`, `prefix_store_bytes`,
+  `prefix_store_compactions_total`.
+
+  The global suffix cache (`draft-suffix-global-mib`) keeps its file in the same directory,
+  `DIR/<served-model-name>.suffix`, under its own key (the vocabulary), so a rebuild that
+  invalidates the KV store leaves it valid.
   **The directory holds conversation content (KV and token ids) unencrypted**; startup says so.
 
   Safety: the files are only read by an engine that would compute the same bytes. The key is a

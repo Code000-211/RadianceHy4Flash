@@ -3022,6 +3022,7 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
     loop_status_.store(RAD_OK, std::memory_order_release);
     done_.reserve((size_t)cfg_.max_seqs);
 
+    ranks_[0]->prefix.set_lrfu_half_life((double)cfg_.prefix_cache_lrfu_half_life_s);
     RAD_TRY(pcache_open());
     gsuffix_open();
 

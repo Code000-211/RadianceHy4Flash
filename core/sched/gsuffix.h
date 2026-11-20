@@ -16,8 +16,12 @@
  *     tokens (sum of D) than that chain and than the head's verifies accept on average.
  *
  * Responses go in whole after their request ends, with the last kmax tokens of the prompt in front
- * as context (counted only where the follower is a response token). They are held oldest first;
- * past the size cap the oldest response's counts are taken out again. Contexts are keyed by a 64-bit
+ * as context (counted only where the follower is a response token). Each carries an LRFU score
+ * (PcScore, mem/prefix.h): its insertion is one reference, and every verify that accepts rows of a
+ * chain it started (the context node's latest response, `Out::src`) is another (credit()). Past
+ * the size cap the lowest-scoring response's counts are taken out again; with no credits that is
+ * the oldest. A save keeps only responses that were credited, plus at a stop those inserted
+ * within `active_s`. Contexts are keyed by a 64-bit
  * hash, so a clash merges two contexts' counts. Every proposed token is verified, so a clash, a
  * stale count or an evicted response changes how many tokens a step lands, never which.
  *
@@ -32,11 +36,13 @@
  */
 #pragma once
 #include "ngram.h"
+#include "mem/prefix.h"   /* PcScore */
 
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
+#include <list>
 #include <mutex>
 #include <shared_mutex>
 #include <string>
@@ -51,6 +57,7 @@ public:
     struct Config {
         int     kmin = 6, kmax = 9;
         int64_t cap_bytes = 0;      /* 0 is off */
+        double  half_s = 6 * 3600.0;   /* the LRFU half-life */
     };
     ~GlobalSuffix() { stop(); }
     void configure(const Config& c);
@@ -71,10 +78,17 @@ public:
         float score = 0.0f;       /* D of the last token */
         float expect = 0.0f;      /* sum of D along the chain */
         bool  busy = false;       /* the write lock was held: nothing looked up */
+        uint64_t src = 0;         /* the response the first token's context came from last */
     };
+    /* `accepted` rows of a chain from response `src` were accepted: one reference to it. Queued,
+     * applied by the inserter; never waits. */
+    void credit(uint64_t src);
     Out propose(const TokenSeq& seq, int max_rows, float min_score, int32_t* out) const;
 
-    int  save(const std::string& path, const std::string& key_text);
+    /* Writes what earned it: credited responses, and with `final` those inserted within
+     * `active_s` seconds. `written` gets how many. */
+    int  save(const std::string& path, const std::string& key_text, bool final = true,
+              int64_t active_s = 3600, int64_t* written = nullptr);
     /* RAD_OK and the responses queued, or an error and nothing loaded (a missing file is
      * RAD_E_NOTFOUND). */
     int  load(const std::string& path, const std::string& key_text, int64_t* n_seqs = nullptr);
@@ -82,27 +96,41 @@ public:
     struct Stats {
         int64_t seqs = 0, tokens = 0, contexts = 0, bytes = 0, evicted = 0, inserted = 0;
         int64_t queued = 0, dropped = 0;
+        int64_t credits = 0;
     };
     Stats stats() const;
+    /* Whether response `id` (Out::src) is still held. Tests. */
+    bool holds(uint64_t id) const { std::shared_lock lk(mu_); return by_id_.count(id) > 0; }
     /* Bumped by every insert and eviction: a save has something new when it moved. */
     uint64_t generation() const { return gen_.load(std::memory_order_relaxed); }
 
 private:
-    struct Seq { std::vector<int32_t> toks; int32_t nctx = 0; };
+    struct Seq {
+        std::vector<int32_t> toks;
+        int32_t nctx = 0;
+        uint64_t id = 0;
+        int64_t  born_ms = 0;
+        PcScore  score;
+    };
     struct Node {
         uint32_t total = 0;
+        uint64_t last = 0;                              /* the latest response through it */
         std::vector<std::pair<int32_t, uint32_t>> f;   /* follower, count */
     };
     static uint64_t ctx_hash(const int32_t* t, int k);
     void count(const Seq& s, int64_t from, int64_t to, int delta);
     void insert_locked_steps(Seq s);
+    void apply_credits();
     void evict_locked();
     void worker();
     int64_t bytes_locked() const;
 
     Config cfg_;
     mutable std::shared_mutex mu_;
-    std::deque<Seq> seqs_;
+    std::list<Seq> seqs_;
+    std::unordered_map<uint64_t, std::list<Seq>::iterator> by_id_;
+    uint64_t next_id_ = 1;
+    int64_t credits_ = 0;
     std::vector<std::unordered_map<uint64_t, Node>> tab_;   /* by k - kmin */
     int64_t tokens_ = 0, followers_ = 0, nodes_ = 0;
     int64_t evicted_ = 0, inserted_ = 0;
@@ -111,6 +139,7 @@ private:
     std::mutex qmu_;
     std::condition_variable qcv_;
     std::deque<Seq> queue_;
+    std::vector<uint64_t> credit_q_;
     int64_t dropped_ = 0;
     bool stopping_ = false;
     std::thread worker_;

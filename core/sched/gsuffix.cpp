@@ -31,6 +31,7 @@ void GlobalSuffix::configure(const Config& c) {
     if (cfg_.kmin < 1) cfg_.kmin = 1;
     if (cfg_.kmax < cfg_.kmin) cfg_.kmax = cfg_.kmin;
     seqs_.clear();
+    by_id_.clear();
     tab_.assign((size_t)(cfg_.kmax - cfg_.kmin + 1), {});
     tokens_ = followers_ = nodes_ = evicted_ = inserted_ = 0;
 }
@@ -75,6 +76,7 @@ void GlobalSuffix::count(const Seq& s, int64_t from, int64_t to, int delta) {
                 Node& n = ins.first->second;
                 if (ins.second) ++nodes_;
                 ++n.total;
+                n.last = s.id;
                 auto f = std::find_if(n.f.begin(), n.f.end(), [&](const auto& p) { return p.first == t[e]; });
                 if (f == n.f.end()) { n.f.push_back({ t[e], 1u }); ++followers_; }
                 else ++f->second;
@@ -96,17 +98,25 @@ int64_t GlobalSuffix::bytes_locked() const {
 
 void GlobalSuffix::insert_locked_steps(Seq s) {
     std::lock_guard ik(imu_);
+    apply_credits();
     const int64_t n = (int64_t)s.toks.size();
     if (n <= s.nctx || n <= cfg_.kmin) return;
+    std::list<Seq>::iterator it;
     {
         std::unique_lock lk(mu_);
+        s.id = next_id_++;
+        const int64_t now = pc_unix_ms();
+        if (s.born_ms == 0) s.born_ms = now;
+        if (s.score.crf <= 0) s.score.ref(now, cfg_.half_s, false);   /* the insertion */
         seqs_.push_back(std::move(s));
+        it = std::prev(seqs_.end());
+        by_id_[it->id] = it;
         tokens_ += n;
     }
-    /* The deque's back is stable while this thread is the only writer. */
+    /* List nodes are stable while this thread is the only writer. */
     for (int64_t at = 0; at < n; at += kStep) {
         std::unique_lock lk(mu_);
-        count(seqs_.back(), at, std::min(n, at + kStep), +1);
+        count(*it, at, std::min(n, at + kStep), +1);
     }
     {
         std::unique_lock lk(mu_);
@@ -119,18 +129,28 @@ void GlobalSuffix::insert_locked_steps(Seq s) {
 void GlobalSuffix::evict_locked() {
     for (;;) {
         int64_t n;
+        std::list<Seq>::iterator victim;
         {
             std::unique_lock lk(mu_);
             if (seqs_.size() <= 1 || bytes_locked() <= cfg_.cap_bytes) return;
-            n = (int64_t)seqs_.front().toks.size();
+            /* The lowest LRFU score; among equals the oldest (the list is in insertion order). */
+            const int64_t now = pc_unix_ms();
+            victim = seqs_.begin();
+            float best = victim->score.at(now, cfg_.half_s);
+            for (auto it = std::next(seqs_.begin()); it != std::prev(seqs_.end()); ++it) {
+                const float v = it->score.at(now, cfg_.half_s);
+                if (v < best) { best = v; victim = it; }
+            }
+            n = (int64_t)victim->toks.size();
         }
         for (int64_t at = 0; at < n; at += kStep) {
             std::unique_lock lk(mu_);
-            count(seqs_.front(), at, std::min(n, at + kStep), -1);
+            count(*victim, at, std::min(n, at + kStep), -1);
         }
         std::unique_lock lk(mu_);
         tokens_ -= n;
-        seqs_.pop_front();
+        by_id_.erase(victim->id);
+        seqs_.erase(victim);
         ++evicted_;
         gen_.fetch_add(1, std::memory_order_relaxed);
     }
@@ -152,12 +172,44 @@ void GlobalSuffix::submit(const int32_t* ctx, int64_t nctx, const int32_t* out, 
     qcv_.notify_one();
 }
 
+void GlobalSuffix::credit(uint64_t src) {
+    if (!enabled() || src == 0) return;
+    {
+        std::lock_guard lk(qmu_);
+        if (credit_q_.size() < 4096) credit_q_.push_back(src);
+    }
+    qcv_.notify_one();
+}
+
+void GlobalSuffix::apply_credits() {
+    std::vector<uint64_t> c;
+    {
+        std::lock_guard lk(qmu_);
+        c.swap(credit_q_);
+    }
+    if (c.empty()) return;
+    const int64_t now = pc_unix_ms();
+    std::unique_lock lk(mu_);
+    for (uint64_t id : c) {
+        auto it = by_id_.find(id);
+        if (it == by_id_.end()) continue;
+        it->second->score.ref(now, cfg_.half_s, true);
+        ++credits_;
+    }
+}
+
 void GlobalSuffix::worker() {
     for (;;) {
         Seq s;
         {
             std::unique_lock lk(qmu_);
-            qcv_.wait(lk, [this] { return stopping_ || !queue_.empty(); });
+            qcv_.wait(lk, [this] { return stopping_ || !queue_.empty() || !credit_q_.empty(); });
+            if (queue_.empty() && !credit_q_.empty()) {
+                lk.unlock();
+                std::lock_guard ik(imu_);
+                apply_credits();
+                continue;
+            }
             if (queue_.empty()) return;            /* stopping, nothing left */
             s = std::move(queue_.front());
             queue_.pop_front();
@@ -167,6 +219,10 @@ void GlobalSuffix::worker() {
 }
 
 void GlobalSuffix::drain() {
+    {
+        std::lock_guard ik(imu_);
+        apply_credits();
+    }
     for (;;) {
         Seq s;
         {
@@ -216,7 +272,7 @@ GlobalSuffix::Out GlobalSuffix::propose(const TokenSeq& seq, int max_rows, float
         d *= p;
         sum += d;
         out[m] = tok;
-        if (m == 0) r.match = used;
+        if (m == 0) { r.match = used; r.src = best->last; }
         if (w < cfg_.kmax) win[w++] = tok;
         else { std::memmove(win, win + 1, (size_t)(w - 1) * sizeof(int32_t)); win[w - 1] = tok; }
     }
@@ -236,6 +292,7 @@ GlobalSuffix::Stats GlobalSuffix::stats() const {
         s.bytes = bytes_locked();
         s.evicted = evicted_;
         s.inserted = inserted_;
+        s.credits = credits_;
     }
     std::lock_guard lk(const_cast<std::mutex&>(qmu_));
     s.queued = (int64_t)queue_.size();
@@ -243,22 +300,33 @@ GlobalSuffix::Stats GlobalSuffix::stats() const {
     return s;
 }
 
-int GlobalSuffix::save(const std::string& path, const std::string& key_text) {
+int GlobalSuffix::save(const std::string& path, const std::string& key_text, bool final,
+                       int64_t active_s, int64_t* written) {
+    if (written) *written = 0;
     if (!enabled()) return RAD_E_STATE;
     drain();    /* what is queued is held too */
+    const int64_t now = pc_unix_ms();
+    auto earned = [&](const Seq& s) {
+        return s.score.hits > 0 || (final && active_s > 0 && now - s.born_ms <= active_s * 1000);
+    };
     std::string b;
     b.append(kMagic, 8);
     const BlockHash key = pc_key_of(key_text);
     {
         std::shared_lock lk(mu_);
-        put(b, (uint32_t)1);
+        put(b, (uint32_t)2);
         put(b, key.hi); put(b, key.lo);
         put(b, (uint32_t)key_text.size());
         b += key_text;
         put(b, (int32_t)cfg_.kmin); put(b, (int32_t)cfg_.kmax);
-        put(b, (uint64_t)seqs_.size());
+        uint64_t n = 0;
+        for (const Seq& s : seqs_) n += earned(s) ? 1 : 0;
+        put(b, n);
+        if (written) *written = (int64_t)n;
         for (const Seq& s : seqs_) {
+            if (!earned(s)) continue;
             put(b, s.nctx);
+            put(b, s.born_ms); put(b, s.score.crf); put(b, s.score.at_ms); put(b, s.score.hits);
             put(b, (uint64_t)s.toks.size());
             b.append(reinterpret_cast<const char*>(s.toks.data()), s.toks.size() * 4);
         }
@@ -324,7 +392,7 @@ int GlobalSuffix::load(const std::string& path, const std::string& key_text, int
     uint32_t ver = 0, kl = 0;
     BlockHash key;
     get(&ver, 4); get(&key.hi, 8); get(&key.lo, 8); get(&kl, 4);
-    if (bad || ver != 1 || at + kl > end || key != pc_key_of(key_text) ||
+    if (bad || ver != 2 || at + kl > end || key != pc_key_of(key_text) ||
         b.compare(at, kl, key_text) != 0)
         return RAD_E_FORMAT;
     at += kl;
@@ -336,7 +404,9 @@ int GlobalSuffix::load(const std::string& path, const std::string& key_text, int
     for (uint64_t i = 0; i < n && !bad; ++i) {
         Seq s;
         uint64_t len = 0;
-        get(&s.nctx, 4); get(&len, 8);
+        get(&s.nctx, 4);
+        get(&s.born_ms, 8); get(&s.score.crf, 4); get(&s.score.at_ms, 8); get(&s.score.hits, 4);
+        get(&len, 8);
         if (bad || len > (end - at) / 4) { bad = true; break; }
         s.toks.resize((size_t)len);
         get(s.toks.data(), (size_t)len * 4);

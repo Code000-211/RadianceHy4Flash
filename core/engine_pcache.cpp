@@ -232,6 +232,10 @@ int Engine::pcache_open() {
     pstore_ = std::move(st);
     pstore_last_ns_ = rad_mono_ns();
     pstore_seen_ = pcache_activity();
+    pstore_bucket_ = (double)cfg_.prefix_cache_dir_write_mib_per_hour * (1 << 20);
+    pstore_bucket_ns_ = pstore_compact_ns_ = rad_mono_ns();
+    pstore_m_.loaded = ne;
+    pcache_publish_metrics();
     return RAD_OK;
 }
 
@@ -248,6 +252,10 @@ void Engine::pcache_page_in(const Request& req) {
     PcPageIn r;
     (void)pc_page_in(lead.prefix, lead.tiers, ck_store_.enabled() ? &ck_store_ : nullptr, *pstore_,
                      req.prompt, mm, &r);
+    if (r.entries > 0) {
+        pstore_m_.paged_in += r.entries;
+        pcache_publish_metrics();
+    }
     if (r.entries > 0 || r.snap || r.failed > 0)
         RAD_INFO("prefix store: request %llu read %lld entries (%lld tokens)%s, %s, from disk in "
                  "%.3f s%s", (unsigned long long)req.id, (long long)r.entries,
@@ -269,16 +277,44 @@ void Engine::pcache_flush(bool final) {
         if (pump_ && !pump_->copy.empty()) (void)flush_copies();
     }
     const double land_s = (double)(rad_mono_ns() - t0) * 1e-9;
+    /* The write budget: refilled at N MiB an hour, holding at most an hour's worth. */
+    const double cap = (double)cfg_.prefix_cache_dir_write_mib_per_hour * (1 << 20);
+    const uint64_t now = rad_mono_ns();
+    if (cap > 0) {
+        pstore_bucket_ = std::min(cap, pstore_bucket_ + cap * (double)(now - pstore_bucket_ns_) * 1e-9 / 3600.0);
+        pstore_bucket_ns_ = now;
+    }
+    PcPolicy pol;
+    pol.ttl_s = cfg_.prefix_cache_ttl;
+    pol.half_s = (double)cfg_.prefix_cache_lrfu_half_life_s;
+    pol.active_s = cfg_.prefix_cache_dir_active_s;
+    pol.long_tokens = cfg_.prefix_cache_dir_long_tokens;
+    pol.final = final;
+    /* The stop writes what it admits whatever the budget; an idle flush only what it allows. */
+    pol.opts.write_budget = final || cap <= 0 ? -1 : (int64_t)std::max(0.0, pstore_bucket_);
+    /* Compaction at most once an hour, never at the stop. */
+    pol.opts.compact = !final && now - pstore_compact_ns_ >= 3600ull * 1000000000ull;
     PcFlush f;
     int rc;
     {
         const auto lk = sched_.hold();
         rc = pc_flush_cache(lead.prefix, lead.tiers, ck_store_.enabled() ? &ck_store_ : nullptr,
-                            *pstore_, cfg_.prefix_cache_ttl, &f);
+                            *pstore_, pol, &f);
     }
     pstore_last_ns_ = rad_mono_ns();
     pstore_seen_ = pcache_activity();
     if (rc < 0) return;   /* the store said why */
+    if (cap > 0) pstore_bucket_ -= (double)f.written_bytes;
+    if (f.compacted) { pstore_compact_ns_ = now; ++pstore_m_.compactions; }
+    pstore_m_.written_bytes += f.written_bytes;
+    pstore_m_.admitted += f.written_items;
+    pstore_m_.rejected += f.rejected;
+    pstore_m_.deferred += f.deferred;
+    if (f.written_bytes > 0) pstore_hour_.push_back({ now, f.written_bytes });
+    {
+        const auto lk = sched_.hold();
+        pcache_publish_metrics();
+    }
     if (final || f.written_items > 0 || f.segs_deleted > 0)
         RAD_INFO("prefix store: %s: wrote %lld item(s), %s, in %.2f s%s; it holds %lld item(s), "
                  "%s live, %s on disk%s%s", final ? "at stop" : "idle flush",
@@ -288,15 +324,33 @@ void Engine::pcache_flush(bool final) {
                  humanb(pstore_->disk_bytes()).c_str(),
                  f.compacted ? ", compacted" : "",
                  f.dropped ? fmt(", %lld left out by the cap", (long long)f.dropped).c_str() : "");
+    if (f.rejected || f.deferred)
+        RAD_INFO("prefix store: %lld new item(s) not admitted (not reused, not a long "
+                 "conversation%s), %lld left for later by the write budget",
+                 (long long)f.rejected, final ? ", not in use lately" : "", (long long)f.deferred);
+}
+
+void Engine::pcache_publish_metrics() {
+    const uint64_t now = rad_mono_ns();
+    while (!pstore_hour_.empty() && now - pstore_hour_.front().first > 3600ull * 1000000000ull)
+        pstore_hour_.pop_front();
+    pstore_m_.written_hour = 0;
+    for (const auto& w : pstore_hour_) pstore_m_.written_hour += w.second;
+    if (pstore_) {
+        pstore_m_.entries = pstore_->n_entries();
+        pstore_m_.snaps = pstore_->n_snaps();
+        pstore_m_.bytes = pstore_->disk_bytes();
+    }
+    sched_.set_disk_metrics(pstore_m_);
 }
 
 void Engine::gsuffix_open() {
     GlobalSuffix& g = sched_.global_suffix();
     if (!g.enabled()) return;
-    const std::string dir = !cfg_.draft_suffix_dir.empty() ? cfg_.draft_suffix_dir : cfg_.prefix_cache_dir;
+    const std::string& dir = cfg_.prefix_cache_dir;
     RAD_INFO("draft-suffix: a global cache of earlier responses, up to %lld MiB, beside each "
              "request's own index%s", (long long)cfg_.draft_suffix_global_mib,
-             dir.empty() ? " (not kept across restarts: no --draft-suffix-dir)" : "");
+             dir.empty() ? " (not kept across restarts: no --prefix-cache-dir)" : "");
     if (dir.empty() || !vocab_) return;
     if (::mkdir(dir.c_str(), 0700) != 0 && errno != EEXIST) {
         RAD_WARN("draft-suffix: cannot create %s: %s", dir.c_str(), std::strerror(errno));
@@ -337,11 +391,13 @@ void Engine::gsuffix_save(bool final) {
     }
     if (g.generation() == gsuffix_saved_gen_ && g.stats().queued == 0) return;
     const uint64_t t0 = rad_mono_ns();
-    if (g.save(gsuffix_path_, gsuffix_key_) != RAD_OK) return;
+    int64_t kept = 0;
+    if (g.save(gsuffix_path_, gsuffix_key_, final, cfg_.prefix_cache_dir_active_s, &kept) != RAD_OK) return;
     gsuffix_saved_gen_ = g.generation();
     const GlobalSuffix::Stats st = g.stats();
-    RAD_INFO("draft-suffix: %lld response(s), %lld tokens, saved to %s in %.3f s%s",
-             (long long)st.seqs, (long long)st.tokens, gsuffix_path_.c_str(),
+    RAD_INFO("draft-suffix: %lld of %lld response(s) (credited%s), %lld credits, saved to %s in %.3f s%s",
+             (long long)kept, (long long)st.seqs, final ? " or recent" : "", (long long)st.credits,
+             gsuffix_path_.c_str(),
              (double)(rad_mono_ns() - t0) * 1e-9, final ? " at stop" : "");
 }
 

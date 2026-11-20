@@ -4,6 +4,7 @@
 #include "mem/kvtier.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <numeric>
 #include <unordered_set>
@@ -460,6 +461,10 @@ CacheHit PrefixCache::lookup(const std::vector<int32_t>& tokens,
     /* Deepest first, so the chain's first block is the most recent: under pressure a conversation
      * loses its end before its start, and what is left still hits. */
     for (int64_t b = matched - 1; b >= 0; --b) touch(*matched_entries[(size_t)b], now);
+    if (matched > 0) {
+        const int64_t ms = pc_unix_ms();
+        for (int64_t b = 0; b < matched; ++b) matched_entries[(size_t)b]->score.ref(ms, half_s_, true);
+    }
     if (blocks_out)
         for (int64_t b = 0; b < matched; ++b) {
             const Entry& e = *matched_entries[(size_t)b];
@@ -488,6 +493,7 @@ CacheHit PrefixCache::lookup(const std::vector<int32_t>& tokens,
     }
     hit.n_linear_tokens = (int32_t)best->second.pos;
     hit.checkpoint_slot = best->second.slot;
+    best->second.score.ref(pc_unix_ms(), half_s_, true);
     best->second.used = best->second.resumed = ++clock_;
     best->second.used_ns = now;
     handed_.push_back(best->first);
@@ -583,6 +589,7 @@ int PrefixCache::insert(uint64_t session,
         e.tokens.assign(tokens.begin() + b * block_size_,
                         tokens.begin() + (b + 1) * block_size_);
         e.used_ns = now;
+        e.score.ref(pc_unix_ms(), half_s_, false);
         lru_.push_back(h);
         e.lru = std::prev(lru_.end());
         e.in_lru = true;
@@ -1054,6 +1061,7 @@ int PrefixCache::reserve_checkpoint(uint64_t session, int64_t pos, const BlockHa
 
     Ckpt c;
     c.session = session; c.pos = pos; c.prefix = prefix; c.slot = slot;
+    c.score.ref(pc_unix_ms(), half_s_, false);
     c.used = c.made = ++clock_;
     c.used_ns = rad_mono_ns();
     ck_by_prefix_.emplace(prefix, c);
@@ -1336,7 +1344,8 @@ int PrefixCache::release_session(const std::string& label, uint64_t id, int64_t 
 /* ------------------------------------------------------------------ the store on disk */
 
 int PrefixCache::import_entry(const BlockHash& key, const std::vector<int32_t>& tokens,
-                              int64_t depth, uint8_t n_children, uint64_t used_ns) {
+                              int64_t depth, uint8_t n_children, uint64_t used_ns,
+                              const PcScore& score) {
     if (!enabled_ || !tiers_ || !tiers_->host_on() || !demotable_) return RAD_E_UNSUPPORTED;
     if ((int64_t)tokens.size() != block_size_) return RAD_E_INVAL;
     if (map_.count(key)) return RAD_OK;
@@ -1344,6 +1353,7 @@ int PrefixCache::import_entry(const BlockHash& key, const std::vector<int32_t>& 
     e.tokens = tokens;
     e.n_children = n_children;
     e.used_ns = used_ns;
+    e.score = score;
     e.in_lru = false;
     map_.emplace(key, std::move(e));
     tiers_->add_disk(key, used_ns, depth);
@@ -1351,7 +1361,7 @@ int PrefixCache::import_entry(const BlockHash& key, const std::vector<int32_t>& 
 }
 
 int PrefixCache::import_snapshot(const BlockHash& key, int64_t pos, uint64_t session,
-                                 uint64_t used_ns) {
+                                 uint64_t used_ns, const PcScore& score) {
     if (!enabled_ || !has_linear_) return RAD_E_UNSUPPORTED;
     if (pos <= 0 || pos % block_size_ != 0) return RAD_E_INVAL;
     if (ck_by_prefix_.count(key)) return RAD_OK;
@@ -1364,6 +1374,7 @@ int PrefixCache::import_snapshot(const BlockHash& key, int64_t pos, uint64_t ses
     c.used_ns = used_ns;
     c.valid = true;
     c.disk = true;
+    c.score = score;
     ck_by_prefix_.emplace(key, c);
     ++ck_positions_[pos];
     ck_by_session_[session].push_back(key);
@@ -1432,10 +1443,12 @@ void PrefixCache::snap_page_in_done(const BlockHash& key, int32_t slot, bool ok)
 }
 
 void PrefixCache::persist_export(std::vector<PersistEntry>* ents,
-                                 std::vector<PersistSnap>* snaps) const {
+                                 std::vector<PersistSnap>* snaps, int64_t long_tokens) const {
     ents->clear();
     snaps->clear();
     if (!enabled_ || !tiers_) return;
+    std::unordered_set<BlockHash, BlockHashHash> longs;
+    tiers_->long_chains(long_tokens, &longs);
     /* The depth tiers record is set only with a host tier; the chain is rebuilt from the
      * tokens on load, so the depth only orders what a cap keeps. */
     ents->reserve(map_.size());
@@ -1451,6 +1464,8 @@ void PrefixCache::persist_export(std::vector<PersistEntry>* ents,
         p.depth = v.depth;
         p.host_slot = v.host_slot;
         p.disk = v.disk;
+        p.score = kv.second.score;
+        p.long_chain = longs.count(kv.first) > 0;
         ents->push_back(p);
     }
     for (const auto& kv : ck_by_prefix_) {
@@ -1464,6 +1479,7 @@ void PrefixCache::persist_export(std::vector<PersistEntry>* ents,
         p.used_ns = c.used_ns;
         p.slot = c.slot;
         p.disk = c.disk;
+        p.score = c.score;
         snaps->push_back(p);
     }
 }

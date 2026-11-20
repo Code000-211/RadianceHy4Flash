@@ -113,6 +113,8 @@ struct SchedReq {
     SuffixIndex suffix_ix;
     /* The prompt's index has been copied to the scheduler's suffix stash (suffix_index). */
     bool        suffix_stashed = false;
+    /* The global cache's response the last suffix proposal came from (0: the request's own). */
+    uint64_t    suffix_src = 0;
     /* Prompt lookup's index over prompt ++ output (ngram.h), built at the sequence's first lookup
      * and extended by each later one. It depends on the tokens alone, so preemption keeps it; it
      * is keyed by request id, so a recycled slot starts over, and a closed request frees it. */
@@ -769,8 +771,9 @@ private:
 public:
     /* Tests: the stash's size. */
     size_t suffix_stash_size() const { return suffix_stash_.size(); }
-    /* The engine loads and saves it (--draft-suffix-dir). */
+    /* The engine loads and saves it (--prefix-cache-dir). */
     GlobalSuffix& global_suffix() { return gsuffix_; }
+    void set_disk_metrics(const SchedMetrics::Disk& d) { m_.disk = d; }
 private:
     /* Prompt lookup is the deployment's only drafter and --draft-window adaptive is on: its
      * proposals feed each sequence's estimate and are capped by its window, as a head's are. */

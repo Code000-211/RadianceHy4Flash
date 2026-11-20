@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <cmath>
 #include <chrono>
 #include <cstring>
 #include <dirent.h>
@@ -25,7 +26,7 @@ namespace {
 constexpr char kSegMagic[8] = { 'R', 'A', 'D', 'P', 'C', 'S', 'G', '1' };
 constexpr char kIdxMagic[8] = { 'R', 'A', 'D', 'P', 'C', 'I', 'X', '1' };
 constexpr char kEndMagic[8] = { 'R', 'A', 'D', 'P', 'C', 'E', 'N', 'D' };
-constexpr uint32_t kVersion = 1;
+constexpr uint32_t kVersion = 2;   /* 2: LRFU scores in the index */
 constexpr int64_t kSegHeader = 64;
 constexpr int64_t kMiB = (int64_t)1 << 20;
 
@@ -310,13 +311,14 @@ int PrefixStore::load_index() {
         e.key.hi = r.get<uint64_t>(); e.key.lo = r.get<uint64_t>();
         e.loc.seg = r.get<uint32_t>(); e.loc.off = r.get<uint64_t>(); e.loc.sum = r.get<uint64_t>();
         e.depth = r.get<int64_t>(); e.n_children = r.get<uint8_t>(); e.used_ms = r.get<int64_t>();
+        e.score.crf = r.get<float>(); e.score.at_ms = r.get<int64_t>(); e.score.hits = r.get<uint32_t>();
         const char* t = r.take((size_t)cfg_.block_tokens * 4);
         if (r.bad || !t) break;
         e.tokens.resize((size_t)cfg_.block_tokens);
         std::memcpy(e.tokens.data(), t, (size_t)cfg_.block_tokens * 4);
         if (!fits(e.loc, cfg_.entry_bytes)) continue;
         if (e.used_ms < cut_ms) { ++expired; continue; }
-        EMeta m{ e.tokens, e.depth, e.n_children, e.used_ms, e.loc };
+        EMeta m{ e.tokens, e.depth, e.n_children, e.used_ms, e.score, e.loc };
         ents_[e.key] = std::move(m);
         load_e_.push_back(std::move(e));
     }
@@ -325,10 +327,11 @@ int PrefixStore::load_index() {
         s.key.hi = r.get<uint64_t>(); s.key.lo = r.get<uint64_t>();
         s.loc.seg = r.get<uint32_t>(); s.loc.off = r.get<uint64_t>(); s.loc.sum = r.get<uint64_t>();
         s.pos = r.get<int64_t>(); s.group = r.get<uint64_t>(); s.used_ms = r.get<int64_t>();
+        s.score.crf = r.get<float>(); s.score.at_ms = r.get<int64_t>(); s.score.hits = r.get<uint32_t>();
         if (r.bad) break;
         if (cfg_.snap_bytes <= 0 || !fits(s.loc, cfg_.snap_bytes)) continue;
         if (s.used_ms < cut_ms) { ++expired; continue; }
-        snaps_[s.key] = SMeta{ s.pos, s.group, s.used_ms, s.loc };
+        snaps_[s.key] = SMeta{ s.pos, s.group, s.used_ms, s.score, s.loc };
         load_s_.push_back(s);
     }
     if (r.bad) {
@@ -454,8 +457,8 @@ int PrefixStore::write_index(const std::unordered_map<BlockHash, EMeta, BlockHas
                              const std::unordered_map<BlockHash, SMeta, BlockHashHash>& s,
                              const std::unordered_map<uint32_t, Seg>& segs, uint32_t next_seg) {
     std::string b;
-    b.reserve(256 + cfg_.key_text.size() + e.size() * (53 + (size_t)cfg_.block_tokens * 4) +
-              s.size() * 60 + segs.size() * 12);
+    b.reserve(256 + cfg_.key_text.size() + e.size() * (69 + (size_t)cfg_.block_tokens * 4) +
+              s.size() * 76 + segs.size() * 12);
     b.append(kIdxMagic, 8);
     put(b, kVersion);
     put(b, (uint32_t)cfg_.key_text.size());
@@ -470,12 +473,14 @@ int PrefixStore::write_index(const std::unordered_map<BlockHash, EMeta, BlockHas
         put(b, kv.first.hi); put(b, kv.first.lo);
         put(b, kv.second.loc.seg); put(b, kv.second.loc.off); put(b, kv.second.loc.sum);
         put(b, kv.second.depth); put(b, kv.second.n_children); put(b, kv.second.used_ms);
+        put(b, kv.second.score.crf); put(b, kv.second.score.at_ms); put(b, kv.second.score.hits);
         b.append(reinterpret_cast<const char*>(kv.second.tokens.data()), (size_t)cfg_.block_tokens * 4);
     }
     for (const auto& kv : s) {
         put(b, kv.first.hi); put(b, kv.first.lo);
         put(b, kv.second.loc.seg); put(b, kv.second.loc.off); put(b, kv.second.loc.sum);
         put(b, kv.second.pos); put(b, kv.second.group); put(b, kv.second.used_ms);
+        put(b, kv.second.score.crf); put(b, kv.second.score.at_ms); put(b, kv.second.score.hits);
     }
     put(b, pc_checksum(b.data(), (int64_t)b.size()));
     b.append(kEndMagic, 8);
@@ -495,7 +500,8 @@ int PrefixStore::write_index(const std::unordered_map<BlockHash, EMeta, BlockHas
     return RAD_OK;
 }
 
-int PrefixStore::flush(const std::vector<PcPut>& ents, const std::vector<PcPut>& snaps, PcFlush* out) {
+int PrefixStore::flush(const std::vector<PcPut>& ents, const std::vector<PcPut>& snaps, PcFlush* out,
+                       const PcFlushOpts& opts) {
     PcFlush res;
     if (!enabled_) return RAD_E_STATE;
     const uint64_t t0 = rad_mono_ns();
@@ -505,19 +511,29 @@ int PrefixStore::flush(const std::vector<PcPut>& ents, const std::vector<PcPut>&
     std::unordered_map<BlockHash, SMeta, BlockHashHash> ns;
     struct Job { bool snap; BlockHash key; const void* bytes; };
     std::vector<Job> jobs;
-    int64_t live = 0;
-    /* Snapshots first in the budget: one is worth thousands of entries' prefill on a hybrid. */
+    int64_t live = 0, budget_left = opts.write_budget;
+    /* A new payload: admitted, and within this flush's write budget. Budget refusals are
+     * deferred, not lost: the item stays in memory and a later flush may write it. */
+    auto may_write = [&](const PcPut& p, int64_t n) {
+        if (!p.admit) { ++res.rejected; return false; }
+        if (budget_left >= 0 && n > budget_left) { ++res.deferred; return false; }
+        if (budget_left >= 0) budget_left -= n;
+        return true;
+    };
+    /* Snapshots first in the cap: one is worth thousands of entries' prefill on a hybrid. Each
+     * kind arrives most valuable first, so a full cap leaves out the lowest LRFU scores. */
     for (const PcPut& p : snaps) {
         if (sb <= 0 || ns.count(p.key)) continue;
         if (cfg_.cap_bytes > 0 && live + sb > cfg_.cap_bytes) { ++res.dropped; continue; }
         auto old = snaps_.find(p.key);
-        SMeta m{ p.pos, p.group, p.used_ms, {} };
+        SMeta m{ p.pos, p.group, p.used_ms, p.score, {} };
         if (!p.bytes) {
             if (old == snaps_.end()) { ++res.dropped; continue; }
             m.loc = old->second.loc;
         } else if (!p.fresh && old != snaps_.end()) {
             m.loc = old->second.loc;
         } else {
+            if (!may_write(p, sb)) continue;
             jobs.push_back({ true, p.key, p.bytes });
         }
         ns[p.key] = m;
@@ -528,7 +544,7 @@ int PrefixStore::flush(const std::vector<PcPut>& ents, const std::vector<PcPut>&
         if (cfg_.cap_bytes > 0 && live + eb > cfg_.cap_bytes) { ++res.dropped; continue; }
         auto old = ents_.find(p.key);
         EMeta m;
-        m.depth = p.depth; m.n_children = p.n_children; m.used_ms = p.used_ms;
+        m.depth = p.depth; m.n_children = p.n_children; m.used_ms = p.used_ms; m.score = p.score;
         if (!p.bytes) {
             if (old == ents_.end()) { ++res.dropped; continue; }
             m.tokens = old->second.tokens;
@@ -537,6 +553,7 @@ int PrefixStore::flush(const std::vector<PcPut>& ents, const std::vector<PcPut>&
             if (!p.tokens) continue;
             m.tokens.assign(p.tokens, p.tokens + cfg_.block_tokens);
             if (!p.fresh && old != ents_.end() && old->second.tokens == m.tokens) m.loc = old->second.loc;
+            else if (!may_write(p, eb)) continue;
             else jobs.push_back({ false, p.key, p.bytes });
         }
         ne[p.key] = std::move(m);
@@ -549,7 +566,10 @@ int PrefixStore::flush(const std::vector<PcPut>& ents, const std::vector<PcPut>&
     for (const auto& kv : ne) if (kv.second.loc.seg) kept_old += eb;
     for (const auto& kv : ns) if (kv.second.loc.seg) kept_old += sb;
     const int64_t dead = old_total - kept_old;
-    const bool compact = dead > 256 * kMiB && dead > kept_old;
+    /* Over half the segments dead (and 256 MiB of it), when the flush may and its budget covers
+     * the rewrite. The rest of the time dead bytes wait for their segment to empty. */
+    const bool compact = opts.compact && dead > 256 * kMiB && dead > kept_old &&
+                         (budget_left < 0 || kept_old <= budget_left);
     std::unordered_map<BlockHash, const void*, BlockHashHash> ram_e, ram_s;
     if (compact) {
         for (const PcPut& p : ents) if (p.bytes) ram_e[p.key] = p.bytes;
@@ -717,18 +737,24 @@ uint64_t unix_ms_to_mono(int64_t ms, uint64_t mono_now, int64_t unix_now) {
 }  // namespace
 
 int pc_flush_cache(PrefixCache& pc, IdleTiers& t, const HostArena* ck, PrefixStore& st,
-                   int64_t ttl_s, PcFlush* out) {
+                   const PcPolicy& pol, PcFlush* out) {
     std::vector<PrefixCache::PersistEntry> ents;
     std::vector<PrefixCache::PersistSnap> snaps;
-    pc.persist_export(&ents, &snaps);
+    pc.persist_export(&ents, &snaps, pol.long_tokens);
     const uint64_t mono = rad_mono_ns();
     const int64_t unix_ms = now_ms();
-    const uint64_t cut = ttl_s > 0 && mono > (uint64_t)ttl_s * 1000000000ull
-                             ? mono - (uint64_t)ttl_s * 1000000000ull : 0;
-    std::sort(ents.begin(), ents.end(), [](const auto& a, const auto& b) {
-        return a.used_ns != b.used_ns ? a.used_ns > b.used_ns : a.depth < b.depth; });
-    std::sort(snaps.begin(), snaps.end(), [](const auto& a, const auto& b) {
-        return a.used_ns > b.used_ns; });
+    const uint64_t cut = pol.ttl_s > 0 && mono > (uint64_t)pol.ttl_s * 1000000000ull
+                             ? mono - (uint64_t)pol.ttl_s * 1000000000ull : 0;
+    const uint64_t active = pol.final && pol.active_s > 0 && mono > (uint64_t)pol.active_s * 1000000000ull
+                                ? mono - (uint64_t)pol.active_s * 1000000000ull
+                                : (pol.final && pol.active_s > 0 ? 1 : UINT64_MAX);
+    /* Most valuable first: the LRFU score now, and among equals the chain's start first. */
+    const double h = pol.half_s;
+    std::sort(ents.begin(), ents.end(), [&](const auto& a, const auto& b) {
+        const float sa = a.score.at(unix_ms, h), sb = b.score.at(unix_ms, h);
+        return sa != sb ? sa > sb : a.depth < b.depth; });
+    std::sort(snaps.begin(), snaps.end(), [&](const auto& a, const auto& b) {
+        return a.score.at(unix_ms, h) > b.score.at(unix_ms, h); });
     std::vector<PcPut> pe, ps;
     pe.reserve(ents.size());
     for (const auto& e : ents) {
@@ -741,6 +767,9 @@ int pc_flush_cache(PrefixCache& pc, IdleTiers& t, const HostArena* ck, PrefixSto
         p.depth = e.depth;
         p.n_children = e.n_children;
         p.used_ms = mono_to_unix_ms(e.used_ns, mono, unix_ms);
+        p.score = e.score;
+        /* Earned: reused, on a long conversation, or (at a stop) in use lately. */
+        p.admit = e.score.hits > 0 || e.long_chain || e.used_ns >= active;
         pe.push_back(p);
     }
     for (const auto& s : snaps) {
@@ -753,10 +782,13 @@ int pc_flush_cache(PrefixCache& pc, IdleTiers& t, const HostArena* ck, PrefixSto
         p.pos = s.pos;
         p.group = s.session;
         p.used_ms = mono_to_unix_ms(s.used_ns, mono, unix_ms);
+        p.score = s.score;
+        p.admit = s.score.hits > 0 || (pol.long_tokens > 0 && s.pos >= pol.long_tokens) ||
+                  s.used_ns >= active;
         ps.push_back(p);
     }
     PcFlush f;
-    const int rc = st.flush(pe, ps, &f);
+    const int rc = st.flush(pe, ps, &f, pol.opts);
     if (rc == RAD_OK) {
         pc.persist_stored(f.stored_entries, f.stored_snaps);
         /* What the store no longer holds, and what was offered from disk but left out. */
@@ -775,7 +807,7 @@ int64_t pc_import(PrefixCache& pc, PrefixStore& st, int64_t* snaps) {
     int64_t n = 0, k = 0;
     for (const PcEntry& e : st.loaded_entries())
         if (pc.import_entry(e.key, e.tokens, e.depth, e.n_children,
-                            unix_ms_to_mono(e.used_ms, mono, unix_ms)) == RAD_OK) ++n;
+                            unix_ms_to_mono(e.used_ms, mono, unix_ms), e.score) == RAD_OK) ++n;
     /* One session a group: the retention policy sees each conversation's ladder again. Ids
      * from 2^62 never meet a request id. */
     std::unordered_map<uint64_t, uint64_t> remap;
@@ -783,7 +815,8 @@ int64_t pc_import(PrefixCache& pc, PrefixStore& st, int64_t* snaps) {
         auto it = remap.find(s.group);
         const uint64_t sid = it != remap.end() ? it->second
                                                : (remap[s.group] = (1ull << 62) + remap.size());
-        if (pc.import_snapshot(s.key, s.pos, sid, unix_ms_to_mono(s.used_ms, mono, unix_ms)) == RAD_OK)
+        if (pc.import_snapshot(s.key, s.pos, sid, unix_ms_to_mono(s.used_ms, mono, unix_ms),
+                               s.score) == RAD_OK)
             ++k;
     }
     if (snaps) *snaps = k;

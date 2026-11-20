@@ -322,7 +322,9 @@ TEST(the_prefix_cache_disk_tier_flag_is_gone_the_host_size_was_renamed_and_the_d
     Config p;
     CHECK_EQ(parse({}, &p), RAD_OK);
     CHECK(p.prefix_cache_dir.empty());
-    CHECK_EQ(p.prefix_cache_flush_s, 60ll);
+    CHECK_EQ(p.prefix_cache_flush_s, 600ll);
+    CHECK_EQ(p.prefix_cache_dir_write_mib_per_hour, 4096ll);
+    CHECK_EQ(p.draft_suffix_global_mib, 256ll);
     Config q;
     CHECK_EQ(parse({ "--prefix-cache-dir", "/srv/kv", "--prefix-cache-dir-mib", "8192",
                      "--prefix-cache-flush-s", "0" }, &q), RAD_OK);
@@ -642,7 +644,9 @@ const std::map<std::string, std::vector<std::string>>& legal_values() {
         { "--prefix-cache-mib", { "256" } }, { "--prefix-cache-ttl", { "60" } },
         { "--prefix-cache-dir", { "/srv/kv" } }, { "--prefix-cache-dir-mib", { "1024" } },
         { "--prefix-cache-flush-s", { "30" } },
-        { "--draft-suffix-global-mib", { "64" } }, { "--draft-suffix-dir", { "/srv/kv" } },
+        { "--draft-suffix-global-mib", { "64" } },
+        { "--prefix-cache-dir-write-mib-per-hour", { "1024" } }, { "--prefix-cache-lrfu-half-life-s", { "3600" } },
+        { "--prefix-cache-dir-long-tokens", { "16384" } }, { "--prefix-cache-dir-active-s", { "600" } },
         { "--placement", { "all_vram" } }, { "--checkpoint-interval", { "256" } },
         { "--prefill-span", { "2" } },
         { "--prefill-span-pass", { "step", "--prefill-span", "2" } },
@@ -771,6 +775,8 @@ TEST(every_listed_option_parses_and_is_reported_as_given) {
  * as 0 or "12k" as 12 would each be served as a decision. Seconds are whole numbers too. */
 TEST(every_numeric_option_refuses_what_is_not_its_kind) {
     const std::vector<std::string> seconds = { "--prefix-cache-ttl", "--prefix-cache-flush-s",
+                                               "--prefix-cache-lrfu-half-life-s",
+                                               "--prefix-cache-dir-active-s",
                                                "--read-timeout",
                                                "--write-timeout", "--keep-alive-timeout",
                                                "--retry-after" };

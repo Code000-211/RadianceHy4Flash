@@ -60,6 +60,7 @@ struct PcEntry {
     int64_t depth = 0;
     uint8_t n_children = 0;
     int64_t used_ms = 0;          /* unix ms of the last use */
+    PcScore score;
     PcLoc   loc;
 };
 
@@ -70,6 +71,7 @@ struct PcSnap {
     int64_t  pos = 0;
     uint64_t group = 0;
     int64_t  used_ms = 0;
+    PcScore  score;
     PcLoc    loc;
 };
 
@@ -88,12 +90,24 @@ struct PcPut {
     int64_t pos = 0;
     uint64_t group = 0;
     int64_t used_ms = 0;
+    PcScore score;
+    /* Write it if it is not on disk yet. False leaves a new item off disk (admission control);
+     * one the index already holds with these bytes stays either way. */
+    bool admit = true;
+};
+
+/* What one flush may do. */
+struct PcFlushOpts {
+    int64_t write_budget = -1;    /* payload bytes this flush may write, -1 unbounded */
+    bool    compact = true;       /* rewrite everything when dead bytes outweigh the live */
 };
 
 struct PcFlush {
     int64_t written_items = 0, written_bytes = 0;   /* payloads written this flush */
     int64_t kept_items = 0, live_bytes = 0;         /* in the new index */
     int64_t dropped = 0;                            /* left out: the cap, or not offered */
+    int64_t rejected = 0;                           /* new, not admitted (PcPut::admit) */
+    int64_t deferred = 0;                           /* admitted, over the write budget */
     int64_t segs_deleted = 0;
     bool    compacted = false;
     double  secs = 0;
@@ -146,7 +160,8 @@ public:
     /* Writes the cache's live set: `ents` and `snaps` each most valuable first. What is not
      * offered, or does not fit the cap, leaves the index. On any failure (a full disk, an I/O
      * error) the previous index and its segments stay as they were and an error is returned. */
-    int flush(const std::vector<PcPut>& ents, const std::vector<PcPut>& snaps, PcFlush* out);
+    int flush(const std::vector<PcPut>& ents, const std::vector<PcPut>& snaps, PcFlush* out,
+              const PcFlushOpts& opts = PcFlushOpts{});
 
     struct Stats {
         int64_t flushes = 0, flush_failures = 0, reads = 0, read_bytes = 0, read_failures = 0;
@@ -161,8 +176,8 @@ public:
 private:
     struct Seg { int64_t bytes = 0; int fd = -1; };
     struct EMeta { std::vector<int32_t> tokens; int64_t depth = 0; uint8_t n_children = 0;
-                   int64_t used_ms = 0; PcLoc loc; };
-    struct SMeta { int64_t pos = 0; uint64_t group = 0; int64_t used_ms = 0; PcLoc loc; };
+                   int64_t used_ms = 0; PcScore score; PcLoc loc; };
+    struct SMeta { int64_t pos = 0; uint64_t group = 0; int64_t used_ms = 0; PcScore score; PcLoc loc; };
 
     int  load_index();
     int  write_index(const std::unordered_map<BlockHash, EMeta, BlockHashHash>& e,
@@ -196,10 +211,24 @@ private:
 class IdleTiers;
 class HostArena;
 
-/* Writes the cache's live set (what has a host copy or is held on disk; snapshots in `ck`),
- * most recently used first, leaving out what --prefix-cache-ttl has expired. */
+/* The store's policy (--prefix-cache-dir-*). What a flush keeps is ordered by LRFU score, and a
+ * cap or budget takes the lowest first. A new item is admitted to disk only when it has earned it:
+ * reused at least once, or part of a long conversation (a chain of `long_tokens` or more, its
+ * snapshots at or past that depth); at a clean stop (`final`) also anything used within
+ * `active_s`, so the conversations in progress resume. */
+struct PcPolicy {
+    int64_t ttl_s = 0;
+    double  half_s = 6 * 3600.0;
+    int64_t active_s = 3600;      /* 0: the stop admits nothing extra */
+    int64_t long_tokens = 32768;  /* 0: no length rule */
+    bool    final = false;
+    PcFlushOpts opts;
+};
+
+/* Writes the cache's live set (what has a host copy or is held on disk; snapshots in `ck`) by
+ * the policy, leaving out what --prefix-cache-ttl has expired. */
 int pc_flush_cache(PrefixCache& pc, IdleTiers& t, const HostArena* ck, PrefixStore& st,
-                   int64_t ttl_s, PcFlush* out);
+                   const PcPolicy& pol, PcFlush* out);
 /* Imports what the store loaded into an empty cache: entries as disk records, snapshots on disk
  * only. Returns the entries imported; `snaps` the snapshots. */
 int64_t pc_import(PrefixCache& pc, PrefixStore& st, int64_t* snaps);

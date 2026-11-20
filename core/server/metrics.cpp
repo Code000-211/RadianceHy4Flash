@@ -209,6 +209,16 @@ void Metrics::sample(const SchedMetrics& m) {
     c_suffix_global_.advance_to(m.suffix_global);
     c_suffix_global_busy_.advance_to(m.suffix_global_busy);
     c_suffix_adopted_.advance_to(m.suffix_adopted);
+    c_suffix_global_credited_.advance_to(m.suffix_global_credited);
+    c_disk_written_.advance_to(m.disk_written_bytes);
+    c_disk_admitted_.advance_to(m.disk_admitted);
+    c_disk_rejected_.advance_to(m.disk_rejected);
+    c_disk_deferred_.advance_to(m.disk_deferred);
+    c_disk_paged_in_.advance_to(m.disk_paged_in);
+    c_disk_compactions_.advance_to(m.disk_compactions);
+    g_disk_hour_.set((double)m.disk_written_hour); g_disk_entries_.set((double)m.disk_entries);
+    g_disk_snaps_.set((double)m.disk_snaps); g_disk_bytes_.set((double)m.disk_bytes);
+    g_disk_loaded_.set((double)m.disk_loaded);
     c_attn_cached_.advance_to(m.attn_cached_tokens);
     c_linear_cached_.advance_to(m.linear_cached_tokens);
     c_prefix_queries_.advance_to(m.prefix_queries);
@@ -503,6 +513,31 @@ std::string Metrics::render() const {
     w.counter("radiance:suffix_global_busy_total",
               "Suffix lookups that found the global cache mid-insert and skipped it.", L,
               c_suffix_global_busy_.get());
+    w.counter("radiance:suffix_global_credited_total",
+              "Accepted global-suffix rows credited to the responses they came from (LRFU).", L,
+              c_suffix_global_credited_.get());
+    w.counter("radiance:prefix_store_written_bytes_total",
+              "Payload bytes --prefix-cache-dir wrote (entries and snapshots).", L, c_disk_written_.get());
+    w.counter("radiance:prefix_store_admitted_total",
+              "Items --prefix-cache-dir wrote.", L, c_disk_admitted_.get());
+    w.counter("radiance:prefix_store_rejected_total",
+              "New items not admitted to disk: never reused, not part of a long conversation, and "
+              "not in use at a stop.", L, c_disk_rejected_.get());
+    w.counter("radiance:prefix_store_deferred_total",
+              "Admitted items left for a later flush by --prefix-cache-dir-write-mib-per-hour.", L,
+              c_disk_deferred_.get());
+    w.counter("radiance:prefix_store_paged_in_total",
+              "Entries read back from --prefix-cache-dir on a hit.", L, c_disk_paged_in_.get());
+    w.counter("radiance:prefix_store_compactions_total",
+              "Rewrites of --prefix-cache-dir into one segment.", L, c_disk_compactions_.get());
+    w.gauge("radiance:prefix_store_written_bytes_last_hour",
+            "Payload bytes --prefix-cache-dir wrote in the last hour.", L, g_disk_hour_.get());
+    w.gauge("radiance:prefix_store_entries", "Entries --prefix-cache-dir holds.", L, g_disk_entries_.get());
+    w.gauge("radiance:prefix_store_snapshots", "Snapshots --prefix-cache-dir holds.", L, g_disk_snaps_.get());
+    w.gauge("radiance:prefix_store_bytes", "Bytes --prefix-cache-dir holds on disk.", L, g_disk_bytes_.get());
+    w.gauge("radiance:prefix_store_hit_rate",
+            "Of the entries indexed at startup, the share read back on a hit so far.", L,
+            g_disk_loaded_.get() > 0 ? c_disk_paged_in_.get() / g_disk_loaded_.get() : 0.0);
     w.counter("radiance:suffix_adopted_total",
               "Requests whose suffix index was taken over from an earlier turn's prompt.", L,
               c_suffix_adopted_.get());

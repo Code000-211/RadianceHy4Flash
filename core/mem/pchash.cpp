@@ -5,6 +5,8 @@
 
 #include "util/simd.h"
 
+#include <chrono>
+
 namespace rad {
 
 namespace {
@@ -38,6 +40,11 @@ BlockHash pc_key_of(const std::string& text) {
     h.lo = mix64(b + s);
     if (!h.valid()) h.lo = 1;
     return h;
+}
+
+int64_t pc_unix_ms() {
+    return (int64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::system_clock::now().time_since_epoch()).count();
 }
 
 }  /* namespace rad */

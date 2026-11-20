@@ -651,6 +651,14 @@ bool IdleTiers::clear_disk(const BlockHash& key) {
     return true;
 }
 
+void IdleTiers::long_chains(int64_t min_tokens,
+                            std::unordered_set<BlockHash, BlockHashHash>* out) const {
+    if (min_tokens <= 0) return;
+    std::lock_guard lk(mu_);
+    for (const auto& kv : sessions_)
+        if (kv.second.n_tokens >= min_tokens) out->insert(kv.second.chain.begin(), kv.second.chain.end());
+}
+
 /* ------------------------------------------------------------------ the session view */
 
 /* Two chains are the same conversation when one is a prefix of the other: blocks are content

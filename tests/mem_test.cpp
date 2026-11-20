@@ -8384,6 +8384,27 @@ TEST(an_entry_with_a_streamed_group_is_never_demoted) {
 
 /* ================================================================== the store on disk */
 
+/* A clean stop that admits everything used lately: the tests' plain flush. */
+static PcPolicy all_admit() {
+    PcPolicy p;
+    p.final = true;
+    p.active_s = (int64_t)1 << 30;
+    return p;
+}
+static PcPolicy idle_flush(int64_t long_tokens = 0, int64_t budget = -1) {
+    PcPolicy p;
+    p.final = false;
+    p.long_tokens = long_tokens;
+    p.opts.write_budget = budget;
+    return p;
+}
+static PrefixStore::Config store_cfg(const std::string& dir, const TierFixture& x) {
+    PrefixStore::Config sc;
+    sc.dir = dir; sc.name = "m"; sc.key_text = "k\n"; sc.entry_bytes = 1024;
+    sc.snap_bytes = x.f.ck.enabled() ? x.f.ck.slot_bytes() : 0; sc.block_tokens = 16;
+    return sc;
+}
+
 /* A conversation's entries and snapshot go to disk at a stop and come back, byte for byte, into
  * a fresh cache: lazily, only when a prompt's chain reaches them. */
 TEST(a_restarted_cache_pages_a_conversation_back_byte_for_byte) {
@@ -8426,11 +8447,11 @@ TEST(a_restarted_cache_pages_a_conversation_back_byte_for_byte) {
         PrefixStore st;
         CHECK_OK(st.open(sc));
         PcFlush f;
-        CHECK_OK(pc_flush_cache(x.f.pc, x.t, &x.f.ck, st, 0, &f));
+        CHECK_OK(pc_flush_cache(x.f.pc, x.t, &x.f.ck, st, all_admit(), &f));
         CHECK_EQ(f.written_items, 21ll);
         /* A second flush with nothing new writes nothing. */
         PcFlush g;
-        CHECK_OK(pc_flush_cache(x.f.pc, x.t, &x.f.ck, st, 0, &g));
+        CHECK_OK(pc_flush_cache(x.f.pc, x.t, &x.f.ck, st, all_admit(), &g));
         CHECK_EQ(g.written_items, 0ll);
         CHECK_EQ(g.kept_items, 21ll);
     }
@@ -8478,7 +8499,7 @@ TEST(a_restarted_cache_pages_a_conversation_back_byte_for_byte) {
     CHECK(std::memcmp(y.f.ck.at(h.checkpoint_slot), want_s.data(), want_s.size()) == 0);
     /* Paged-in records are known to be on disk: the next flush writes nothing. */
     PcFlush f;
-    CHECK_OK(pc_flush_cache(y.f.pc, y.t, &y.f.ck, st, 0, &f));
+    CHECK_OK(pc_flush_cache(y.f.pc, y.t, &y.f.ck, st, all_admit(), &f));
     CHECK_EQ(f.written_items, 0ll);
     CHECK_EQ(f.kept_items, 21ll);
 }
@@ -8501,7 +8522,7 @@ TEST(store_held_copies_are_demoted_to_disk_not_lost) {
     sc.snap_bytes = x.f.ck.slot_bytes(); sc.block_tokens = 16;
     PrefixStore st;
     CHECK_OK(st.open(sc));
-    CHECK_OK(pc_flush_cache(x.f.pc, x.t, &x.f.ck, st, 0, nullptr));
+    CHECK_OK(pc_flush_cache(x.f.pc, x.t, &x.f.ck, st, all_admit(), nullptr));
     /* A second conversation needs the only snapshot slot. */
     x.f.pc.begin_step();
     const auto b = tok_run(5000, 336);
@@ -8514,6 +8535,141 @@ TEST(store_held_copies_are_demoted_to_disk_not_lost) {
     x.f.pc.plan_page_in(a, {}, &plan);
     CHECK(plan.has_snap);
     CHECK_EQ(plan.snap_pos, 320ll);
+}
+
+
+/* Admission: an idle flush writes only what earned it. A conversation nobody came back to stays
+ * off the disk; once a lookup reuses it, the next flush writes it, and only it. */
+TEST(an_idle_flush_admits_only_what_was_reused_or_long) {
+    const std::string dir = radtest::tmp_path("pcache_admit");
+    (void)std::system(("rm -rf '" + dir + "'").c_str());
+    TierFixture x;
+    CHECK_OK(x.build(true, 4));
+    const auto a = tok_run(1000, 336), b = tok_run(5000, 336);
+    publish(x.f, 1, a, 320);
+    (void)ckpt_at(x.f, 1, chain_of(a), 320);
+    publish(x.f, 2, b, 320);
+    x.f.kv.free_sequence(1);
+    x.f.kv.free_sequence(2);
+    (void)copy_now(x.t);
+    PrefixStore st;
+    CHECK_OK(st.open(store_cfg(dir, x)));
+    PcFlush f0;
+    CHECK_OK(pc_flush_cache(x.f.pc, x.t, &x.f.ck, st, idle_flush(), &f0));
+    CHECK_EQ(f0.written_items, 0ll);
+    CHECK_EQ(f0.rejected, 41ll);                       /* 40 entries and a snapshot */
+    /* The first conversation comes back: its prefix and snapshot are reused. */
+    x.f.pc.begin_step();
+    const CacheHit h = x.f.pc.lookup(a, {});
+    CHECK_EQ(h.n_linear_tokens, 320);
+    PcFlush f1;
+    CHECK_OK(pc_flush_cache(x.f.pc, x.t, &x.f.ck, st, idle_flush(), &f1));
+    CHECK_EQ(f1.written_items, 21ll);
+    CHECK_EQ(f1.rejected, 20ll);
+    CHECK(st.has_entry(chain_of(a)[0]) && !st.has_entry(chain_of(b)[0]));
+    /* Nothing new: nothing written, nothing rewritten. */
+    PcFlush f2;
+    CHECK_OK(pc_flush_cache(x.f.pc, x.t, &x.f.ck, st, idle_flush(), &f2));
+    CHECK_EQ(f2.written_items, 0ll);
+    CHECK_EQ(f2.kept_items, 21ll);
+    /* A long conversation needs no reuse (here: 320 tokens is long). */
+    PcFlush f3;
+    CHECK_OK(pc_flush_cache(x.f.pc, x.t, &x.f.ck, st, idle_flush(320), &f3));
+    CHECK_EQ(f3.written_items, 20ll);
+    /* And the stop admits what was in use lately. */
+    TierFixture y;
+    CHECK_OK(y.build(true, 4));
+    publish(y.f, 3, a, 320);
+    y.f.kv.free_sequence(3);
+    (void)copy_now(y.t);
+    const std::string dir2 = dir + "_stop";
+    (void)std::system(("rm -rf '" + dir2 + "'").c_str());
+    PrefixStore s2;
+    CHECK_OK(s2.open(store_cfg(dir2, y)));
+    PcPolicy stop;
+    stop.final = true;
+    stop.active_s = 3600;
+    PcFlush f4;
+    CHECK_OK(pc_flush_cache(y.f.pc, y.t, &y.f.ck, s2, stop, &f4));
+    CHECK_EQ(f4.written_items, 20ll);
+    PcPolicy none = stop;
+    none.active_s = 0;
+    TierFixture z;
+    CHECK_OK(z.build(true, 4));
+    publish(z.f, 4, b, 320);
+    z.f.kv.free_sequence(4);
+    (void)copy_now(z.t);
+    PcFlush f5;
+    CHECK_OK(pc_flush_cache(z.f.pc, z.t, &z.f.ck, s2, none, &f5));
+    CHECK_EQ(f5.written_items, 0ll);
+}
+
+/* The write budget holds an idle flush to its bytes; what it defers is written by the next. */
+TEST(the_write_budget_defers_what_does_not_fit_and_loses_nothing) {
+    const std::string dir = radtest::tmp_path("pcache_budget");
+    (void)std::system(("rm -rf '" + dir + "'").c_str());
+    TierFixture x;
+    CHECK_OK(x.build(false, 0));
+    const auto a = tok_run(1000, 336);
+    publish(x.f, 1, a, 320);
+    x.f.kv.free_sequence(1);
+    (void)copy_now(x.t);
+    (void)x.f.pc.lookup(a, {});
+    PrefixStore st;
+    CHECK_OK(st.open(store_cfg(dir, x)));
+    PcFlush f1, f2, f3;
+    CHECK_OK(pc_flush_cache(x.f.pc, x.t, nullptr, st, idle_flush(0, 8 * 1024 + 100), &f1));
+    CHECK_EQ(f1.written_items, 8ll);
+    CHECK(f1.written_bytes <= 8 * 1024 + 100);
+    CHECK_EQ(f1.deferred, 12ll);
+    /* The first eight are the chain's start: a deferred chain still resumes as far as it got. */
+    CHECK(st.has_entry(chain_of(a)[0]) && st.has_entry(chain_of(a)[7]) && !st.has_entry(chain_of(a)[8]));
+    CHECK_OK(pc_flush_cache(x.f.pc, x.t, nullptr, st, idle_flush(0, 8 * 1024), &f2));
+    CHECK_EQ(f2.written_items, 8ll);
+    CHECK_OK(pc_flush_cache(x.f.pc, x.t, nullptr, st, idle_flush(0, 0), &f3));
+    CHECK_EQ(f3.written_items, 0ll);
+    CHECK_EQ(f3.deferred, 4ll);
+    CHECK_EQ(st.n_entries(), 16ll);
+}
+
+/* The cap keeps the highest LRFU score: a conversation reused often outlives a newer one used
+ * once, which plain LRU would have kept instead. */
+TEST(the_store_cap_keeps_the_conversation_reused_most) {
+    const std::string dir = radtest::tmp_path("pcache_lrfu");
+    (void)std::system(("rm -rf '" + dir + "'").c_str());
+    TierFixture x;
+    CHECK_OK(x.build(false, 0));
+    const auto a = tok_run(1000, 336), b = tok_run(5000, 336);
+    publish(x.f, 1, a, 320);
+    x.f.kv.free_sequence(1);
+    for (int i = 0; i < 4; ++i) (void)x.f.pc.lookup(a, {});
+    publish(x.f, 2, b, 320);
+    x.f.kv.free_sequence(2);
+    (void)x.f.pc.lookup(b, {});                      /* newer, used once */
+    (void)copy_now(x.t);
+    PrefixStore::Config sc = store_cfg(dir, x);
+    sc.cap_bytes = 20 * 1024;                        /* one conversation */
+    PrefixStore st;
+    CHECK_OK(st.open(sc));
+    CHECK_OK(pc_flush_cache(x.f.pc, x.t, nullptr, st, all_admit(), nullptr));
+    CHECK(st.has_entry(chain_of(a)[19]));
+    CHECK(!st.has_entry(chain_of(b)[0]));
+    /* The scores survive a restart: what comes back is ordered the same. */
+    PrefixStore r;
+    CHECK_OK(r.open(sc));
+    REQUIRE_EQ(r.loaded_entries().size(), 20u);
+    CHECK_EQ(r.loaded_entries()[0].score.hits, 4u);
+}
+
+TEST(the_lrfu_score_halves_every_half_life_and_adds_one_a_reference) {
+    PcScore s;
+    s.ref(0, 3600.0, false);
+    CHECK(s.crf == 1.0f && s.hits == 0u);
+    CHECK_NEAR(s.at(3600 * 1000, 3600.0), 0.5, 1e-6);
+    s.ref(3600 * 1000, 3600.0, true);
+    CHECK_NEAR(s.crf, 1.5, 1e-6);
+    CHECK_EQ(s.hits, 1u);
+    CHECK_NEAR(s.at(3 * 3600 * 1000, 3600.0), 0.375, 1e-6);
 }
 
 RAD_TEST_MAIN()

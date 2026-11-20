@@ -306,4 +306,28 @@ TEST(the_checksum_sees_every_byte) {
     CHECK(pc_key_of("a\n") != pc_key_of("b\n"));
 }
 
+TEST(a_new_item_not_admitted_stays_off_disk_and_a_stored_one_stays_on) {
+    const std::string d = fresh_dir("pcs_admit");
+    std::vector<Item> a{ make(1, EB), make(2, EB) };
+    PrefixStore s;
+    CHECK_OK(s.open(cfg_of(d)));
+    CHECK_OK(s.flush(puts_of({ a[0] }, false), {}, nullptr));
+    /* Both offered, neither admitted: the stored one stays (no write), the new one is refused. */
+    std::vector<PcPut> p = puts_of(a, false, false);
+    p[1].fresh = true;
+    for (PcPut& x : p) x.admit = false;
+    PcFlush f;
+    CHECK_OK(s.flush(p, {}, &f));
+    CHECK_EQ(f.written_items, 0ll);
+    CHECK_EQ(f.rejected, 1ll);
+    CHECK(s.has_entry(a[0].key) && !s.has_entry(a[1].key));
+    /* A zero budget defers instead. */
+    p[1].admit = true;
+    PcFlushOpts o;
+    o.write_budget = 0;
+    CHECK_OK(s.flush(p, {}, &f, o));
+    CHECK_EQ(f.deferred, 1ll);
+    CHECK(!s.has_entry(a[1].key));
+}
+
 RAD_TEST_MAIN()

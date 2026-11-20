@@ -45,6 +45,7 @@
 #include "rad_core.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <list>
 #include <map>
@@ -57,6 +58,29 @@
 namespace rad {
 
 class IdleTiers;
+
+/* ------------------------------------------------------------------ the LRFU score */
+/* LRFU (Lee et al., 1999): each reference adds one to a combined recency-frequency value that
+ * halves every `half_s` seconds, CRF(t) = sum 2^-((t - t_i) / half_s). An item referenced often
+ * and lately scores high; one referenced once long ago, near zero. `hits` counts the references
+ * after the first (a lookup that reused it). The store on disk (pcstore.h) orders and admits by
+ * it; times are unix milliseconds so a score survives a restart. */
+struct PcScore {
+    float    crf = 0;
+    int64_t  at_ms = 0;           /* the value is as of this time */
+    uint32_t hits = 0;
+    float at(int64_t now_ms, double half_s) const {
+        if (crf <= 0) return 0;
+        const double dt = (double)(now_ms - at_ms) * 1e-3;
+        return dt <= 0 || half_s <= 0 ? crf : (float)(crf * std::exp2(-dt / half_s));
+    }
+    void ref(int64_t now_ms, double half_s, bool hit) {
+        crf = at(now_ms, half_s) + 1.0f;
+        at_ms = now_ms;
+        if (hit && hits != 0xffffffffu) ++hits;
+    }
+};
+int64_t pc_unix_ms();
 
 /* ------------------------------------------------------------------ block identity */
 /* 128 bits, chained: identical spans under different prefixes are different blocks. The width
@@ -486,8 +510,12 @@ public:
      * resume from, reads them, and reports back. A snapshot the store also holds is demoted to
      * disk rather than retired when the store's slots are wanted. Needs the tiers. */
     int  import_entry(const BlockHash& key, const std::vector<int32_t>& tokens, int64_t depth,
-                      uint8_t n_children, uint64_t used_ns);
-    int  import_snapshot(const BlockHash& key, int64_t pos, uint64_t session, uint64_t used_ns);
+                      uint8_t n_children, uint64_t used_ns, const PcScore& score = PcScore{});
+    int  import_snapshot(const BlockHash& key, int64_t pos, uint64_t session, uint64_t used_ns,
+                         const PcScore& score = PcScore{});
+    /* The LRFU half-life entries and snapshots are scored with (--prefix-cache-lrfu-half-life-s). */
+    void set_lrfu_half_life(double s) { half_s_ = s > 0 ? s : 6 * 3600.0; }
+    double lrfu_half_life() const { return half_s_; }
     struct PageIn {
         std::vector<BlockHash> entries;   /* disk records on the chain, in chain order */
         BlockHash snap;                   /* the snapshot to read, when `has_snap` */
@@ -509,6 +537,8 @@ public:
         int64_t  depth = 0;
         int32_t  host_slot = -1;   /* the bytes in the tiers' arena, or -1 */
         bool     disk = false;     /* the store holds the same bytes */
+        PcScore  score;
+        bool     long_chain = false;   /* on a stored conversation of `long_tokens` or more */
     };
     struct PersistSnap {
         BlockHash key;
@@ -517,10 +547,12 @@ public:
         uint64_t used_ns = 0;
         int32_t  slot = -1;        /* the snapshot store slot, or -1 on disk only */
         bool     disk = false;
+        PcScore  score;
     };
     /* Everything a flush can write: entries with a host copy or a disk record, and committed
      * snapshots. VRAM-only entries (no host copy yet) are left out. */
-    void persist_export(std::vector<PersistEntry>* ents, std::vector<PersistSnap>* snaps) const;
+    void persist_export(std::vector<PersistEntry>* ents, std::vector<PersistSnap>* snaps,
+                        int64_t long_tokens = 0) const;
     /* After a flush: the store now holds these (flags set), or no longer holds these (flags
      * cleared; one held only on disk is forgotten). */
     void persist_stored(const std::vector<BlockHash>& ents, const std::vector<BlockHash>& snaps);
@@ -569,6 +601,7 @@ private:
         /* Last hit or publish, monotonic clock. Every path that moves an entry to the LRU's back
          * stamps it, so the list is in this order and expiry stops at the first entry it keeps. */
         uint64_t used_ns = 0;
+        PcScore score;                  /* references: the publish, then every hit */
         std::list<BlockHash>::iterator lru;
     };
     struct Ckpt {
@@ -586,6 +619,7 @@ private:
         bool      valid = false;
         /* The store on disk holds these bytes; with slot -1 they are only there. */
         bool      disk = false;
+        PcScore   score;                /* references: the save, then every hand-out */
     };
 
     std::vector<BlockHash> chain_all(const std::vector<int32_t>& tokens,
@@ -637,6 +671,7 @@ private:
      * out or reserved this step (a disk-held one is demoted, not lost). RAD_E_FULL if none. */
     int  alloc_ck_slot(uint64_t session, int64_t pos, int32_t* slot);
     int64_t ckpt_commits_ = 0;
+    double  half_s_ = 6 * 3600.0;
 
     KVManager*  kv_ = nullptr;
     IdleTiers*  tiers_ = nullptr;

@@ -62,6 +62,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace rad {
@@ -240,6 +241,9 @@ public:
     void set_disk(const BlockHash& key);
     bool clear_disk(const BlockHash& key);
     void*  host_ptr(int32_t slot) const { return slot >= 0 ? arena_.at(slot) : nullptr; }
+    /* Every block of the stored conversations at least `min_tokens` long (the store's admission
+     * of long sessions). */
+    void long_chains(int64_t min_tokens, std::unordered_set<BlockHash, BlockHashHash>* out) const;
 
     /* ---------------- the session view ----------------
      *

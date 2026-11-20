@@ -79,6 +79,7 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
         gc.kmin = cfg_.draft_suffix_min_match;
         gc.kmax = std::min(cfg_.draft_suffix_min_match + (int)SuffixIndex::kExtra, (int)SuffixIndex::kMaxK);
         gc.cap_bytes = cfg_.draft_suffix_global_mib << 20;
+        gc.half_s = (double)cfg_.prefix_cache_lrfu_half_life_s;
         gsuffix_.configure(gc);
         gsuffix_.start();
     }
@@ -1205,6 +1206,7 @@ int Scheduler::suffix_propose(SchedReq& s, int32_t* out, int* match) {
     seq.b = r.output.data();
     seq.nb = (int64_t)r.output.size();
     const int rows = std::min(cfg_.draft_suffix_max, (int)RAD_SCHED_MAX_SPEC);
+    s.suffix_src = 0;
     const SuffixIndex::Out o =
         s.suffix_ix.propose(seq, r.id, cfg_.draft_suffix_min_match, rows,
                             cfg_.draft_suffix_min_score, out);
@@ -1220,6 +1222,7 @@ int Scheduler::suffix_propose(SchedReq& s, int32_t* out, int* match) {
             (head_verifies_ < 64 || (double)go.expect > head_accept_ewma_)) {
             std::copy(g, g + go.n, out);
             if (match) *match = go.match;
+            s.suffix_src = go.src;
             ++m_.suffix_global;
             return go.n;
         }
@@ -3982,6 +3985,11 @@ int Scheduler::commit(StepResult& res) {
                     head_accept_ewma_ = head_verifies_ == 0 ? (double)a
                                                             : 0.97 * head_accept_ewma_ + 0.03 * (double)a;
                     ++head_verifies_;
+                }
+                if (e.suffix && s.suffix_src && a > 0) {
+                    /* The response the chain came from earned a reference (its LRFU score). */
+                    gsuffix_.credit(s.suffix_src);
+                    ++m_.suffix_global_credited;
                 }
                 if (e.suffix) {
                     ++m_.suffix_steps;
