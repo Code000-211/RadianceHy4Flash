@@ -688,6 +688,53 @@ TEST(resident_queue_scratch_is_charged_with_the_hardware_queues) {
     CHECK_EQ(want1 - want0, 160LL << 20);
 }
 
+/* What of "already held" is device code: the code objects resident on the card, each one loaded
+ * whole from its module at its kernel's first launch. M-14 measures it, because libr4d carries the
+ * integer-expert forms a given quantization never launches and each of them still loads whole. It
+ * is a report line and not a term: the bytes are already inside what `free` excludes, so naming
+ * them must not move the split. */
+TEST(the_receipt_says_what_of_the_held_memory_is_device_code) {
+    Config c = small_config();
+    c.vram_weights_mib = 0;
+    c.vram_kv_mib      = 0;
+    c.gpu_headroom_mib = 96;
+    VramFacts f{};
+    f.capacity   = 32LL << 30;
+    f.free       = f.capacity - (512LL << 20);
+    f.arena      = 144LL << 20;
+    f.staging    = 98LL << 20;
+    f.statics    = 2LL << 30;
+    f.experts    = 200LL << 30;
+    f.kv_ceiling = 100LL << 30;
+    VramBudget none;
+    CHECK_OK(vram_budget_resolve(c, { f }, &none));
+    CHECK_EQ(none.code_bytes, 0ll);
+    CHECK(none.report.find("of which code") == std::string::npos);   /* a backend with nothing to say */
+
+    /* Cards that have loaded code say so, and the worst rank's figure is the one printed, as with
+     * every fold here. */
+    Config c1 = small_config();
+    c1.vram_weights_mib = 0;
+    c1.vram_kv_mib      = 0;
+    c1.gpu_headroom_mib = 96;
+    VramFacts a = f, b = f;
+    a.code_bytes   = (40LL << 20) + 100 * 1024;
+    a.code_modules = 61;
+    b.code_bytes   = (110LL << 20) + 600 * 1024;   /* what libr4d's 121 gfx1201 modules weigh */
+    b.code_modules = 121;
+    VramBudget got;
+    CHECK_OK(vram_budget_resolve(c1, { a, b }, &got));
+    CHECK_EQ(got.code_bytes, b.code_bytes);
+    CHECK_EQ(got.code_modules, 121);
+    CHECK(got.report.find("of which code") != std::string::npos);
+    CHECK(got.report.find("121 code module(s) resident") != std::string::npos);
+
+    /* Measuring changes nothing: the same split as the card that could not say. */
+    CHECK_EQ(got.claimable, none.claimable);
+    CHECK_EQ(got.kv, none.kv);
+    CHECK_EQ(got.experts, none.experts);
+}
+
 TEST(the_smallest_card_binds_and_a_short_one_refuses_by_name) {
     Config c = small_config();
     c.vram_weights_mib = 0;

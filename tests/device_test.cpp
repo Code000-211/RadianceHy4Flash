@@ -2545,4 +2545,23 @@ TEST(granules_remapped_at_random_never_share_a_page) {
     rad_stream_destroy(s);
 }
 
+/* The code objects a card holds -- DeviceBackend::code_resident -- is the line the VRAM receipt
+ * prints beside `already held` (M-14): every module loaded there, each whole from its code object.
+ * The AQL backend counts what module_load took; a backend that loads no device code refuses rather
+ * than answering zero, so the receipt leaves the line out instead of claiming a card holds none. */
+TEST(the_resident_device_code_query_answers_for_whichever_backend_is_running) {
+    int64_t bytes = -1;
+    int     modules = -1;
+    const int s = rad::dev_code_resident(0, &bytes, &modules);
+    if (s == RAD_OK) {
+        CHECK(bytes >= 0);
+        CHECK(modules >= 0);
+        if (bytes > 0) CHECK(modules > 0);      /* bytes came from somewhere */
+    } else {
+        CHECK_EQ(s, RAD_E_UNSUPPORTED);
+        CHECK_EQ(bytes, -1);                    /* nothing written where there is no answer */
+        CHECK_EQ(modules, -1);
+    }
+}
+
 RAD_TEST_MAIN_HOST_KARGS()
