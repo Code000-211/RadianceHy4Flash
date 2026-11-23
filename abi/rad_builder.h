@@ -328,10 +328,21 @@ static inline int rad_build_slot(const RadBuildCtx* c) { return c->slot_base + c
  * steered exactly when its `scales` entry is nonzero, so a plugin asks that and cannot disagree
  * with the loader. */
 typedef struct RadControlVector {
-    const float* dir;        /* device, [n_layers, n_embd] f32, unit rows */
+    const float* dir;        /* device, [n_layers, rank, n_embd] f32, unit rows */
     const float* scales;     /* host,    [n_layers]     f32, |d_l| * user scale; 0 = not steered */
     int64_t      n_embd;
     int64_t      n_layers;
+    /* Directions per layer. `dir` holds layer l's direction k at ((l*rank)+k)*n_embd. 1 is the
+     * single-direction package every 2.2 release wrote; 0 is treated as 1 so a package built
+     * against the older struct steers exactly as it did. Trailing and zero-defaulted. */
+    int64_t      rank;
+    /* 1: `dir` is per-stream, [n_layers, rank, hc, n_embd] where rank counts direction GROUPS and
+     * each group holds one direction per hyper-connection stream, so stream s of group k is at
+     * (((l*rank)+k)*hc + s)*n_embd and a kernel must project stream s against its own vector. 0:
+     * one direction per group, applied to every stream (the pre-45 behaviour). The four streams of
+     * this architecture carry the refusal signal differently (cosines 0.1-0.6), which is why the
+     * published refusal vector is per-stream. Trailing and zero-defaulted. */
+    int64_t      per_stream;
 } RadControlVector;
 
 /* ================================================================== weights */

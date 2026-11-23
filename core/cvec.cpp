@@ -22,6 +22,11 @@ uint64_t hash_table(const ControlVector& cv) {
     };
     mix(cv.dir.data(), cv.dir.size() * sizeof(float));
     mix(cv.scales.data(), cv.scales.size() * sizeof(float));
+    /* The layout is part of the identity: the same bytes read as one shared direction and as a
+     * per-stream table are different operators, and blocks computed under one must never be served
+     * to a request steered by the other. */
+    const int64_t shape[2] = { cv.rank, cv.per_stream };
+    mix(shape, sizeof(shape));
     return h ? h : 1ull;
 }
 
@@ -160,9 +165,12 @@ int control_vector_load(const std::string& path, const std::string& arch, int64_
                     "', this container is '" + arch + "' -- a direction from another model's "
                     "residual basis would move hidden states along a meaningless axis");
 
-    /* The file's directions: direction.<l>, one dimensional, F32, n_embd wide. Anything else is
-     * refused rather than skipped, because a quietly missing layer is a differently steered model. */
+    /* The file's directions: direction.<l>, one or more rows, F32, n_embd wide. A rank-1 tensor is
+     * one direction (the original format); a rank-2 [n_embd, rank] tensor is `rank` directions for
+     * that layer, applied in order. Anything else is refused rather than skipped, because a quietly
+     * missing layer is a differently steered model. */
     int64_t n_dir = 0, dir_first = -1, dir_last = -1;
+    int64_t file_rank = 0;
     for (const GgufTensor& t : f.tensors()) {
         if (t.name.rfind("direction.", 0) != 0)
             return fail("control vector " + path + ": tensor '" + t.name +
@@ -179,14 +187,33 @@ int control_vector_load(const std::string& path, const std::string& arch, int64_
         if (layer < 1 || layer >= n_model_layers)
             return fail("control vector " + path + ": direction." + std::to_string(layer) +
                         " is outside this model's " + std::to_string(n_model_layers) + " layers");
-        if (t.n_dims != 1 || t.ne[0] != n_embd)
-            return fail("control vector " + path + ": " + t.name + " is shape [" +
-                        std::to_string(t.ne[0]) + "] with rank " + std::to_string(t.n_dims) +
-                        "; this model's residual streams are " + std::to_string(n_embd) +
-                        " wide and a direction is one row of that");
+        int64_t k = 1;
+        if (t.n_dims == 1) {
+            k = 1;
+        } else if (t.n_dims == 2 && t.ne[1] >= 1) {
+            k = t.ne[1];
+        } else {
+            return fail("control vector " + path + ": " + t.name + " has rank " +
+                        std::to_string(t.n_dims) + "; a direction is one row, or [n_embd, k] for "
+                        "k directions");
+        }
+        if (t.ne[0] != n_embd)
+            return fail("control vector " + path + ": " + t.name + " is " +
+                        std::to_string(t.ne[0]) + " wide; this model's residual streams are " +
+                        std::to_string(n_embd));
         if (gguf_to_rad_dtype(t.ggml_type) != RAD_F32)
             return fail("control vector " + path + ": " + t.name +
                         " is not F32 -- only an f32 direction is read");
+        if (k > kControlVectorMaxRank)
+            return fail("control vector " + path + ": " + t.name + " carries " +
+                        std::to_string(k) + " directions; at most " +
+                        std::to_string(kControlVectorMaxRank) +
+                        " are applied, one per declared hook");
+        if (file_rank == 0) file_rank = k;
+        else if (k != file_rank)
+            return fail("control vector " + path + ": " + t.name + " carries " +
+                        std::to_string(k) + " directions and another layer carries " +
+                        std::to_string(file_rank) + "; every layer must carry the same count");
         if (dir_first < 0 || layer < dir_first) dir_first = layer;
         if (layer > dir_last)                  dir_last  = layer;
         ++n_dir;
@@ -216,36 +243,65 @@ int control_vector_load(const std::string& path, const std::string& arch, int64_
      * for layer 0, and every row a model can name exists. */
     out->n_layers = n_model_layers;
     out->n_dirs = n_dir;
+    out->rank = file_rank;
+    /* The package says whether its rows are per-stream. A per-stream file carries
+     * `rank = streams * groups` rows per layer; the engine projects group k of stream s against
+     * its own vector. Confirmed against the row count so a mislabelled file is refused. */
+    int64_t per_stream_kv = 0;
+    const bool per_stream = f.get_i64("controlvector.per_stream", &per_stream_kv) && per_stream_kv;
+    if (per_stream && (file_rank % 4) != 0)
+        return fail("control vector " + path + ": it is marked per_stream but carries " +
+                    std::to_string(file_rank) + " rows per layer, which is not a multiple of 4 "
+                    "hyper-connection streams");
+    out->per_stream = per_stream ? 1 : 0;
     out->first = first;
     out->last = last;
     out->user_scale = scale;
     out->path = path;
-    out->dir.assign((size_t) (out->n_layers * n_embd), 0.0f);
+    out->dir.assign((size_t) (out->n_layers * file_rank * n_embd), 0.0f);
     out->scales.assign((size_t) out->n_layers, 0.0f);
 
-    double worst = 0.0;
-    for (int64_t l = 1; l <= n_model_layers; ++l) {
+    double worst = 0.0, worst_dot = 0.0;
+    for (int64_t l = 1; l < n_model_layers; ++l) {
         const GgufTensor* t = f.tensor("direction." + std::to_string(l));
         if (!t) continue;
         const float* d = (const float*) f.tensor_data(*t);
         if (!d) return fail("control vector " + path + ": " + t->name + " lies outside the file");
 
-        double nn = 0.0;
-        for (int64_t i = 0; i < n_embd; ++i) nn += (double) d[i] * (double) d[i];
-        const double norm = std::sqrt(nn);
-        if (!(norm > 0.0) || !std::isfinite(norm))
-            return fail("control vector " + path + ": " + t->name + " has no direction");
+        double first_norm = 1.0;
+        for (int64_t k = 0; k < file_rank; ++k) {
+            const float* src = d + (size_t) k * (size_t) n_embd;
+            double nn = 0.0;
+            for (int64_t i = 0; i < n_embd; ++i) nn += (double) src[i] * (double) src[i];
+            const double norm = std::sqrt(nn);
+            if (!(norm > 0.0) || !std::isfinite(norm))
+                return fail("control vector " + path + ": " + t->name + " direction " +
+                            std::to_string(k) + " has no direction");
+            if (k == 0) first_norm = norm;
 
-        float* dst = &out->dir[(size_t) (l * n_embd)];
-        const float inv = (float) (1.0 / norm);
-        for (int64_t i = 0; i < n_embd; ++i) dst[i] = d[i] * inv;
-        /* Zero outside the range: a layer is steered exactly when its scale is nonzero
-         * (abi/rad_builder.h, RadControlVector), and a file carries directions for layers the
-         * package's JSON leaves out. The row is kept so a range change needs no new upload. */
-        out->scales[(size_t) l] = (l >= first && l <= last) ? (float) norm * scale : 0.0f;
+            float* dst = &out->dir[(size_t) ((l * file_rank + k) * n_embd)];
+            const float inv = (float) (1.0 / norm);
+            for (int64_t i = 0; i < n_embd; ++i) dst[i] = src[i] * inv;
+            if (l >= first && l <= last) worst = std::max(worst, std::fabs(norm - 1.0));
+            /* A basis is applied as k chained projections. Rows that are not orthogonal do not
+             * remove the k-space the package was derived for: the second projection takes the part
+             * of the stream along v_2 that v_1 left, and removes it whole. */
+            for (int64_t j = 0; j < k; ++j) {
+                const float* b = &out->dir[(size_t) ((l * file_rank + j) * n_embd)];
+                double dot = 0.0;
+                for (int64_t i = 0; i < n_embd; ++i) dot += (double) dst[i] * (double) b[i];
+                if (l >= first && l <= last) worst_dot = std::max(worst_dot, std::fabs(dot));
+            }
+        }
+        /* One strength per layer. A single direction keeps the original `norm * scale` (the file's
+         * own magnitude is the strength); an orthonormal rank-k basis removes each component whole,
+         * so its strength is the package scale and the rows must be normal (checked below). */
+        out->scales[(size_t) l] =
+            (l >= first && l <= last)
+                ? (file_rank == 1 ? (float) (first_norm * scale) : scale)
+                : 0.0f;
 
         /* A layer inside the range with no direction would silently be unsteered. */
-        if (l >= first && l <= last) worst = std::max(worst, std::fabs(norm - 1.0));
     }
     for (int64_t l = first; l <= last; ++l)
         if (out->scales[(size_t) l] == 0.0f)
@@ -257,6 +313,10 @@ int control_vector_load(const std::string& path, const std::string& arch, int64_
         RAD_WARN("control vector: %s: the directions are not unit-normalised (worst |norm - 1| "
                  "= %.4f); each is divided by its own norm, so the operation is unchanged",
                  path.c_str(), worst);
+    if (worst_dot > 1e-2)
+        RAD_WARN("control vector: %s: the rows of a layer are not orthogonal (worst |v_i.v_j| = "
+                 "%.4f); the chained projections then remove more than the intended %lld-space",
+                 path.c_str(), worst_dot, (long long) file_rank);
     return RAD_OK;
 }
 
@@ -266,6 +326,8 @@ RadControlVector control_vector_view(const ControlVector& cv, const float* dir_d
     v.scales = cv.scales.data();
     v.n_embd = cv.n_embd;
     v.n_layers = cv.n_layers;
+    v.rank = cv.rank > 0 ? cv.rank : 1;
+    v.per_stream = cv.per_stream ? 1 : 0;
     return v;
 }
 

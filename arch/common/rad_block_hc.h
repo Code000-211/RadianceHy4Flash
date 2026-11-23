@@ -437,6 +437,7 @@ struct HcProject {
     rad_buf      on = 0;           /* [rows] int32: 1 = project this row */
     rad_buf      h = 0;            /* the model's wide stream */
     int64_t      n = 0, hc = 0;
+    int          ps = 0;           /* 1: per-stream table, stream s reads its own direction */
 
     bool steered() const { return op != 0; }
 
@@ -462,12 +463,17 @@ struct HcProject {
         return rad_decl_buffer(b, name, &d);
     }
 
-    /* `layer`'s projection, when the vector steers it. Called for every layer; the unsteered ones
-     * (outside the file, outside the range, or no vector at all) declare nothing. */
+    /* `layer`'s projection `k` of `rank`, when the vector steers it. Called for every layer and
+     * every direction; the unsteered ones (outside the file, outside the range, or no vector at
+     * all) declare nothing. Directions of a layer are chained on the same stream, so with an
+     * orthonormal basis the layer removes its whole k-dimensional subspace. */
     int declare(RadBuilder* b, const char* name, const Geom& g, int64_t layer,
-                const RadControlVector* cv, rad_buf mask, rad_buf stream, int64_t hc_streams) {
+                const RadControlVector* cv, rad_buf mask, rad_buf stream, int64_t hc_streams,
+                int64_t k = 0) {
         if (!b || !mask || !stream || !cv || !cv->dir || hc_streams <= 1) return RAD_OK;
         if (layer <= 0 || layer >= cv->n_layers || layer >= g.n_layer) return RAD_OK;
+        const int64_t rank = cv->rank > 0 ? cv->rank : 1;
+        if (k < 0 || k >= rank) return RAD_OK;
         const float scale = cv->scales ? cv->scales[(size_t) layer] : 0.0f;
         if (scale == 0.0f) return RAD_OK;
 
@@ -475,10 +481,15 @@ struct HcProject {
         hc  = hc_streams;
         on  = mask;
         h   = stream;
-        dir = cv->dir + (size_t) layer * (size_t) n;
+        /* A per-stream package holds one direction per hyper-connection stream inside each
+         * group, so group k's table is hc rows long and stream s reads row s. A single-direction
+         * package is one row shared by every stream (vsep 0, the pre-45 behaviour). */
+        ps  = cv->per_stream ? 1 : 0;
+        dir = cv->dir + (size_t) ((layer * rank) + (k * (ps ? hc : 1))) * (size_t) n;
 
         op = rw(b, RAD_OP(b, "hc_project",
                    RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", n), RAD_INT("hc", hc),
+                              RAD_INT("vsep", ps ? n : 0),
                               RAD_F64("scale", (double) scale), RAD_STR("dtype", g.dtype)),
                    RAD_NOWEIGHTS),
                {h, mask}, {h});
@@ -498,7 +509,7 @@ struct HcProject {
         if (!op || !batch || !batch->control_vector) return;
         RAD_ISSUE_N(c_, op, rows,
                     brow_slice(h, r0, rows, hc * n),
-                    praw(dir, RAD_F32, n),
+                    praw(dir, RAD_F32, ps ? n * hc : n),
                     praw((const int32_t*) rad_buf_ptr(c_, on) + r0, RAD_I32, rows));
     }
 };

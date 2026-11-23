@@ -589,8 +589,8 @@ static const RadOperandSpec oGdnConvRecurrentUpdateHad[] = {
 
 /* The control vector's projection (r4d_hc_bf16.hip, with the other gated-residual kernels): a bf16
  * stream, one unit f32 direction for every stream, an int32 switch per row. */
-static const RadParamSpec pHcProject[] = { P_INT("M"), P_INT("n"), P_INT("hc"), P_F64("scale"),
-                                           P_STR("dtype") };
+static const RadParamSpec pHcProject[] = { P_INT("M"), P_INT("n"), P_INT("hc"), P_INTO("vsep"),
+                                           P_F64("scale"), P_STR("dtype") };
 static const RadOperandSpec oHcProject[] = {
     { "h", RAD_OPD_INOUT, 0 }, { "v", RAD_OPD_IN, 0 }, { "on", RAD_OPD_IN, 0 },
 };
@@ -3971,10 +3971,11 @@ static const RadOpSchema kSchemas[] = {
            "the block-scaled fp8 form of the block input and its Hadamard-rotated twin."),
     SCHEMA("hc_project", pHcProject, oHcProject,
            "the control vector's projection (llama.cpp's `--cvec-mode project`): for each of the "
-           "hc streams of a row whose `on` flag is 1, h[s] -= scale * (h[s] . v) * v, v that "
-           "layer's unit direction -- the same v for every stream -- and scale its stored norm. A "
-           "row whose flag is 0 is neither read nor written, so an unprojected request's stream is "
-           "the stock model's."),
+           "hc streams of a row whose `on` flag is 1, h[s] -= scale * (h[s] . v_s) * v_s, v_s that "
+           "layer's unit direction for stream s -- one direction for every stream when `vsep` is "
+           "0, or a per-stream table [hc, n] when `vsep` is n -- and scale its stored norm. A row "
+           "whose flag is 0 is neither read nor written, so an unprojected request's stream is the "
+           "stock model's."),
     SCHEMA("hc_write", pHcPlain, oHcWrite,
            "the write half: h[s] += inj[s] * y, into the UNNORMED stream."),
     SCHEMA("mtp_enter", pMtpEnter, oMtpEnter,
