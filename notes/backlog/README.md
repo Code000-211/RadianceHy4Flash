@@ -58,3 +58,10 @@ it (21.7 / 22.2 / 23.1 -> 22.3 / 23.4 / 26.6 us at 16 rows, B = 3/4/5). Deleting
 time, so the run search is not the 17 us a layer above the byte floor and (b)'s descriptor list would shorten the same
 prologue; the gap is the tile's own work. `moe_down_dec` already takes G column tiles a block, and its G rule's own
 measurement rejects more of them at low rows. Numbers, tables and commands: `closed/K-07.md`.
+- **K-46 (junction arithmetic at prefill: share the `fn` reads across a block's rows):** closed without code. Measured by
+an outside contributor at TP4 on 4 x R9700 (u4, 270 W), not on the TP2/u3 lane. As written (groups of 4 in the twins
+and the TP1 row) the hc 4 kernels go to 255-256 VGPRs and 5 waves, and the prefill junction is +101 % (groups of 2:
++9.7 %), decode -2.5..-2.7 %; bounded to the one-row kernel's occupancy only pairs fit, and a separate pair kernel at
+M >= 2048 is -0.8 % on the prefill junction, inside base's 7.9 % spread, and +-0.4 % end to end. At TP4 the twin is
+fused only up to 8 rows; a TP2 test needs a bounded pair kernel in the 2-rank twin, not written. Numbers, parity and
+what a TP2 lane could check: `closed/K-46.md`.
