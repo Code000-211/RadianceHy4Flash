@@ -17756,6 +17756,24 @@ static void fp8_logits_numeric(const Plugin& pl, int64_t N, int64_t K, int64_t M
     ok(i8 ? "logits_gemm_i8 vs host ref over its planes" : "logits_gemm_fp8 vs host ref over its planes",
        e < 2e-3, "rel_l2 " + std::to_string(e) + tag);
 
+    /* K-20's chained form, checked the way the other chained forms are: the same logits. There is no
+     * chain record outside an AQL pass -- the wrapper reads it from the kernel arguments and finds
+     * none -- so the wait and the done half fall through and what is compared is the kernel this
+     * height launches, the matvec at M <= 2 and the WMMA pass above it, with the handshake around it. */
+    if (void* d_c = dalloc((size_t)M * N * 4)) {
+        st_memset(d_c, 0x5a, (size_t)M * N * 4);
+        const int crc = launch_row(lg, { T(d_x, RAD_BF16, { M, K }),
+                                         T(d_w, i8 ? RAD_I8 : RAD_F8E4M3, { N, K }),
+                                         T(d_c, RAD_F32, { M, N }) },
+                                   { PI("M", M), PI("n_vocab", N), PI("n_embd", K),
+                                     PS("dtype", "bf16"), PI("chain", 1) });
+        std::vector<float> ch((size_t)M * N, 0.f);
+        if (crc == RAD_OK) st_memcpy(ch.data(), d_c, ch.size() * 4, hipMemcpyDeviceToHost);
+        ok((std::string(row) + " chained, same logits").c_str(),
+           crc == RAD_OK && std::memcmp(ch.data(), got.data(), ch.size() * 4) == 0,
+           "rc=" + std::to_string(crc) + tag);
+    }
+
     /* The drafter's rescoring reads the same stored head, so it is checked over the same bytes:
      * R candidates per row (one an id past the shard, which must come back a pad), each scored
      * against the planes, sorted by value. */
@@ -38297,9 +38315,11 @@ static void device_phase(const Plugin& pl) {
             iqr_embed_case(pl, f, 512, 640, 3.25f);
         }
     }
-    /* The int8 head over the same stored row: both forms, and the padded K = 2560 row. */
+    /* The int8 head over the same stored row: both forms, and the padded K = 2560 row. M = 1 and 2
+     * are the matvec's two heights, the chained form among them (K-20). */
     if (sel("logits_gemm_i8") || sel("logit_rerank_i8")) {
-        for (const int64_t M : { (int64_t)1, (int64_t)8, (int64_t)33, (int64_t)64, (int64_t)100 })
+        for (const int64_t M : { (int64_t)1, (int64_t)2, (int64_t)8, (int64_t)33, (int64_t)64,
+                                 (int64_t)100 })
             fp8_logits_numeric(pl, 5120, 5120, M, true);
         for (const int64_t M : { (int64_t)1, (int64_t)8 })
             fp8_logits_numeric(pl, 2560, 2560, M, true);

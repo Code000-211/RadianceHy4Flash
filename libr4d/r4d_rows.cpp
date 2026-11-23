@@ -11981,8 +11981,8 @@ extern "C" int rad_kernel_chain(int i) {
         /* the two-rank one-shot at a decode-sized message, and the rotated wire's row for the
          * messages under its size floor, which the exact kernel carries */
         "ar_oneshot_2rank_exact", "ar_oneshot_2rank_wht6",
-        /* the decode tail: the embedding, the sampled rows' gather, the lm_head's WMMA pass (the
-         * matvec below three rows stays plain) and the soft-cap */
+        /* the decode tail: the embedding, the sampled rows' gather, the lm_head at either height
+         * (its WMMA pass above three rows, the matvec at or below) and the soft-cap */
         "embed_lookup_bf16", "gather_rows_bf16", "logits_gemm_i8",
         "logit_softcap_bf16", "logit_softcap_f32",
         /* the vocab-parallel sampler's candidate chain (temperature, top-k, the gathered sets'

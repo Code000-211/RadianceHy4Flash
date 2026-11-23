@@ -420,8 +420,11 @@ template <class OT> __device__ __forceinline__ OT mvm_store(float v);
 template <> __device__ __forceinline__ uint16_t mvm_store<uint16_t>(float v) { return f32_to_bf16(v); }
 template <> __device__ __forceinline__ float mvm_store<float>(float v) { return v; }
 
+/* The body; mvm_kernel and its chained form (RadKernelChainFn) wrap it. No block returns early --
+ * the one `break` leaves a loop and falls through to the stores -- so the wrapper's done half runs
+ * exactly once a block, which is what the chain contract asks of a chained form. */
 template <uint32_t MT, bool SROW, class OT, uint32_t RB = 1, bool I8 = false, uint32_t TB = 0>
-__global__ __launch_bounds__(kDenseThreads) void mvm_kernel(
+__device__ __forceinline__ void mvm_body(
     const uint8_t* __restrict__ W, const uint16_t* __restrict__ S,
     const uint16_t* __restrict__ X, uint32_t a_ld, OT* __restrict__ out, uint32_t c_ld,
     uint32_t rows, uint32_t cols, uint32_t w_ld, uint32_t sc_cols, uint32_t m_real) {
@@ -447,6 +450,37 @@ __global__ __launch_bounds__(kDenseThreads) void mvm_kernel(
         }
     }
 }
+
+#define R4D_MVM_PARAMS                                                                       \
+    const uint8_t* __restrict__ W, const uint16_t* __restrict__ S,                           \
+    const uint16_t* __restrict__ X, uint32_t a_ld, OT* __restrict__ out, uint32_t c_ld,       \
+    uint32_t rows, uint32_t cols, uint32_t w_ld, uint32_t sc_cols, uint32_t m_real
+#define R4D_MVM_ARGS W, S, X, a_ld, out, c_ld, rows, cols, w_ld, sc_cols, m_real
+
+template <uint32_t MT, bool SROW, class OT, uint32_t RB = 1, bool I8 = false, uint32_t TB = 0>
+__global__ __launch_bounds__(kDenseThreads) void mvm_kernel(R4D_MVM_PARAMS) {
+    mvm_body<MT, SROW, OT, RB, I8, TB>(R4D_MVM_ARGS);
+}
+
+/* The matvec's chained form, the head at M <= 2 (K-20). Its wait takes the scalar half or not by
+ * the form: the byte head (TB = 0) reads nothing at an address the wave shares -- weight and
+ * activation as `lane * 16` uint4s, a scale at the lane's own column, and the ragged tail's one
+ * byte at a time the same way -- so its wait leaves the scalar-cache invalidate out. An IQR head
+ * reads its row's table at a wave-uniform address (`lm_table`), and a value the compiler loads
+ * through the scalar data cache has to be invalidated to be the launch in front's, so that form
+ * keeps `r4d_chain_wait`. The row's promise in r4d_rows.cpp is 2 -- the wait covers everything the
+ * form reads -- and it is a library-wide one, so a form that read a written operand through the
+ * scalar cache here would put the fences back on every chained packet; tests/chain_scalar_audit.py
+ * compiles the unit both ways and fails a form that skips the instruction and loads uniformly
+ * behind it. */
+template <uint32_t MT, bool SROW, class OT, uint32_t RB = 1, bool I8 = false, uint32_t TB = 0>
+__global__ __launch_bounds__(kDenseThreads) void r4dchain_mvm(R4D_MVM_PARAMS) {
+    if constexpr (TB != 0) r4d_chain_wait();
+    else                   r4d_chain_wait_vec();
+    mvm_body<MT, SROW, OT, RB, I8, TB>(R4D_MVM_ARGS);
+    r4d_chain_done();
+}
+#undef R4D_MVM_PARAMS
 
 template <uint32_t RB, class XV>
 __global__ __launch_bounds__(kDenseThreads) void mv_rb_kernel(
@@ -803,8 +837,8 @@ extern "C" int r4d_logits_gemm_i8(long a, long wq, long c, int M, int K, int N,
     return logits_gemm_8<true>(a, wq, c, M, K, N, a_ld, c_ld, w_ld, stream);
 }
 
-/* `chain`: the WMMA pass's chained form (the plugin entry, where the row resolved with `chain`);
- * the matvec below three rows stays plain. */
+/* `chain`: the chained form of whichever path serves the height -- the WMMA pass above three rows
+ * and, since K-20, the matvec at or below (the plugin entry, where the row resolved with `chain`). */
 template <bool I8, uint32_t TB>
 static int logits_gemm_8(long a, long wq, long c, int M, int K, int N, int a_ld, int c_ld,
                          int w_ld, long stream, bool chain) {
@@ -878,10 +912,12 @@ static int logits_gemm_8(long a, long wq, long c, int M, int K, int N, int a_ld,
 
     const uint32_t blocks = std::min<uint32_t>(2048u, (rows + kDenseWaves - 1) / kDenseWaves);
 #define R4D_LGF8(NM)                                                                            \
-    hipLaunchKernelGGL((mvm_kernel<NM, true, float, 1, I8, TB>), dim3(blocks), dim3(kDenseThreads),  \
-                       0, (hipStream_t)stream, (const uint8_t*)wq, (const uint16_t*)nullptr,     \
-                       (const uint16_t*)a, (uint32_t)a_ld, (float*)c, (uint32_t)c_ld,            \
-                       rows, cols, (uint32_t)w_ld, 0u, (uint32_t)M)
+    hipLaunchKernelGGL((chain ? r4dchain_mvm<NM, true, float, 1, I8, TB>                         \
+                              : mvm_kernel<NM, true, float, 1, I8, TB>),                         \
+                       dim3(blocks), dim3(kDenseThreads), 0, (hipStream_t)stream,                \
+                       (const uint8_t*)wq, (const uint16_t*)nullptr, (const uint16_t*)a,         \
+                       (uint32_t)a_ld, (float*)c, (uint32_t)c_ld, rows, cols,                    \
+                       (uint32_t)w_ld, 0u, (uint32_t)M)
     if (M == 1) R4D_LGF8(1);
     else        R4D_LGF8(2);
 #undef R4D_LGF8
