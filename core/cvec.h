@@ -12,7 +12,8 @@
  *
  * The vector shipped in data/vectors/ is a refusal-direction projection for Qwen3.8-Flash-Next:
  * with it on, the model declines far fewer requests. It is loaded only with --control-vector, and
- * each request can name its own choice.
+ * each request can name its own choice. The same directory carries the Hy4-flash package, whose
+ * rows are grouped per hyper-connection stream (controlvector.per_stream, rank = 4 * groups).
  *
  * A file is refused unless
  *

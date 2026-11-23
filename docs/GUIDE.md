@@ -2613,7 +2613,8 @@ them on. With the key the engine looks, in order, at:
 1. `<container without its extension>.control-vector.gguf` beside the model,
 2. `control-vector.gguf` in the container's directory (one file for a directory of quants), then
 3. `<home>/vectors/<architecture>-control-vector.gguf` for each `server.radiance-home`. radiance ships
-   `qwen4exp-control-vector.gguf` there (`data/vectors/`, installed into every plugin home).
+   `qwen4exp-control-vector.gguf` and `hyv4flash-control-vector.gguf` there (`data/vectors/`,
+   installed into every plugin home).
 
 **Directions per layer, and per stream.** A `direction.<l>` tensor is F32 and exactly the model's
 width. One row (`[n_embd]`) is a single direction; `[n_embd, k]` is k directions, applied as k
@@ -2701,13 +2702,15 @@ by 0.002-0.003 nats.
 ### 4.10.1 The Hy4-flash refusal package (per-stream)
 
 `hyv4flash` declares one projection per group per layer and carries four hyper-connection streams,
-so its package is `controlvector.per_stream: true` with `rank = 4 * groups`. The package shipped
-beside the Hy4-flash container
-(`<model>.control-vector.gguf` + `.json`) is derived with the recipe of
-`huggingface.co/alesha-pro/Hy4-flash-Uncensored-GGUF` (`tools/abliteration/directions_rt.py`):
-per layer, per stream, `mean(harmful) - mean(harmless)` at the last prompt token, the harmless-mean
-span projected out, two groups over four framings (`N,NA|H,HA`: thinking off/on, with and without
-a coding-agent system prompt), orthonormalised within a stream.
+so its package is `controlvector.per_stream: true` with `rank = 4 * groups`. radiance ships one,
+`data/vectors/hyv4flash-control-vector.gguf` (41 layers, 8 rows each, 4.0 MB), which lookup path 3
+finds when no file sits beside the container. It is the publisher's recipe
+(`huggingface.co/alesha-pro/Hy4-flash-Uncensored-GGUF`) run on the taps of the quant this host
+serves, not on their FP8 weights: per layer, per stream, `mean(harmful) - mean(harmless)` at the
+last prompt token, the harmless-mean span projected out, two groups over four framings
+(`N,NA|H,HA`: thinking off/on, with and without a coding-agent system prompt), orthonormalised
+within a stream. The sidecar `data/vectors/hyv4flash-control-vector.json` records the samples and
+the measurements below.
 
 Measured on this box (HarmBench-320, stock weights, nothing on disk changed):
 
@@ -2724,6 +2727,12 @@ Measured on this box (HarmBench-320, stock weights, nothing on disk changed):
 The cost is visible on adversarial prompts: ~26% of the complied answers run past a 1024-token cap
 (an eval setting, not the model's 262144), ~9% leak chain-of-thought or a stray reasoning tag into
 the visible answer, and ~13% loop on lyrics. Ordinary work is unaffected.
+
+The table is the publisher's package on these weights. The shipped file is our derivation of the
+same recipe, and the two are within noise of each other on every measure taken: first-token refusal
+mass 0.167 against 0.164, KL 0.199 / 0.082 against 0.197 / 0.082, and 29 refusals of the publisher's
+held-out 146 against 28. Either is fine to ship; ours is the one that can be re-derived and re-tuned
+here.
 
 To use it: keep `control-vector: off` as the deployment default (as this host does), then either
 flip the dashboard's **Control vector** switch (`POST /admin/control-vector {"enabled": true}`),
