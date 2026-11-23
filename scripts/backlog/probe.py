@@ -10,7 +10,11 @@ leaves VRAM for the experts and its prefix still resumes; RAD_IDLE_CHARS, RAD_ID
 longctx (eight ~46K-token sessions: a prefill wave of one token each, then the same eight prompts
 decoded 128 tokens, so all eight are at long context together: the shape notes/backlog/refs/notes/
 longctx.md measured as N8 48K, where the stager overflows its ring -- longctx-pre / longctx-decode in
-the JSON). The token counts are the ones the backlog's own runs measured on these phases, so a lane's
+the JSON), and lctxN (N sessions of RAD_LCTX_CHARS characters -- 190,000 is the 58,903-token
+conversation of notes/backlog/CARDS.md §1.3, so the default is a 60K session -- filled by a one-token
+wave and then decoded for RAD_LCTX_NTOK tokens: the long-context decode stamps of T-03, at one
+decoder as `lctx1` and at four as `lctx4`, with `lctxN-pre` / `lctxN-decode` in the JSON). The token
+counts are the ones the backlog's own runs measured on these phases, so a lane's
 ttft compares with the numbers in notes/backlog/."""
 import hashlib, json, sys, threading, time, urllib.request, os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -233,8 +237,8 @@ def long8(chars, gen=32):
          "kv_mib": {x["at"]: x["kv_mib"] for x in v}, "host_mib": {x["at"]: x["host_mib"] for x in v},
          "expert_vram_units": {x["at"]: (x["expert_units"] or {}).get("vram") for x in v},
          "slab_mib": {x["at"]: x["slab_mib"] for x in v}, "lend_mib": {x["at"]: x["lend_mib"] for x in v},
-         "views": v}
-    print(json.dumps({k: x for k, x in o.items() if k != "views"}), flush=True)
+         "views": v, "waves": [a, r]}
+    print(json.dumps({k: x for k, x in o.items() if k not in ("views", "waves")}), flush=True)
     for x in v: print(json.dumps(x), flush=True)
     time.sleep(2)
     return o
@@ -295,8 +299,34 @@ def longctx(chars=140000, n=8, ntok=128):
     ps = [long_prompt(chars, 40 + i, stamp=True) for i in range(n)]
     pre = phase("longctx-pre", ps, 1)
     dec = phase("longctx-decode", ps, ntok)
-    return {"prefill": pre, "decode": dec}
+    return {"name": "longctx", "prefill": pre, "decode": dec}
+
+def lctx(n, chars, ntok):
+    """T-03, the long-context decode stamps: N conversations of about `chars` characters fill with a
+    one-token wave, then the same strings decode, so the decode passes carry the whole context. The
+    default 190,000 characters is the 58,903-token conversation notes/backlog/CARDS.md §1.3 measured,
+    so `lctx1` and `lctx4` are that session at one and at four decoders -- the shape K-25's
+    `qsa_select` and `idx_score` terms have no served number for (notes/backlog/refs/notes/idxint8.md
+    has only `--perfidx` ones); the run's short `c1` / `c4` phases are the baseline they compare to.
+    Both waves are recorded as ordinary phases (`lctxN-pre`, `lctxN-decode`), so agg.py --match, attr.py
+    and layer.py window the decode at 60K. `hit` near 1 and a non-zero `cache` in the server log say the
+    decode wave resumed the fill rather than prefilling it again -- at four sessions the whole 236K
+    tokens are in the pool, so read both before trusting the decode step's context."""
+    ps = [long_prompt(chars, 120 + i, stamp=True) for i in range(n)]
+    return [phase(f"lctx{n}-pre", ps, 1), phase(f"lctx{n}-decode", ps, ntok)]
+
 R = {"phases": []}
+def record(o):
+    """One phase's result into the JSON. A composite phase (`longctx`, `long8`) keeps its summary entry
+    as it always did, and now also records the waves it ran as phases of their own: the stamp readers
+    (`agg.py`, `attr.py`, `layer.py`) work per phase window and a summary entry has none, so without
+    this a stamped long-context run cannot be read at all -- the readers name and skip what has no
+    window, and read the waves this puts in."""
+    R["phases"].append(o)
+    if isinstance(o, dict):
+        for v in o.values():
+            for x in (v if isinstance(v, list) else [v]):
+                if isinstance(x, dict) and x.get("mono_ns") and "decode_steps" in x: R["phases"].append(x)
 if "nowarm" not in PH: request(P[11], 48); request(P[10], 48)
 for ph in PH:
     if ph == "c1": R["phases"].append(phase("c1", [P[0]]))
@@ -315,13 +345,18 @@ for ph in PH:
     elif ph == "stall4": R["phases"].append(stall("stall4", 4, 22000))
     elif ph.startswith("tail"):  # tailN: prompt of ~N chars lone, to size small prefill steps
         R["phases"].append(phase(ph, [long_prompt(int(ph[4:]), 3)], 2))
-    elif ph == "greedy": R["phases"].append(greedy())
-    elif ph == "longctx": R["phases"].append(longctx())
+    elif ph == "greedy": record(greedy())
+    elif ph == "longctx": record(longctx())
+    elif ph.startswith("lctx"):  # lctxN: N sessions of RAD_LCTX_CHARS fill, then the same strings decode
+        if not ph[4:].isdigit():
+            sys.exit(f"probe.py: lctx wants a session count (lctx1, lctx4); got '{ph}'")
+        R["phases"].extend(lctx(int(ph[4:]), int(os.environ.get("RAD_LCTX_CHARS", 190000)),
+                                int(os.environ.get("RAD_LCTX_NTOK", 128))))
     elif ph == "pf6c": R["phases"].append(phase("pf6c", [long_prompt(22000, 7, stamp=True)], 2))
     elif ph.startswith("resume"):  # resumeN: a ~N-character session, then N-row turns resumed
-        R["phases"].append(resume(int(ph[6:]), int(os.environ.get("RAD_RESUME_EXTRA", 900))))
-    elif ph == "idle": R["phases"].append(idle(int(os.environ.get("RAD_IDLE_CHARS", 72000))))
-    elif ph == "long8": R["phases"].append(long8(int(os.environ.get("RAD_LONG8_CHARS", 140000))))
+        record(resume(int(ph[6:]), int(os.environ.get("RAD_RESUME_EXTRA", 900))))
+    elif ph == "idle": record(idle(int(os.environ.get("RAD_IDLE_CHARS", 72000))))
+    elif ph == "long8": record(long8(int(os.environ.get("RAD_LONG8_CHARS", 140000))))
     else: sys.exit(f"probe.py: no phase '{ph}'; phases: c1 c1b c1s c2 c4 c8 c8s think pf2 pf6 pf6c pf8 pf20 "
-                  "greedy longctx stall1 stall4 tailN idle long8 resumeN nowarm")
+                  "greedy longctx lctxN stall1 stall4 tailN idle long8 resumeN nowarm")
 json.dump(R, open(OUT, "w"), indent=1)

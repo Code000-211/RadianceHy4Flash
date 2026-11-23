@@ -935,6 +935,11 @@ if(RAD_PYTHON3)
   add_test(NAME dspark_qos_regression_test
            COMMAND ${RAD_PYTHON3} ${CMAKE_CURRENT_SOURCE_DIR}/dspark_qos_regression_test.py)
   set_tests_properties(dspark_qos_regression_test PROPERTIES LABELS "unit;fast" TIMEOUT ${RAD_TEST_TIMEOUT})
+  # scripts/backlog/{probe,agg,attr,layer}.py over a made-up run: a stamped long-context run holds phases
+  # with no window of their own, and the readers must read the waves rather than die on them (T-03).
+  add_test(NAME backlog_stamps_test COMMAND ${RAD_PYTHON3} ${CMAKE_CURRENT_SOURCE_DIR}/backlog_stamps_test.py)
+  set_tests_properties(backlog_stamps_test PROPERTIES LABELS "unit;fast" SKIP_RETURN_CODE 77
+                       TIMEOUT ${RAD_TEST_TIMEOUT})
 endif()
 
 # ================================================================== the shipped plugins, out of tree
