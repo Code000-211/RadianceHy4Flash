@@ -78,9 +78,10 @@ static const int64_t kMoeRouterFusedRows = 64;
  * and 15.7 against the pair's 15.3 and 16.6; at 16 rows it was level with the pair (21.3 against
  * 21.2), so that row is not in its band. Neither goes past 16: above that the row's form needs a
  * block four times as wide and was 115 us against the pair's 32.3 at 32 rows. A lane can widen
- * either once stamps show the pair beaten where the band ends. */
+ * either once stamps show the pair beaten where the band ends. Both are row counts: the pass
+ * height above which the fused row is not used. */
 static const int64_t kMoeSigmoidFusedRows = 16;
-static const int64_t kMoeSigmoidFusedBare = 8;
+static const int64_t kMoeSigmoidFusedBareRows = 8;
 
 /* ---- RADIANCE_DEBUG_ROUTING: prints token 0's routing weights once per layer.
  *
@@ -1807,10 +1808,12 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
 
     /* The router's projection and that selection as one op (K-10): a block computes the
      * projection's own tile and the workgroup whose arrival completes the grid ranks the pass's
-     * rows, so the logits never leave the launch. Declared beside the selection it replaces; the
-     * projection it replaces is `glm_router.project`, which is one unsplit launch at these heights
-     * (SplitF32Proj::takes is a prefill threshold) -- where it is not, the fused row is not used.
-     * Undeclared or unresolved, the two launches serve. */
+     * rows from it. The tile still goes through `w.logits`, as `router_gemm_topk_scatter`'s does --
+     * the completing workgroup is a different one, so the bytes have to be visible to it -- but the
+     * second launch and the host's ordering between them are gone. Declared beside the selection it
+     * replaces; the projection it replaces is `glm_router.project`, which is one unsplit launch at
+     * these heights (SplitF32Proj::takes is a prefill threshold) -- where it is not, the fused row
+     * is not used. Undeclared or unresolved, the two launches serve. */
     if (op_sigmoid_scatter && c.sigmoid_router && c.router_fuse &&
         rad_op_declared(b, "router_gemm_sigmoid_scatter")) {
         /* The latent's own codes, when this pass writes them: the same op the separate quantiser
@@ -1818,7 +1821,7 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
          * moving. Folding them also moves the row's band: they are what the fusion was measured
          * faster by above 8 rows (`kMoeSigmoidFusedRows`). */
         const bool hq_fold = op_hq != 0;
-        const int64_t band = hq_fold ? kMoeSigmoidFusedRows : kMoeSigmoidFusedBare;
+        const int64_t band = hq_fold ? kMoeSigmoidFusedRows : kMoeSigmoidFusedBareRows;
         sigmoid_gemm_rows = sigmoid_scatter_rows < band ? sigmoid_scatter_rows : band;
         if (sigmoid_gemm_rows > 0) {
             const RadParam gp[] = {
