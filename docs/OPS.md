@@ -2174,6 +2174,7 @@ The VAEs' convolutions are `conv3d_ndhwc` with `tpad` and the audio VAE's `conv2
 | `router_sigmoid_topk_scatter` | `M`(range) `n_expert` `n_local`/opt `top_k` `norm` `route_scale`:f64 `dtype` `expert_base`/opt `protect`:str/opt | `logits`, `bias`w → `ids`, `weights`, `sorted_tok`, `expert_offset`, `expert_count`, `gate`?, `inverse`? |
 | `moe_scatter_inv` | `M`(range) `n_expert` `top_k` `expert_base`/opt `protect`:str/opt | `expert_ids` → `sorted_tok`, `expert_offset`, `expert_count`, `inverse` |
 | `moe_gather_inv` | `M`(range) `n` `top_k` `dtype` `act`:str/opt | `y_expert`, `expert_w`, `inverse`, `shared`?, `shared_gate`? → `y` |
+| `moe_gather_inv_i8g` | `M`(range) `n` `top_k` `dtype` `group` | `y_expert`, `expert_w`, `inverse` → `q8`, `q8_scale`, `y` |
 | `moe_gather` | `M`(range) `n` `top_k` `dtype` `act`:str/opt | `y_expert`, `expert_w`, `sorted_tok`, `shared`?, `shared_gate`? → `y` |
 | `row_topk` | `M`(range) `N` `R` `vocab_off`/opt `dtype` | `x` → `idx`, `val`, `pairs`? |
 | `row_topk_merge` | `M` `R` `world_size` `dtype` | `gathered` → `idx`, `val` |
@@ -2388,6 +2389,18 @@ own because `moe_scatter`'s and `moe_gather`'s operand lists are the shared voca
 512), and `moe_gather_inv` runs the kernel `moe_gather` picks at the same size, bf16 or f32
 weights; both are byte-identical to the pair they replace, at GLM's shape with f32 routing weights
 and the shared arm folded in (`r4d_selftest`).
+
+**`moe_gather_inv_i8g`** is `moe_gather_inv` at `top_k = 16` with no shared arm, writing the sum's
+rotated int8 codes (`q8`, `[M, n]` i8) and their f32 scales (`q8_scale`, `[M, n / group]`) in the
+same launch, so a linear reading the sum declares no quantiser of its own -- one launch fewer a
+layer (K-19). The gather's 256-column wave is exactly the 128-wide FWHT and the group's amax that
+`quant_act_i8g` runs (`group` 128, or 256 for an IQ8R trunk), so `q8` and `q8_scale` are
+byte-identical to running `quant_act_i8g` over `y` afterwards; `y` is byte-identical to
+`moe_gather_inv`'s (`tests/r4d_emu/test_moefuse.cpp` drives its entry point over both of its wave
+forms and each pinned form, codes and scales against a host reference over six shapes;
+`--perfmoefuse` checks the same against the gather + `had_quant_act_i8g` pair on the card). `n` is
+a multiple of 256 and `group` is 128 or 256; operands are writes after the reads because the shared
+vocabulary's lists are fixed, hence an op of its own.
 
 At `dtype=mxfp4a8` (the host libraries; libr4d has no row), `w` and `w_odd` are OCP e2m1 codes and `w_scale` and `w_odd_scale` hold one
 E8M0 exponent per (row, 32 of K), typed `e8m0` or raw `u8`; either way a byte is an exponent, not

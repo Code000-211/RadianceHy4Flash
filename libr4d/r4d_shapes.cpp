@@ -1952,6 +1952,33 @@ extern "C" int r4d_shape_moe_gather_inv(const RadParam* p, int n_p, int operand,
     return r4d_shape_moe_gather(p, n_p, operand, out);
 }
 
+/* moe_gather_inv writing the sum's rotated int8 codes as well (K-19): its `y` is still the row it
+ * sums, and the shared arm's two slots hold the codes' pair -- the codes one int8 a column, and
+ * their scales one f32 a `group`-wide block (`group`: 128, or 256 for an IQ8R trunk). The linear
+ * that reads the sum reads them in place of its own quantiser's output, so they are the same
+ * [M, n] and [M, n/group] a quantiser op declares. */
+extern "C" int r4d_shape_moe_gather_inv_i8g(const RadParam* p, int n_p, int operand,
+                                            RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M"), n = pi(p, n_p, "n");
+    const int64_t k = pi(p, n_p, "top_k"), g = pi(p, n_p, "group");
+    if (M <= 0 || n <= 0 || k <= 0 || g <= 0 || n % g != 0) return RAD_E_UNSUPPORTED;
+    /* The entry point's band (r4d_rad_moe_gather_inv_i8g, r4d_moe.hip): the codes need a whole
+     * 256-column wave live, the sixteen-slot form needs top_k = 16, and the scale is written once a
+     * `group`-wide block, which is 128 or 256 wide. */
+    if (n % 256 != 0 || k != 16 || (g != 128 && g != 256)) return RAD_E_UNSUPPORTED;
+    const uint32_t D = dt_act(p, n_p, "dtype");
+    const RadOpdDesc l[] = {
+        opd(D, M * k, n),
+        opd(D, M, k),
+        /* Distinct, as in the plain form: the table holds distinct rows of `y_expert`. */
+        opd_idx(M * k, 0, M * k, -1, (uint32_t)RAD_OPD_F_IDX_UNIQUE),
+        opd((uint32_t)RAD_I8, M, n),
+        opd((uint32_t)RAD_F32, M, n / g),
+        opd(D, M, n),
+    };
+    R4D_PICK(l);
+}
+
 /* row_topk -- exact per-row top-R of a wide bf16 matrix (shim in r4d_rowtopk_bf16.hip). R is at
  * most 32, stage 2's PT. */
 extern "C" int r4d_shape_row_topk(const RadParam* p, int n_p, int operand,

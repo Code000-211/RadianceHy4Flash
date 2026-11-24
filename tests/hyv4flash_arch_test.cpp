@@ -15,7 +15,8 @@ namespace {
 /* The `mini` preset as rad-convert records its config: 3 layers (sparse, sliding, sparse; layer 0
  * dense, 1-2 latent MoE), two streams, an Engram in front of layer 1, dense limit 16. `wide` is
  * `mini4`: 4 sparse and 8 sliding heads and 8 experts, so four ranks hold whole heads. */
-MetaKV mini_meta(bool wide = false, int64_t ff_exp = 128, int64_t n_embd = 128) {
+MetaKV mini_meta(bool wide = false, int64_t ff_exp = 128, int64_t n_embd = 128,
+                 int64_t latent = 0, int64_t top_k = 0, int64_t n_exp = 0) {
     RadModelMeta m{};
     m.arch_id = "hyv4flash";
     m.name = "test-hy4-mini";
@@ -68,6 +69,14 @@ MetaKV mini_meta(bool wide = false, int64_t ff_exp = 128, int64_t n_embd = 128) 
         k.set("n_routed_experts", "8");
     }
     if (ff_exp != 128) k.set("moe_intermediate_size", std::to_string(ff_exp).c_str());
+    /* A trunk whose routed MoE is wider than the preset's (K-19's fusion wants a latent a 256-group
+     * divides and the sixteen-slot selection), and one with a wider routed arm. */
+    if (latent) k.set("routed_expert_hidden_size", std::to_string(latent).c_str());
+    if (top_k) k.set("num_experts_per_tok", std::to_string(top_k).c_str());
+    if (n_exp) {
+        k.m.n_expert = n_exp;
+        k.set("n_routed_experts", std::to_string(n_exp).c_str());
+    }
     return k;
 }
 
@@ -130,8 +139,9 @@ struct Declared {
     RadBuildCtx ctx = build_ctx();
     int rc = 0;
     explicit Declared(void (*encs)(RadBuilder*) = bf16_encs, int world = 1, int rank = 0,
-                      bool wide = false, int64_t ff_exp = 128)
-        : mk(mini_meta(wide, ff_exp)) {
+                      bool wide = false, int64_t ff_exp = 128, int64_t latent = 0,
+                      int64_t top_k = 0, int64_t n_exp = 0)
+        : mk(mini_meta(wide, ff_exp, 128, latent, top_k, n_exp)) {
         encs(&b);
         ctx = build_ctx(rank, world);
         G3Env g3env;
@@ -1538,6 +1548,61 @@ void int8_trunk_encs_host(RadBuilder* b) {
     int8_trunk_encs(b);
     for (const char* op : { "gated_had_quant_i8g", "rmsnorm_had_quant_i8g", "router_sigmoid_topk_scatter" })
         b->undeclared.insert(op);
+}
+
+/* K-19: the gather writes the routed sum's rotated int8 codes and scales in the launch that sums
+ * it (`moe_gather_inv_i8g`), so `ffn_latent_out` declares no `had_quant_act_i8g` of its own -- one
+ * launch fewer on every MoE layer, the same codes. It needs the slot table, no shared arm in the
+ * gather, `top_k` 16 (the codes' 256-column wave is written from the sixteen-slot selection), a
+ * latent that is a whole number of those waves and one the weight's scale group divides; where any
+ * of those fails the plain gather serves and the linear quantises for itself (and the codes' pair
+ * is only declared, never written, when the switch is off). */
+TEST(the_moe_gather_writes_the_routed_sums_codes) {
+    struct Run {
+        const char* what;
+        bool off;              /* RADIANCE_HY4_FUSE_GATHER_Q8=0 */
+        int64_t latent, top_k;
+        int q8g;               /* moe_gather_inv_i8g launches, one on each of the two MoE layers */
+        int had;               /* had_quant_act_i8g: the latent_out pair gone where fused */
+    };
+    const Run runs[] = {
+        { "latent 256, sixteen slots", false, 256, 16, 2, 8 - 2 },
+        { "the switch off", true, 256, 16, 0, 8 },
+        { "a latent the group does not divide", false, 128, 16, 0, 8 },
+        { "eight slots, not the sixteen the codes need", false, 256, 8, 0, 8 },
+    };
+    for (const Run& r : runs) {
+        fprintf(stderr, "run %s\n", r.what);
+        if (r.off) setenv("RADIANCE_HY4_FUSE_GATHER_Q8", "0", 1);
+        Declared d(int8_trunk_encs, 1, 0, false, 128, r.latent, r.top_k, 16);
+        unsetenv("RADIANCE_HY4_FUSE_GATHER_Q8");
+        REQUIRE_EQ(d.rc, RAD_OK);
+        const RadBuilder& b = d.b;
+        CHECK_EQ(count_op(b, "moe_gather_inv_i8g"), r.q8g);
+        CHECK_EQ(count_op(b, "moe_gather_inv"), r.q8g ? 0 : 2);
+        CHECK_EQ(count_op(b, "had_quant_act_i8g"), r.had);
+        /* The routed sum's pair: a role of its own (`sum`), the trunk's for that width and group,
+         * the codes one int8 a column; lat_out reads them only where the gather wrote them. */
+        const RecBuf* q8 = find_b(b, "trunk_codes.sum.256.128.q8");
+        CHECK_EQ(q8 != nullptr, r.q8g > 0);
+        if (q8) CHECK_EQ(q8->d.dtype, RAD_I8);
+        for (int i = 0; i < r.q8g; ++i) {
+            const RecOp* o = find_op(b, "moe_gather_inv_i8g", i);
+            REQUIRE(o != nullptr);
+            /* y_expert, expert_w and the slot table read; the codes, their scales and the sum
+             * written -- the sum being the bf16 latent ffn_latent_out reads. */
+            REQUIRE_EQ(o->reads.size(), (size_t)3);
+            REQUIRE_EQ(o->writes.size(), (size_t)3);
+            CHECK_EQ(o->writes[0], buf_named(b, "trunk_codes.sum.256.128.q8"));
+            CHECK_EQ(o->writes[1], buf_named(b, "trunk_codes.sum.256.128.s8"));
+            CHECK_EQ(o->writes[2], buf_named(b, "moe.latent"));
+            CHECK_EQ(pint(o, "group"), 128);
+            CHECK_EQ(pint(o, "n"), 256);
+            CHECK_EQ(pint(o, "top_k"), 16);
+        }
+        every_weight_read(b);
+        steps_clean_at(d.b, 0, 1);
+    }
 }
 
 TEST(quantised_trunk_linears_share_one_quantiser_an_input) {

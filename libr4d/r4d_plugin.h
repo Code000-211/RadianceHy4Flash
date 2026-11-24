@@ -922,6 +922,10 @@ int r4d_rad_moe_scatter_inv(const RadArgs*, RadStream);
 int r4d_shape_moe_scatter_inv(const RadParam*, int, int, RadOpdDesc*);
 int r4d_rad_moe_gather_inv(const RadArgs*, RadStream);
 int r4d_shape_moe_gather_inv(const RadParam*, int, int, RadOpdDesc*);
+/* `moe_gather_inv` also writing the sum's rotated int8 codes and their per-group scales (K-19), so
+ * the int8 linear that reads the sum needs no quantiser launch of its own. */
+int r4d_rad_moe_gather_inv_i8g(const RadArgs*, RadStream);
+int r4d_shape_moe_gather_inv_i8g(const RadParam*, int, int, RadOpdDesc*);
 int r4d_shape_router_sigmoid_topk_scatter(const RadParam*, int, int, RadOpdDesc*);
 int r4d_rad_gelu_mul        (const RadArgs*, RadStream);
 int r4d_rad_rope            (const RadArgs*, RadStream);

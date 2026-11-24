@@ -354,6 +354,11 @@ struct MoeFP8 {
         ActFP8  sff{};         /* [max_tok, n_ff_shared] */
         rad_buf sout    = 0;   /* [max_tok, n_embd]           bf16 */
         rad_buf sgate   = 0;   /* [max_tok, 1]                bf16 */
+        /* The routed sum's rotated int8 codes and scales, and their scale group (0: off). With them
+         * the gather writes the sum's codes in the launch that sums it (moe_gather_inv_i8g, K-19)
+         * and the linear reading the sum declares no quantiser of its own (`q8`, `s8` and `g8` are
+         * what it reads; `x` is `h`'s). */
+        ActFP8  sum{};
     };
 
     /* Checkpoint names. `experts` is a prefix ("....mlp.experts") from which per-expert names are
@@ -417,8 +422,9 @@ struct MoeFP8 {
     LinearFP8    sh_gate_up{}, sh_down{};
     rad_op op_router = 0, op_topk = 0, op_scatter = 0;
     /* `op_scatter` is moe_scatter_inv and `op_gather` moe_gather_inv: the sort writes `w.inv` and
-     * the gather reads it (Wire::inv). */
-    bool   scatter_inv = false, gather_inv = false;
+     * the gather reads it (Wire::inv). `gather_q8`: `op_gather` is moe_gather_inv_i8g, which also
+     * writes the sum's rotated int8 codes into `w.sum` (K-19). */
+    bool   scatter_inv = false, gather_inv = false, gather_q8 = false;
     /* `router_topk_scatter`, if it resolves: topk and scatter in one launch. The pair is declared
      * either way, since the fused form is bounded by the sort's single workgroup and a prefill
      * chunk exceeds it. */
@@ -1579,6 +1585,25 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
     const bool separate_fp32_combine = shared && c.shared_fp32_combine &&
                                        (g.world > 1 || !c.shared_ungated);
     gfold = shared && !separate_fp32_combine;
+    /* K-19: the gather wave also writes the sum's rotated int8 codes when the linear that reads the
+     * sum takes them (`w.sum.q8`, which ActFP8 leaves 0 until a model declares it). Only the
+     * slot-table form has it, only without the shared arm, and only where the gather writes the sum
+     * itself -- with a separate f32 combine the plane it writes is `w.moe`, an arm's partial, not
+     * the latent `h.x` the codes would have to describe. */
+    if (w.sum.q8 && w.sum.s8 && scatter_inv && !gfold && !separate_fp32_combine) {
+        rad_buf grd[3] = { w.edn, w.ew, w.inv };
+        rad_buf gwr[3] = { w.sum.q8, w.sum.s8, w.h.x };
+        op_gather = RAD_OP(b, "moe_gather_inv_i8g",
+                           RAD_PARAMS(RAD_RANGE("M", 1, c.rows), RAD_INT("n", g.n_embd),
+                                      RAD_INT("top_k", c.top_k), RAD_STR("dtype", g.dtype),
+                                      RAD_INT("group", w.sum.g8)),
+                           RAD_NOWEIGHTS);
+        if (op_gather) {
+            gather_inv = gather_q8 = true;
+            rad_op_reads (b, op_gather, grd, 3);
+            rad_op_writes(b, op_gather, gwr, 3);
+        }
+    }
     for (int form = scatter_inv ? 0 : 1; form < 2 && !op_gather; ++form) {
         rad_buf grd[5] = { w.edn, w.ew, form ? w.sorted : w.inv, w.sout, w.sgate };
         rad_buf gwr[1] = { separate_fp32_combine ? w.moe : w.h.x };
@@ -2174,8 +2199,10 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
     if (op_combine || !gather_taken(g, T, gather_out_rows, gather_out_rows6))
         RAD_ISSUE_N(c_, op_gather, rows, brows(w.edn, rows * k), brow_slice(w.ew, r0, rows, k),
                     brows(gather_inv ? w.inv : w.sorted, rows * k),
-                    gfold ? brow_slice(w.sout, r0, rows, g.n_embd) : RAD_NONE,
-                    gfold ? brow_slice(w.sgate, r0, rows, 1) : RAD_NONE,
+                    gather_q8 ? brow_slice(w.sum.q8, r0, rows, g.n_embd)
+                              : (gfold ? brow_slice(w.sout, r0, rows, g.n_embd) : RAD_NONE),
+                    gather_q8 ? brow_slice(w.sum.s8, r0, rows, g.n_embd / w.sum.g8)
+                              : (gfold ? brow_slice(w.sgate, r0, rows, 1) : RAD_NONE),
                     brow_slice(op_combine ? w.moe : w.h.x, r0, rows, g.n_embd));
     if (op_moe_ar)
         RAD_ISSUE_N(c_, op_moe_ar, rows * g.n_embd,

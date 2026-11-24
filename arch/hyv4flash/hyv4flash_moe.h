@@ -105,6 +105,9 @@ enum { kArmBf16 = 0, kArmE4M3 = 1, kArmI8 = 2 };
 /* The routed arm's planes and the shared arm's, shared by every MoE layer. */
 struct MoeWire {
     ActFP8 lat{};          /* [T, latent] latent_in's output, then the routed sum */
+    /* The routed sum's rotated int8 codes and scales, where ffn_latent_out takes them and the
+     * gather writes them (K-19): see Ffn::declare. Empty (g8 0) otherwise. */
+    ActFP8 sum{};
     rad_buf routed = 0;    /* [T, n] latent_out's output, then routed + shared */
     rad_buf sgu = 0;       /* [T, 2 * ff_shared] */
     rad_buf sff = 0;       /* [T, ff_shared] */
@@ -329,13 +332,41 @@ struct Ffn {
             MoeFP8::Wire mw = w.moe;
             mw.h = w.lat;
             mw.route = xf;
+            /* K-19: the gather writes the sum's rotated int8 codes in the launch that sums it, and
+             * ffn_latent_out reads them in place of its own quantiser, where that linear's weight is
+             * rotated int8 at a group the latent divides (probed here, as lat_in's is above; the
+             * linear checks the form again and quantises for itself if it disagrees). The pair is the
+             * trunk's, shared by every layer of this width and group (Codes). */
+            if (gather_q8_on() && s.latent % 256 == 0 && src->cfg.top_k == 16) {
+                const char* lwn = nm.f("blk.%d.ffn_latent_out.weight", l);
+                if (!lat_out.mapped) {
+                    RAD_ARCH_TRY(map_linear(b, lwn,
+                                            { nm.ckpt("%s.routed_expert_up_proj.weight", mp) }));
+                    lat_out.mapped = true;
+                }
+                const CodeForm f = code_form(b, lwn);
+                Codes* cp = codes_of(b);
+                const Codes::Pair* pr = cp && f.i8 && f.rot && f.g8 > 0 && s.latent % f.g8 == 0
+                                            ? cp->get(s.latent, f.g8, "sum")
+                                            : nullptr;
+                if (pr) {
+                    w.sum.q8 = pr->q8;
+                    w.sum.s8 = pr->s8;
+                    w.sum.g8 = f.g8;
+                    w.sum.q8_rot = true;
+                    mw.sum = w.sum;
+                }
+            }
             /* Quantised experts read their codes (MoeWire); bf16 ones the bf16 plane. */
             ge.w_bf16 = src->cfg.expert_bf16 != 0;
             RAD_ARCH_TRY(moe.declare(b, nm, ge, l, mw, *src, false, false));
+            /* The codes the gather wrote, if it took the quantising form (declare sets it). */
+            if (w.sum.q8 && moe.gather_q8) lat_out.fed_codes = &w.sum;
             RAD_ARCH_TRY(lat_out.declare(b, nm, g, nm.f("blk.%d.ffn_latent_out", l), s.n_embd,
                                          s.latent, RAD_SHARD_NONE, grp,
                                          { nm.ckpt("%s.routed_expert_up_proj.weight", mp) }, w.lat,
                                          w.routed));
+            lat_out.fed_codes = nullptr;
             RAD_ARCH_TRY(shared.declare(b, nm, g, s, l, nm.f("blk.%d.ffn_gate_up_shexp", l),
                                         nm.f("blk.%d.ffn_down_shexp", l),
                                         nm.ckpt("%s.shared_experts", mp), s.n_ff_shared_r, xf,

@@ -323,6 +323,16 @@ inline bool chain_q8_on() {
     return !(e && *e && std::strcmp(e, "0") == 0);
 }
 
+/* K-19: the routed MoE gather writes the sum's rotated int8 codes and scales in the launch that sums
+ * it (moe_gather_inv_i8g), so ffn_latent_out declares no quantiser of its own -- one launch fewer a
+ * layer, the same codes. It needs the slot table, no shared arm in the gather and a rotated int8
+ * latent_out at a group the latent divides; where those do not hold the plain gather serves and the
+ * linear quantises for itself. Off: RADIANCE_HY4_FUSE_GATHER_Q8=0. */
+inline bool gather_q8_on() {
+    const char* e = std::getenv("RADIANCE_HY4_FUSE_GATHER_Q8");
+    return !(e && *e && std::strcmp(e, "0") == 0);
+}
+
 /* The G-3 launch fusions (levers-general.md L3), each behind its own switch, on by default:
  * RADIANCE_HY4_FUSE_SWIGLU (the routed arm's clamped SwiGLU with its rotated int8 quantiser),
  * RADIANCE_HY4_FUSE_EXPAND_QUANT (the expansion with the gate and the quantiser of attn_output's

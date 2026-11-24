@@ -23313,6 +23313,129 @@ static void moefuse_gather(const Plugin& pl, int64_t rows, bool slice, int iters
     fuse_line("gather alone", us_go, us_gn, same);
 }
 
+/* moe_gather_inv_i8g against the pair it replaces, moe_gather_inv + had_quant_act_i8g: the
+ * gathered rows byte for byte, and the int8 codes and f32 scales those two write over them (the
+ * row's contract: "the codes are the ones had_quant_act_i8g would write from `y`"). The op picks
+ * its wave form from the shape -- the sixteen-slot one at a decode height, the wide
+ * 256-column-wave one at 40 rows with bf16 routing weights -- and `pin` forces one where a lane
+ * wants a form the shape would not pick. No shared arm: this form has none, so the pair runs
+ * `moe_gather_inv`'s shared arm with a zero gate (its rows are still read, its sum adds nothing).
+ * Timed, the pair and the one launch alone. */
+static void moefuse_gather_q8(const Plugin& pl, int64_t rows, int64_t g8, bool f32w, int pin,
+                             int iters) {
+    const bool check = iters < 0;
+    if (iters == 0) iters = 200;
+    const char* what = "moe_gather_inv_i8g";
+    const std::string lbl = fmt("%s, group %lld%s", what, (long long)g8,
+                                pin ? fmt(", form %d", pin).c_str() : "");
+    const int64_t ne = 288, k = 16, n = 4096, nkb = n / g8, slots = rows * k;
+    const RadKernelInfo* gi = find(pl, "moe_gather_inv_bf16");
+    const RadKernelInfo* gq = find(pl, "moe_gather_inv_i8g");
+    const RadKernelInfo* qz = find(pl, "had_quant_act_i8g");
+    typedef void (*PinFn)(int);
+    const PinFn pin_form = (PinFn)dlsym(pl.h, "r4d_moe_gather_pin_form");
+    if (!gi || !gq || !qz || !pin_form) { ok(lbl.c_str(), false, "a row or the pin is absent"); return; }
+    std::vector<int32_t> ids((size_t)slots);
+    for (int64_t r = 0; r < rows; ++r) {
+        std::vector<int32_t> pool((size_t)ne);
+        for (int64_t e = 0; e < ne; ++e) pool[(size_t)e] = (int32_t)e;
+        for (int64_t j = 0; j < k; ++j) {
+            const int64_t pick = j + (int64_t)(st_mix32((uint32_t)(r * 131 + j)) % (uint32_t)(ne - j));
+            std::swap(pool[(size_t)j], pool[(size_t)pick]);
+            ids[(size_t)(r * k + j)] = pool[(size_t)j];
+        }
+    }
+    /* The inverse table the gather reads: the slot's row in the stable sort by expert. */
+    std::vector<int32_t> srt((size_t)slots), inv((size_t)slots);
+    for (int64_t p = 0; p < slots; ++p) srt[(size_t)p] = (int32_t)p;
+    std::stable_sort(srt.begin(), srt.end(),
+                     [&](int32_t a, int32_t b) { return ids[(size_t)a] < ids[(size_t)b]; });
+    for (int64_t p = 0; p < slots; ++p) inv[(size_t)srt[(size_t)p]] = (int32_t)p;
+    std::vector<uint16_t> ye((size_t)(slots * n));
+    for (size_t i = 0; i < ye.size(); ++i)
+        ye[i] = h_to_bf16((float)((int)(st_mix32((uint32_t)i + 11u) % 2001) - 1000) / 1000);
+    std::vector<float> ewf((size_t)slots);
+    std::vector<uint16_t> ewb((size_t)slots);
+    for (size_t i = 0; i < ewf.size(); ++i) {
+        ewf[i] = (float)(st_mix32((uint32_t)i + 3u) % 1000) / 2000;
+        ewb[i] = h_to_bf16(ewf[i]);
+    }
+    void* d_ye = dalloc(ye.size() * 2);
+    void* d_inv = dalloc(inv.size() * 4);
+    void* d_ew = dalloc(f32w ? ewf.size() * 4 : ewb.size() * 2);
+    std::vector<uint16_t> sh((size_t)(rows * n));
+    for (size_t i = 0; i < sh.size(); ++i)
+        sh[i] = h_to_bf16((float)((int)(st_mix32((uint32_t)i + 99u) % 2001) - 1000) / 1000);
+    void* d_sh = dalloc(sh.size() * 2);
+    void* d_sg = dalloc((size_t)rows * 2);
+    /* the pair's gathered rows, its codes and scales, then the fused op's three: 64-byte tails */
+    const size_t sy = (size_t)(rows * n) * 2 + 64, sq = (size_t)(rows * n) + 64,
+                 ss = (size_t)(rows * nkb) * 4 + 64;
+    const size_t sz3[3] = { sy, sq, ss };
+    void* o[2][3];
+    for (int f = 0; f < 2; ++f) { o[f][0] = dalloc(sy); o[f][1] = dalloc(sq); o[f][2] = dalloc(ss); }
+    if (!d_ye || !d_inv || !d_ew || !d_sh || !d_sg) { ok(lbl.c_str(), false, "allocation failed"); return; }
+    for (int f = 0; f < 2; ++f) for (int j = 0; j < 3; ++j)
+        if (!o[f][j]) { ok(lbl.c_str(), false, "allocation failed"); return; }
+    st_memcpy(d_ye, ye.data(), ye.size() * 2, hipMemcpyHostToDevice);
+    st_memcpy(d_inv, inv.data(), inv.size() * 4, hipMemcpyHostToDevice);
+    st_memcpy(d_sh, sh.data(), sh.size() * 2, hipMemcpyHostToDevice);
+    st_memset(d_sg, 0, (size_t)rows * 2);
+    st_memcpy(d_ew, f32w ? (const void*)ewf.data() : (const void*)ewb.data(),
+              f32w ? ewf.size() * 4 : ewb.size() * 2, hipMemcpyHostToDevice);
+    std::vector<RadParam> p_g = { PI("M", rows), PI("n", n), PI("top_k", k),
+                                  PS("dtype", "bf16"), PS("act", "none") };
+    std::vector<RadParam> p_q = { PI("M", rows), PI("n", n), PI("top_k", k),
+                                  PS("dtype", "bf16"), PI("group", g8) };
+    std::vector<RadParam> p_z = { PI("M", rows), PI("n", n), PI("group", g8),
+                                  PS("dtype", "bf16") };
+    std::vector<RadTensor> g_old = { T(d_ye, RAD_BF16, { slots, n }),
+                                     T(d_ew, f32w ? RAD_F32 : RAD_BF16, { rows, k }),
+                                     T(d_inv, RAD_I32, { slots }), T(d_sh, RAD_BF16, { rows, n }),
+                                     T(d_sg, RAD_BF16, { rows, 1 }), T(o[0][0], RAD_BF16, { rows, n }) };
+    std::vector<RadTensor> z_new = { T(o[0][0], RAD_BF16, { rows, n }), T(o[0][1], RAD_I8, { rows, n }),
+                                     T(o[0][2], RAD_F32, { rows, nkb }) };
+    std::vector<RadTensor> g_new = { g_old[0], g_old[1], g_old[2], T(o[1][1], RAD_I8, { rows, n }),
+                                     T(o[1][2], RAD_F32, { rows, nkb }),
+                                     T(o[1][0], RAD_BF16, { rows, n }) };
+    auto args = [](std::vector<RadTensor>& t, std::vector<RadParam>& p, const RadKernelInfo* r) {
+        RadArgs a{};
+        a.t = t.data(); a.n_t = (int)t.size(); a.p = p.data(); a.n_p = (int)p.size(); a.world_size = 1;
+        const int64_t need = r->scratch ? r->scratch(&a) : 0;
+        if (need > 0) { a.scratch = dalloc((size_t)need); a.scratch_bytes = need; }
+        return a;
+    };
+    RadArgs a_go = args(g_old, p_g, gi), a_zn = args(z_new, p_z, qz), a_gn = args(g_new, p_q, gq);
+    auto pair_new = [&]() {
+        int rc = gi->launch(&a_go, nullptr);
+        return rc == RAD_OK ? qz->launch(&a_zn, nullptr) : rc;
+    };
+    auto fused_new = [&]() { return gq->launch(&a_gn, nullptr); };
+    for (int f = 0; f < 2; ++f) for (int j = 0; j < 3; ++j) st_memset(o[f][j], 0xa5, sz3[j]);
+    pin_form(pin);
+    const int orc = pair_new(), nrc = fused_new();
+    pin_form(0);
+    const bool ran = orc == RAD_OK && nrc == RAD_OK && st_stream_sync(nullptr) == hipSuccess;
+    bool same = ran;
+    int first = -1;
+    for (int j = 0; j < 3 && ran; ++j)
+        if (fetch_bytes(o[0][j], sz3[j]) != fetch_bytes(o[1][j], sz3[j])) {
+            same = false; if (first < 0) first = j;
+        }
+    static const char* const kOut[3] = { "gathered rows", "int8 codes", "f32 scales" };
+    if (check) {
+        ok(fmt("%s at M=%lld%s%s: byte-identical to moe_gather_inv + had_quant_act_i8g",
+               lbl.c_str(), (long long)rows, f32w ? ", f32 routing weights" : "",
+               pin ? ", pinned" : "").c_str(), same,
+           !ran ? fmt("rc %d / %d", orc, nrc) : same ? "" : fmt("%s differ", kOut[first]));
+        return;
+    }
+    if (!ran) { std::printf("--perfmoefuse: %s launch failed (rc %d / %d)\n", lbl.c_str(), orc, nrc); return; }
+    const double us_po = st_time_us([&](int) { pair_new(); }, iters, nullptr);
+    const double us_pn = st_time_us([&](int) { fused_new(); }, iters, nullptr);
+    fuse_line(fmt("gather + had_quant_act_i8g g%lld", (long long)g8).c_str(), us_po, us_pn, same);
+}
+
 /* --perfmoefuse: every decode fusion of GLM's MoE block at one M, separate against fused. */
 static void moefuse_perf(const Plugin& pl, int64_t rows, int iters) {
     std::printf("GLM MoE decode fusions, M=%lld (288 experts, top 8, TP8 widths), %s, %d launches\n",
@@ -23325,6 +23448,15 @@ static void moefuse_perf(const Plugin& pl, int64_t rows, int iters) {
     moefuse_router_gemm(pl, rows, 4096, 128, false, 0, iters);
     moefuse_router_gemm(pl, rows, 4096, 256, true, 0, iters);
     moefuse_gather(pl, rows, false, iters);
+    /* the quantising gather: the sixteen-slot form at `rows`, the wide one at 40 (M > 32 with bf16
+     * weights), each form pinned at 40, and f32 routing weights (which offer only the sixteen) */
+    moefuse_gather_q8(pl, rows, 128, false, 0, iters);
+    if (rows <= 32) {
+        moefuse_gather_q8(pl, 40, 128, false, 0, iters);
+        moefuse_gather_q8(pl, 40, 128, false, 3, iters);
+        moefuse_gather_q8(pl, 40, 128, true, 0, iters);
+        moefuse_gather_q8(pl, 40, 256, false, 0, iters);
+    }
 }
 
 /* gemm_nt_f32 at the tile form its rule picks for M, compared byte for byte with the arithmetic
@@ -38058,6 +38190,17 @@ static void device_phase(const Plugin& pl) {
                     moefuse_router_gemm(pl, rows, K, 128, true, wb, -1);
                     moefuse_router_gemm(pl, rows, K, 256, true, wb, -1);
                 }
+    }
+    if (sel("moe_gather_inv_i8g")) {
+        /* both groups an IQ8R trunk or an ordinary one takes, both weight dtypes (bf16 offers the
+         * wide form above the self-scan height, f32 only the sixteen-slot one), and each pin. */
+        for (int64_t rows : { 1, 6, 48, 65, 256 })
+            for (int64_t g8 : { (int64_t)128, (int64_t)256 })
+                for (bool f32w : { false, true }) moefuse_gather_q8(pl, rows, g8, f32w, 0, -1);
+        for (int pin : { 2, 3 }) {
+            moefuse_gather_q8(pl, 40, 128, false, pin, -1);
+            moefuse_gather_q8(pl, 40, 256, true, 3, -1);
+        }
     }
     if (sel("moe_scatter_inv_i32") || sel("moe_gather_inv_bf16")) {
         /* 512 slots is moe_gather's self-scan bound, 1024 the sort's one workgroup. */
