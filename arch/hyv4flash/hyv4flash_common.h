@@ -567,7 +567,9 @@ struct Trunk {
  * ar_rmsnorm_ihc_junction the same behind the exact all-reduce (two ranks at every height, four at
  * decode and verify heights). `tail` false stops behind ihc_post (an Engram sits in front of the
  * next layer and writes h between); `next` the head's collapse makes the last one end in the final
- * norm. y and x are stored only for the debug taps.
+ * norm. y and x are stored only for the debug taps. P-07: the `engram` form runs the Engram's gate
+ * between ihc_post and ihc_pre, so an Engram layer's four launches (gate, ihc_pre, rmsnorm, and the
+ * ones the junction already had) meet in one.
  *
  * RADIANCE_HY4_JUNCTION=0 keeps the unfused chain; so does a calibration run (its hooks read
  * between the ops). Where the fused all-reduce is not served (a library without it, four ranks
@@ -604,6 +606,14 @@ inline int64_t junction_rows(const Geom& g) {
     return kjRows4;
 }
 
+/* The Engram gate's operands, as the Engram hands them to the junction that fuses it (P-07). */
+struct EgWire {
+    rad_buf key = 0, val = 0, mask = 0;
+    rad_weight w_key = 0, w_query = 0, w_val = 0, w_branch = 0;
+    double eps = 0;
+    bool ok = false;
+};
+
 struct Junction {
     rad_op op = 0, op_ar = 0;           /* the plain row, the all-reduce twin */
     rad_op op_add = 0, op_reduce = 0;   /* the chain's add and all_reduce, for the fallback */
@@ -617,6 +627,12 @@ struct Junction {
      * this junction writes beside `xn`, so the readers of `xn` issue no quantiser; unset (q8 0) where
      * the chain runs or the junction does not write them. */
     ActFP8 codes{};
+    /* P-07: the Engram form's seven operands and its eps; `eg` set means `op` and `op_ar` carry them
+     * (the `engram` 1 the declare passes) and that ihc_post's h is the gate's input and output. */
+    bool eg = false;
+    rad_buf eg_key = 0, eg_val = 0, eg_mask = 0;
+    rad_weight eg_w_key = 0, eg_w_query = 0, eg_w_val = 0, eg_w_branch = 0;
+    double eg_eps = 0;
     explicit operator bool() const { return op != 0; }
     /* The codes the readers of xn find, or null. */
     const ActFP8* codes_if() const { return op && codes.q8 ? &codes : nullptr; }
@@ -627,10 +643,13 @@ struct Junction {
      * gain; `next` the next connection (0 for tail 0) and `w_next` the next block's input norm,
      * whose output is `xn`. `op_add` / `op_reduce` are the chain's own ops (0 where absent). Leaves
      * `op` 0 (the chain runs) where no library serves the row. `pair` (tail only, G-3b): the code
-     * pair the junction writes of `xn` (n % 128 == 0), read by the linears that accept it. */
+     * pair the junction writes of `xn` (n % 128 == 0), read by the linears that accept it. `egw`
+     * (P-07, tail only): the Engram's gate, run between ihc_post and ihc_pre; where the library does
+     * not serve that form `eg` stays false and the chain runs, the gate with it. */
     int declare(RadBuilder* bl, const Shape& s, const Geom& g, int64_t T, const Trunk& tr,
                 rad_buf a_, rad_buf b_, rad_weight w_post_, const Hyper* next, rad_weight w_next_,
-                rad_buf xn_, rad_op add_, rad_op reduce_, const Codes::Pair* pair = nullptr) {
+                rad_buf xn_, rad_op add_, rad_op reduce_, const Codes::Pair* pair = nullptr,
+                const EgWire* egw = nullptr) {
         *this = Junction{};
         if (!junction_on() || calib_dir() != nullptr) return RAD_OK;
         if (s.n_embd % 8) return RAD_OK;
@@ -664,6 +683,24 @@ struct Junction {
         }
         if (y) wr.push_back(y);
         if (x) wr.push_back(x);
+        /* P-07: the tail must reach ihc_pre (the gate sits in front of it), and a row of the gate's
+         * own shape is required (the next connection's collapse has one stream, not `hc`). */
+        if (egw && egw->ok && tail && rows == 2 * s.hc) {
+            eg = true;
+            eg_eps = egw->eps;
+            eg_key = egw->key; eg_val = egw->val; eg_mask = egw->mask;
+            eg_w_key = egw->w_key; eg_w_query = egw->w_query;
+            eg_w_val = egw->w_val; eg_w_branch = egw->w_branch;
+            ps.push_back(RAD_INT("engram", 1));
+            ps.push_back(RAD_F64("eg_eps", eg_eps));
+            rd.push_back(eg_key);
+            rd.push_back(eg_val);
+            rd.push_back(eg_mask);
+            ws.push_back(eg_w_key);
+            ws.push_back(eg_w_query);
+            ws.push_back(eg_w_val);
+            ws.push_back(eg_w_branch);
+        }
         /* An op no loaded library declares (the twin on a host-only deployment) is not declared at
          * all: an undeclared op name stops the startup. */
         auto decl = [&](const char* name, const std::vector<RadParam>& p) -> rad_op {
@@ -686,7 +723,10 @@ struct Junction {
             op_ar = decl("ar_rmsnorm_ihc_junction", pa);
         }
         op = decl("rmsnorm_ihc_junction", ps);
-        if (!op) op_ar = 0;   /* one served without the other: keep the chain whole */
+        if (!op) {
+            op_ar = 0;   /* one served without the other: keep the chain whole */
+            eg = false;  /* an Engram form the library refused is no form: the gate stays a launch */
+        }
         if (world > 1 && !op_ar && !op_reduce) op = 0;
         if (op && qc) {
             codes.q8 = pair->q8;
@@ -720,7 +760,11 @@ struct Junction {
                         tail ? RAD_W(base) : RAD_NONE, tail ? RAD_W(w_next) : RAD_NONE,
                         xn ? brows(xn, T) : RAD_NONE, y ? brows(y, T) : RAD_NONE,
                         x ? brows(x, T) : RAD_NONE, codes.q8 ? brows(codes.q8, T) : RAD_NONE,
-                        codes.s8 ? brows(codes.s8, T) : RAD_NONE);
+                        codes.s8 ? brows(codes.s8, T) : RAD_NONE,
+                        eg ? brows(eg_key, T) : RAD_NONE, eg ? brows(eg_val, T) : RAD_NONE,
+                        eg ? brows(eg_mask, T) : RAD_NONE, eg ? RAD_W(eg_w_key) : RAD_NONE,
+                        eg ? RAD_W(eg_w_query) : RAD_NONE, eg ? RAD_W(eg_w_val) : RAD_NONE,
+                        eg ? RAD_W(eg_w_branch) : RAD_NONE);
         };
         if (op_ar && T <= ar_rows) { issue(op_ar, B); return; }
         if (world > 1) {
@@ -745,7 +789,14 @@ struct Junction {
                         tail ? RAD_W(fn) : RAD_NONE, tail ? RAD_W(scale) : RAD_NONE,
                         tail ? RAD_W(base) : RAD_NONE, tail ? RAD_W(w_next) : RAD_NONE,
                         xn ? row(xn, n) : RAD_NONE, y ? row(y, n) : RAD_NONE,
-                        x ? row(x, n) : RAD_NONE);
+                        x ? row(x, n) : RAD_NONE,
+                        /* the codes are not written in the pipelined pieces (as before), but the
+                         * gate's operands are positional behind them */
+                        eg ? RAD_NONE : RAD_NONE, eg ? RAD_NONE : RAD_NONE,
+                        eg ? row(eg_key, hc_n) : RAD_NONE, eg ? row(eg_val, n) : RAD_NONE,
+                        eg ? row(eg_mask, 1) : RAD_NONE, eg ? RAD_W(eg_w_key) : RAD_NONE,
+                        eg ? RAD_W(eg_w_query) : RAD_NONE, eg ? RAD_W(eg_w_val) : RAD_NONE,
+                        eg ? RAD_W(eg_w_branch) : RAD_NONE);
         };
         if (op_ar && rows <= ar_rows && !beside) { issue(op_ar, B); return; }
         if (world > 1) {

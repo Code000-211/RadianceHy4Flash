@@ -763,9 +763,11 @@ static int trunk_layer(RadBuilder* b, Model& m, int l, MoeFP8::Src* msrc) {
     if (!lay.attn_gain) return RAD_E_INVAL;
     lay.op_attn_norm = decl_rmsnorm(b, T, E, s.eps, lay.attn_gain, m.tr.x, m.tr.xn);
     HY4_NEED(lay.op_attn_norm, "rmsnorm");
-    /* The previous layer's junction into this connection (one with an Engram in front of it
-     * declared its tail 0 form behind the previous layer). */
-    if (l > 0 && lay.engram < 0) {
+    /* The previous layer's junction into this connection. One with an Engram in front of it takes the
+     * Engram form (P-07): its gate runs between the junction's ihc_post and its ihc_pre, so the gate
+     * and the layer's own enter meet there. Where the library serves no such form the junction stops
+     * behind ihc_post (tail 0) and the Engram steps whole. */
+    if (l > 0) {
         Layer& pv = m.layers[(size_t)l - 1];
         /* G-3b: the junction writes the rotated int8 codes the attention's three input linears read,
          * where their weights take them (q_a's form; each linear checks its own). */
@@ -775,10 +777,24 @@ static int trunk_layer(RadBuilder* b, Model& m, int l, MoeFP8::Src* msrc) {
             Codes* cs = codes_of(b);
             if (cs && f.i8 && f.rot && f.g8 == RAD_FP8_BLOCK) jp = cs->get(E, f.g8, "junc_attn_in");
         }
+        EgWire egw{};
+        /* the gate goes with the junction where the Engram opens a layer this graph then runs */
+        if (lay.engram >= 0 && l + 1 < (int)m.layers.size())
+            egw = m.engrams[(size_t)lay.engram].gate_wire();
         RAD_ARCH_TRY(pv.j_end.declare(b, s, g, T, m.tr, pv.ffn.junction_a(), pv.ffn.junction_b(),
                                       pv.ffn.post_gain, &lay.hc_attn, lay.attn_gain, m.tr.xn,
-                                      pv.ffn.op_join, pv.ffn.op_ar, jp));
+                                      pv.ffn.op_join, pv.ffn.op_ar, jp, egw.ok ? &egw : nullptr));
+        if (egw.ok && !pv.j_end.eg)
+            RAD_ARCH_TRY(pv.j_end.declare(b, s, g, T, m.tr, pv.ffn.junction_a(), pv.ffn.junction_b(),
+                                          pv.ffn.post_gain, nullptr, 0, 0, pv.ffn.op_join,
+                                          pv.ffn.op_ar, nullptr));
     }
+
+    /* P-07: the Engram's gate goes with the junction that runs it round its own ihc_post; where
+     * this layer has no such junction in front of it, or the junction stopped behind ihc_post, the
+     * gate is a launch of its own again. */
+    if (lay.engram >= 0 && !(l > 0 && m.layers[(size_t)l - 1].j_end.eg))
+        RAD_ARCH_TRY(m.engrams[(size_t)lay.engram].declare_gate(b, nm, l));
 
     /* The layer's latent group, declared before its first store; a sparse layer's indexer
      * groups before the first pool. */
@@ -791,8 +807,7 @@ static int trunk_layer(RadBuilder* b, Model& m, int l, MoeFP8::Src* msrc) {
     RAD_ARCH_TRY(lay.attn.declare(b, nm, s, g, l, lay.sliding,
                                   lay.sliding ? m.aw_sliding : m.aw_sparse, m.tr.xn, m.tr.y, kv,
                                   block, ap, first_kv,
-                                  l > 0 && lay.engram < 0 ? m.layers[(size_t)l - 1].j_end.codes_if()
-                                                          : nullptr));
+                                  l > 0 ? m.layers[(size_t)l - 1].j_end.codes_if() : nullptr));
     if (!lay.sliding) {
         if (!m.kv_tail) {
             RadKVGroupDecl d{};
@@ -864,12 +879,6 @@ static int trunk_layer(RadBuilder* b, Model& m, int l, MoeFP8::Src* msrc) {
     RAD_ARCH_TRY(lay.ffn.declare(b, nm, s, g, l, m.tr.xn, m.tr.y, m.mw, m.dense_gu, m.dense_ff,
                                  m.dense_out, msrc, lay.j_mid.codes_if()));
     RAD_ARCH_TRY(lay.hc_ffn.declare_post(b, s, T, m.tr.h, m.tr.post, m.tr.y));
-    /* An Engram opens the next layer: the junction stops behind the write (tail 0). */
-    for (int e : s.engram_layers)
-        if (e == l + 1)
-            RAD_ARCH_TRY(lay.j_end.declare(b, s, g, T, m.tr, lay.ffn.junction_a(),
-                                           lay.ffn.junction_b(), lay.ffn.post_gain, nullptr, 0, 0,
-                                           lay.ffn.op_join, lay.ffn.op_ar, nullptr));
     RAD_ARCH_TRY(lay.t_resid.declare(b, nm, T, "resid", l, RAD_BF16, s.hc * E, m.tr.h));
     RAD_ARCH_TRY(m.calib.layer(b, g, s, l, m.tr.xn, lay.attn, !lay.sliding, lay.ffn,
                                lay.engram >= 0 ? &m.engrams[(size_t)lay.engram] : nullptr));
@@ -1348,12 +1357,16 @@ static void step(RadCtx* c, const RadBatch* batch) {
     const RadBatch* queries = batch;
     QueryRows rows{nullptr, T};
     bool entered = false;   /* the previous junction ran this layer's connection and input norm */
+    bool eg_fused = false;  /* ... and the Engram's gate with it (P-07) */
     for (size_t i = 0; i < m.layers.size(); ++i) {
         const Layer& l = m.layers[i];
         if (l.engram >= 0) {
-            if (!m.engrams[(size_t)l.engram].step(c, batch)) return;
+            /* P-07: where the junction in front took the Engram form it already ran the gate (its
+             * `pre` half was issued before that junction), so only the chain's own step runs here. */
+            if (!eg_fused && !m.engrams[(size_t)l.engram].step(c, batch)) return;
             m.calib.after_engram(c, (int)i, T);
         }
+        eg_fused = false;
         l.t_stream_in.step(c, brows(m.tr.h, T), T);
         if (!entered) l.hc_attn.pre(c, m.tr.h, m.tr.x, m.tr.post, T);
         l.t_attn_x.step(c, brows(m.tr.x, T), T);
@@ -1410,6 +1423,13 @@ static void step(RadCtx* c, const RadBatch* batch) {
                 move_rows(c, m.pack_post, m.tr.post, s.hc, src, dst, n);
             });
         const bool pipe_tail = pipe && jm && je;
+        /* P-07: the next layer's Engram reads nothing the junction writes but h, so its ids, its
+         * gather, the row norm and its two GEMMs are issued before the junction whose gate it is. */
+        auto eg_pre = [&]() -> bool {
+            if (!(je && l.j_end.eg) || i + 1 >= m.layers.size()) return true;
+            const int e = m.layers[i + 1].engram;
+            return e < 0 || m.engrams[(size_t)e].pre(c, batch);
+        };
         auto junction = [&](const Junction& j) {
             if (pipe_tail) {
                 pipe_issue(c, [&] { j.step(c, 0, rows.n, pipe_lane()); });
@@ -1452,6 +1472,7 @@ static void step(RadCtx* c, const RadBatch* batch) {
             pipe_issue(c, [&] { l.j_mid.step(c, n0, n1, pipe_lane()); });
             l.ffn.body(c, rows.n, 0, n0);
             pipe_join(c);
+            if (!eg_pre()) return;
             pipe_issue(c, [&] { l.j_end.step(c, 0, n0, pipe_lane()); });
             l.ffn.body(c, rows.n, n0, n1);
             l.ffn.route_report(c);
@@ -1459,10 +1480,12 @@ static void step(RadCtx* c, const RadBatch* batch) {
             pipe_issue(c, [&] { l.j_end.step(c, n0, n1, pipe_lane()); });
             pipe_join(c);
             entered = je && l.j_end.tail;
+            eg_fused = je && l.j_end.eg;
             continue;
         }
         if (!l.ffn.step(c, queries, je)) return;
         if (je) {
+            if (!eg_pre()) return;
             junction(l.j_end);
             l.ffn.tail_taps(c, rows.n);
         }
@@ -1470,6 +1493,7 @@ static void step(RadCtx* c, const RadBatch* batch) {
         if (!je) l.hc_ffn.post_add(c, m.tr.y, m.tr.post, m.tr.h, rows.n);
         l.t_resid.step(c, brows(m.tr.h, rows.n), rows.n);
         entered = je && l.j_end.tail;
+        eg_fused = je && l.j_end.eg;
     }
     if (!entered) m.hc_head.pre(c, m.tr.h, m.tr.x, 0, rows.n);
     m.t_hc_head.step(c, brows(m.tr.x, rows.n), rows.n);

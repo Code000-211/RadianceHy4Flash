@@ -291,12 +291,22 @@ struct Engram {
                     { RAD_RANGE("M", 1, T), RAD_INT("N", E), RAD_INT("K", W),
                       RAD_STR("dtype", "bf16") },
                     { val_w, val_b }, { w.e }, { w.val });
+        op_gate = 0;   /* declare_gate's, after the junction that may take it (P-07) */
+        HY4_NEED(op_norm, "engram_norm");
+        HY4_NEED(op_key && op_val, "gemm_nt_bias");
+        return RAD_OK;
+    }
+
+    /* The gate over the streams and its engram_out tap: declared by the step that owns it, which is
+     * the junction in front of the layer where that junction took the Engram form (P-07) and this
+     * layer's own call otherwise. */
+    int declare_gate(RadBuilder* b, Names& nm, int l) {
+        const int64_t T = g.max_tok, E = s.n_embd, H = s.engram_heads;
+        const double eps = engram_eps();
         op_gate = mk(b, "engram_gate",
                      { RAD_RANGE("M", 1, T), RAD_INT("n", E), RAD_INT("hc", s.hc),
                        RAD_F64("eps", eps), RAD_STR("dtype", "bf16") },
                      { key_g, query_g, val_g, branch }, { w.key, w.val, w.mask, h }, { h });
-        HY4_NEED(op_norm, "engram_norm");
-        HY4_NEED(op_key && op_val, "gemm_nt_bias");
         HY4_NEED(op_gate, "engram_gate");
 
         /* engram_out: the residual the add made, the streams after it less a copy before it. */
@@ -324,8 +334,13 @@ struct Engram {
 
     /* The step's ids, the decode half with num_accepted (its window read where the last verify
      * left it), the prefill half without (each chunk's tail lands at offset zero): ple_conv's two
-     * layouts, as rad_block_ple.h issues ngram_ids. */
+     * layouts, as rad_block_ple.h issues ngram_ids. The step in two halves: `pre` (the ids, the
+     * gather, the row norm and the two GEMMs, none of which reads h) and `gate` (the gate over h and
+     * the taps), so that a junction can run the gate round its own ihc_post (P-07). */
     bool step(RadCtx* c, const RadBatch* batch) const {
+        return pre(c, batch) && gate(c, batch->n_tok);
+    }
+    bool pre(RadCtx* c, const RadBatch* batch) const {
         const int64_t T = batch->n_tok, S = batch->n_seq, H = s.engram_heads;
         const RadKVGroupBatch* hb = kv_batch(batch, hist);
         const int32_t* sidx = hb ? hb->state_index : nullptr;
@@ -383,6 +398,13 @@ struct Engram {
                     brows(w.key, T));
         RAD_ISSUE_N(c, op_val, T, brows(w.e, T), RAD_W(val_w), RAD_W(val_b), RAD_NONE,
                     brows(w.val, T));
+        return true;
+    }
+
+    /* The gate over the streams `h` (which ihc_post of the layer in front wrote), then the taps: the
+     * second half of the step, and on its own for the junction that runs it between ihc_post and
+     * ihc_pre (P-07, Junction::declare's `eg`). */
+    bool gate(RadCtx* c, int64_t T) const {
         if (op_tap_copy) RAD_ISSUE_N(c, op_tap_copy, T, brows(h, T), brows(w.before, T));
         RAD_ISSUE_N(c, op_gate, T, brows(w.key, T), brows(w.val, T), brows(w.mask, T), RAD_W(key_g),
                     RAD_W(query_g), RAD_W(val_g), RAD_W(branch), brows(h, T));
@@ -392,6 +414,26 @@ struct Engram {
             RAD_ISSUE_N(c, op_tap_add, T, brows(h, T), brows(w.before, T), brows(t_out.buf, T));
         }
         return true;
+    }
+
+    /* A fused junction runs the two halves round its own ihc_post, so neither half can carry the
+     * engram_out tap (it copies h before the gate writes it): with the taps on the gate stays a
+     * launch of its own. */
+    bool gate_fusable() const { return !taps_on(); }
+
+    /* The gate's operands, for the junction that fuses it; `ok` false where it cannot be fused. */
+    EgWire gate_wire() const {
+        EgWire e{};
+        e.key = w.key;
+        e.val = w.val;
+        e.mask = w.mask;
+        e.w_key = key_g;
+        e.w_query = query_g;
+        e.w_val = val_g;
+        e.w_branch = branch;
+        e.eps = engram_eps();
+        e.ok = gate_fusable() && w.key && w.val && w.mask && key_g && query_g && val_g && branch;
+        return e;
     }
 };
 

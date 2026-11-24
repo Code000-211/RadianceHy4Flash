@@ -211,7 +211,7 @@ TEST(the_mini_graph_declares_every_layer_kind) {
     CHECK_EQ(count_op(b, "quant_act_fp8"), 1);          /* the bf16 table's E4M3 round trip */
     CHECK_EQ(count_op(b, "dequant"), 1);
     CHECK_EQ(count_op(b, "engram_norm"), 1);
-    CHECK_EQ(count_op(b, "engram_gate"), 1);
+    CHECK_EQ(count_op(b, "engram_gate"), 0);   /* P-07: the gate is the junction in front of it */
     CHECK_EQ(count_op(b, "router_sigmoid_topk"), 2);
     CHECK_EQ(count_op(b, "swiglu_clamped"), 2);         /* the routed arms; the shared ones are not */
     CHECK_EQ(count_op(b, "logits_gemm"), 1);
@@ -2470,4 +2470,42 @@ TEST(g3_junctions_write_the_codes_their_readers_take) {
     CHECK_EQ(with_codes(off.b), 0);
     /* every junction that writes codes removes the quantiser behind it */
     CHECK(had_on < count_op(off.b, "had_quant_act_i8g"));
+}
+
+/* P-07: the junction in front of an Engram takes the Engram form -- rmsnorm_ihc_junction (and its
+ * two-rank twin) with `engram` 1, `eg_eps` and the gate's seven operands -- so the gate's own launch
+ * and the connection's ihc_pre and rmsnorm meet in the one that was already there. With the
+ * junction off the chain is back, the gate a launch of its own, and the step still runs. */
+TEST(p07_the_junction_in_front_of_an_engram_takes_its_gate) {
+    /* the junctions of one form that carry `engram` 1, and the tail they must carry it with */
+    auto eg_junctions = [](const RadBuilder& b, const char* name) {
+        int n = 0;
+        for (const auto& o : b.ops) {
+            if (o.op != name) continue;
+            for (const auto& p : o.p)
+                if (p.key == "engram" && p.ival != 0) {
+                    ++n;
+                    for (const auto& q : o.p) CHECK(q.key != "tail" || q.ival != 0);
+                }
+        }
+        return n;
+    };
+    for (int world : { 1, 2 }) {
+        /* the step reads the model the last declare built, so each graph is stepped before the next */
+        Declared on(bf16_encs, world, 0, true);
+        REQUIRE_EQ(on.rc, RAD_OK);
+        CHECK_EQ(eg_junctions(on.b, "rmsnorm_ihc_junction"), 1);   /* in front of the Engram's layer */
+        CHECK_EQ(eg_junctions(on.b, "ar_rmsnorm_ihc_junction"), world == 1 ? 0 : 1);
+        CHECK_EQ(count_op(on.b, "engram_gate"), 0);                /* the gate went into it */
+        every_weight_read(on.b);
+        steps_clean_at(on.b, 0, 1);
+    }
+    setenv("RADIANCE_HY4_JUNCTION", "0", 1);
+    Declared off(bf16_encs, 1, 0, true);
+    unsetenv("RADIANCE_HY4_JUNCTION");
+    REQUIRE_EQ(off.rc, RAD_OK);
+    CHECK_EQ(eg_junctions(off.b, "rmsnorm_ihc_junction"), 0);
+    CHECK_EQ(count_op(off.b, "engram_gate"), 1);        /* the chain: the gate as its own launch */
+    every_weight_read(off.b);
+    steps_clean_at(off.b, 0, 1);
 }
