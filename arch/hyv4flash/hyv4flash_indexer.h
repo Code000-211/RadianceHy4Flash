@@ -191,10 +191,12 @@ struct Indexer {
                        RAD_F64("theta", s.theta_sparse), RAD_STR("mode", "gptj"),
                        RAD_INT("block_size", r), RAD_STR("dtype", "bf16") },
                      { wv, wg, ape, pool_gain }, { w.tk }, { w.page, w.bpos, w.nc });
-            HY4_NEED(op_front, "qsa_work_pool_tail");
-            /* Declared, but a library may not serve this geometry (rad_op_resolved); the three-op
-             * path below is the answer there as it is where the op is missing altogether. */
-            if (!rad_op_resolved(b, op_front)) op_front = 0;
+            /* A library that carries the row need not serve every geometry of it: no band matches
+             * a narrower indexer than the row's kernel is compiled for (n 128), and the conversion
+             * tests declare 16-wide ones. `mk` answers that with a null handle -- an unresolved op
+             * is recorded and returns null (abi/rad_builder.h), and declaring one is not an error
+             * -- so the null handle is the three-op path's cue, where `HY4_NEED` would fail the
+             * whole declare on a geometry the three ops serve. */
         }
         if (!op_front) {
             op_work = mk(b, "qsa_work",

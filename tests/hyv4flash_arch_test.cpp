@@ -548,6 +548,35 @@ TEST(k24_a_library_without_the_fused_key_side_keeps_the_three_ops) {
     CHECK(issue_of(b, c, "qsa_tail_store") != nullptr);
 }
 
+/* And the third case between them: a library that *declares* the fused key side -- libr4d does --
+ * need not serve every geometry of it. Its kernel is compiled for the indexer the model has (n
+ * 128, the row's constraint), where the conversion tests build 16-wide ones, so `mk` returns a
+ * null handle there; that is the three-op path's cue, not a missing library, and declaring it is
+ * not an error (`rad_op_resolved`, abi/rad_builder.h). A `HY4_NEED` on that handle would fail
+ * every narrow declare instead. */
+TEST(k24_a_declared_but_unserved_fused_key_side_still_declares) {
+    RadBuilder b;
+    bf16_encs(&b);
+    b.refuse.insert("qsa_work_pool_tail");
+    auto mk = mini_meta();
+    auto ctx = build_ctx();
+    REQUIRE_EQ(hyv4flash::declare(&b, mk.meta(), &ctx), RAD_OK);
+    const auto& last = hyv4flash::models[0]->layers.back();
+    CHECK_EQ(last.ix.op_front, (rad_op)0);
+    REQUIRE(last.ix.op_work != 0);
+    REQUIRE(last.ix.op_pool != 0);
+    REQUIRE(last.ix.op_tail != 0);
+    auto k = kit(b, {}, { 1 });
+    RadCtx c{ .b = &b, .batch = &k->b };
+    hyv4flash::step(&c, &k->b);
+    CHECK(c.step_fail.empty());
+    CHECK_LINT(b, &c);
+    CHECK_EQ(issue_of(b, c, "qsa_work_pool_tail"), nullptr);
+    CHECK(issue_of(b, c, "qsa_work") != nullptr);
+    CHECK(issue_of(b, c, "idx_pool_gated") != nullptr);
+    CHECK(issue_of(b, c, "qsa_tail_store") != nullptr);
+}
+
 TEST(compact_dense_prefill_keeps_full_keys_and_restores_gather_indices) {
     Declared d;
     REQUIRE_EQ(d.rc, RAD_OK);

@@ -3207,7 +3207,11 @@ attention when the group's KV streams; it is described below, after `qsa_select`
 `qsa_work_pool_tail` is not a sixth step: it is `qsa_work`, `idx_pool_gated` and `qsa_tail_store`
 in one launch for the exact key path, and has no libref row of its own (the three are its oracle).
 An architecture asks for it only where a loaded library serves it (`rad_op_declared`,
-`abi/rad_builder.h`), so the reference and host backends keep the three.
+`abi/rad_builder.h`), so the reference and host backends keep the three; and a library that carries
+the row serves it only at the geometries its kernel was compiled for (the indexer width `n`), where
+the declaration answers a null handle and the three run as well. The row declares the three as the chain it
+replaces, so `r4d_selftest` and rad-kbench compare the one launch with them byte for byte where the
+ring holds the step.
 
 ### `qsa_block_key`
 
