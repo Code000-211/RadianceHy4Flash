@@ -1150,8 +1150,11 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
 
     /* In a staged pass a collective holds the card's link; the stager's copy lists yield meanwhile
      * (see rad_link_hold). Taken after every wait this op's operands put on the stream, so nothing
-     * between hold and release can wait on a weight stuck behind a yielding list. */
-    const bool hold = staging_ && p.collective && dom == RAD_DOMAIN_DEVICE;
+     * between hold and release can wait on a weight stuck behind a yielding list. Not on lane 1
+     * (a pipelined prefill's collectives beside lane-0 work): under expert-tiered copies a lane-1
+     * hold left the gate odd on every card and stalled a yielding list mid-flight (issue #2; the
+     * sequence that skips the kernel-side release is not yet identified). */
+    const bool hold = staging_ && p.collective && dom == RAD_DOMAIN_DEVICE && lane_ == 0;
     const RadArgs* la = &ip.args;
     RadArgs gate_args;
     if (hold) {
