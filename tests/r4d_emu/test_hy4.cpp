@@ -389,7 +389,11 @@ static void engram_norm_gate() {
         check("engram_norm", r4d_rad_engram_norm, w, p, ops);
     }
     struct G { int64_t M, hc, n, pad; double eps; };
-    for (const G& g : { G{ 4, 2, 48, 0, 0.0078125 }, G{ 3, 4, 20, 6, 1.19e-7 }, G{ 3, 1, 33, 0, 1e-6 } }) {
+    /* n 48 in one eight-wide run a thread's row; 2080 past 8 * kEgThreads, so a thread takes two
+     * runs; 8 the one-group corner; 20 and 33 the scalar tail; 32 pitched to 65 the scalar path
+     * with a whole-eight n. */
+    for (const G& g : { G{ 4, 2, 48, 0, 0.0078125 }, G{ 3, 4, 20, 6, 1.19e-7 }, G{ 3, 1, 33, 0, 1e-6 },
+                        G{ 2, 1, 2080, 0, 0.0078125 }, G{ 4, 1, 8, 0, 1e-6 }, G{ 3, 2, 32, 1, 1e-6 } }) {
         Rng rng((uint32_t)(g.n * 5));
         const int64_t W = g.hc * g.n;
         std::vector<Opd> ops;
