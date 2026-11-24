@@ -132,6 +132,7 @@ public:
     int         lora_alias(const char* native, const char* from, const char* to, int64_t from_lo,
                            int64_t from_hi, int64_t to_lo);
     int         drafter_short_block(int64_t block);
+    int         drafter_any_block(int64_t min_rows);
     int         drafter_tree(rad_buf parents);
     int         route_table(rad_buf table);
     int         declare_encoder(const RadEncoderDecl* d);

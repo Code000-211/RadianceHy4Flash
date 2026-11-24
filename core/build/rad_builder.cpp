@@ -2282,6 +2282,33 @@ int Builder::drafter_short_block(int64_t block) {
     return RAD_OK;
 }
 
+/* A block drafter that serves any block of `min_rows` .. its own rows a sequence (rad_builder.h):
+ * the core stages a step's block at the rounds the depth rule can take. Validated at declare, like
+ * the short block: a block the plugin did not declare its ops at would fail the step. */
+int Builder::drafter_any_block(int64_t min_rows) {
+    if (finished_) {
+        err(RAD_E_STATE, "drafter_any_block after declare finished");
+        return RAD_E_STATE;
+    }
+    if (prog_.drafter.kind != RAD_DRAFT_BLOCK) {
+        err(RAD_E_STATE, "drafter_any_block: %s. Only a BLOCK drafter proposes a block; declare "
+                         "it with rad_declare_drafter first.",
+            prog_.drafter.kind == RAD_DRAFT_NONE ? "no drafter is declared"
+                                                 : "the declared drafter is a SERIAL head");
+        return RAD_E_STATE;
+    }
+    const int64_t full = prog_.drafter.block > 0 ? prog_.drafter.block : prog_.drafter.depth + 1;
+    const int64_t lead = full - prog_.drafter.depth;     /* rows ahead of the proposing ones */
+    if (min_rows > full || min_rows - lead < 1 || min_rows < 2) {
+        err(RAD_E_INVAL, "drafter_any_block '%s': %lld rows. The shortest block must still propose "
+                         "a token (more than %lld rows) and be at most the drafter's own (%lld).",
+            prog_.drafter_name.c_str(), (long long)min_rows, (long long)lead, (long long)full);
+        return RAD_E_INVAL;
+    }
+    prog_.drafter_any_block = min_rows;
+    return RAD_OK;
+}
+
 /* A block drafter whose proposal is a tree (rad_builder.h). */
 int Builder::drafter_tree(rad_buf parents) {
     if (finished_) {
@@ -2915,6 +2942,11 @@ int rad_chain_on(void) { return rad_dev_chain_enabled(); }
 int rad_drafter_short_block(RadBuilder* b, int64_t block) {
     if (!b) return RAD_E_INVAL;
     return B(b)->drafter_short_block(block);
+}
+
+int rad_drafter_any_block(RadBuilder* b, int64_t min_rows) {
+    if (!b) return RAD_E_INVAL;
+    return B(b)->drafter_any_block(min_rows);
 }
 
 int rad_declare_encoder(RadBuilder* b, const RadEncoderDecl* d) {

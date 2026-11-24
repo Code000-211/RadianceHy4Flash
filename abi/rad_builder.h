@@ -883,6 +883,18 @@ int rad_chain_on(void);
 /* ---- appended in ABI 27 (a block drafter's short block) */
 int rad_drafter_short_block(RadBuilder* b, int64_t block);
 
+/* A block drafter that serves any block of `min_rows` .. RadDrafterDecl::block rows a sequence, not
+ * only its own and its short one (rad_drafter_short_block): the plugin declared its query pass with
+ * the same anchor convention at every block in that range. The core stages a step's block at the
+ * rounds its depth rule can take (the chain is proposed whole, so a round past the depth the verify
+ * reads is a head pass and a correction nothing verifies), one row a round above the anchor, and
+ * reads a sequence's rows from RadBatch::n_tok and n_seq. `min_rows` still proposes a token, the
+ * same bound as the short block's. Absent, the core stages only the drafter's own block and its
+ * short one. Called once, after rad_declare_drafter. Additive export; RAD_ABI_VERSION does not
+ * move. */
+/* ---- appended in ABI 44 (the block a step's chain is staged at) */
+int rad_drafter_any_block(RadBuilder* b, int64_t min_rows);
+
 /* ================================================================== the encoder */
 /* A media encoder the plugin runs on an encoder pass (RadBatch::enc). The core drives the pass and
  * reads its result, so the plugin declares it. A plugin that declares none serves text only, and

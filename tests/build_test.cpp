@@ -1168,6 +1168,42 @@ TEST(a_block_drafters_short_block_is_shorter_and_still_proposes) {
     }
 }
 
+/* rad_drafter_any_block: a block drafter that serves any block from a length up to its own, which
+ * the core stages a step's chain at (D-07: the rounds the depth rule took). Like the short block it
+ * is refused for anything that is not a block drafter, for a length past its own, and for one that
+ * leaves no row to propose a token from -- the core would stage a block the plugin has no ops for. */
+TEST(a_block_drafter_serves_any_block_from_a_length_that_still_proposes) {
+    Registry reg;
+    {
+        Builder b(reg, make_meta(), make_ctx());
+        CHECK_EQ(rad_drafter_any_block(&b, 2), RAD_E_STATE);     /* nothing declared */
+    }
+    {
+        Builder b(reg, make_meta(), make_ctx());
+        RadDrafterDecl d{};
+        d.kind = RAD_DRAFT_SERIAL; d.name = "mtp"; d.depth = 4;
+        CHECK_OK(rad_declare_drafter(&b, &d));
+        CHECK_EQ(rad_drafter_any_block(&b, 2), RAD_E_STATE);     /* a serial head */
+    }
+    {
+        Builder b(reg, make_meta(), make_ctx());
+        RadBufDecl bd{};
+        bd.dtype = RAD_I32; bd.rank = 2; bd.shape[0] = 256; bd.shape[1] = 4;
+        const rad_buf prop = rad_decl_buffer(&b, "prop", &bd);
+        RadDrafterDecl d{};
+        d.kind = RAD_DRAFT_BLOCK; d.name = "df"; d.depth = 4; d.mask_token = 5;
+        d.proposal = prop; d.proposal_pitch = 4;               /* block 5: the anchor + 4 */
+        CHECK_OK(rad_declare_drafter(&b, &d));
+        CHECK_EQ(rad_drafter_any_block(&b, 6), RAD_E_INVAL);     /* past its own block */
+        CHECK_EQ(rad_drafter_any_block(&b, 1), RAD_E_INVAL);     /* proposes nothing */
+        CHECK_EQ(b.program().drafter_any_block, 0);
+        CHECK_OK(rad_drafter_any_block(&b, 2));                  /* the anchor and one row */
+        CHECK_EQ(b.program().drafter_any_block, 2);
+        CHECK_OK(rad_drafter_any_block(&b, 5));                  /* == its own block, harmless */
+        CHECK_EQ(b.program().drafter_any_block, 5);
+    }
+}
+
 /* A tree drafter (rad_drafter_tree) takes a short block too: a block-16 tree of 15 nodes declares
  * one of 8 rows, over which the drafter grows a tree of its own of up to 7 nodes; and a tree of 7
  * nodes over the same block, where a chain's rule (rows past the 9 that propose nothing) would refuse

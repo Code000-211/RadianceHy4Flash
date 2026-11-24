@@ -413,6 +413,9 @@ public:
     int32_t        drafter_pos_offset = 0;
     /* A block drafter's shorter block (rad_drafter_short_block), 0 when it serves only its own. */
     int64_t        drafter_short_block = 0;
+    /* The shortest block a block drafter serves besides its own (rad_drafter_any_block), 0 when it
+     * serves only its own and its short one. */
+    int64_t        drafter_any_block = 0;
     /* A block drafter that proposes a tree (rad_drafter_tree): `drafter_parents` holds each
      * proposal's parent node, at the proposal's pitch. False and 0 for a chain drafter. */
     bool           drafter_tree = false;
