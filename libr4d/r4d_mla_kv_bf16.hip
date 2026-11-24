@@ -189,10 +189,12 @@ __device__ __forceinline__ void kvp_body(const uint16_t* __restrict__ x,
      * by no op of a pass (operand role RAD_OPD_WEIGHT, core/runtime/issue.cpp's haz_note orders no
      * read of one), so neither load can see a partial write, and the fragments stay in registers
      * across the acquire. The tokens, the attention output the predecessor wrote, stay behind the
-     * wait, exactly where the plain form's single `load` has them. */
+     * wait, exactly where the plain form's single `load` has them -- and they are this block's only
+     * read there, a vector load of its two rows, so the wait is the vector-cache one: no scalar
+     * load crosses it (tests/chain_scalar_audit.py, K-29). */
     if constexpr (CH::on) {
         wload(a0, 0);
-        r4d_chain_wait();
+        r4d_chain_wait_vec();
         xload(b0, 0);
     } else {
         load(a0, b0, 0);
@@ -336,10 +338,11 @@ __device__ __forceinline__ void kvq_body(const uint16_t* __restrict__ x, const u
         for (int qq = 0; qq < KC; ++qq) acc = kvp_wmma(a[qq], b[qq], acc);
     };
     /* Chained, the weight's first chunk goes out before the acquire and the tokens' after it, as
-     * kvp_body's do (a static weight's bytes; see the note there). */
+     * kvp_body's do (a static weight's bytes; see the note there), and for the same reason the wait
+     * is the vector-cache one. */
     if constexpr (CH::on) {
         wload(a0, 0);
-        r4d_chain_wait();
+        r4d_chain_wait_vec();
         xload(b0, 0);
     } else {
         load(a0, b0, 0);
