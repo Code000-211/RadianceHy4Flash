@@ -2371,8 +2371,11 @@ share of the projection with `gemm_nt_f32`'s own tile, whose per-lane k order an
 depend on the geometry that feeds it, so `logits` is that GEMM's bytes; the workgroup whose arrival
 completes the grid then reads them back and ranks the pass's rows, so `ids`, `weights`, the sort,
 the ungated shared gate's fill and the inverse are that launch's bytes too. `logits` is written and
-read inside this launch. Decode only: `M` up to 64 and `M * top_k` inside the sort's single
-workgroup (at most 1024), and a pass past either is refused rather than served at another cost.
+read inside this launch: the completing workgroup is not the one that computed the tile, so the bytes
+have to be visible to it, exactly as `router_gemm_topk_scatter`'s are -- what the fusion removes is
+the second launch and the host's ordering between the two, not the buffer. Decode only: `M` up to
+64 and `M * top_k` inside the sort's single workgroup (at most 1024), and a pass past either is
+refused rather than served at another cost.
 With `hq_group` 128 or 256 set it also writes the latent's rotated codes: `hq_q` `[M, K]` (int8 at
 either group, E4M3 at 128, by `hq_dtype`) and `hq_s` `[M, K / hq_group]` are `had_quant_act_i8g`'s
 or `had_quant_act_fp8`'s bytes of `x` at that group, computed by the waves the grid leaves idle
