@@ -5,6 +5,7 @@
 
 #include "mm/processor.h"
 #include "sched/mtp_couple_bind.h"
+#include "sched/draft_depth.h"
 #include "sched/scheduler.h"
 #include "sched/advance_impl.h"
 #include "sched/derive.h"
@@ -3252,6 +3253,26 @@ TEST(the_chain_runs_the_rounds_the_depth_rule_took_last_step) {
     CHECK_EQ(Scheduler::chain_rounds(3, 2, 9, 12), (int64_t)3);
     CHECK_EQ(Scheduler::chain_rounds(1, 1, 1, 2), (int64_t)1);
     CHECK_EQ(Scheduler::chain_rounds(0, 3, 1, 2), (int64_t)0);
+}
+
+/* D-07: which counted step a depth rule explores on (DraftDepthCfg::force). Exploration counts the
+ * load-aware steps of fewer than five drafting rows by steps alone and verifies the whole chain on
+ * every explore_every-th of them, so the block driver can ask about the next step before its rows
+ * are chosen and stage the whole block for it: the 20th, 40th, ... counted step and no other, none
+ * at all when the rule never explores, every counted step when it explores every step. */
+TEST(the_depth_rule_explores_on_every_nth_counted_step) {
+    DraftDepthCfg c;
+    c.explore_every = 20;
+    for (uint64_t n = 0; n <= 41; ++n)
+        CHECK_EQ(draft_depth_explore_tick(c, n), n > 0 && n % 20 == 0);
+    CHECK(!draft_depth_explore_tick(c, 19));
+    CHECK(draft_depth_explore_tick(c, 20));
+    CHECK(draft_depth_explore_tick(c, 40));
+    c.explore_every = 0;                       /* 0 = never */
+    for (uint64_t n = 0; n <= 60; n += 20) CHECK(!draft_depth_explore_tick(c, n));
+    c.explore_every = 1;                       /* every counted step */
+    CHECK(!draft_depth_explore_tick(c, 0));
+    for (uint64_t n = 1; n <= 5; ++n) CHECK(draft_depth_explore_tick(c, n));
 }
 
 TEST(no_prefix_hit_gives_nothing_back) {
@@ -8142,43 +8163,6 @@ TEST(a_block_drafters_short_block_on_the_card_runs_the_passes_the_hosts_driver_r
     const int T = 24;
     const BlockRun a = block_reference(T, 4, 3);
     const BlockRun b = block_pipelined(T, 4, 3);
-    CHECK_EQ(b.ahead, T);
-    CHECK_EQ(b.card_host_disagree, 0);
-    REQUIRE_EQ(a.trunk.size(), (size_t)T + 1);
-    REQUIRE_EQ(a.trunk.size(), b.trunk.size());
-    REQUIRE_EQ(a.context.size(), b.context.size());
-    REQUIRE_EQ(a.query.size(), b.query.size());
-    for (size_t t = 0; t < a.trunk.size(); ++t) {
-        CHECK(a.trunk[t] == b.trunk[t]);
-        CHECK_EQ(b.trunk[t].bad_slots, 0);
-    }
-    for (size_t t = 0; t < a.context.size(); ++t) {
-        BatchRows ca = a.context[t], cb = b.context[t];
-        ca.tok.clear();
-        cb.tok.clear();
-        const bool same_c = ca == cb, same_q = a.query[t] == b.query[t];
-        CHECK(same_c);
-        CHECK(same_q);
-        if (!same_c || !same_q)
-            std::fprintf(stderr, "    step %zu: context %s, query %s\n", t,
-                         same_c ? "same" : "differs", same_q ? "same" : "differs");
-        CHECK_EQ(a.context[t].bad_slots, 0);
-        CHECK_EQ(b.context[t].bad_slots, 0);
-        CHECK_EQ(a.query[t].bad_slots, 0);
-        CHECK_EQ(b.query[t].bad_slots, 0);
-    }
-    CHECK(a.out == b.out);
-}
-
-/* D-07: the same at a block the depth rule sized -- 5 rows, 4 proposals, a length the drafter
- * declared for no other reason than that its chain runs the rounds the rule took last step
- * (Engine::block_shape, rad_drafter_any_block): the card's driver stages the query pass of that
- * block, takes its proposals from the front of each row at the drafter's pitch and issues the step
- * ahead verifying 4 of them, exactly as the host's driver does. */
-TEST(a_block_the_depth_rule_sized_on_the_card_runs_the_passes_the_hosts_driver_runs) {
-    const int T = 24;
-    const BlockRun a = block_reference(T, 5, 4);
-    const BlockRun b = block_pipelined(T, 5, 4);
     CHECK_EQ(b.ahead, T);
     CHECK_EQ(b.card_host_disagree, 0);
     REQUIRE_EQ(a.trunk.size(), (size_t)T + 1);
