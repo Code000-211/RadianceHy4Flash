@@ -379,10 +379,12 @@ int Engine::tree_compact(int rows) {
  * the card is not held up by that. */
 /* The drafts an exploring step verifies whatever the tables say (DraftDepthCfg::force), 0 for the
  * others: every explore_every-th load-aware step of fewer than kExploreBelow drafting rows, counted
- * by steps alone. */
+ * by steps alone. The block driver decides this a step earlier, before it stages the chain
+ * (block_shape); this one counts the serial driver's steps as it decides them. */
 int Engine::depth_explore_force(bool load, int n) {
     if (!load || depth_cfg_.explore_every <= 0 || n >= DraftDepthCfg::kExploreBelow) return 0;
-    return (++depth_explore_n_ % (uint64_t)depth_cfg_.explore_every) == 0 ? depth_cfg_.max : 0;
+    ++depth_explore_n_;
+    return draft_depth_explore_tick(depth_cfg_, depth_explore_n_) ? depth_cfg_.max : 0;
 }
 
 int Engine::depth_row_nodes(int i) const {
@@ -1078,6 +1080,21 @@ void Engine::block_shape(int* block, int* steps) {
             *block  = (int)drafter_short_;
         }
     }
+    /* An exploring step (DraftDepthCfg::force, --draft-depth-explore) verifies the whole chain
+     * whatever the tables say, so its block is staged whole: a round the clamp below left out is
+     * one the rule can never verify, and the exploration is what lets it grow back. Whether this
+     * step is the exploring one is known only once its rows are chosen, so it is decided here, on
+     * the load of the step just run (as the short block above), and taken by block_depth_decide:
+     * one count a step, and a step exploration does not count leaves the tick due for the next
+     * one. */
+    depth_explore_step_ = false;
+    if (depth_block_ && depth_cfg_.load &&
+        draft_depth_explore_tick(depth_cfg_, depth_explore_n_ + 1) &&
+        depth_note_rows_ >= depth_cfg_.load_from &&
+        depth_note_rows_ < DraftDepthCfg::kExploreBelow) {
+        ++depth_explore_n_;
+        depth_explore_step_ = true;
+    }
     /* The rounds the depth rule can take (D-07, L5b): a block drafter that serves any block
      * (rad_drafter_any_block) proposes its chain whole in one pass, so a round past the depth the
      * rule takes this step is a head pass and a correction the verify never reads. The last step's
@@ -1087,8 +1104,9 @@ void Engine::block_shape(int* block, int* steps) {
      * is never different; a step whose rule grows by more than one round drafts and verifies a
      * shorter prefix, which is fewer tokens a step. A greedy row has no law and takes the whole
      * block, so a step that drafts only for greedy requests keeps the block at the declared depth
-     * (the first decision is the whole block, and a later one grows it back by a round a step). */
-    if (drafter_any_block_ > 0 && depth_cfg_.on) {
+     * (the first decision is the whole block, and a later one grows it back by a round a step). An
+     * exploring step keeps the whole block (above). */
+    if (drafter_any_block_ > 0 && depth_cfg_.on && !depth_explore_step_) {
         const int rounds = (int)Scheduler::chain_rounds(*steps, depth_last_, depth_cfg_.min,
                                                         drafter_any_block_);
         if (rounds < *steps) {
@@ -1240,7 +1258,11 @@ int Engine::block_depth_decide() {
         }
     }
     depth_load_step_ = load;
-    depth_cfg_.force = depth_explore_force(load, n);
+    /* An exploring step verifies the whole chain (DraftDepthCfg::force): block_shape decided it
+     * before the block was staged, from the load of the step just run, and staged the whole block
+     * for it, so the forced rounds are ones the drafter proposed. */
+    depth_cfg_.force = depth_explore_step_ ? depth_cfg_.max : 0;
+    depth_explore_step_ = false;
     if (load) {
         draft_depth_block_load(depth_cfg_, depth_row_.data(), n, steps, depth_other_rows_);
         for (int i = 0; i < n; ++i) depth_of_[(size_t)i] = std::max(1, std::min(depth_row_[(size_t)i].depth, steps));

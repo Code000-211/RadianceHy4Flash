@@ -135,6 +135,16 @@ struct DraftDepthCfg {
     int    late_lag = 1;      /* rounds the choice does not wait for: 1 = it is made while the last round runs */
 };
 
+/* Whether exploration counts a step as one of its own (DraftDepthCfg::force): it counts the
+ * load-aware steps of fewer than kExploreBelow drafting rows by steps alone, and the
+ * `explore_every`-th of them verifies the whole chain. `counted` is how many it has counted, so
+ * this asks about the next one. The block driver asks before a step's rows are known, to stage the
+ * chain whole when the step may be an exploring one (Engine::block_shape); the serial driver asks
+ * at the decision (Engine::depth_explore_force). */
+inline bool draft_depth_explore_tick(const DraftDepthCfg& c, uint64_t counted) {
+    return c.explore_every > 0 && counted > 0 && counted % (uint64_t)c.explore_every == 0;
+}
+
 /* One drafting row's chain while its step is drafted. */
 struct DraftDepthRow {
     double conf   = 1.0;     /* conf(seen) */

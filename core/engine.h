@@ -228,6 +228,7 @@ public:
 
 private:
     friend struct EngineBaseWeightsTestAccess;
+    friend struct EngineBlockShapeTestAccess;
     /* One thread per tensor-parallel rank, each owning one device. Ranks share the address
      * space, so there is no IPC or serialisation and the step batch is shared by pointer rather
      * than broadcast (spec §1). */
@@ -304,6 +305,10 @@ private:
      * runs on meta_kv_k_/meta_kv_v_ before their pointer arrays are built. */
     int apply_rope_scaling();
     int declare();
+    /* The shortest block a step's chain may be staged at (rad_drafter_any_block): a block
+     * drafter's, and no tree's, whose nodes are not a prefix of a shorter pass's. Declared here
+     * so declare() and its test read the same rule (block_shape). */
+    static int64_t any_block_of(int kind, bool tree, int64_t declared);
     int plan();
     /* Runtime LoRA (core/engine_lora.cpp). Targets are fixed before declare; adapters are loaded
      * into slots after every rank's Ctx is bound, and a request's `model` names one. */
@@ -754,7 +759,11 @@ private:
     std::chrono::steady_clock::time_point depth_note_t_{};
     int           depth_note_step_ = -2, depth_note_rows_ = 0;
     uint64_t      depth_note_n_ = 0;
-    uint64_t      depth_explore_n_ = 0;                  /* load-aware steps counted for DraftDepthCfg::force */
+    uint64_t      depth_explore_n_ = 0;                  /* steps counted for DraftDepthCfg::force */
+    /* The step in hand is the exploring one (DraftDepthCfg::force): block_shape decides it before
+     * it stages the chain, from the load of the step just run, and stages the whole block for it;
+     * block_depth_decide takes the decision as the step's `force`. */
+    bool          depth_explore_step_ = false;
     int           depth_explore_force(bool load, int n);
     void          depth_step_note(const RadBatch* b, const StepOut& so);
     void          depth_load_log(const char* when) const;

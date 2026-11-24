@@ -1045,6 +1045,10 @@ RadBuildCtx Engine::build_ctx(int rank, int64_t max_tok) const {
     return bc;
 }
 
+int64_t Engine::any_block_of(int kind, bool tree, int64_t declared) {
+    return kind == RAD_DRAFT_BLOCK && !tree ? declared : 0;
+}
+
 int Engine::declare() {
     /* An architecture that declares no streamed ops cannot stream, so with --kv-resident set on one
      * the flag is turned off here, with the decision named, before anything is planned for it. */
@@ -1664,7 +1668,7 @@ int Engine::declare() {
      * runs only with the depth rule (block_shape), which is the one thing that knows the rounds a
      * step will verify before its block is proposed. A tree's nodes are not a prefix of a shorter
      * pass's, so a tree keeps its block. */
-    drafter_any_block_ = drafter_.kind == RAD_DRAFT_BLOCK && !tree_ ? p0.drafter_any_block : 0;
+    drafter_any_block_ = any_block_of(drafter_.kind, tree_, p0.drafter_any_block);
     if (cfg_.draft_short_from > 0 && drafter_.kind == RAD_DRAFT_NONE)
         RAD_WARN("--draft-short-from %lld: this deployment runs no drafter, so there is no block "
                  "to shorten", (long long)cfg_.draft_short_from);
