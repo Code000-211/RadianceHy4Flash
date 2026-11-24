@@ -3693,7 +3693,9 @@ depth fixed when the container has the drafter).
 DFly2 also serves a short block of 4 rows (3 proposals) at depth 4 and 5, which the core stages per
 step under load with `draft-short-from: N` (from N decoding sequences on; off by default for a chain
 drafter). The draft is causal, so the short pass is the full one's first rows and the verify is
-unchanged.
+unchanged. Through `rad_drafter_any_block` it serves every block of 2 to 6 rows the same way, so with
+`draft-depth: adaptive` the core stages a step's chain at the rounds the rule took on the last step
+plus one, and the rounds the rule cannot reach are not proposed, corrected or verified (D-07).
 
 **Coupled proposals** (`--draft-coupling on`, WP13.8; kernels/dfly2.md §8.2). DFly2 has no candidate
 lattice (its predecessor dependence is the correction head plus the lm_head), so the coupled draw is

@@ -1839,7 +1839,14 @@ the walk's largest probabilities up to j (`top`) or of its drawn tokens' probabi
 (the rule reads Q_1 .. Q_j and the path x_1 .. x_{j-1}, never x_j's own mass, never Q_{j+1}, never the
 target; `tests/mtp_rrs_test.cpp` drives the real coupled walk with the two controls that fail). The
 host waits for the walk's state copy before it issues the next verify (`draft depth adaptive
-(block)` at startup). A greedy row has no law and verifies the whole block. `draft-depth-load: on`
+(block)` at startup). A greedy row has no law and verifies the whole block. With a drafter that
+serves any block from the anchor and one row up (`rad_drafter_any_block`; DFly2 does), the block is
+staged at the rounds the rule can take -- the last step's decided depth plus one, never below
+`draft-depth-min` -- so a round past that depth is not proposed, corrected or verified at all; the
+rows are the same rows, a shorter pass being the longer one's first. A step whose rule grows by two
+rounds or more drafts and verifies the shorter prefix, so it makes fewer tokens; a greedy row has no
+law and takes the whole block, so a run that drafts only for greedy requests stays at the declared
+depth. `draft-depth-load: on`
 picks the prefixes of a step's rows by the same cost model, one block pass counting as one round.
 
 **Several sequences in one step: `draft-depth-load: on`.** The stop rule prices a draft as one stream pays

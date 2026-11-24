@@ -409,6 +409,18 @@ says so with `RAD_ARCH_SERVES_IMPORTS(0)` (`qwen35_w8a8` does), and imports keep
   depth (a row holds the whole block's proposals and a short block fills its front) and is refused
   below it. The pass's block is `n_tok / n_seq`; a block the plugin has no ops for should fail the
   step (`rad_block_dflash2.h` does). Appended in ABI 27.
+- **A block drafter may serve every block from a length up.**
+  `rad_drafter_any_block(b, min_rows)`, called once after `rad_declare_drafter`, says the plugin
+  declared its query pass at every block of `min_rows` .. `RadDrafterDecl::block` rows a sequence,
+  the same anchor convention at each, so the core may stage a step at any of them; `min_rows - (the
+  drafter's block - depth)` tokens are proposed. With it the core stages a chain at the rounds its
+  depth rule can take (`--draft-depth`, GUIDE §4.6): a step whose rule took depth `d` last step
+  drafts and verifies `d + 1` rounds, not the whole block, since a round the rule cannot reach is a
+  head pass and a correction the verify never reads. A tree drafter keeps its block (its tree is not
+  a shorter pass's nodes). The builder refuses it without a block drafter, past the drafter's own
+  block, and where it would propose nothing. The plugin should refuse a block it did not declare
+  (the pass's block is `n_tok / n_seq`); `hyv4flash_dfly.h` does. Appended in ABI 44; a plugin that
+  does not call it is unaffected.
 - **Media preprocessing is the core's** (`core/mm`): resizing, patching, placeholder-token
   expansion and positions, in six processor families (Qwen-VL, Gemma 4, LFM2-VL, Unlimited-OCR,
   GLM-5.3 and Pixtral for Nemotron 3.5) chosen by the container's `vision_config.model_type`
