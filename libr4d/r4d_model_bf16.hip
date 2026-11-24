@@ -767,9 +767,14 @@ __global__ __launch_bounds__(kThreads) void rope_rows_kernel(
     const uint16_t* __restrict__ k, const uint16_t* __restrict__ v,                              \
     const int32_t* __restrict__ slot, uint16_t* __restrict__ kv, uint32_t head_dim,              \
     uint32_t kv_heads, uint32_t block_size, uint32_t n_blocks, uint32_t k_ld, uint32_t v_ld
-__device__ __forceinline__ void kv_store_body(R4D_KVS_PARAMS) {
+/* One token's key and value rows into the cache slot it maps to: `s` is the row's slot, kept apart
+ * from the body so that a chained block can read the mapping in front of its wait (K-29). */
+__device__ __forceinline__ void kv_store_row(const uint16_t* __restrict__ k,
+                                             const uint16_t* __restrict__ v, int32_t s,
+                                             uint16_t* __restrict__ kv, uint32_t head_dim,
+                                             uint32_t kv_heads, uint32_t block_size,
+                                             uint32_t n_blocks, uint32_t k_ld, uint32_t v_ld) {
     const uint32_t t = blockIdx.x;
-    const int32_t s = slot[t];
     if (s < 0 || (uint32_t)s / block_size >= n_blocks) return;
     const uint32_t blk = (uint32_t)s / block_size, off = (uint32_t)s % block_size;
     const size_t slot_base = ((size_t)blk * kv_heads * block_size + (size_t)off) * 2 * head_dim;
@@ -782,12 +787,19 @@ __device__ __forceinline__ void kv_store_body(R4D_KVS_PARAMS) {
         c[head_dim + d] = v[(size_t)t * v_ld + j];
     }
 }
+__device__ __forceinline__ void kv_store_body(R4D_KVS_PARAMS) {
+    kv_store_row(k, v, slot[blockIdx.x], kv, head_dim, kv_heads, block_size, n_blocks, k_ld, v_ld);
+}
 __global__ __launch_bounds__(kThreads) void kv_store_kernel(R4D_KVS_PARAMS) {
     kv_store_body(k, v, slot, kv, head_dim, kv_heads, block_size, n_blocks, k_ld, v_ld);
 }
 __global__ __launch_bounds__(kThreads) void r4dchain_kv_store(R4D_KVS_PARAMS) {
-    r4d_chain_wait();
-    kv_store_body(k, v, slot, kv, head_dim, kv_heads, block_size, n_blocks, k_ld, v_ld);
+    /* K-29: the step's slot mapping in front of the wait, which then covers its load; nothing else
+     * the body reads there is a scalar load (tests/chain_scalar_audit.py), so the vector-cache wait
+     * does. */
+    const int32_t s = slot[blockIdx.x];
+    r4d_chain_wait_vec();
+    kv_store_row(k, v, s, kv, head_dim, kv_heads, block_size, n_blocks, k_ld, v_ld);
     r4d_chain_done();
 }
 #undef R4D_KVS_PARAMS
