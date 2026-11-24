@@ -7,10 +7,11 @@
  * into LDS, 8 x 8 a wave) takes over; its
  * shapes cover a K short of a whole stage and of a whole step, tail rows and columns, waves with
  * no columns, and x's pitch with and without 16-byte vectors.
- * At verify heights (17-63 rows, N 128 or more) the verify staged form (x staged transposed into
- * LDS, a wave a column): its shapes cover each row bound, K one stage, short of a step and past
- * whole stages, M no multiple of 8, N no multiple of 4 (waves with no column), and x's pitch even
- * (4-byte staging) and odd, and an odd K (2-byte staging).
+ * At verify heights (17-63 rows, N 256 or more) the verify staged form (x staged transposed into
+ * LDS, a wave a column): its shapes cover each row bound, the N bound (N 255 and 128 stay on 8x1),
+ * K one stage, short of a step and past whole stages, M no multiple of 8, N no multiple of 4
+ * (waves with no column), and x's pitch even (4-byte staging) and odd, and an odd K (2-byte
+ * staging).
  *
  * R4D_EMU_F32_DUMP=<file> runs a grid instead (M 1..4096, N 128/256/512, K 3072, f32 and bf16
  * weights; R4D_EMU_F32_DUMP_M=<m> one M of it, R4D_EMU_F32_DUMP_PAD=<p> x's pitch K + p, default 0)
@@ -277,9 +278,10 @@ int main() {
     // each bound: x's pitch odd (staged a value at a time) and
     // a multiple of 8 (16 bytes at a time), K past and short of a whole stage of 256 and of a whole
     // step of 32, M no multiple of 8, and N no multiple of 32 (the last workgroup's last waves
-    // have no columns) or of 8. At 17-63 rows and N 128+ the verify staged form: 17 and 63 rows
-    // (16 and 64 are the 2x2 and 8x4 controls), K one stage, past whole stages, short of a step and
-    // under one step, N no multiple of 4, x's pitch even and odd and K odd; N 127 stays on 2x2.
+    // have no columns) or of 8. At 17-63 rows and N 256+ the verify staged form: N 256 against
+    // N 255 and 128 (8x1) at 17, 32 and 63 rows (16 and 64 are the 2x2 and 8x4 controls), K one
+    // stage, past whole stages, short of a step and under one step, N no multiple of 4, x's pitch
+    // even and odd and K odd; N 127 stays on 2x2.
     const GemmCase shapes[] = {
         { 1, 288, 512, 517 },    { 2, 288, 129, 134 },    { 3, 36, 129, 134 },
         { 8, 288, 129, 134 },    { 33, 32, 512, 517 },    { 70, 36, 129, 134 },
@@ -289,10 +291,13 @@ int main() {
         { 769, 128, 300, 305 },  { 775, 130, 600, 605 },  { 383, 256, 520, 520 },
         { 400, 256, 520, 520 },  { 800, 203, 264, 264 },  { 776, 136, 1000, 1000 },
         { 255, 512, 96, 101 },   { 256, 512, 96, 101 },   { 768, 128, 24, 24 },
-        { 17, 128, 3072, 3072 }, { 63, 256, 3072, 3080 }, { 40, 512, 520, 520 },
-        { 24, 130, 600, 602 },   { 33, 203, 24, 24 },     { 20, 128, 256, 258 },
-        { 48, 136, 4098, 4098 }, { 63, 128, 1000, 1005 }, { 30, 131, 513, 513 },
-        { 16, 128, 3072, 3072 }, { 64, 128, 3072, 3072 }, { 40, 127, 3072, 3072 },
+        { 17, 128, 3072, 3072 }, { 32, 128, 3072, 3080 }, { 63, 128, 3072, 3077 },
+        { 17, 255, 3072, 3072 }, { 32, 255, 3072, 3080 }, { 63, 255, 3072, 3077 },
+        { 17, 256, 3072, 3072 }, { 32, 256, 3072, 3080 }, { 63, 256, 3072, 3077 },
+        { 40, 512, 520, 520 },   { 24, 258, 600, 602 },   { 33, 259, 24, 24 },
+        { 20, 256, 256, 258 },   { 48, 264, 4098, 4098 }, { 63, 512, 1000, 1005 },
+        { 30, 259, 513, 513 },   { 24, 130, 600, 602 },   { 33, 203, 24, 24 },
+        { 16, 256, 3072, 3072 }, { 64, 256, 3072, 3072 }, { 40, 127, 3072, 3072 },
     };
     for (const GemmCase& sh : shapes) {
         ++cases;

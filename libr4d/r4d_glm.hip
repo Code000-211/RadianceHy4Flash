@@ -172,7 +172,7 @@ __global__ void __launch_bounds__(128)
     gemm_nt_f32_lds_body<R, C, KC, VX>(x, w, y, xp, wp, yp, m, n, k);
 }
 
-/* The staged form for verify heights (17-63 rows at N >= 128). Its grid is the 8x1 form's: a wave
+/* The staged form for verify heights (17-63 rows at N >= 256). Its grid is the 8x1 form's: a wave
  * a column, four columns and 8 rows a workgroup. The 8 rows' x is staged once a workgroup, 256
  * values of k at a time and transposed: the 8 rows' bf16 at one k are 16 bytes, so a step of k
  * costs a wave one weight load from memory and one LDS read for 8 FMA, where the 8x1 form loads a
@@ -363,14 +363,16 @@ int gemm_f32_body(const RadArgs* a, RadStream stream) {
      * pays: from 256 rows at N 512, 384 at N 256 and 768 at N 128 (below those 8x4 was as fast or
      * faster on gfx1201). It holds 16 waves a SIMD like 8x4 (8 KiB of LDS a workgroup); 16x8 and
      * 16x4 drop to 8. Decode heights keep the forms above.
-     * At verify heights (17-63 rows, N >= 128) the 8x1 form's grid with x staged transposed in
+     * At verify heights (17-63 rows) from N 256 the 8x1 form's grid with x staged transposed in
      * LDS: a step of k is one weight load and one LDS read a wave for 8 FMA, where 8x1 loads 8
-     * values of x and a weight from memory. It holds 16 waves a SIMD (8 KiB of LDS). */
+     * values of x and a weight from memory. It holds 16 waves a SIMD (8 KiB of LDS). At N 128 it
+     * was 2-21 % slower than 8x1 at every verify height (gfx1201, K 3072), so N 128-255 keeps 8x1. */
     const long rows = x.shape[0];
     const bool ch = r4d_geti_or(a, "chain", 0) != 0 && rows <= 64;   /* decode heights */
     if (n <= 8) return gemm_f32_tile<4, 1>(stream, x, w, y, n, k, ch);
     if (rows <= 16 || (rows < 64 && n < 128)) return gemm_f32_tile<2, 2, 16>(stream, x, w, y, n, k, ch);
-    if (rows < 64) return gemm_f32_xt(stream, x, w, y, n, k, ch);   /* N >= 128 here */
+    if (rows < 64 && n >= 256) return gemm_f32_xt(stream, x, w, y, n, k, ch);
+    if (rows < 64) return gemm_f32_tile<8, 1, 8>(stream, x, w, y, n, k, ch);   /* N 128-255 */
     const long lds_rows = n >= 512 ? 256 : n >= 256 ? 384 : 768;   /* where staging x pays */
     if (n >= 128 && rows >= lds_rows) return gemm_f32_lds<8, 8, 256>(stream, x, w, y, n, k);
     return gemm_f32_tile<8, 4>(stream, x, w, y, n, k, ch);
