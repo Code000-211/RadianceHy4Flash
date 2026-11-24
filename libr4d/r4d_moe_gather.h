@@ -5,6 +5,7 @@
 #include <cstdint>
 
 #include "r4d_common.h"
+#include "r4d_fwht.h"
 
 // Internal linkage, as the unit's own definition had.
 #include "r4d_chain.h"
@@ -43,6 +44,50 @@ __device__ __forceinline__ float gather_mac(float wj, float x, float acc) {
     if constexpr (F32) return fmaf(wj, x, acc);
     else return acc + wj * x;
 }
+/* The quantising form's epilogue (moe_gather_inv_i8g, K-19): the eight columns a lane has just
+ * summed, as the rotated int8 codes and the scale the linear reading them needs. It is
+ * quant_act_fp8_body<ROT, I8> (r4d_quant_act_fp8.hip) over those columns, from the values instead
+ * of from a re-read: the rotation stays 128 wide (r4d_fwht_part<8, 16> is r4d_fwht_wave<128> over
+ * sixteen lanes, r4d_fwht.h), the amax covers the scale group (`g8`: 128 columns, or 256 for an
+ * IQ8R trunk, whose two 128-wide blocks share a scale), the scale is
+ * amax/127 and the codes are round-to-nearest into -127..127. Same rotation, same sum order and
+ * same rounding, so the codes are byte for byte the standalone quantiser's.
+ *
+ * `c` is the lane's first column (a multiple of eight) and `lane` its hardware lane: the sixteen
+ * lanes of a 128-wide block are a contiguous column range, starting on a block boundary, so the
+ * wave's lane `c` holds its 8 columns of the sum row, `q` is already at the row's column `c` and
+ * `s` at the row's first scale. */
+__device__ __forceinline__ void gather_quant(const uint32_t o[4], uint32_t lane, uint32_t c,
+                                            uint32_t g8, uint8_t* __restrict__ q,
+                                            float* __restrict__ s) {
+    float v[kGatherCols];
+#pragma unroll
+    for (uint32_t i = 0; i < 4; ++i) {
+        v[2 * i]     = bf16_to_f32((uint16_t)(o[i] & 0xFFFFu));
+        v[2 * i + 1] = bf16_to_f32((uint16_t)(o[i] >> 16));
+    }
+    r4d_fwht_part<8, 16>(v, (int)lane);
+    float m = 0.0f;
+#pragma unroll
+    for (uint32_t j = 0; j < kGatherCols; ++j) m = fmaxf(m, fabsf(v[j]));
+    /* A wave holds two 128-wide blocks, so one lane a block writes its block's scale; a 256-wide
+     * group is both blocks, whose amax and scale are the wave's. */
+    const bool wide = g8 > 128;
+    m = wide ? r4d_wave_max(m) : r4d_xor_max<16>(m);
+    const float sc = m > 0.0f ? m * (1.0f / 127.0f) : 1.0f;
+    if ((lane & (wide ? 31u : 15u)) == 0) s[c / g8] = sc;
+    const float inv = 1.0f / sc;
+#pragma unroll
+    for (uint32_t i = 0; i < 2; ++i) {
+        uint32_t b = 0;
+#pragma unroll
+        for (uint32_t j = 0; j < 4; ++j) {
+            const int code = (int)rintf(fminf(fmaxf(v[4 * i + j] * inv, -127.0f), 127.0f));
+            b |= ((uint32_t)code & 0xFFu) << (8 * j);
+        }
+        *(uint32_t*)(q + 4 * i) = b;
+    }
+}
 /* The body, over the block's two shared tables, which the kernel that calls it owns: a function
  * because a block past the last token returns at once, and a chained block must still add to its
  * queue's counter (r4d_chain.h)).
@@ -59,8 +104,12 @@ __device__ __forceinline__ float gather_mac(float wj, float x, float acc) {
     const uint16_t* __restrict__ sg, uint32_t sh_ld, uint32_t sg_ld, int sig
 #define R4D_MG_ARGS                                                                              \
     ye, ew, inv, y, M, n, top_k, ye_ld, ew_ld, y_ld, sorted, T, sh, sg, sh_ld, sg_ld, sig
-template <uint32_t NTHR, bool F32, uint32_t TOPK = 0, uint32_t COLS = 1>
-__device__ __forceinline__ void gather_body(R4D_MG_PARAMS, int32_t* s_i, float* s_w) {
+template <uint32_t NTHR, bool F32, uint32_t TOPK = 0, uint32_t COLS = 1, bool Q = false>
+__device__ __forceinline__ void gather_body(R4D_MG_PARAMS, int32_t* s_i, float* s_w,
+                                            uint8_t* __restrict__ q8 = nullptr,
+                                            float* __restrict__ s8 = nullptr,
+                                            uint32_t q_ld = 0, uint32_t s_ld = 0,
+                                            uint32_t g8 = 128) {
     const uint32_t t = blockIdx.x;
     if (t >= M) return;
     const uint32_t k = TOPK ? TOPK : top_k;
@@ -159,6 +208,10 @@ __device__ __forceinline__ void gather_body(R4D_MG_PARAMS, int32_t* s_i, float* 
                 o[q] = (uint32_t)lo | ((uint32_t)hi << 16);
             }
             *(uint4*)(y + (size_t)t * y_ld + c) = make_uint4(o[0], o[1], o[2], o[3]);
+            /* The same sums, as the codes a following int8 linear reads (K-19). */
+            if constexpr (Q)
+                gather_quant(o, threadIdx.x & 31u, c, g8, q8 + (size_t)t * q_ld + c,
+                             s8 + (size_t)t * s_ld);
         }
     }
 }
@@ -175,6 +228,20 @@ __global__ __launch_bounds__(NTHR) void gather_kernel16(R4D_MG_PARAMS) {
     __shared__ int32_t s_i[kGatherSlots];
     __shared__ float   s_w[kGatherSlots];
     gather_body<NTHR, F32, 16, kGatherCols>(R4D_MG_ARGS, s_i, s_w);
+}
+/* The quantising sixteen-slot form (moe_gather_inv_i8g): the same sums and the same `y` store, and
+ * the rotated int8 codes and scales of the row it sums, so `lat_out`'s quantiser launch goes away.
+ * The launcher takes it only where `n` is a whole number of 256-column waves (a wave is two
+ * 128-wide rotation blocks) and top_k is sixteen. */
+template <uint32_t NTHR, bool F32 = false>
+__global__ __launch_bounds__(NTHR) void gather_kernel16_q8(R4D_MG_PARAMS,
+                                                          uint8_t* __restrict__ q8,
+                                                          float* __restrict__ s8,
+                                                          uint32_t q_ld, uint32_t s_ld,
+                                                          uint32_t g8) {
+    __shared__ int32_t s_i[kGatherSlots];
+    __shared__ float   s_w[kGatherSlots];
+    gather_body<NTHR, F32, 16, kGatherCols, true>(R4D_MG_ARGS, s_i, s_w, q8, s8, q_ld, s_ld, g8);
 }
 /* The chained form, taken where the gather is the op's one launch (a decode step). */
 template <uint32_t NTHR, bool F32 = false>

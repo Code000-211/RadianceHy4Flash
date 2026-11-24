@@ -2259,6 +2259,25 @@ inline rad_op decl_gated_fold_mx(RadBuilder* b, int64_t rows, int64_t N, int64_t
     return 0;
 }
 
+/* The operands decl_gated_fold_iqr serves, one rule for every gated MLP (the dense block, the
+ * shared expert, the plugin's GatedMlp): the gate_up's weight is IQR (the layout gemm_iqr_gated
+ * decodes), and its input's codes and the product's are the rotated int8 trunk's pair at the
+ * 128-wide group the op is declared with, the product's written by the producer that quantised
+ * it (`out.q8_fed`) and the input's either fed the same way (`in_fed`, a linear that shares a
+ * producer's codes, Lin::feed) or written by the gate_up's own rotating quantiser
+ * (had_quant_act_i8g, which the caller issues in front: Lin::quantise). A fed input has to be the
+ * rotated pair's, `q8_fed` with `q8_rot` as the blocks' own condition read it; an input the
+ * gate_up quantises itself needs the pair at the op's group and no more, because that quantiser
+ * writes the rotated codes. Anything else -- another form, a group the op does not read, a weight
+ * in bf16 -- takes the pair instead. */
+inline bool gated_fold_iqr_ok(const LinearFP8& gu, const ActFP8& in, const ActFP8& out,
+                              bool in_fed) {
+    if (!gu.iqr) return false;
+    if (!out.q8 || !out.s8 || !out.q8_fed || !out.q8_rot || out.g8 != RAD_FP8_BLOCK) return false;
+    if (!in.q8 || !in.s8 || in.g8 != out.g8) return false;
+    return in_fed ? (in.q8_fed && in.q8_rot) : true;
+}
+
 /* The same fold over an IQR [2n, K] gate_up weight under the rotated int8 trunk (`gemm_nt_q_gated`
  * at i8a8h: the codes and scale views gemm_nt_q reads, the input's and the output's int8 pairs, both
  * in the Hadamard domain), declared for M up to min(rows, 16): libr4d's gemm_iqr_gated serves its

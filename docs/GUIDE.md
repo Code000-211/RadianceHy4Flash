@@ -979,10 +979,11 @@ models:
 *An n-gram table* (Qwen3.8-Flash-Next's is 47.7 GiB) is read a few rows a token. `disk` reads rows
 from the container through a row cache with direct reads on the host; about half of a step's rows
 are first-seen, so steps wait on the drive. `ram` copies the table into host memory at load (12 to
-40 s more startup, depending on the page cache) and the card's gather kernel reads the pinned copy,
-so a step has no host work. `vram` puts all of it on every card. `ram` needs the table's size free
-after the pinned host pools and the prefix cache's host tier, with `memory.host-headroom-mib` to spare
-(default 4 GiB), under every memory cgroup the process sits in, and refuses the start otherwise.
+40 s of reading, run beside the container pass, depending on the page cache) and the card's gather
+kernel reads the pinned copy, so a step has no host work. `vram` puts all of it on every card.
+`ram` needs the table's size free after the pinned host pools and the prefix cache's host tier, with
+`memory.host-headroom-mib` to spare (default 4 GiB), under every memory cgroup the process sits in,
+and refuses the start otherwise.
 `auto` takes the first of `vram`, `ram` and `disk` that holds the table. Without a device kernel
 for the gather (no libr4d) the table is read on the host: `vram` is refused, and `ram` is a copy in
 locked huge pages, which also needs a memlock limit that large (`--ulimit memlock=-1` in Docker,
@@ -4888,9 +4889,12 @@ curl -s -H "Authorization: Bearer $KEY" localhost:8000/diagnostics | jq '.findin
 
 Before the report the bring-up logs one `startup: <phase> in <x.x> s (at <y.y> s)` line per phase:
 `declare` (with `arena levels` in it), `plan` (with `host pool pin` in it), `weights` (the one pass
-over the container and the Engram table copies), `kv`, `contexts`, `settle` and `ready`, where `in`
-is the phase's own duration and `at` the seconds since the engine started; the n-gram table and
-container-pass lines give their own duration and take only the `(at <y.y> s)` suffix.
+over the container, which the Engram table copies run beside), `kv`, `contexts`, `settle` and
+`ready`, where `in` is the phase's own duration and `at` the seconds since the engine started; each
+n-gram table's line gives that table's own fill duration (`filled beside the container pass`) and
+the container-pass line its own, both taking only the `(at <y.y> s)` suffix. The tables start
+reading as the pass meets them and are joined after it, so the phase is the longer of the pass and
+the tables rather than their sum.
 
 ### 7.2 Messages and what they mean
 

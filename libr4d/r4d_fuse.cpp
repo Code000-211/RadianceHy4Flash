@@ -510,6 +510,49 @@ extern "C" int r4d_fuse_gemm_nt_q_gated_iqr(const RadParam* p, int n_p, uint64_t
 }
 
 /* ==========================================================================================
+ * gemm_nt_q_dual at i8a8h -- two IQR weights of one activation's codes read in one launch (K-02's
+ * q_nope and q_rope). (row: gemm_iqr_dual, M == 1; kernel: libr4d/r4d_gemm_iqr.hip, whose dual
+ * GEMV puts the two launches' blocks in one grid at one eight-wave block size, each part doing what
+ * it does in a launch of its own, so each writes its own launch's bytes.)
+ *
+ * Operands: [0] a  [1] a_scale  [2] b  [3] b_scale  [4] y  [5] b2  [6] b2_scale  [7] y2
+ *
+ * The chain of the two `gemm_nt_q` rows it replaces: the first of the pair over `a`, then the
+ * second, over the same `a` and scales and with its own N (`N2`).
+ */
+extern "C" int r4d_fuse_gemm_nt_q_dual_iqr(const RadParam* p, int n_p, uint64_t present, int step,
+                                          RadFuseStep* out) {
+    (void)present;
+    if (!out) return RAD_E_INVAL;
+    const int64_t M = pi(p, n_p, "M"), N = pi(p, n_p, "N"), N2 = pi(p, n_p, "N2"),
+                  K = pi(p, n_p, "K");
+    const char* dt = r4d_pgets(p, n_p, "dtype");
+    if (M <= 0 || N <= 0 || N2 <= 0 || K <= 0) return RAD_E_UNSUPPORTED;
+    if (pi(p, n_p, "group", R4D_FP8_BLOCK) != R4D_FP8_BLOCK) return RAD_E_UNSUPPORTED;
+    if (!dt || (std::strcmp(dt, "i8a8") && std::strcmp(dt, "i8a8h"))) return RAD_E_UNSUPPORTED;
+
+    switch (step) {
+    case 0: {
+        Step s(out, "gemm_nt_q");
+        s.mirror(p, n_p, "M").mirror(p, n_p, "N").mirror(p, n_p, "K")
+         .mirror(p, n_p, "group").mirror(p, n_p, "dtype");
+        /* a, a_scale, b, b_scale, y, a_sum, b_ref */
+        return s.wire({ 0, 1, 2, 3, 4, RAD_FUSE_NONE, RAD_FUSE_NONE });
+    }
+    case 1: {
+        Step s(out, "gemm_nt_q");
+        /* the second weight's own N is the pair's N2 */
+        s.mirror(p, n_p, "M").pint("N", N2).mirror(p, n_p, "K")
+         .mirror(p, n_p, "group").mirror(p, n_p, "dtype");
+        /* the second weight reads the same a and a_scale */
+        return s.wire({ 0, 1, 5, 6, 7, RAD_FUSE_NONE, RAD_FUSE_NONE });
+    }
+    default:
+        return RAD_E_NOTFOUND;
+    }
+}
+
+/* ==========================================================================================
  * gdn_conv_recurrent_update -- the decode convolution folded into the recurrent update's prologue.
  * (row: gdn_conv_recurrent_update_k128_v128_bf16; kernel: libr4d/
  * r4d_gdn_recurrent_update_k128_v128_bf16_fp32state.hip, r4d_gdn_recurrent_update_kernel under CV)
