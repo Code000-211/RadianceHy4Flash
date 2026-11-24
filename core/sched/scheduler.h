@@ -523,6 +523,29 @@ public:
         if (decoded <= 1 || decoded + 2 <= from) return false;
         return was_on;
     }
+    /* The rounds a block drafter's chain runs this step, from the depth the depth rule took on the
+     * last one (D-07, L5b). The rule cannot take draft j + 1 once its statistic fails at j, and a
+     * block is proposed whole in one pass, so a round past the depth the rule takes is a head
+     * pass and a correction nothing verifies. `decided` is the deepest row of the last step's
+     * decision (0 before the first one): the chain runs one round past it, for a statistic that
+     * grows between steps, never past the head's depth `depth` and never below the floor -- the
+     * rounds the rule always takes (`rule_min`) and the shortest chain the drafter serves
+     * (`min_rows - 1`, a block's rows less its anchor).
+     *
+     * The number is a function of the past -- the last step's decision -- like the rule's own
+     * statistic, so a step's drafts and the law it emits are unchanged wherever the chain is at
+     * least as long as the rule takes this step; where it is shorter the step drafts and verifies
+     * a shorter prefix (a different number of tokens a step, never a different token). */
+    static int64_t chain_rounds(int64_t depth, int64_t decided, int64_t rule_min, int64_t min_rows) {
+        if (depth < 1) return 0;
+        if (decided < 1) return depth;          /* no decision yet: the declared depth */
+        int64_t r = decided + 1;                /* one round of headroom */
+        const int64_t serve_min = min_rows - 1;
+        const int64_t floor_rounds = rule_min > serve_min ? rule_min : serve_min;
+        if (r < floor_rounds) r = floor_rounds;
+        if (r > depth) r = depth;
+        return r;
+    }
     const RadBatch* block_context(int step);
     const RadBatch* block_query(int step);
     void block_end();

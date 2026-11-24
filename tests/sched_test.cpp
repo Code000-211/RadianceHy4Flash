@@ -3224,6 +3224,36 @@ TEST(the_short_block_switches_off_at_one_sequence) {
     CHECK(!Scheduler::short_block_on(true, 0, 1));
 }
 
+/* D-07: the rounds a block drafter's chain runs, from the depth the rule took on the last step. The
+ * first step (no decision) runs the head's whole depth; after that one round past the deepest row
+ * of the last decision, never past the depth and never below the floor the rule and the drafter
+ * insist on. */
+TEST(the_chain_runs_the_rounds_the_depth_rule_took_last_step) {
+    /* The first step: nothing decided, so the declared depth, whatever the floors say. */
+    CHECK_EQ(Scheduler::chain_rounds(5, 0, 1, 2), (int64_t)5);
+    CHECK_EQ(Scheduler::chain_rounds(2, 0, 1, 2), (int64_t)2);
+    /* A decision of j runs j + 1 rounds: one of headroom for a statistic that grows between
+     * steps. The rules are minimal (a round, and a block of two rows) so nothing clamps. */
+    const int64_t want[6] = { 5, 2, 3, 4, 5, 5 };
+    for (int64_t decided = 0; decided <= 5; ++decided)
+        CHECK_EQ(Scheduler::chain_rounds(5, decided, 1, 2), want[decided]);
+    /* Never below the floor the rule always takes (--draft-depth-min). */
+    CHECK_EQ(Scheduler::chain_rounds(5, 1, 3, 2), (int64_t)3);
+    CHECK_EQ(Scheduler::chain_rounds(5, 2, 3, 2), (int64_t)3);
+    CHECK_EQ(Scheduler::chain_rounds(5, 3, 3, 2), (int64_t)4);
+    /* Nor below the shortest chain the drafter serves (a block of min_rows rows): the plugin's
+     * kBlockRowsMin is 2, and a drafter with a shorter block could still be asked for more. */
+    CHECK_EQ(Scheduler::chain_rounds(5, 1, 1, 4), (int64_t)3);
+    CHECK_EQ(Scheduler::chain_rounds(6, 1, 1, 4), (int64_t)3);
+    CHECK_EQ(Scheduler::chain_rounds(6, 3, 1, 4), (int64_t)4);
+    /* Never past the depth, floor and headroom alike, and nothing for a depth of none. */
+    CHECK_EQ(Scheduler::chain_rounds(2, 5, 1, 2), (int64_t)2);
+    CHECK_EQ(Scheduler::chain_rounds(3, 2, 9, 2), (int64_t)3);
+    CHECK_EQ(Scheduler::chain_rounds(3, 2, 9, 12), (int64_t)3);
+    CHECK_EQ(Scheduler::chain_rounds(1, 1, 1, 2), (int64_t)1);
+    CHECK_EQ(Scheduler::chain_rounds(0, 3, 1, 2), (int64_t)0);
+}
+
 TEST(no_prefix_hit_gives_nothing_back) {
     const RefillRun r = refill_run(1100, 0);
     CHECK_EQ(r.m.draft_refills, (int64_t)0);
@@ -8112,6 +8142,43 @@ TEST(a_block_drafters_short_block_on_the_card_runs_the_passes_the_hosts_driver_r
     const int T = 24;
     const BlockRun a = block_reference(T, 4, 3);
     const BlockRun b = block_pipelined(T, 4, 3);
+    CHECK_EQ(b.ahead, T);
+    CHECK_EQ(b.card_host_disagree, 0);
+    REQUIRE_EQ(a.trunk.size(), (size_t)T + 1);
+    REQUIRE_EQ(a.trunk.size(), b.trunk.size());
+    REQUIRE_EQ(a.context.size(), b.context.size());
+    REQUIRE_EQ(a.query.size(), b.query.size());
+    for (size_t t = 0; t < a.trunk.size(); ++t) {
+        CHECK(a.trunk[t] == b.trunk[t]);
+        CHECK_EQ(b.trunk[t].bad_slots, 0);
+    }
+    for (size_t t = 0; t < a.context.size(); ++t) {
+        BatchRows ca = a.context[t], cb = b.context[t];
+        ca.tok.clear();
+        cb.tok.clear();
+        const bool same_c = ca == cb, same_q = a.query[t] == b.query[t];
+        CHECK(same_c);
+        CHECK(same_q);
+        if (!same_c || !same_q)
+            std::fprintf(stderr, "    step %zu: context %s, query %s\n", t,
+                         same_c ? "same" : "differs", same_q ? "same" : "differs");
+        CHECK_EQ(a.context[t].bad_slots, 0);
+        CHECK_EQ(b.context[t].bad_slots, 0);
+        CHECK_EQ(a.query[t].bad_slots, 0);
+        CHECK_EQ(b.query[t].bad_slots, 0);
+    }
+    CHECK(a.out == b.out);
+}
+
+/* D-07: the same at a block the depth rule sized -- 5 rows, 4 proposals, a length the drafter
+ * declared for no other reason than that its chain runs the rounds the rule took last step
+ * (Engine::block_shape, rad_drafter_any_block): the card's driver stages the query pass of that
+ * block, takes its proposals from the front of each row at the drafter's pitch and issues the step
+ * ahead verifying 4 of them, exactly as the host's driver does. */
+TEST(a_block_the_depth_rule_sized_on_the_card_runs_the_passes_the_hosts_driver_runs) {
+    const int T = 24;
+    const BlockRun a = block_reference(T, 5, 4);
+    const BlockRun b = block_pipelined(T, 5, 4);
     CHECK_EQ(b.ahead, T);
     CHECK_EQ(b.card_host_disagree, 0);
     REQUIRE_EQ(a.trunk.size(), (size_t)T + 1);
