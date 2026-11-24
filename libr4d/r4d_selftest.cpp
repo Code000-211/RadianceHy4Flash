@@ -34306,6 +34306,10 @@ struct IjDev {
         if (!c.ys) absent(t[10]);
         if (!c.xs) absent(t[11]);
         if (c.eg) {
+            /* the Engram form carries no codes, but xq and xs are operands of the op all the same:
+             * a list without their slots puts eg_key where xq's i8 tensor is expected */
+            t.push_back(RadTensor{});
+            t.push_back(RadTensor{});
             t.push_back(T(key, RAD_BF16, { M, W }));
             t.push_back(T(val, RAD_BF16, { M, n }));
             t.push_back(T(mask, RAD_I32, { M, 1 }));
