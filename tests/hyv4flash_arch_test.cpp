@@ -426,6 +426,8 @@ TEST(the_ahead_ids_are_hashed_only_for_a_host_gather) {
     run(false, "1");            /* the A/B arm: hashed for a device gather too */
     run(true, "0");             /* never hashed */
     unsetenv("RADIANCE_HY4_ENGRAM_AHEAD");
+}
+
 TEST(last_layer_keeps_cache_writers_at_chunk_height_and_queries_at_output_height) {
     RadBuilder b;
     bf16_encs(&b);
