@@ -16,6 +16,7 @@
 #include <cmath>
 #include <cstdint>
 #include "r4d_common.h"
+#include "r4d_engram_gate.h"   // the Engram form's gate stage (P-07)
 #include "r4d_q8.h"   // q8_row_had_i8g: the next norm's rotated int8 codes (G-3b)
 
 namespace r4d_ihc {
@@ -138,15 +139,20 @@ __device__ __forceinline__ void collapse8(const uint16_t* __restrict__ hr, const
 //     here is held in LDS as the bf16 the chain stores.
 //   * ihc_post's `bf16(post[j] * y + h)` with the product rounded first (__fmul_rn / __fadd_rn);
 //   * ihc_pre's order above, over the h just written (from the same registers);
+//   * the Engram form (EG): engram_gate's own row (r4d_engram_gate.h) between the write and those
+//     sums, over the h as stored, the first 256 threads' waves taking the gate's partition;
 //   * the collapse x rounded to bf16 into LDS and normed from there.
 //
 // The row's input (`a`, or `a + b`, or the reduced sum) is in `ybuf` (n bf16, 16-byte aligned) on
 // entry, each thread having written its own 8-column groups; `ybuf` ends holding x (TAIL) or y.
-template <int HC, bool POST>
+template <int HC, bool POST, bool EG = false>
 struct JuncLds {
     float red1[kWaves], red2[kWaves];
     float part[kWaves][(POST ? 2 * HC : HC) + 1];
     float gate[HC], pv[HC];
+    /* EG: engram_gate's two wave-sum arrays, in its order (wave, value) */
+    float eg1[EG ? r4d_eg::kWaves : 1][EG ? 1 + 2 * HC : 1];
+    float eg2[EG ? r4d_eg::kWaves : 1][EG ? HC : 1];
 };
 
 // rmsnorm_bf16's block_sum: the wave butterfly, then the waves from 0.0f in order.
@@ -181,9 +187,9 @@ __device__ __forceinline__ void norm_row(const uint16_t* buf, const float* __res
     }
 }
 
-// Passed by value as a kernel argument: no padding anywhere (the pointers first, the 32-bit
-// fields filling 32 bytes), so the argument bytes are the fields' and a recorded pass's audit
-// (core/runtime/ctx.cpp tapes_agree) compares the same bytes every step.
+// Passed by value as a kernel argument: no padding anywhere (the pointers and 64-bit fields first,
+// the 32-bit fields filling a whole 8-byte multiple), so the argument bytes are the fields' and a
+// recorded pass's audit (core/runtime/ctx.cpp tapes_agree) compares the same bytes every step.
 struct JuncRow {
     const float* w_post;
     float* post_row;          // [hc] f32: read (this connection), written (the next one's, POST && TAIL)
@@ -199,12 +205,20 @@ struct JuncRow {
     uint64_t cqp, csp;        // the row pitches of cq and cs
     uint32_t n;
     float eps, ieps, heps, pmag, wadd, mult;
+    /* the Engram form (EG): its key [hc * n] and val [n] bf16 rows at the pitches egkp / egvp, its
+     * mask [M], its four WT weights (wk, wq, wb [hc * n], wv [n]) and engram_gate's two floats */
+    const void *eg_key, *eg_val, *eg_wk, *eg_wq, *eg_wv, *eg_wb;
+    const int32_t* eg_mask;
+    uint64_t egkp, egvp;
+    float eg_eps, eg_inv_sqrt_n;
+    uint32_t eg_w_bf16 = 0;
     uint32_t pad_ = 0;
 };
-static_assert(sizeof(JuncRow) == 15 * 8 + 8 * 4, "JuncRow carries no padding");
+static_assert(sizeof(JuncRow) == 24 * 8 + 12 * 4, "JuncRow carries no padding");
 
-template <int HC, bool POST, bool TAIL>
-__device__ __forceinline__ void junction_row(JuncLds<HC, POST>& L, uint16_t* ybuf, const JuncRow& r) {
+template <int HC, bool POST, bool TAIL, bool EG = false>
+__device__ __forceinline__ void junction_row(JuncLds<HC, POST, EG>& L, uint16_t* ybuf,
+                                            const JuncRow& r) {
     constexpr int R = POST ? 2 * HC : HC;
     const uint32_t t = threadIdx.x, n = r.n;
     if (t < (uint32_t)HC) L.pv[t] = r.post_row[t];
@@ -234,7 +248,30 @@ __device__ __forceinline__ void junction_row(JuncLds<HC, POST>& L, uint16_t* ybu
             f[e] = bf16_to_f32(b[e]);
         }
         *(uint4*)(r.hr + c0) = pack8(b);
-        if (TAIL) acc_piece<R, true>(acc, f, 8u, r.fn, r.fp, c0);
+        if constexpr (TAIL && !EG) acc_piece<R, true>(acc, f, 8u, r.fn, r.fp, c0);
+    }
+    if constexpr (EG) {
+        // 2b. The Engram's gate over the h just written (engram_gate's row: its first 256 threads'
+        //     waves own the columns), then the next connection's sums over the gated h as stored.
+        //     `eg_mask` is this block's rows (the caller has added the row it holds).
+        __syncthreads();
+        const bool on = r.eg_mask[0] != 0 && t < (uint32_t)r4d_eg::kThreads;
+        if (r.eg_w_bf16)
+            r4d_eg::row<HC, uint16_t>((const uint16_t*)r.eg_key, (const uint16_t*)r.eg_val,
+                                      (const uint16_t*)r.eg_wk, (const uint16_t*)r.eg_wq,
+                                      (const uint16_t*)r.eg_wv, (const uint16_t*)r.eg_wb, r.hr, n,
+                                      r.eg_eps, r.eg_inv_sqrt_n, L.eg1, L.eg2, on);
+        else
+            r4d_eg::row<HC, float>((const uint16_t*)r.eg_key, (const uint16_t*)r.eg_val,
+                                   (const float*)r.eg_wk, (const float*)r.eg_wq,
+                                   (const float*)r.eg_wv, (const float*)r.eg_wb, r.hr, n, r.eg_eps,
+                                   r.eg_inv_sqrt_n, L.eg1, L.eg2, on);
+        __syncthreads();
+        for (uint32_t p = t; p < pieces; p += kThreads) {
+            float f[8];
+            unpack8(*(const uint4*)(r.hr + 8u * p), f);
+            acc_piece<R, true>(acc, f, 8u, r.fn, r.fp, 8u * p);
+        }
     }
     if constexpr (TAIL) {
         // 3. gates and post (finish's barriers also publish h to the block), the collapse into
@@ -268,6 +305,8 @@ struct R4dIhcJunction {
     long long M = 0, ap = 0, bp = 0, pp = 0, hp = 0, xnp = 0, yp = 0, xp = 0;
     int hc = 0;
     bool post = false, tail = false;
+    bool eg = false;        // the Engram form: the gate between the write and the sums
+    bool eg_w_bf16 = false; // its four weights are bf16 (else f32)
 };
 
 }  // namespace r4d_ihc

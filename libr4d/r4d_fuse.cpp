@@ -907,17 +907,20 @@ extern "C" int r4d_fuse_ar_rmsnorm_quant_fp8(const RadParam* p, int n_p, uint64_
 }
 
 /* ==========================================================================================
- * rmsnorm_ihc_junction -- [add] -> rmsnorm -> ihc_post -> [ihc_pre -> rmsnorm].
+ * rmsnorm_ihc_junction -- [add] -> rmsnorm -> ihc_post -> [engram_gate] -> [ihc_pre -> rmsnorm].
  * (kernel: libr4d/r4d_ihc_bf16.hip, ihc_junction_kernel over r4d_ihc.h's junction_row)
  *
  * Operands: [0] a (inout)  [1] b?  [2] w_post  [3] post (inout)  [4] h (inout)  [5] fn?  [6] scale?
  *           [7] base?  [8] w_next?  [9] xn?  [10] y?  [11] x?  [12] xq?  [13] xs?
+ *           [14] eg_key?  [15] eg_val?  [16] eg_mask?  [17] eg_w_key?  [18] eg_w_query?
+ *           [19] eg_w_val?  [20] eg_w_branch?
  *
  * The add (when `b` is present) writes the sum back into `a`, which the norm then reads, as the
  * Hy4 plugin's MoE join does. `y` and `x` are the chain's intermediates: a fused operand when the
  * caller passed one, else a temporary. `post` is ihc_post's input and, at rows == 2 hc, ihc_pre's
  * output (the next connection's weights); the head form (rows == hc) passes ihc_pre no `post`.
- * ihc_pre's `eps` is the junction's `ihc_eps`.
+ * ihc_pre's `eps` is the junction's `ihc_eps`. With `engram` (P-07) the Engram's gate sits between
+ * ihc_post and ihc_pre, over the h ihc_post wrote, and reads its seven operands from [14] on.
  */
 namespace {
 int fuse_ihc_junction(const RadParam* p, int n_p, uint64_t present, int step, RadFuseStep* out,
@@ -948,6 +951,9 @@ int fuse_ihc_junction(const RadParam* p, int n_p, uint64_t present, int step, Ra
         }
         --k;
     }
+    /* P-07: the Engram's gate is one more step, so every step behind it shifts by one. */
+    const bool eg = tail && pi(p, n_p, "engram", 0) != 0;
+    if (eg && k > 2) --k;
     switch (k) {
     case 0: {
         Step s(out, "rmsnorm");
@@ -961,6 +967,20 @@ int fuse_ihc_junction(const RadParam* p, int n_p, uint64_t present, int step, Ra
     }
     case 2: {
         if (!tail) return RAD_E_NOTFOUND;
+        /* P-07: the Engram's gate over the h ihc_post wrote, before ihc_pre reads it. */
+        if (pi(p, n_p, "engram", 0)) {
+            const RadParam* ee = rad_param_find(p, n_p, "eg_eps");
+            if (!ee || rows != 2 * hc) return RAD_E_UNSUPPORTED;
+            if (!RAD_FUSE_HAS(present, 14) || !RAD_FUSE_HAS(present, 15) ||
+                !RAD_FUSE_HAS(present, 16) || !RAD_FUSE_HAS(present, 17) ||
+                !RAD_FUSE_HAS(present, 18) || !RAD_FUSE_HAS(present, 19) ||
+                !RAD_FUSE_HAS(present, 20))
+                return RAD_E_NOTFOUND;
+            Step s(out, "engram_gate");
+            s.mirror(p, n_p, "M").mirror(p, n_p, "n").mirror(p, n_p, "hc").pf64("eps", ee->dval)
+             .mirror(p, n_p, "dtype");
+            return s.wire({ 14, 15, 16, 17, 18, 19, 20, 4 });   /* .., eg_w_branch, h */
+        }
         const RadParam* ie = rad_param_find(p, n_p, "ihc_eps");
         const RadParam* he = rad_param_find(p, n_p, "hc_eps");
         if (!ie || !he) return RAD_E_UNSUPPORTED;

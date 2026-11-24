@@ -31,14 +31,16 @@
 #include "r4d_chain.h"
 #include "r4d_common.h"
 #include "r4d_emit.h"
+#include "r4d_engram_gate.h"
 #include <cmath>
 #include <cstdint>
 
 namespace {
 
-enum { kEgThreads = 256, kEgWaves = kEgThreads / 32 };
+enum { kEgThreads = r4d_eg::kThreads, kEgWaves = r4d_eg::kWaves };
 
-__device__ __forceinline__ float eg_sigmoid(float x) { return 1.0f / (1.0f + expf(-x)); }
+
+__device__ __forceinline__ float eg_sigmoid(float x) { return r4d_eg::sigmoid(x); }
 
 __device__ __forceinline__ int64_t eg_floor_mod(int64_t a, int64_t b) {
     const int64_t r = a % b;

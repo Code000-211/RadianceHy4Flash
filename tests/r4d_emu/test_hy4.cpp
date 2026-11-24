@@ -581,13 +581,20 @@ static void host_rmsnorm_row(const uint16_t* x, const float* g, int n, float eps
 }
 
 static void ihc_junction() {
-    struct G { int64_t hc, n, M; bool add, ys, xs, tail, head; };
+    struct G { int64_t hc, n, M; bool add, ys, xs, tail, head; bool eg, egbf; };
     const G cases[] = {
         { 4, 3072, 1, false, false, false, true, false }, { 4, 3072, 6, true, true, true, true, false },
         { 4, 512, 17, true, false, true, true, false },   { 4, 512, 6, false, true, false, true, true },
         { 2, 128, 6, true, true, true, false, false },    { 2, 128, 64, false, false, false, true, false },
         { 4, 512, 3, true, false, false, true, true },    { 8, 64, 2, false, true, true, true, false },
         { 2, 128, 1024, true, true, false, true, false },
+        /* P-07: the Engram form -- the gate between ihc_post and ihc_pre -- f32 and bf16 weights,
+         * the second also over the y / x stores an engram layer's junction does not use */
+        { 4, 3072, 1, false, false, false, true, false, true, false },
+        { 4, 3072, 6, true, true, true, true, false, true, true },
+        { 2, 512, 17, true, false, false, true, false, true, false },
+        { 4, 128, 1024, false, true, true, true, false, true, true },
+        { 8, 64, 3, true, true, true, true, false, true, false },
     };
     for (const G& g : cases) {
         Rng rng((uint32_t)(g.hc * 13 + g.n + g.M));
@@ -604,11 +611,34 @@ static void ihc_junction() {
         for (auto& v : P) v = 0.5f + rng.u();
         for (auto& v : fn) v = rng.n() * 0.05f;
         for (auto& v : base) v = rng.n() * 0.7f;
+        /* the Engram form's seven operands: key [M, hc n], val [M, n], the row mask (every third
+         * row off, so the gate leaves it untouched), and its four weights, f32 or bf16 */
+        std::vector<uint16_t> KY((size_t)(M * W)), VA((size_t)(M * n)), WKh, WQh, WVh, WBh;
+        std::vector<int32_t> MK((size_t)M);
+        std::vector<float> WK((size_t)W), WQ((size_t)W), WV((size_t)n), WB((size_t)W);
+        for (auto& v : KY) v = f2b(rng.n() * 2);
+        for (auto& v : VA) v = f2b(rng.n() * 2);
+        for (int64_t r = 0; r < M; ++r) MK[(size_t)r] = (r % 3 == 2) ? 0 : 1;
+        for (auto& v : WK) v = 1.0f + rng.n() * 0.2f;
+        for (auto& v : WQ) v = 1.0f + rng.n() * 0.2f;
+        for (auto& v : WV) v = 1.0f + rng.n() * 0.2f;
+        for (auto& v : WB) v = rng.n() * 0.2f;
+        if (g.egbf) {
+            for (float v : WK) WKh.push_back(f2b(v));
+            for (float v : WQ) WQh.push_back(f2b(v));
+            for (float v : WV) WVh.push_back(f2b(v));
+            for (float v : WB) WBh.push_back(f2b(v));
+        }
+        const uint32_t WD = g.egbf ? RAD_BF16 : RAD_F32;
+        const void* const wkp = g.egbf ? (const void*)WKh.data() : (const void*)WK.data();
+        const void* const wqp = g.egbf ? (const void*)WQh.data() : (const void*)WQ.data();
+        const void* const wvp = g.egbf ? (const void*)WVh.data() : (const void*)WV.data();
+        const void* const wbp = g.egbf ? (const void*)WBh.data() : (const void*)WB.data();
         /* the fused kernel */
         auto Ak = A, Hk = H;
         auto Pk = P;
         std::vector<uint16_t> XNk((size_t)(M * n), 0x7e7e), Yk((size_t)(M * n), 0x7e7e), Xk((size_t)(M * n), 0x7e7e);
-        RadTensor t[12] = {
+        RadTensor t[21] = {
             t2(Ak.data(), RAD_BF16, M, n, n), g.add ? t2(B.data(), RAD_BF16, M, n, n) : RadTensor{},
             t1(wp.data(), RAD_F32, n), t2(Pk.data(), RAD_F32, M, hc, hc), t2(Hk.data(), RAD_BF16, M, W, W),
             g.tail ? t2(fn.data(), RAD_F32, rows, W, W) : RadTensor{},
@@ -617,16 +647,28 @@ static void ihc_junction() {
             g.tail ? t1(wn.data(), RAD_F32, n) : RadTensor{},
             g.tail ? t2(XNk.data(), RAD_BF16, M, n, n) : RadTensor{},
             g.ys ? t2(Yk.data(), RAD_BF16, M, n, n) : RadTensor{},
-            g.xs && g.tail ? t2(Xk.data(), RAD_BF16, M, n, n) : RadTensor{} };
+            g.xs && g.tail ? t2(Xk.data(), RAD_BF16, M, n, n) : RadTensor{},
+            /* xq / xs stay absent here (the chain runs no quantiser), but the Engram operands are
+             * positional behind them */
+            RadTensor{}, RadTensor{},
+            g.eg ? t2(KY.data(), RAD_BF16, M, W, W) : RadTensor{},
+            g.eg ? t2(VA.data(), RAD_BF16, M, n, n) : RadTensor{},
+            g.eg ? t1(MK.data(), RAD_I32, M) : RadTensor{},
+            g.eg ? t1((void*)wkp, WD, W) : RadTensor{},
+            g.eg ? t1((void*)wqp, WD, W) : RadTensor{},
+            g.eg ? t1((void*)wvp, WD, n) : RadTensor{},
+            g.eg ? t1((void*)wbp, WD, W) : RadTensor{} };
         std::vector<RadParam> p = { pi("M", M), pi("n", n), pi("hc", hc), pi("rows", rows), pf("eps", 1e-6),
                                     pf("ihc_eps", 1e-5), pf("hc_eps", 1e-6), pi("tail", g.tail ? 1 : 0),
                                     ps("dtype", "bf16") };
         if (post) p.push_back(pf("post_mag", 2.0));
-        RadArgs a{}; a.t = t; a.n_t = 12; a.p = p.data(); a.n_p = (int)p.size(); a.world_size = 1;
+        if (g.eg) { p.push_back(pi("engram", 1)); p.push_back(pf("eg_eps", 1e-5)); }
+        RadArgs a{}; a.t = t; a.n_t = g.eg ? 21 : 12; a.p = p.data(); a.n_p = (int)p.size(); a.world_size = 1;
         char w[160];
-        std::snprintf(w, sizeof w, "rmsnorm_ihc_junction hc %lld n %lld M %lld%s%s%s%s vs the chain, bit for bit",
+        std::snprintf(w, sizeof w, "rmsnorm_ihc_junction hc %lld n %lld M %lld%s%s%s%s%s vs the chain, bit for bit",
                       (long long)hc, (long long)n, (long long)M, g.add ? " add" : "", g.tail ? "" : " tail 0",
-                      g.head ? " head" : "", g.ys || g.xs ? " y/x stored" : "");
+                      g.head ? " head" : "", g.ys || g.xs ? " y/x stored" : "",
+                      g.eg ? (g.egbf ? " engram, bf16 weights" : " engram") : "");
         ++g_cases;
         if (r4d_rad_rmsnorm_ihc_junction(&a, nullptr) != RAD_OK) { std::printf("FAIL %s: launch\n", w); ++g_fails; continue; }
         /* the chain */
@@ -642,6 +684,17 @@ static void ihc_junction() {
             std::vector<RadParam> q = { pi("M", M), pi("n", n), pi("hc", hc), ps("dtype", "bf16") };
             RadArgs b{}; b.t = tp; b.n_t = 3; b.p = q.data(); b.n_p = (int)q.size(); b.world_size = 1;
             if (r4d_rad_ihc_post(&b, nullptr) != RAD_OK) { std::printf("FAIL %s: chain ihc_post\n", w); ++g_fails; continue; }
+        }
+        if (g.eg) {
+            /* P-07: engram_gate over the h ihc_post wrote, its `h` inout as in the plugin */
+            RadTensor tp[8] = { t2(KY.data(), RAD_BF16, M, W, W), t2(VA.data(), RAD_BF16, M, n, n),
+                                t1(MK.data(), RAD_I32, M), t1((void*)wkp, WD, W), t1((void*)wqp, WD, W),
+                                t1((void*)wvp, WD, n), t1((void*)wbp, WD, W),
+                                t2(Hc.data(), RAD_BF16, M, W, W) };
+            std::vector<RadParam> q = { pi("M", M), pi("n", n), pi("hc", hc), pf("eps", 1e-5),
+                                        ps("dtype", "bf16") };
+            RadArgs b{}; b.t = tp; b.n_t = 8; b.p = q.data(); b.n_p = (int)q.size(); b.world_size = 1;
+            if (r4d_rad_engram_gate(&b, nullptr) != RAD_OK) { std::printf("FAIL %s: chain engram_gate\n", w); ++g_fails; continue; }
         }
         if (g.tail) {
             RadTensor tp[6] = { t2(Hc.data(), RAD_BF16, M, W, W), t2(fn.data(), RAD_F32, rows, W, W),

@@ -105,14 +105,16 @@ __global__ __launch_bounds__(kThreads) void ihc_pre_kernel(R4D_IHC_PRE_PARAMS) {
 // rmsnorm_ihc_junction: `[add] -> rmsnorm -> ihc_post -> [ihc_pre -> rmsnorm]` a token row a
 // workgroup of 512 threads (r4d_ihc.h's junction_row), byte-identical to add_bf16, rmsnorm_bf16,
 // ihc_post_bf16, ihc_pre_bf16 and rmsnorm_bf16 in sequence. ADD: the row is bf16(a + b), stored
-// back into `a` as add_bf16 stores it. TAIL 0 stops behind the write (an Engram in front of the
-// next layer writes h between). LDS: n bf16 (the row, then x) + about 0.9 KiB; no scratch.
-template <int HC, bool POST, bool TAIL, bool ADD>
+// back into `a` as add_bf16 stores it. TAIL 0 stops behind the write (the chain form in front of an
+// Engram, which writes h between); the Engram form (EG) runs engram_gate's row there instead and
+// carries on, so the Engram layers keep one junction launch. LDS: n bf16 (the row, then x) + about
+// 0.9 KiB (1.3 KiB at EG); no scratch.
+template <int HC, bool POST, bool TAIL, bool EG, bool ADD>
 __device__ __forceinline__ void ihc_junction_body(
     uint16_t* __restrict__ a, const uint16_t* __restrict__ b, JuncRow r, uint64_t ap, uint64_t bp,
     uint64_t pp, uint64_t hp, uint64_t xnp, uint64_t yp, uint64_t xp) {
     R4D_DYN_LDS(uint4, jbuf);
-    __shared__ JuncLds<HC, POST> L;
+    __shared__ JuncLds<HC, POST, EG> L;
     uint16_t* const ybuf = (uint16_t*)jbuf;
     const uint64_t row = blockIdx.x;
     uint16_t* __restrict__ ar = a + row * ap;
@@ -136,15 +138,21 @@ __device__ __forceinline__ void ihc_junction_body(
     if (r.cq) { r.cq += row * r.cqp; r.cs += row * r.csp; }
     if (r.yr) r.yr += row * yp;
     if (r.xr) r.xr += row * xp;
-    junction_row<HC, POST, TAIL>(L, ybuf, r);
+    if constexpr (EG) {   /* this block's row: the mask one entry, key and val one row each */
+        r.eg_mask += row;
+        r.eg_key = (const uint16_t*)r.eg_key + row * r.egkp;
+        r.eg_val = (const uint16_t*)r.eg_val + row * r.egvp;
+    }
+    junction_row<HC, POST, TAIL, EG>(L, ybuf, r);
 }
 
-template <int HC, bool POST, bool TAIL, bool ADD, class CH>
+template <int HC, bool POST, bool TAIL, bool EG, bool ADD, class CH>
 __global__ __launch_bounds__(kThreads) void ihc_junction_kernel(
     uint16_t* __restrict__ a, const uint16_t* __restrict__ b, JuncRow r, uint64_t ap, uint64_t bp,
     uint64_t pp, uint64_t hp, uint64_t xnp, uint64_t yp, uint64_t xp, uint32_t M) {
     if (CH::on) r4d_chain_wait();
-    if (blockIdx.x < M) ihc_junction_body<HC, POST, TAIL, ADD>(a, b, r, ap, bp, pp, hp, xnp, yp, xp);
+    if (blockIdx.x < M)
+        ihc_junction_body<HC, POST, TAIL, EG, ADD>(a, b, r, ap, bp, pp, hp, xnp, yp, xp);
     if (CH::on) r4d_chain_done();
 }
 // h[j][i] = bf16(post[j] * y[i] + h[j][i]). The product is its own f32 rounding, as libref's.
@@ -369,20 +377,24 @@ extern "C" int r4d_rad_gate_mul(const RadArgs* a, RadStream s) {
 
 /* ---- rmsnorm_ihc_junction. Operands (docs/OPS.md):
  *   [0] a:inout  [1] b?  [2] w_post w  [3] post:inout  [4] h:inout  [5] fn w?  [6] scale w?
- *   [7] base w?  [8] w_next w?  [9] xn?  [10] y?  [11] x?
+ *   [7] base w?  [8] w_next w?  [9] xn?  [10] y?  [11] x?  [12] xq?  [13] xs?  [14] eg_key?
+ *   [15] eg_val?  [16] eg_mask?  [17] eg_w_key?  [18] eg_w_query?  [19] eg_w_val?  [20] eg_w_branch?
  * `tail` 1 needs fn, scale, base, w_next and xn; `rows` 2 hc (post_mag given) writes the next
- * write weights into `post`, `rows` hc (the head) leaves it. */
+ * write weights into `post`, `rows` hc (the head) leaves it. `engram` 1 (P-07) runs engram_gate's
+ * row between the write and ihc_pre, so it needs tail 1, rows 2 hc and its seven operands. */
 enum { IJ_A = 0, IJ_B, IJ_WPOST, IJ_POST, IJ_H, IJ_FN, IJ_SCALE, IJ_BASE, IJ_WNEXT, IJ_XN, IJ_Y, IJ_X,
-       IJ_XQ, IJ_XS };
+       IJ_XQ, IJ_XS, IJ_KEY, IJ_VAL, IJ_MASK, IJ_WK, IJ_WQ, IJ_WV, IJ_WB, IJ_N };
 
 int r4d_ihc_junction_args(const RadArgs* a, r4d_ihc::R4dIhcJunction* o) {
     *o = R4dIhcJunction{};
-    const RadTensor* t[14];
-    for (int i = 0; i < 14; ++i) t[i] = r4d_opt(a, i);
+    const RadTensor* t[IJ_N];
+    for (int i = 0; i < IJ_N; ++i) t[i] = r4d_opt(a, i);
     const long long n = r4d_geti_or(a, "n", 0), hc = r4d_geti_or(a, "hc", 0),
-                    rows = r4d_geti_or(a, "rows", 0), tail = r4d_geti_or(a, "tail", 1);
+                    rows = r4d_geti_or(a, "rows", 0), tail = r4d_geti_or(a, "tail", 1),
+                    engram = r4d_geti_or(a, "engram", 0);
     if (!t[IJ_A] || !t[IJ_WPOST] || !t[IJ_POST] || !t[IJ_H]) return RAD_E_INVAL;
     if (tail != 0 && tail != 1) return RAD_E_INVAL;
+    if (engram != 0 && engram != 1) return RAD_E_INVAL;
     if (tail && (!t[IJ_FN] || !t[IJ_SCALE] || !t[IJ_BASE] || !t[IJ_WNEXT] || !t[IJ_XN]))
         return RAD_E_INVAL;
     for (int i : { IJ_A, IJ_B, IJ_H, IJ_XN, IJ_Y, IJ_X })
@@ -400,6 +412,33 @@ int r4d_ihc_junction_args(const RadArgs* a, r4d_ihc::R4dIhcJunction* o) {
     }
     const bool post = rows == 2 * hc;
     if (tail && !post && rows != hc) return RAD_E_SHAPE;
+    /* P-07: the Engram form, tail 1 and post 1 only (its two GEMMs' rows, then this row) */
+    const bool eg = engram != 0;
+    bool eg_w_bf16 = false;
+    float egeps = 0.0f;
+    if (eg) {
+        if (!tail || !post) return RAD_E_SHAPE;
+        for (int i = IJ_KEY; i <= IJ_WB; ++i)
+            if (!t[i]) return RAD_E_INVAL;
+        if (!ihc_bf16(t[IJ_KEY]) || !ihc_bf16(t[IJ_VAL])) return RAD_E_DTYPE;
+        if (t[IJ_MASK]->dtype != RAD_I32) return RAD_E_DTYPE;
+        egeps = (float)r4d_getf(a, "eg_eps", 0);
+        if (!std::isfinite(egeps) || egeps <= 0) return RAD_E_SHAPE;
+        const int wd = t[IJ_WK]->dtype;
+        if (wd != RAD_F32 && wd != RAD_BF16) return RAD_E_DTYPE;
+        for (int i = IJ_WK; i <= IJ_WB; ++i)
+            if (t[i]->dtype != wd) return RAD_E_DTYPE;
+        eg_w_bf16 = wd == RAD_BF16;
+        const long long W0 = hc * n;
+        if (r4d_numel(t[IJ_WK]) != W0 || r4d_numel(t[IJ_WQ]) != W0 || r4d_numel(t[IJ_WB]) != W0 ||
+            r4d_numel(t[IJ_WV]) != n)
+            return RAD_E_SHAPE;
+        for (int i = IJ_WK; i <= IJ_WB; ++i)
+            if (!r4d_contig(t[i])) return RAD_E_SHAPE;
+    } else {
+        for (int i = IJ_KEY; i < IJ_N; ++i)
+            if (t[i]) return RAD_E_INVAL;
+    }
     const float eps = (float)r4d_getf(a, "eps", 0), ieps = (float)r4d_getf(a, "ihc_eps", 0),
                 heps = (float)r4d_getf(a, "hc_eps", 0);
     if (!std::isfinite(eps) || eps <= 0) return RAD_E_SHAPE;
@@ -433,6 +472,15 @@ int r4d_ihc_junction_args(const RadArgs* a, r4d_ihc::R4dIhcJunction* o) {
         if (!ihc_vec(t[i]->data, (uint64_t)pv)) return RAD_E_ALIGN;
     }
     long long cqp = 0, csp = 0;
+    long long egkp = 0, egvp = 0;
+    if (eg) {
+        long long mk = 0, mv = 0, mm = 0;
+        egkp = r4d_rows_pitch(t[IJ_KEY], hc * n, &mk);
+        egvp = r4d_rows_pitch(t[IJ_VAL], n, &mv);
+        const long long mp = r4d_rows_pitch(t[IJ_MASK], 1, &mm);
+        if (egkp < 0 || egvp < 0 || mp < 0) return RAD_E_STRIDE;
+        if (mk != M || mv != M || mm != M) return RAD_E_SHAPE;
+    }
     if (codes) {
         long long mq = 0, ms = 0;
         cqp = r4d_rows_pitch(t[IJ_XQ], n, &mq);
@@ -475,6 +523,20 @@ int r4d_ihc_junction_args(const RadArgs* a, r4d_ihc::R4dIhcJunction* o) {
     r.cs = codes ? (float*)t[IJ_XS]->data : nullptr;
     r.cqp = (uint64_t)cqp; r.csp = (uint64_t)csp;
     o->M = M; o->hc = (int)hc; o->post = post; o->tail = tail != 0;
+    o->eg = eg; o->eg_w_bf16 = eg_w_bf16;
+    if (eg) {
+        r.eg_key = t[IJ_KEY]->data;
+        r.eg_val = t[IJ_VAL]->data;
+        r.eg_mask = (const int32_t*)t[IJ_MASK]->data;
+        r.eg_wk = t[IJ_WK]->data;
+        r.eg_wq = t[IJ_WQ]->data;
+        r.eg_wv = t[IJ_WV]->data;
+        r.eg_wb = t[IJ_WB]->data;
+        r.eg_w_bf16 = eg_w_bf16 ? 1u : 0u;   /* which of r4d_eg::row's two WTs this launch runs */
+        r.egkp = (uint64_t)egkp; r.egvp = (uint64_t)egvp;
+        r.eg_eps = egeps;
+        r.eg_inv_sqrt_n = (float)std::pow((double)n, -0.5);   // engram_gate's own
+    }
     o->ap = ap; o->bp = bp; o->pp = pp; o->hp = hp; o->xnp = xnp; o->yp = yp; o->xp = xp;
     return RAD_OK;
 }
@@ -487,16 +549,19 @@ extern "C" int r4d_rad_rmsnorm_ihc_junction(const RadArgs* a, RadStream s) {
     const bool ch = r4d_geti_or(a, "chain", 0) != 0;
     const uint32_t lds = j.r.n * 2u;
     const uint32_t grid = r4d_cliff_rows((uint32_t)j.M, 1, kWaves);   /* see ihc_pre_kernel */
-#define R4D_IJ_K(HC_, PO_, TA_, AD_, CH_)                                                          \
-    R4D_EMIT(s, (ihc_junction_kernel<HC_, PO_, TA_, AD_, CH_>), dim3(grid),                       \
+#define R4D_IJ_K(HC_, PO_, TA_, EG_, AD_, CH_)                                                      \
+    R4D_EMIT(s, (ihc_junction_kernel<HC_, PO_, TA_, EG_, AD_, CH_>), dim3(grid),                  \
              dim3(kThreads), lds, j.a, j.b, j.r, (uint64_t)j.ap, (uint64_t)j.bp, (uint64_t)j.pp,  \
              (uint64_t)j.hp, (uint64_t)j.xnp, (uint64_t)j.yp, (uint64_t)j.xp, (uint32_t)j.M)
-#define R4D_IJ_C(HC_, PO_, TA_, AD_)                                                               \
-    (ch ? R4D_IJ_K(HC_, PO_, TA_, AD_, r4dchain) : R4D_IJ_K(HC_, PO_, TA_, AD_, R4dUnchained))
-#define R4D_IJ_A(HC_, PO_, TA_) (add ? R4D_IJ_C(HC_, PO_, TA_, true) : R4D_IJ_C(HC_, PO_, TA_, false))
-#define R4D_IJ_HC(HC_)                                                                             \
-    return !j.tail ? R4D_IJ_A(HC_, false, false)                                                   \
-                   : j.post ? R4D_IJ_A(HC_, true, true) : R4D_IJ_A(HC_, false, true)
+#define R4D_IJ_C(HC_, PO_, TA_, EG_, AD_)                                                           \
+    (ch ? R4D_IJ_K(HC_, PO_, TA_, EG_, AD_, r4dchain)                                               \
+        : R4D_IJ_K(HC_, PO_, TA_, EG_, AD_, R4dUnchained))
+#define R4D_IJ_A(HC_, PO_, TA_, EG_)                                                                \
+    (add ? R4D_IJ_C(HC_, PO_, TA_, EG_, true) : R4D_IJ_C(HC_, PO_, TA_, EG_, false))
+#define R4D_IJ_HC(HC_)                                                                              \
+    return !j.tail ? R4D_IJ_A(HC_, false, false, false)                                             \
+         : !j.post ? R4D_IJ_A(HC_, false, true, false)                                              \
+                   : (j.eg ? R4D_IJ_A(HC_, true, true, true) : R4D_IJ_A(HC_, true, true, false))
     switch (j.hc) {
         case 2: R4D_IJ_HC(2);
         case 3: R4D_IJ_HC(3);

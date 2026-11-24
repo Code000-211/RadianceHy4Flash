@@ -654,10 +654,12 @@ static const RadOperandSpec oIhcPost[] = {
 };
 /* rmsnorm_ihc_junction: `[add] -> rmsnorm -> ihc_post -> [ihc_pre -> rmsnorm]` in one launch
  * (WP16.2); ar_rmsnorm_ihc_junction the same behind the exact all-reduce of `a`. `tail` 0 stops
- * behind ihc_post (no fn .. xn). */
+ * behind ihc_post (no fn .. xn). `engram` 1 (P-07) runs engram_gate's row between the write and
+ * ihc_pre, so the Engram layers keep one launch too. */
 static const RadParamSpec pIhcJunction[] = {
     P_INT("M"), P_INT("n"), P_INT("hc"), P_INT("rows"), P_F64("eps"), P_F64O("ihc_eps"),
     P_F64O("hc_eps"), P_F64O("post_mag"), P_INTO("tail"), P_STR("dtype"), P_INTO("group"),
+    P_INTO("engram"), P_F64O("eg_eps"),
 };
 static const RadParamSpec pArIhcJunction[] = {
     P_INT("M"), P_INT("n"), P_INT("hc"), P_INT("rows"), P_F64("eps"), P_F64O("ihc_eps"),
@@ -667,6 +669,8 @@ static const RadParamSpec pArIhcJunction[] = {
      * ar_rmsnorm_ihc_junction_4rank_lane, which is the same kernel: the junction takes whole rows a
      * block, so its one a row is already the narrow launch. */
     P_INTO("overlap"),
+    /* the Engram form (P-07): engram_gate's row between ihc_post and ihc_pre */
+    P_INTO("engram"), P_F64O("eg_eps"),
 };
 static const RadOperandSpec oIhcJunction[] = {
     {"a", RAD_OPD_INOUT, 0}, {"b", RAD_OPD_IN, 1}, {"w_post", RAD_OPD_WEIGHT, 0},
@@ -674,6 +678,10 @@ static const RadOperandSpec oIhcJunction[] = {
     {"scale", RAD_OPD_WEIGHT, 1}, {"base", RAD_OPD_WEIGHT, 1}, {"w_next", RAD_OPD_WEIGHT, 1},
     {"xn", RAD_OPD_OUT, 1}, {"y", RAD_OPD_OUT, 1}, {"x", RAD_OPD_OUT, 1},
     {"xq", RAD_OPD_OUT, 1}, {"xs", RAD_OPD_OUT, 1},
+    /* the Engram form (`engram` 1): engram_gate's operands but its `h`, which is the junction's */
+    {"eg_key", RAD_OPD_IN, 1}, {"eg_val", RAD_OPD_IN, 1}, {"eg_mask", RAD_OPD_IN, 1},
+    {"eg_w_key", RAD_OPD_WEIGHT, 1}, {"eg_w_query", RAD_OPD_WEIGHT, 1},
+    {"eg_w_val", RAD_OPD_WEIGHT, 1}, {"eg_w_branch", RAD_OPD_WEIGHT, 1},
 };
 static const RadOperandSpec oGateMul[] = {
     {"a", RAD_OPD_IN, 0}, {"g", RAD_OPD_IN, 0}, {"y", RAD_OPD_OUT, 0},
@@ -3872,7 +3880,9 @@ static const RadOpSchema kSchemas[] = {
            "y = rmsnorm(a or the sum; w_post, eps); ihc_post(y, post, h); with `tail` (default 1) "
            "ihc_pre(h; fn, scale, base; rows, ihc_eps, hc_eps, post_mag) -> x and, at rows == 2*hc, "
            "the next post (into `post`); xn = rmsnorm(x; w_next, eps). `y` and `x` are stored only "
-           "when passed. Byte-identical to the five ops in sequence."),
+           "when passed. With `engram` (default 0) h gains engram_gate's row (eg_key, eg_val, "
+           "eg_mask, eg_w_*, eg_eps) between ihc_post and ihc_pre, so it needs `tail` and rows == "
+           "2*hc. Byte-identical to the five ops in sequence, or to those plus engram_gate."),
     SCHEMA("gate_mul", pMnDtype, oGateMul,
            "y = round(f32(a) * sigmoid(f32(g))): one rounding. act_mul's sigmoid form rounds the sigmoid "
            "first, which is a different bf16 result."),
@@ -4297,7 +4307,8 @@ static const RadOpSchema kSchemas[] = {
            "either wire, as ar_rmsnorm_quant_fp8."),
     SCHEMA("ar_rmsnorm_ihc_junction", pArIhcJunction, oIhcJunction,
            "the exact all-reduce of `a` (after the add, when `b` is passed) and rmsnorm_ihc_junction "
-           "over the reduced sum, in one kernel; the reduced sum lands in `a`."),
+           "over the reduced sum, in one kernel; the reduced sum lands in `a`. With `engram` its "
+           "gate runs between ihc_post and ihc_pre, as rmsnorm_ihc_junction's does."),
     SCHEMA("ar_hc_write", pArHcWrite, oArHcWrite,
            "the all-reduce and the gated residual's write that follows it, in one kernel. Both "
            "wires at two ranks, the exact one at four."),

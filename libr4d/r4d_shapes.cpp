@@ -508,13 +508,17 @@ extern "C" int r4d_shape_ihc_post(const RadParam* p, int n_p, int operand, RadOp
     R4D_PICK(l);
 }
 /* rmsnorm_ihc_junction and its all-reduce twin: every optional operand described (the add form,
- * `y` and `x` stored), the next connection's only with `tail` (default 1). */
+ * `y` and `x` stored), the next connection's only with `tail` (default 1), the Engram form's seven
+ * only with `engram` (P-07, which needs `tail` and `rows` 2 hc). */
 extern "C" int r4d_shape_rmsnorm_ihc_junction(const RadParam* p, int n_p, int operand,
                                               RadOpdDesc* out) {
     const int64_t M = pi(p, n_p, "M"), n = pi(p, n_p, "n"), hc = pi(p, n_p, "hc"),
-                  rows = pi(p, n_p, "rows"), tail = pi(p, n_p, "tail", 1);
+                  rows = pi(p, n_p, "rows"), tail = pi(p, n_p, "tail", 1),
+                  engram = pi(p, n_p, "engram", 0);
     if (hc < 1 || (tail && rows != hc && rows != 2 * hc)) return RAD_E_UNSUPPORTED;
+    if (engram && (!tail || rows != 2 * hc)) return RAD_E_UNSUPPORTED;
     const bool post = rows == 2 * hc;
+    const bool eg = engram != 0;
     const bool codes = pi(p, n_p, "group", 0) == R4D_FP8_BLOCK;   /* G-3b: xq, xs described */
     const uint32_t D = dt_act(p, n_p, "dtype"), F = (uint32_t)RAD_F32;
     const RadOpdDesc l[] = { opd(D, M, n), opd(D, M, n), opd(F, n), opd(F, M, hc), opd(D, M, hc * n),
@@ -522,7 +526,14 @@ extern "C" int r4d_shape_rmsnorm_ihc_junction(const RadParam* p, int n_p, int op
         tail ? opd(F, rows) : opd_none(), tail ? opd(F, n) : opd_none(),
         tail ? opd(D, M, n) : opd_none(), opd(D, M, n), tail ? opd(D, M, n) : opd_none(),
         tail && codes ? opd((uint32_t)RAD_I8, M, n) : opd_none(),
-        tail && codes ? opd((uint32_t)RAD_F32, M, n / R4D_FP8_BLOCK) : opd_none() };
+        tail && codes ? opd((uint32_t)RAD_F32, M, n / R4D_FP8_BLOCK) : opd_none(),
+        eg ? opd(D, M, hc * n) : opd_none(),          /* eg_key, eg_val */
+        eg ? opd(D, M, n) : opd_none(),
+        eg ? opd_idx(M, 0, 0, 1) : opd_none(),        /* eg_mask */
+        eg ? opd(D, hc * n) : opd_none(),             /* eg_w_key, eg_w_query, eg_w_branch */
+        eg ? opd(D, hc * n) : opd_none(),
+        eg ? opd(D, n) : opd_none(),                  /* eg_w_val */
+        eg ? opd(D, hc * n) : opd_none() };
     R4D_PICK(l);
 }
 extern "C" int r4d_shape_gate_mul(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {

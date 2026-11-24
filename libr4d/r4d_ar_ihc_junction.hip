@@ -102,8 +102,8 @@ __device__ __forceinline__ int4 arij_add(const int4 a, const uint16_t* b) {
 }
 
 // The rows [r0, r1) of `a`, reduced, through the junction one by one.
-template <int HC, bool POST, bool TAIL>
-__device__ __forceinline__ void arij_rows(JuncLds<HC, POST>& L, uint16_t* ybuf, uint16_t* a,
+template <int HC, bool POST, bool TAIL, bool EG>
+__device__ __forceinline__ void arij_rows(JuncLds<HC, POST, EG>& L, uint16_t* ybuf, uint16_t* a,
                                           JuncRow r, int r0, int r1, uint64_t pp, uint64_t hp,
                                           uint64_t xnp, uint64_t yp, uint64_t xp) {
     const uint32_t n = r.n, wpr = n / 8u;
@@ -128,14 +128,14 @@ __device__ __forceinline__ void arij_rows(JuncLds<HC, POST>& L, uint16_t* ybuf, 
 
 // ---- two ranks. CODED: the push coded (r4d_ar_arc2.h); the launcher takes it for rows of whole
 // 256 values, so a block's word range is whole waves' and every lane of a wave is in each pass.
-template <int HC, bool POST, bool TAIL, bool ADD, bool CODED, class CH>
+template <int HC, bool POST, bool TAIL, bool EG, bool ADD, bool CODED, class CH>
 __global__ __launch_bounds__(kThreads) void ar_ihc_junction_2rank_kernel(
     R4D_ARIJ_ROWPARAMS, int4* peer_base, const int4* my_base, unsigned int* peer_flags,
     unsigned int* my_flags, unsigned int* seq_ctrs, int slot_stride16, int drain, int acq,
     unsigned int nbw, long stage) {
     if (CH::on) r4d_chain_wait();
     R4D_DYN_LDS(uint4, jbuf);
-    __shared__ JuncLds<HC, POST> L;
+    __shared__ JuncLds<HC, POST, EG> L;
     __shared__ unsigned int s_seq, s_slot;
     const int bk = (int)blockIdx.x, nb = (int)gridDim.x;
     const int tid = (int)threadIdx.x, lane = tid & 31;
@@ -194,7 +194,7 @@ __global__ __launch_bounds__(kThreads) void ar_ihc_junction_2rank_kernel(
         a4[k] = arij_fold2(a4[k], pv);
     }
     __syncthreads();
-    arij_rows<HC, POST, TAIL>(L, (uint16_t*)jbuf, a, r, r0, r1, pp, hp, xnp, yp, xp);
+    arij_rows<HC, POST, TAIL, EG>(L, (uint16_t*)jbuf, a, r, r0, r1, pp, hp, xnp, yp, xp);
     if (CH::on) r4d_chain_done();
 }
 
@@ -210,7 +210,7 @@ struct ArijPeers {
 static_assert(sizeof(ArijPeers) == sizeof(R4DArWidePeers<int4, 3>) &&
                   std::has_unique_object_representations_v<ArijPeers>,
               "ArijPeers is a kernel argument by value and carries no padding");
-template <int HC, bool POST, bool TAIL, bool ADD, class CH>
+template <int HC, bool POST, bool TAIL, bool EG, bool ADD, class CH>
 __global__ __launch_bounds__(kThreads) void ar_ihc_junction_4rank_kernel(
     R4D_ARIJ_ROWPARAMS, ArijPeers pa, const int4* __restrict__ my_base,
     unsigned int* __restrict__ my_flags, unsigned int* __restrict__ seq_ctrs, int slot_stride16,
@@ -225,7 +225,7 @@ __global__ __launch_bounds__(kThreads) void ar_ihc_junction_4rank_kernel(
         peers.rank[p] = pa.rank[p];
     }
     R4D_DYN_LDS(uint4, jbuf);
-    __shared__ JuncLds<HC, POST> L;
+    __shared__ JuncLds<HC, POST, EG> L;
     __shared__ unsigned int s_seq, s_slot;
     const int bk = (int)blockIdx.x, nb = (int)gridDim.x, tid = (int)threadIdx.x;
     const int r0 = (int)(((long)bk * M) / nb), r1 = (int)(((long)(bk + 1) * M) / nb);
@@ -259,7 +259,7 @@ __global__ __launch_bounds__(kThreads) void ar_ihc_junction_4rank_kernel(
                             : my_base + ((size_t)parity * WS + q) * (size_t)slot_stride16;
     for (int k = k0 + tid; k < k1; k += kThreads) a4[k] = arij_foldN<WS>(src4, (size_t)k);
     __syncthreads();
-    arij_rows<HC, POST, TAIL>(L, (uint16_t*)jbuf, a, r, r0, r1, pp, hp, xnp, yp, xp);
+    arij_rows<HC, POST, TAIL, EG>(L, (uint16_t*)jbuf, a, r, r0, r1, pp, hp, xnp, yp, xp);
     if (CH::on) r4d_chain_done();
 }
 
@@ -294,23 +294,25 @@ extern "C" int r4d_ar_ihc_junction_2rank(long peer_scratch, long my_scratch, lon
     const bool ch = chain != 0;
     const bool add = j.b != nullptr;
     const uint32_t lds = j.r.n * 2u;
-#define R4D_ARIJ2_K(HC_, PO_, TA_, AD_, CO_, CH_)                                                  \
-    R4D_EMIT((RadStream)stream, (ar_ihc_junction_2rank_kernel<HC_, PO_, TA_, AD_, CO_, CH_>),     \
+#define R4D_ARIJ2_K(HC_, PO_, TA_, EG_, AD_, CO_, CH_)                                             \
+    R4D_EMIT((RadStream)stream, (ar_ihc_junction_2rank_kernel<HC_, PO_, TA_, EG_, AD_, CO_, CH_>), \
              dim3((uint32_t)nb), dim3(kThreads), lds, j.a, j.b, j.r, (uint64_t)j.bp,               \
              (uint64_t)j.pp, (uint64_t)j.hp, (uint64_t)j.xnp, (uint64_t)j.yp, (uint64_t)j.xp,       \
              (int64_t)M, (int4*)peer_scratch, (const int4*)my_scratch, (unsigned int*)peer_flags,              \
              (unsigned int*)my_flags, (unsigned int*)seq_ctrs, (int)slot_stride16, drain, acq,    \
              (unsigned)nbw, stage)
-#define R4D_ARIJ2_C(HC_, PO_, TA_, AD_)                                                            \
-    (coded ? (ch ? R4D_ARIJ2_K(HC_, PO_, TA_, AD_, true, r4dchain)                                 \
-                 : R4D_ARIJ2_K(HC_, PO_, TA_, AD_, true, R4dUnchained))                            \
-           : (ch ? R4D_ARIJ2_K(HC_, PO_, TA_, AD_, false, r4dchain)                                \
-                 : R4D_ARIJ2_K(HC_, PO_, TA_, AD_, false, R4dUnchained)))
-#define R4D_ARIJ2_A(HC_, PO_, TA_)                                                                 \
-    (add ? R4D_ARIJ2_C(HC_, PO_, TA_, true) : R4D_ARIJ2_C(HC_, PO_, TA_, false))
+#define R4D_ARIJ2_C(HC_, PO_, TA_, EG_, AD_)                                                       \
+    (coded ? (ch ? R4D_ARIJ2_K(HC_, PO_, TA_, EG_, AD_, true, r4dchain)                            \
+                 : R4D_ARIJ2_K(HC_, PO_, TA_, EG_, AD_, true, R4dUnchained))                       \
+           : (ch ? R4D_ARIJ2_K(HC_, PO_, TA_, EG_, AD_, false, r4dchain)                           \
+                 : R4D_ARIJ2_K(HC_, PO_, TA_, EG_, AD_, false, R4dUnchained)))
+#define R4D_ARIJ2_G(HC_, PO_, TA_, EG_)                                                            \
+    (add ? R4D_ARIJ2_C(HC_, PO_, TA_, EG_, true) : R4D_ARIJ2_C(HC_, PO_, TA_, EG_, false))
 #define R4D_ARIJ2_HC(HC_)                                                                          \
-    rc = !j.tail ? R4D_ARIJ2_A(HC_, false, false)                                                  \
-                 : j.post ? R4D_ARIJ2_A(HC_, true, true) : R4D_ARIJ2_A(HC_, false, true)
+    rc = !j.tail ? R4D_ARIJ2_G(HC_, false, false, false)                                           \
+                 : j.eg ? R4D_ARIJ2_G(HC_, true, true, true)                                       \
+                        : j.post ? R4D_ARIJ2_G(HC_, true, true, false)                             \
+                                 : R4D_ARIJ2_G(HC_, false, true, false)
     int rc;
     switch (j.hc) {
         case 2: R4D_ARIJ2_HC(2); break;
@@ -319,7 +321,7 @@ extern "C" int r4d_ar_ihc_junction_2rank(long peer_scratch, long my_scratch, lon
         default: return -5;
     }
 #undef R4D_ARIJ2_HC
-#undef R4D_ARIJ2_A
+#undef R4D_ARIJ2_G
 #undef R4D_ARIJ2_C
 #undef R4D_ARIJ2_K
     return rc == RAD_OK ? 0 : -4;
@@ -370,19 +372,22 @@ extern "C" int r4d_ar_ihc_junction_4rank(long peer_scratch0, long peer_scratch1,
     const bool ch = chain != 0;
     const bool add = j.b != nullptr;
     const uint32_t lds = j.r.n * 2u;
-#define R4D_ARIJ4_K(HC_, PO_, TA_, AD_, CH_)                                                       \
-    R4D_EMIT((RadStream)stream, (ar_ihc_junction_4rank_kernel<HC_, PO_, TA_, AD_, CH_>),          \
+#define R4D_ARIJ4_K(HC_, PO_, TA_, EG_, AD_, CH_)                                                  \
+    R4D_EMIT((RadStream)stream, (ar_ihc_junction_4rank_kernel<HC_, PO_, TA_, EG_, AD_, CH_>),     \
              dim3((uint32_t)nb), dim3(kThreads), lds, j.a, j.b, j.r, (uint64_t)j.bp,               \
              (uint64_t)j.pp, (uint64_t)j.hp, (uint64_t)j.xnp, (uint64_t)j.yp, (uint64_t)j.xp,       \
              (int64_t)M, peers, (const int4*)my_scratch, (unsigned int*)my_flags, (unsigned int*)seq_ctrs,     \
              (int)slot_stride16, rank, drain, acq, pub)
-#define R4D_ARIJ4_C(HC_, PO_, TA_, AD_)                                                            \
-    (ch ? R4D_ARIJ4_K(HC_, PO_, TA_, AD_, r4dchain) : R4D_ARIJ4_K(HC_, PO_, TA_, AD_, R4dUnchained))
-#define R4D_ARIJ4_A(HC_, PO_, TA_)                                                                 \
-    (add ? R4D_ARIJ4_C(HC_, PO_, TA_, true) : R4D_ARIJ4_C(HC_, PO_, TA_, false))
+#define R4D_ARIJ4_C(HC_, PO_, TA_, EG_, AD_)                                                       \
+    (ch ? R4D_ARIJ4_K(HC_, PO_, TA_, EG_, AD_, r4dchain)                                           \
+        : R4D_ARIJ4_K(HC_, PO_, TA_, EG_, AD_, R4dUnchained))
+#define R4D_ARIJ4_G(HC_, PO_, TA_, EG_)                                                            \
+    (add ? R4D_ARIJ4_C(HC_, PO_, TA_, EG_, true) : R4D_ARIJ4_C(HC_, PO_, TA_, EG_, false))
 #define R4D_ARIJ4_HC(HC_)                                                                          \
-    rc = !j.tail ? R4D_ARIJ4_A(HC_, false, false)                                                  \
-                 : j.post ? R4D_ARIJ4_A(HC_, true, true) : R4D_ARIJ4_A(HC_, false, true)
+    rc = !j.tail ? R4D_ARIJ4_G(HC_, false, false, false)                                           \
+                 : j.eg ? R4D_ARIJ4_G(HC_, true, true, true)                                       \
+                        : j.post ? R4D_ARIJ4_G(HC_, true, true, false)                             \
+                                 : R4D_ARIJ4_G(HC_, false, true, false)
     int rc;
     switch (j.hc) {
         case 2: R4D_ARIJ4_HC(2); break;
@@ -391,7 +396,7 @@ extern "C" int r4d_ar_ihc_junction_4rank(long peer_scratch0, long peer_scratch1,
         default: return -5;
     }
 #undef R4D_ARIJ4_HC
-#undef R4D_ARIJ4_A
+#undef R4D_ARIJ4_G
 #undef R4D_ARIJ4_C
 #undef R4D_ARIJ4_K
     return rc == RAD_OK ? 0 : -4;

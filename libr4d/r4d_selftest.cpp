@@ -34191,10 +34191,15 @@ static void hy4_ihc_post_case(const Plugin& pl) {
 struct IjCase {
     int64_t M = 1, n = 512, hc = 4;
     bool add = false, ys = false, xs = false, tail = true, head = false;
+    bool eg = false, egbf = false;   /* P-07: the Engram form, its weights f32 or bf16 */
 };
 struct IjData {
     std::vector<uint16_t> a, b, h, xn, y, x;
     std::vector<float> wp, wn, post, fn, base, scale;
+    /* the Engram form's operands: key [M, hc n], val [M, n], the row mask, and the four weights */
+    std::vector<uint16_t> key, val, wkh, wqh, wvh, wbh;
+    std::vector<int32_t> mask;
+    std::vector<float> wk, wq, wv, wb;
 };
 static IjData ij_data(const IjCase& c, uint32_t seed) {
     Hy4Rng rng(seed);
@@ -34215,6 +34220,24 @@ static IjData ij_data(const IjCase& c, uint32_t seed) {
     d.scale = { 3.0f, 2.1f };
     d.xn.assign((size_t)(M * n), 0x7e7e); d.y.assign((size_t)(M * n), 0x7e7e);
     d.x.assign((size_t)(M * n), 0x7e7e);
+    if (c.eg) {
+        d.key.resize((size_t)(M * W)); d.val.resize((size_t)(M * n));
+        for (auto& v : d.key) v = h_to_bf16(rng.n() * 2.0f);
+        for (auto& v : d.val) v = h_to_bf16(rng.n() * 2.0f);
+        d.mask.resize((size_t)M);
+        for (int64_t r = 0; r < M; ++r) d.mask[(size_t)r] = (r % 3 == 2) ? 0 : 1;
+        d.wk.resize((size_t)W); d.wq.resize((size_t)W); d.wv.resize((size_t)n); d.wb.resize((size_t)W);
+        for (auto& v : d.wk) v = 1.0f + rng.n() * 0.2f;
+        for (auto& v : d.wq) v = 1.0f + rng.n() * 0.2f;
+        for (auto& v : d.wv) v = 1.0f + rng.n() * 0.2f;
+        for (auto& v : d.wb) v = rng.n() * 0.2f;
+        if (c.egbf) {
+            for (float v : d.wk) d.wkh.push_back(h_to_bf16(v));
+            for (float v : d.wq) d.wqh.push_back(h_to_bf16(v));
+            for (float v : d.wv) d.wvh.push_back(h_to_bf16(v));
+            for (float v : d.wb) d.wbh.push_back(h_to_bf16(v));
+        }
+    }
     return d;
 }
 static std::vector<RadParam> ij_params(const IjCase& c) {
@@ -34223,12 +34246,15 @@ static std::vector<RadParam> ij_params(const IjCase& c) {
                                 PF("ihc_eps", 1e-5), PF("hc_eps", 1e-6), PI("tail", c.tail ? 1 : 0),
                                 PS("dtype", "bf16") };
     if (!c.head) p.push_back(PF("post_mag", 2.0));
+    if (c.eg) { p.push_back(PI("engram", 1)); p.push_back(PF("eg_eps", 1e-5)); }
     return p;
 }
 /* Device copies of the data (hipMalloc'd: the twin's rank threads use it too). */
 struct IjDev {
     void *a = nullptr, *b = nullptr, *wp = nullptr, *post = nullptr, *h = nullptr, *fn = nullptr,
-         *scale = nullptr, *base = nullptr, *wn = nullptr, *xn = nullptr, *y = nullptr, *x = nullptr;
+         *scale = nullptr, *base = nullptr, *wn = nullptr, *xn = nullptr, *y = nullptr, *x = nullptr,
+         *key = nullptr, *val = nullptr, *mask = nullptr, *wk = nullptr, *wq = nullptr, *wv = nullptr,
+         *wb = nullptr;
     bool up(const IjCase& c, const IjData& d) {
         auto put = [](void*& p, const void* src, size_t bytes) {
             if (hipMalloc(&p, bytes) != hipSuccess) { p = nullptr; return false; }
@@ -34241,6 +34267,16 @@ struct IjDev {
                put(scale, d.scale.data(), 8) && put(base, d.base.data(), d.base.size() * 4) &&
                put(wn, d.wn.data(), d.wn.size() * 4) && put(xn, d.xn.data(), d.xn.size() * 2) &&
                put(y, d.y.data(), d.y.size() * 2) && put(x, d.x.data(), d.x.size() * 2) &&
+               (!c.eg || (put(key, d.key.data(), d.key.size() * 2) && put(val, d.val.data(), d.val.size() * 2) &&
+                          put(mask, d.mask.data(), d.mask.size() * 4) &&
+                          (c.egbf ? (put(wk, d.wkh.data(), d.wkh.size() * 2) &&
+                                     put(wq, d.wqh.data(), d.wqh.size() * 2) &&
+                                     put(wv, d.wvh.data(), d.wvh.size() * 2) &&
+                                     put(wb, d.wbh.data(), d.wbh.size() * 2))
+                                  : (put(wk, d.wk.data(), d.wk.size() * 4) &&
+                                     put(wq, d.wq.data(), d.wq.size() * 4) &&
+                                     put(wv, d.wv.data(), d.wv.size() * 4) &&
+                                     put(wb, d.wb.data(), d.wb.size() * 4))))) &&
                c.M > 0;
     }
     void down(IjData& d) const {
@@ -34252,7 +34288,8 @@ struct IjDev {
         st_memcpy(d.x.data(), x, d.x.size() * 2, hipMemcpyDeviceToHost);
     }
     void free_all() {
-        for (void* p : { a, b, wp, post, h, fn, scale, base, wn, xn, y, x }) if (p) st_free(p);
+        for (void* p : { a, b, wp, post, h, fn, scale, base, wn, xn, y, x, key, val, mask, wk, wq, wv, wb })
+            if (p) st_free(p);
         *this = IjDev{};
     }
     /* The junction's twelve operands; `add` false leaves b out (the twin's reference runs on the
@@ -34268,6 +34305,16 @@ struct IjDev {
         if (!c.tail) for (int i : { 5, 6, 7, 8, 9, 11 }) absent(t[(size_t)i]);
         if (!c.ys) absent(t[10]);
         if (!c.xs) absent(t[11]);
+        if (c.eg) {
+            t.push_back(T(key, RAD_BF16, { M, W }));
+            t.push_back(T(val, RAD_BF16, { M, n }));
+            t.push_back(T(mask, RAD_I32, { M, 1 }));
+            const uint32_t wd = c.egbf ? RAD_BF16 : RAD_F32;
+            t.push_back(T(wk, wd, { W }));
+            t.push_back(T(wq, wd, { W }));
+            t.push_back(T(wv, wd, { n }));
+            t.push_back(T(wb, wd, { W }));
+        }
         return t;
     }
 };
@@ -34305,6 +34352,20 @@ static int ij_chain(const Plugin& pl, const IjCase& c, const IjDev& d, bool add)
         if ((rc = ij_run_row(post, t, p)) != RAD_OK) return rc;
     }
     if (!c.tail) return RAD_OK;
+    if (c.eg) {
+        const RadKernelInfo* gate = find(pl, "engram_gate_bf16");
+        if (!gate) return RAD_E_NOKERNEL;
+        std::vector<RadTensor> t = { T(d.key, RAD_BF16, { M, W }), T(d.val, RAD_BF16, { M, n }),
+                                     T(d.mask, RAD_I32, { M, 1 }),
+                                     T(d.wk, c.egbf ? RAD_BF16 : RAD_F32, { W }),
+                                     T(d.wq, c.egbf ? RAD_BF16 : RAD_F32, { W }),
+                                     T(d.wv, c.egbf ? RAD_BF16 : RAD_F32, { n }),
+                                     T(d.wb, c.egbf ? RAD_BF16 : RAD_F32, { W }),
+                                     T(d.h, RAD_BF16, { M, W }) };
+        std::vector<RadParam> p = { PI("M", M), PI("n", n), PI("hc", c.hc), PF("eps", 1e-5),
+                                    PS("dtype", "bf16") };
+        if ((rc = ij_run_row(gate, t, p)) != RAD_OK) return rc;
+    }
     {
         std::vector<RadTensor> t = { T(d.h, RAD_BF16, { M, W }), T(d.fn, RAD_F32, { rows, W }),
                                      T(d.scale, RAD_F32, { c.head ? 1 : 2 }), T(d.base, RAD_F32, { rows }),
@@ -34354,11 +34415,18 @@ static void hy4_ihc_junction_case(const Plugin& pl) {
     C(3, 3072, 4, false, true, true, true, true);     C(1, 512, 4, true, false, false, true, true);
     C(5, 3072, 4, true, true, false, false, false);   C(6, 128, 2, false, true, true, true, false);
     C(1, 64, 8, true, false, true, true, false);
+    /* P-07: the Engram form, its gate between ihc_post and ihc_pre; the second with bf16 weights */
+    C(1, 3072, 4, false, false, false, true, false);  cs.back().eg = true;
+    C(6, 3072, 4, true, true, true, true, false);     cs.back().eg = true;
+    C(3, 512, 4, false, true, false, true, false);    cs.back().eg = true;
+    C(2, 128, 2, true, false, true, true, false);     cs.back().eg = true; cs.back().egbf = true;
+    C(1, 3072, 4, true, false, false, true, false);   cs.back().eg = true; cs.back().egbf = true;
     for (const IjCase& c : cs) {
-        const std::string what = fmt("rmsnorm_ihc_junction is byte-identical to its chain: hc %lld n %lld "
+        std::string what = fmt("rmsnorm_ihc_junction is byte-identical to its chain: hc %lld n %lld "
                                      "M %lld%s%s%s%s", (long long)c.hc, (long long)c.n, (long long)c.M,
                                      c.add ? ", add" : "", c.tail ? "" : ", tail 0",
                                      c.head ? ", head form" : "", c.ys || c.xs ? ", y / x stored" : "");
+        if (c.eg) what += c.egbf ? ", Engram form, bf16 weights" : ", Engram form";
         IjData d0 = ij_data(c, (uint32_t)(c.M * 131 + c.n + c.hc * 7 + c.add + 2 * c.head));
         IjDev fu, ch;
         if (!fu.up(c, d0) || !ch.up(c, d0)) { ok(what.c_str(), false, "allocation"); fu.free_all(); ch.free_all(); continue; }
