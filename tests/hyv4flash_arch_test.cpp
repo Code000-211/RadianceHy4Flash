@@ -185,6 +185,16 @@ TEST(the_replicated_kv_groups_and_the_chain_request) {
     CHECK_EQ(p.chain_pays, (int)RAD_CHAIN_ALWAYS);
 }
 
+/* S-02: the plugin reports whether its step's trunk can be stopped between two layers and resumed
+ * from a persistent set. This step still runs the whole trunk and declares no persistent set, so a
+ * --chunk-slices request must not slice a chunk on it: the report is 0, and the core keeps m = 1.
+ * S-02b declares the set and reports 1 here when the trunk can stop between two layers. */
+TEST(the_probe_reports_no_resumable_layer_range_on_the_trunk_step) {
+    RadArchProbe p{};
+    CHECK_OK(hyv4flash::probe(mini_meta().meta(), &p));
+    CHECK_EQ(p.slice_layers_ok, 0);
+}
+
 /* Every layer kind's ops, once each where the plan says so: the connections, both MLA forms on
  * both layer kinds (the sparse ones with the selection form), the indexer on the sparse layers, the
  * dense MLP and the latent MoE, the Engram in front of layer 1, the head. */
@@ -663,6 +673,8 @@ TEST(the_head_reads_final_hidden_when_every_row_outputs) {
     CHECK_LINT(d.b, &mc);
     CHECK_EQ(count_issued(d.b, mc, "gather_rows"), 1);
     CHECK_EQ(count_issued(d.b, mc, "logits_gemm"), 1);
+}
+
 /* K-49: the rotaries that turn over a whole prefill chunk are declared under the row-form name.
  * `rope_rows` is the same op with the same parameters -- one thread per (token, pair) looping the
  * heads, so one `sincosf` a (token, pair) instead of one a (token, head, pair) -- byte-identical,

@@ -859,6 +859,23 @@ struct Config {
     /* --mixed-step-target-ms: soft duration target for a mixed prefill/decode step. The scheduler
      * learns an aggregate prefill-row cap from completed mixed steps; 0 keeps the fixed policy. */
     int64_t mixed_step_target_ms = 0;
+    /* --chunk-slices: plan one prefill chunk as m layer-sliced sub-steps (S-02). 0 = off, the
+     * default; -1 = auto, m from chunk_slice_target_ms and chunk_slice_cost_pct; N > 0 = m itself,
+     * capped at 8 and at the trunk's layers. Only a model whose plugin reports it can run the
+     * trunk over a layer range (RadArchProbe::slice_layers_ok) is sliced. */
+    int64_t chunk_slices = 0;
+    /* --chunk-slice-target-ms: the duration a sub-step targets; m follows from it and the learned
+     * chunk and decode step times (Scheduler::chunk_slice_count). */
+    int64_t chunk_slice_target_ms = 150;
+    /* --chunk-slice-cost-pct: the share of a chunk step's time the decode waits between two slices
+     * may pay (percent); 0 caps m at 1, which turns slicing off. */
+    int64_t chunk_slice_cost_pct = 10;
+    /* Engine-internal, not a flag: the model's plugin reports its step's trunk can be stopped
+     * between two layers and resumed from a persistent set (RadArchProbe::slice_layers_ok), read
+     * once in Engine::declare(). With it false no chunk is sliced however --chunk-slices asks, and
+     * the builder is told to declare no persistent set (RadBuildCtx::layer_slices) for a slice to
+     * resume from. */
+    bool    slice_layers_ok = false;
     /* --prefill-room-gate: a fresh prefill starts only when its whole prompt plus one decode
      * position fits beside every runner. Off (the default) admits the first chunk alone, which
      * can fill the pool and be preempted back to zero at the first decode step. */

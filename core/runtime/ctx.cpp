@@ -1000,7 +1000,7 @@ int Ctx::lane_join(int from, int to) {
  * architecture callback. `agen_b`, `vgen_b` and `sgen_b` are set only on generator passes, which are
  * never recorded (below). `ckpt_cut` and `ckpt_cu`: a pass carrying them is never recorded.
  */
-static_assert(sizeof(void*) != 8 || sizeof(RadBatch) == 504,
+static_assert(sizeof(void*) != 8 || sizeof(RadBatch) == 512,
               "RadBatch changed: check that Ctx::pass_key reads every new field a pass depends on");
 static_assert(sizeof(void*) != 8 || sizeof(RadKVGroupBatch) == 88,
               "RadKVGroupBatch changed: check that Ctx::pass_key reads every new field");
@@ -1030,6 +1030,10 @@ uint64_t Ctx::pass_key(const RadBatch* b) const {
     /* A step with a checkpoint inside it copies from addresses the engine armed for it
      * (Ctx::set_ckpt_snap), which no recording could replay. */
     if (b->ckpt_cut > 0) return 0;
+    /* A layer-sliced pass (S-02) carries a group's carried chunk state across steps (the plugin's
+     * persistent set), which no recorded launch replays: its layers are [layer_lo, layer_hi), not
+     * the whole trunk, and the state it resumes from is not in the batch. */
+    if (b->layer_lo != 0 || b->layer_hi != 0) return 0;
     uint64_t h = 0x9e3779b97f4a7c15ull;
     auto mix = [&](uint64_t v) {
         h ^= v + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
