@@ -775,6 +775,10 @@ int router_sgemm_body(const RadArgs* a, RadStream stream) {
     }
     if (ne <= 9 * 32) R4D_RSG(8, 1, 8, 9, 32u);
     R4D_RSG(8, 1, 8, 16, 32u);
+    // Every form above returns from inside the macro chain; naming the outcome here saves the
+    // compiler from having to prove the chain total, and would report a form's absence as the
+    // refusal it would be.
+    return RAD_E_INVAL;
 #undef R4D_RSG
 #undef R4D_RSG_I
 #undef R4D_RSG_C
