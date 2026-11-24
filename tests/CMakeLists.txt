@@ -618,6 +618,7 @@ set(R4D_EMU ${CMAKE_CURRENT_SOURCE_DIR}/r4d_emu)
 set(R4D_EMU_HIP ${R4D_DIR}/r4d_attn_paged_window.hip ${R4D_DIR}/r4d_pair_argmax_f32.hip
                 ${R4D_DIR}/r4d_norm_join_bf16.hip ${R4D_DIR}/r4d_expert_scale_bf16.hip
                 ${R4D_DIR}/r4d_qsa_select_bf16.hip ${R4D_DIR}/r4d_lora_bf16.hip ${R4D_DIR}/r4d_glm.hip
+                ${R4D_DIR}/r4d_gemm_bf16_nt_tiled.hip
                 ${R4D_DIR}/r4d_mhc.hip ${R4D_DIR}/r4d_kda.hip
                 ${R4D_DIR}/r4d_mla.hip ${R4D_DIR}/r4d_quant_act_fp8.hip
                 ${R4D_DIR}/r4d_mla_sink.hip

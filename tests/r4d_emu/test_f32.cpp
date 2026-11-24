@@ -4,12 +4,18 @@
  * arithmetic written out here bit for bit: lane l folds k = l, l+32, ... with fmaf, then the xor
  * butterfly over 16, 8, 4, 2, 1. Tail rows and columns and the pitch's padding stay untouched.
  *
+ * gemm_nt_f32_wmma (r4d_gemm_bf16_nt_tiled.hip) is the same projection on the prefill tile, ORD:
+ * it sums each 16-deep k step as one and so cannot match gemm_nt_f32's order. It is checked against
+ * the exact value instead, and against gemm_nt_f32 - the same products - within the bound the two
+ * summation orders allow (see tile_cases).
+ *
  * router_sigmoid_topk from the same unit: the wave-per-row select must match a serial scan written
  * out here bit for bit, on random and on tied ranks, with the outputs' pitch padding untouched. */
 #include "rad_abi.h"
 #include "rad_plugin.h"
 #include "r4d_plugin.h"
 #include "ref_host.h"
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -31,6 +37,95 @@ static float gemm_model(const uint16_t* x, const float* w, int k) {
         std::memcpy(lane, next, sizeof lane);
     }
     return lane[0];
+}
+
+/* gemm_nt_f32_wmma: the tile has its own k order, so the comparison is a bound, not a byte.
+ * bf16 x bf16 is exact in f32 (8 + 8 significand bits), so the products are the exact ones and
+ * only the summation rounds. Both orders are held to (K + 16) * 2^-24 * sum|x*w| against the
+ * exact (f64) sum: each of the K terms enters one f32 add at most u = 2^-24 of the magnitude it
+ * joins (the WMMA's 16-deep tree and the step adds together, at most K + 16 roundings), which is
+ * what a reordering can move and all it can move. A mis-staged K, a wrong tile or an unwritten
+ * tail would move a value by O(1) relative, far past it. */
+static void tile_cases(std::mt19937& rng, int& cases, int& fails) {
+    std::normal_distribution<float> nd(0.f, 1.f);
+    struct Shape {
+        int M, N, K;
+    };
+    /* One 128-row tile, a tail row block (130 rows), and the TP4 router's 288 / 4 = 72 columns;
+     * K as 1 and 3 whole 64-element stages. */
+    const Shape shapes[] = { { 128, 24, 64 }, { 130, 72, 192 }, { 256, 16, 128 } };
+    for (const Shape& sh : shapes) {
+        const int M = sh.M, N = sh.N, K = sh.K;
+        std::vector<uint16_t> x((size_t)M * K), w((size_t)N * K);
+        for (auto& v : x) v = f2b(nd(rng));
+        for (auto& v : w) v = f2b(nd(rng) * 0.03f);
+        RadTensor t[3]{};
+        t[0].data = x.data();
+        t[0].dtype = RAD_BF16;
+        t[0].rank = 2;
+        t[0].shape[0] = M;
+        t[0].shape[1] = K;
+        t[0].stride[0] = K;
+        t[0].stride[1] = 1;
+        t[1].data = w.data();
+        t[1].dtype = RAD_BF16;
+        t[1].rank = 2;
+        t[1].shape[0] = N;
+        t[1].shape[1] = K;
+        t[1].stride[0] = K;
+        t[1].stride[1] = 1;
+        t[2].dtype = RAD_F32;
+        t[2].rank = 2;
+        t[2].shape[0] = M;
+        t[2].shape[1] = N;
+        t[2].stride[0] = N;
+        t[2].stride[1] = 1;
+        RadParam p[5]{};
+        p[0] = { "M", RAD_P_INT, M };
+        p[1] = { "N", RAD_P_INT, N };
+        p[2] = { "K", RAD_P_INT, K };
+        p[3].key = "dtype";
+        p[3].kind = RAD_P_STR;
+        p[3].sval = "bf16";
+        p[4] = { "weight_bf16", RAD_P_INT, 1 };
+        RadArgs a{};
+        a.t = t;
+        a.n_t = 3;
+        a.p = p;
+        a.n_p = 5;
+        /* Eight words past the end: the tile must write nothing outside its own [M, N]. */
+        std::vector<float> y((size_t)M * N + 8, -7.25f), y32((size_t)M * N + 8, -7.25f);
+        t[2].data = y.data();
+        ++cases;
+        const int rc = r4d_rad_gemm_bf16_tiled_f32(&a, nullptr);
+        const char* const kname = emu_last_kernel;
+        t[2].data = y32.data();
+        const int rc32 = r4d_rad_gemm_nt_f32(&a, nullptr);
+        double worst = 0, worst32 = 0, bound = 0;
+        for (int r = 0; r < M && rc == RAD_OK; ++r)
+            for (int c = 0; c < N; ++c) {
+                double exact = 0, mag = 0;
+                for (int j = 0; j < K; ++j) {
+                    const double pr =
+                        (double)b2f(x[(size_t)r * K + j]) * (double)b2f(w[(size_t)c * K + j]);
+                    exact += pr;
+                    mag += std::fabs(pr);
+                }
+                bound = std::max(bound, (double)(K + 16) * 5.9604645e-8 * mag);
+                worst = std::max(worst, std::fabs((double)y[(size_t)r * N + c] - exact));
+                worst32 = std::max(worst32, std::fabs((double)y32[(size_t)r * N + c] - exact));
+            }
+        bool bad = rc != RAD_OK || rc32 != RAD_OK || worst > bound || worst32 > bound;
+        /* And the row ran the tile, not a fallback: the emulator records the launched kernel. */
+        bad = bad || !std::strstr(kname, "r4d_gemm_bf16_nt_tiled_kernel");
+        for (size_t i = (size_t)M * N; i < y.size() && !bad; ++i)
+            bad = y[i] != -7.25f || y32[i] != -7.25f;
+        if (bad)
+            std::printf("FAIL gemm_nt_f32_wmma at M=%d N=%d K=%d (%s, rc %d / %d): off the exact "
+                        "sum by %.3e (the tile) and %.3e (gemm_nt_f32), bound %.3e\n",
+                        M, N, K, kname, rc, rc32, worst, worst32, bound);
+        fails += bad ? 1 : 0;
+    }
 }
 
 static void router_model(const float* lg, const float* bias, int bp, int ne, int k, int norm,
@@ -227,6 +322,7 @@ int main() {
         }
     }
     router_cases(rng, cases, fails);
+    tile_cases(rng, cases, fails);
     std::printf("%d case(s), %d failure(s)\n", cases, fails);
     return fails ? 1 : 0;
 }

@@ -557,6 +557,7 @@ int  r4d_rad_ar_gather_hc_write_4rank(const RadArgs*, RadStream);
 int r4d_rad_gemm_bf16_m16   (const RadArgs*, RadStream);
 int r4d_rad_gemm_bf16_m64   (const RadArgs*, RadStream);
 int r4d_rad_gemm_bf16_tiled (const RadArgs*, RadStream);
+int r4d_rad_gemm_bf16_tiled_f32(const RadArgs*, RadStream);
 int r4d_rad_gemm_w4a16_m64  (const RadArgs*, RadStream);
 int r4d_rad_gemm_w5a16_m64  (const RadArgs*, RadStream);
 int r4d_rad_gemm_w4a16asym_m64(const RadArgs*, RadStream);

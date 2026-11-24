@@ -18,6 +18,12 @@
 //
 // Fragment rows are clamped as in the skinny kernel: rows past M or N re-read the last valid row
 // and their results are never stored.
+//
+// The same tile writes an F32 C too (r4d_gemm_bf16_nt_tiled_f32, the router's prefill GEMM): the
+// operands, the fragments and the accumulation are the tile above unchanged, and only the store
+// widens. It is NOT byte-identical to the F32 routing projection (gemm_nt_f32), which sums K in
+// its own wave order: a WMMA sums each 16-deep k step as one tree, so the same product lands in a
+// different last bit. Its row is therefore opt-in (docs/OPS.md, gemm_nt_f32_wmma).
 #include "r4d.h"
 #include "r4d_gemm_args.h"
 #include "r4d_bf16_gemm_rows.h"
@@ -34,11 +40,12 @@
 #define BT_WM 2                 // waves over M
 #define BT_WN 4                 // waves over N
 
-// TM x TN WMMA tiles a wave; BM = 2*TM*16, BN = 4*TN*16. SPLIT carries the slice sum.
-template <int TM, int TN, bool SPLIT>
+// TM x TN WMMA tiles a wave; BM = 2*TM*16, BN = 4*TN*16. SPLIT carries the slice sum, F32 widens
+// C from bf16 to f32 at the store.
+template <int TM, int TN, bool SPLIT, bool F32>
 __global__ __launch_bounds__(256) void r4d_gemm_bf16_nt_tiled_kernel(
     const unsigned short* __restrict__ A, const unsigned short* __restrict__ W,
-    __hip_bfloat16* __restrict__ C, int M, int K, int N, int spk) {
+    void* __restrict__ C, int M, int K, int N, int spk) {
   constexpr int BM = BT_WM * TM * 16, BN = BT_WN * TN * 16;
   constexpr int CPR = BT_BK / 8;                  // 16-byte chunks a staged row
   constexpr int AL = BM * CPR / 256, WL = BN * CPR / 256;
@@ -162,7 +169,10 @@ __global__ __launch_bounds__(256) void r4d_gemm_bf16_nt_tiled_kernel(
         if constexpr (SPLIT) v = tot[i][j][e];
         else v += acc[i][j][e];
         const int m = mb + e;
-        if (n < N && m < M) C[(size_t)m * N + n] = (__hip_bfloat16)v;
+        if (n < N && m < M) {
+          if constexpr (F32) ((float*)C)[(size_t)m * N + n] = v;
+          else ((__hip_bfloat16*)C)[(size_t)m * N + n] = (__hip_bfloat16)v;
+        }
       }
     }
 }
@@ -178,9 +188,9 @@ int r4d_gemm_bf16_nt_tiled_arm(int M, int N) {
   return g >= kBtLargeGrid ? 1 : 2;
 }
 
-// `tile`: 1 = 128 x 128, 2 = 64 x 64 (M x N).
-int r4d_gemm_bf16_nt_tiled(long a, long w, long c, int M, int K, int N, int SK, int tile,
-                           long stream) {
+// `tile`: 1 = 128 x 128, 2 = 64 x 64 (M x N). `f32out` widens C to f32, N floats a row.
+static int r4d_gemm_bf16_nt_tiled_out(long a, long w, long c, int M, int K, int N, int SK, int tile,
+                                      bool f32out, long stream) {
   if (M < 1 || N < 1 || K < BT_BK || K % BT_BK) return -1;
   if (SK < 1 || K % ((int64_t)SK * 16)) return -1;
   if (tile != 1 && tile != 2) return -1;
@@ -191,31 +201,50 @@ int r4d_gemm_bf16_nt_tiled(long a, long w, long c, int M, int K, int N, int SK, 
   dim3 block(256);
   auto Wp = (const unsigned short*)w;
   hipStream_t st = (hipStream_t)stream;
-#define LAUNCH(TM, TN, S)                                                                          \
-  hipLaunchKernelGGL((r4d_gemm_bf16_nt_tiled_kernel<TM, TN, S>), grid, block, 0, st, Ap, Wp, Cp,   \
+#define LAUNCH(TM, TN, S, F)                                                                       \
+  hipLaunchKernelGGL((r4d_gemm_bf16_nt_tiled_kernel<TM, TN, S, F>), grid, block, 0, st, Ap, Wp, Cp,\
                      mm, K, N, spk)
   const bool split = SK > 1;
   for (int64_t m0 = 0; m0 < M; m0 += chunk) {
     const int mm = (int)std::min<int64_t>(chunk, M - m0);
     dim3 grid((N + bt - 1) / bt, (mm + bt - 1) / bt);
     auto Ap = (const unsigned short*)a + m0 * K;
-    auto Cp = (__hip_bfloat16*)c + m0 * N;
+    void* Cp = f32out ? (void*)((float*)c + m0 * N) : (void*)((__hip_bfloat16*)c + m0 * N);
     if (tile == 1) {
-      if (split)
-        LAUNCH(4, 2, true);
-      else
-        LAUNCH(4, 2, false);
+      if (split) {
+        if (f32out) LAUNCH(4, 2, true, true);
+        else LAUNCH(4, 2, true, false);
+      } else {
+        if (f32out) LAUNCH(4, 2, false, true);
+        else LAUNCH(4, 2, false, false);
+      }
     } else {
-      if (split)
-        LAUNCH(2, 1, true);
-      else
-        LAUNCH(2, 1, false);
+      if (split) {
+        if (f32out) LAUNCH(2, 1, true, true);
+        else LAUNCH(2, 1, true, false);
+      } else {
+        if (f32out) LAUNCH(2, 1, false, true);
+        else LAUNCH(2, 1, false, false);
+      }
     }
     const hipError_t e = hipGetLastError();
     if (e != hipSuccess) return (int)e;
   }
 #undef LAUNCH
   return 0;
+}
+
+int r4d_gemm_bf16_nt_tiled(long a, long w, long c, int M, int K, int N, int SK, int tile,
+                           long stream) {
+  return r4d_gemm_bf16_nt_tiled_out(a, w, c, M, K, N, SK, tile, false, stream);
+}
+
+// C as f32. K is staged and summed exactly as the bf16 store sums it (same fragments, same
+// ascending 16-deep WMMA steps, same slice order), so a caller reads the f32 the bf16 store would
+// have rounded, and nothing else changes.
+int r4d_gemm_bf16_nt_tiled_f32(long a, long w, long c, int M, int K, int N, int SK, int tile,
+                               long stream) {
+  return r4d_gemm_bf16_nt_tiled_out(a, w, c, M, K, N, SK, tile, true, stream);
 }
 
 // ============================================================== the plugin ABI entry point
@@ -232,5 +261,23 @@ extern "C" int r4d_rad_gemm_bf16_tiled(const RadArgs* a, RadStream s) {
   if (tile == 0) tile = r4d_gemm_bf16_nt_tiled_arm((int)g.M, (int)g.N);
   const int e = r4d_gemm_bf16_nt_tiled(r4d_addr(g.a), r4d_addr(g.b), r4d_addr(g.y), (int)g.M,
                                        (int)g.K, (int)g.N, c.sk, tile, (long)(uintptr_t)s);
+  return e == 0 ? RAD_OK : R4D_NO(e < 0 ? RAD_E_SHAPE : RAD_E_DEVICE);
+}
+
+/* The router's prefill GEMM: the same tile and the same split rule, C written as f32. The
+ * projection is a routing score (gemm_nt_f32), so its output is f32 and its consumer is the
+ * sigmoid/top-k, not another GEMM. */
+extern "C" int r4d_rad_gemm_bf16_tiled_f32(const RadArgs* a, RadStream s) {
+  GemmOps g;
+  int rc = gemm_ops(a, &g, 0);
+  if (rc != RAD_OK) return rc;
+  if (!r4d_bf16_gemm_chunk_rows(g.M, g.N, g.K, 64, 64)) return R4D_NO(RAD_E_SHAPE);
+  Cfg c;
+  rc = cfg_for(a, g.K, g.M, 16, BR_FLAT, &c, (g.N + 15) / 16);
+  if (rc != RAD_OK) return rc;
+  int tile = (int)r4d_geti_or(a, "tile", 0);
+  if (tile == 0) tile = r4d_gemm_bf16_nt_tiled_arm((int)g.M, (int)g.N);
+  const int e = r4d_gemm_bf16_nt_tiled_f32(r4d_addr(g.a), r4d_addr(g.b), r4d_addr(g.y), (int)g.M,
+                                           (int)g.K, (int)g.N, c.sk, tile, (long)(uintptr_t)s);
   return e == 0 ? RAD_OK : R4D_NO(e < 0 ? RAD_E_SHAPE : RAD_E_DEVICE);
 }

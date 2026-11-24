@@ -540,6 +540,10 @@ int  r4d_gemm_bf16_nt_m64_max_m(void);
 int  r4d_gemm_bf16_nt_tiled(long a, long w, long c, int M, int K, int N, int SK, int tile,
                             long stream);
 int  r4d_gemm_bf16_nt_tiled_arm(int M, int N);
+// The tile above with an F32 C (the router's prefill projection): the same fragments, the same
+// ascending 16-deep WMMA steps and the same slice order, stored as f32 instead of rounded to bf16.
+int  r4d_gemm_bf16_nt_tiled_f32(long a, long w, long c, int M, int K, int N, int SK, int tile,
+                                long stream);
 
 // Skinny GEMM with a 4-bit weight: C[M,N] = A[M,K] @ dequant(Wq)[N,K]^T, f16 A, bf16 C. The weight
 // is asymmetric per output channel per group of `group()` contiguous K -- w ~= scale * (q - zero),

@@ -805,6 +805,7 @@ may not have arrived.
 |---|---|---|
 | `gemm_nt` | `M`(range) `N` `K` `dtype` | `a`, `b`w → `y` |
 | `gemm_nt_f32` | `M`(range) `N` `K` `dtype` `weight_bf16`/opt | `a`, `b`w → `y` |
+| `gemm_nt_f32_wmma` | `M`(range) `N` `K` `dtype` `weight_bf16`/opt | `a`, `b`w → `y` |
 | `gemm_nt_bias` | `M`(range) `N` `K` `dtype` `act`/opt | `a`, `b`w, `bias`w, `res`? → `y` |
 | `gemm_nt_q` | `M`(range) `N` `K` `group` `dtype` `pb1`/opt `pb2`/opt `split_n`/opt `w_rb`/opt | `a`, `a_scale`?, `b`w, `b_scale`w → `y`; `a_sum`?, `b_ref`w? |
 | `gemm_nt_q_bias` | `M`(range) `N` `K` `group` `dtype` | `a`, `a_scale`, `b`w, `b_scale`w, `bias`w → `y` |
@@ -895,6 +896,17 @@ rows. A wave computes a tile of rows by columns, chosen by `M` and `N` (a single
 at one row, eight rows by four columns from 64 rows, four rows by one column at `N <= 8`); each
 output keeps one order (lane `l` sums `k = l, l+32, ...` with fused multiply-add, then a fixed
 butterfly), so every tile is byte-identical (`tests/r4d_emu/test_f32.cpp`).
+
+`gemm_nt_f32_wmma` is the same projection on the prefill tile: `a` bf16, `b` the stored bf16
+weight (`weight_bf16=1`), f32 accumulation, f32 `y`, `M >= 128`, `N` up to 512 and `K` a multiple
+of 64 up to 16384. The products and the accumulation are `gemm_nt_f32`'s; the 16-deep k step is
+one WMMA instead of the wave's 32-strided fused multiply-adds, so an output is summed in the
+tile's order and can differ from `gemm_nt_f32`'s in the last bits. It is ORD, not exact: a near-tie
+routing pick can flip, which is why an architecture declares it only behind an off-by-default
+switch (`RADIANCE_HY4_ROUTER_WMMA`, notes/backlog/lossy/P-13.md). libr4d computes it with
+`r4d_gemm_bf16_nt_tiled_f32` — `gemm_bf16_nt_tiled`'s tile, grid and 64-element K stages with the
+store widened — so an image that does not carry the row never declares the op (`tests/r4d_emu/`
+test `f32` runs the source on the host).
 
 ### Runtime LoRA: `lora_shrink` and `lora_expand`
 
