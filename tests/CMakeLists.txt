@@ -399,7 +399,7 @@ if(TARGET hyv4flash_calib_test)
     RAD_CALIB_ST2GRAM="${CMAKE_SOURCE_DIR}/tools/calib_st2gram.py")
 endif()
 foreach(t engine_e2e_test convert_test clef_decision_test laya_decision_test spark25_convert_test
-          hyv4flash_convert_test)
+          hyv4flash_convert_test kernel_reload_e2e_test)
   if(TARGET ${t})
     target_compile_definitions(${t} PRIVATE
       RAD_E2E_SERVER="$<TARGET_FILE:radiance>" RAD_E2E_CONVERT="$<TARGET_FILE:rad-convert>"
@@ -414,6 +414,9 @@ foreach(t engine_e2e_test convert_test clef_decision_test laya_decision_test spa
       target_compile_definitions(${t} PRIVATE
         RAD_CLEF_GOLDEN="${CMAKE_CURRENT_SOURCE_DIR}/data/golden/clef_tiny.json")
       add_dependencies(${t} radiance rad-convert libref libquant clef_bf16)
+    elseif(t STREQUAL "kernel_reload_e2e_test")
+      # The model a tiny qwen35 selects and libref; tests/override adds its own libraries.
+      add_dependencies(${t} radiance libref qwen35_bf16)
     elseif(t STREQUAL "laya_decision_test")
       # The tiny Laya's golden (tests/mklayagolden.py) and the plugin a Laya container selects.
       target_compile_definitions(${t} PRIVATE
@@ -434,6 +437,9 @@ if(TARGET clef_decision_test)
 endif()
 if(TARGET laya_decision_test)
   set_tests_properties(laya_decision_test PROPERTIES LABELS "e2e" TIMEOUT 300)
+endif()
+if(TARGET kernel_reload_e2e_test)
+  set_tests_properties(kernel_reload_e2e_test PROPERTIES LABELS "e2e" TIMEOUT 300)
 endif()
 
 # abi_layout_test compares the ABI's struct layouts with a C translation unit's: abi_c_test.c

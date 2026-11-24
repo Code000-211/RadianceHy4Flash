@@ -584,3 +584,68 @@ What an override is not:
 
 `tests/kernel_override_test.cpp` holds an override to these on the host, against a library linked
 both ways.
+
+### 14.1 Reloading an override under a running server
+
+A server running over an override takes a rebuild of it without a restart and without reloading
+its model. Rebuild the override in place, then ask:
+
+```sh
+cmake --build build --target libr4d_override
+curl -X POST http://127.0.0.1:<port>/admin/kernels/reload
+```
+
+The route is the fleet's, guarded as `/admin/fleet` is (the local operator, or the api key). It
+reloads every loaded override at once. The override loads the file as it now stands on disk under a
+name of its own beside it (the name starts with a dot and does not end in `.so`, and is removed once
+read), reads its rows, and puts their hooks into the rows it serves, which every engine points to.
+The library under the override is not loaded again: the rebuilt units resolve into the one already
+mapped, with its state. The answer names what was taken:
+
+```json
+{"reloaded":[{"library":"<name>","file":"<the override's file>","rows":<rows given new hooks>}],"engines":<engines in the process>}
+```
+
+and the override prints `rad-override: <file> reloaded: <k> of the <n> rows of <library> take new
+hooks: <their names>`. A file that changed under the same name has to be a new file: a linker's output,
+`mv` or `install` give one, while `cp` over it rewrites the file the server has mapped.
+
+**What waits.** The rows are one table for every engine in the process, so every serving engine is
+held at a step boundary at once, with nothing of it in flight (the hold a live restore's moves use),
+while the reload is checked and committed; a parked engine is checked and updated where it rests. A
+request in flight waits for the step in flight to end and for the reload, then runs on: every step
+runs one build, the steps before the reload the old one and the steps after it the new one. Each engine then
+takes every issue plan's launch from its row again and drops its recorded passes, which are
+recorded anew. The route waits up to ten minutes for the engines to come to rest, and answers 503
+if they have not (the outcome then goes to the log).
+
+**What is refused.** A refusal answers 409 with the reason, and every engine runs on as it was:
+
+- no loaded kernel library is an override;
+- the file has not changed since its hooks were loaded;
+- the file does not load (a build cut short, a symbol the library under it lacks), was built against
+  another ABI, is an override of another library, defines no hook of any row, or declares a row
+  differently (only hooks are reloaded; a row-table change is a rebuild of the library);
+- a rebuild with no device code for the card the set was checked against;
+- under an engine that resolved the row, a rebuilt hook whose answer declare used: `init` and
+  `fini` (the instance holds what the running `init` made), `layout`, `relayout`, `unrelayout`
+  and `opd_shape` (the weights lie as the running ones asked), `replaces` (the fusion was chosen at
+  declare); and a rebuilt `scratch` that sizes an instance's scratch differently from the running
+  one, since the arena was sized from it. `launch` is reloaded, `scratch` when its answers are the
+  same, and `tune_valid` (asked only while selecting) always;
+- a model loading, restoring or leaving, or a live restore still moving weights onto its cards: ask
+  again once it is done;
+- an engine running the kernel oracle (`RADIANCE_OP_ORACLE`, `RADIANCE_OP_REPEAT`), which keeps
+  launches of its own.
+
+**What stays.** Every rebuilt file a reload loads stays mapped until the process ends, a refused one
+too: a launch already issued may still run its code, and the device layer keys a kernel by its host
+stub's address and a code object by its bundle's (`core/device/aql.cpp`), so an image unmapped and
+another mapped at the same address would run the old device code under the new name. Each reload
+therefore costs the size of the override's file in memory. A call from one of the library's other
+units into a function a rebuilt unit defines keeps reaching the build it reached when the server
+started (see the last point above): a reload replaces the rows' hooks, not the library's bindings.
+
+`tests/kernel_reload_test.cpp` holds the reload to these through the registry, against a library
+linked both ways, and `tests/kernel_reload_e2e_test.cpp` through a running server on the host
+backend, with a request in flight across the reload.

@@ -39,6 +39,7 @@ struct RadCtx { };
 namespace rad {
 
 class Registry;
+struct HookReload;
 struct XpState;
 struct XpLayer;
 
@@ -239,6 +240,16 @@ public:
     /* Call once on the rank thread before its first run_step: the backend's current device is
      * thread-local, and init may have run on another thread. */
     int bind_thread();
+
+    /* ---------------------------------------------------------- a reload of rebuilt hooks */
+    /* With the engine quiet (Engine::run_quiet), docs/PLUGIN.md §14. hooks_check answers whether
+     * `r` can be committed under this Ctx: refused, with the reason in `why`, when a row this
+     * program resolved would take a hook whose answer declare used (hook_reload_fixed), a scratch
+     * hook that sizes the instance's scratch differently, or when the kernel oracle keeps plans of
+     * its own. hooks_refresh, after the commit, takes every issue plan's launch from its row again
+     * and drops the recorded passes, whose packets and host ops name the old launches. */
+    int  hooks_check(const HookReload& r, std::string* why) const;
+    void hooks_refresh();
     /* The runtime LoRA slot every row of the generator passes that follow runs with, -1 for none
      * (Ctx::issue_lora). Set by the pass loop before it releases the rank for a pass. */
     void set_gen_lora_slot(int32_t s) { gen_lora_slot_ = s; }

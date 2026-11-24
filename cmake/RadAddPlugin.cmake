@@ -154,7 +154,8 @@ set(RAD_KERNEL_OVERRIDE_SOURCE "${CMAKE_CURRENT_LIST_DIR}/rad_kernel_override.cp
 # The result carries the base's file name and lands in <HOME>/kernels (default
 # ${CMAKE_BINARY_DIR}/override_home), a home of its own: put it ahead of the base's on the search
 # path (RADIANCE_HOME=<HOME>:<the base's home>) and it shadows the base, with no configuration
-# naming it. It is never installed.
+# naming it. It is never installed. A running server takes a rebuild of it without a restart
+# (POST /admin/kernels/reload, docs/PLUGIN.md §14.1).
 #
 # The units are compiled as the base compiles them: give the same INCLUDES and GPU_TARGETS, and set
 # on the target what the base's target sets (a language standard, say). Source-file properties need

@@ -760,6 +760,16 @@ void Engine::quiet_service() {
     quiet_cv_.notify_all();
 }
 
+int Engine::hooks_check(const HookReload& r, std::string* why) const {
+    for (const auto& rk : ranks_)
+        if (const int st = rk->ctx.hooks_check(r, why); st < 0) return st;
+    return RAD_OK;
+}
+
+void Engine::hooks_refresh() {
+    for (auto& rk : ranks_) rk->ctx.hooks_refresh();
+}
+
 int32_t* Engine::Readback::reserve(int64_t count) {
     if (count <= n) return p;
     if (p) rad_dev_free(p, RAD_MEM_HOST_PINNED);
