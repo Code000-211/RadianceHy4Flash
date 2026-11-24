@@ -1619,6 +1619,17 @@ TEST(the_router_projection_joins_its_selection_where_a_library_serves_it) {
     const Run runs[] = {
         { "decode 1 row", 1, 0, 1, false, false, 2, 0, 0, 0, false },
         { "decode 6 rows", 6, 0, 1, false, false, 2, 0, 0, 0, false },
+        /* The band's ends, which `--perfmoefuse` set: a bare pass stops at 8 rows (at 16 the fused
+         * row was level with the pair), a pass folding the latent's codes reaches 16, and above that
+         * both keep the pair -- where the row's wider form was 3.5x the pair's time. All but the
+         * first are prefill heights because the indexer's table is one entry a sequence, and one
+         * sequence of n tokens is the same pass height as n decode rows. */
+        { "decode 8 rows", 8, 0, 1, false, false, 2, 0, 0, 0, false },
+        { "prefill 16 rows", 0, 16, 1, false, false, 0, 2, 0, 0, false },
+        { "prefill 17 rows", 0, 17, 1, false, false, 0, 2, 0, 0, false },
+        { "prefill 32 rows", 0, 32, 1, false, false, 0, 2, 0, 0, false },
+        { "prefill 16 rows, rotated experts", 0, 16, 1, false, false, 2, 0, 0, 128, true },
+        { "prefill 17 rows, rotated experts", 0, 17, 1, false, false, 0, 2, 0, 128, true },
         { "TP2 decode", 4, 0, 2, true, false, 2, 0, 0, 0, false },
         { "prefill 96 rows", 0, 96, 1, false, false, 0, 2, 0, 0, false },
         { "decode, rotated experts", 1, 0, 1, false, false, 2, 0, 0, 128, true },
