@@ -820,7 +820,17 @@ TEST(hyv3_fp8_declares_dense_then_sigmoid_moe_with_fp32_combine) {
     const int gather_i = issue_of(moe.op_gather), add_i = issue_of(moe.op_add);
     CHECK(gather_i >= 0 && add_i >= 0 && gather_i < add_i);
     REQUIRE(moe.op_sigmoid_scatter);
-    CHECK(issue_of(moe.op_sigmoid_scatter) >= 0);
+    /* The router's projection is fused into that selection where a library serves the row
+     * (`router_gemm_sigmoid_scatter`, K-10): one launch stands in for the pair, never both. */
+    auto router_fused = [&] {
+        for (size_t i = 0; i < run.issues.size(); ++i) {
+            const RecOp* o = b.op_of(run.issues[i].op);
+            if (o && o->op == "router_gemm_sigmoid_scatter") return (int)i;
+        }
+        return -1;
+    };
+    const int scatter_i = issue_of(moe.op_sigmoid_scatter), fused_i = router_fused();
+    CHECK_EQ((scatter_i >= 0 ? 1 : 0) + (fused_i >= 0 ? 1 : 0), 1);
     CHECK_EQ(issue_of(moe.op_scatter), -1);
     CHECK_EQ(issue_of(moe.op_topk), -1);
     const auto lint = lint_step(b, {&run});
