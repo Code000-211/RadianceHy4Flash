@@ -2170,7 +2170,8 @@ void hc_read_fused_kernel(const unsigned short* __restrict__ h, const float* __r
                           long qrow, long srow, long rqrow, long rsrow, float wadd,
                           unsigned int* __restrict__ sync,
                           unsigned na, unsigned gxa, unsigned gxb, unsigned nb_all) {
-    if (CH::on) r4d_chain_wait_vec();
+    // Scalar body reads behind this wait need the invalidating variant (chain_scalar_audit).
+    if (CH::on) r4d_chain_wait();
     __shared__ unsigned s_ticket;
     if (threadIdx.x == 0)
         s_ticket = __hip_atomic_fetch_add(&sync[0], 1u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);

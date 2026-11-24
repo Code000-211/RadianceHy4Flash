@@ -100,6 +100,17 @@ __device__ __forceinline__ void r4d_chain_acquire(bool scalar = true) {
 // The wait itself; `Scalar` false leaves the scalar data cache alone (see r4d_chain_wait_vec).
 template <bool Scalar>
 __device__ __forceinline__ void r4d_chain_wait_impl() {
+    /* The record is host-written into the argument slot's tail, and the ring reuses that slot
+     * once the read index laps. A bare chained launch carries no packet-processor acquire
+     * (FENCE_SCOPE_NONE, aql.cpp dispatch), so nothing empties the scalar data cache before this
+     * first scalar read of the record: it can still hold the previous occupant's record. A stale
+     * record fails r4d_chain_rec's magic/check validation, the wait returns early WITHOUT the
+     * acquire below, and r4d_chain_done then reads the same stale record and skips its count --
+     * the kernel runs but never adds its blocks, the counter falls short by exactly those blocks,
+     * and a later chained wait (and the chain_flush barrier behind it) spins forever. This is the
+     * TP2 silent 60 s hang. Empty the scalar cache before the record read so it is never stale;
+     * the acquire behind the wait still covers the body's reads. */
+    asm volatile("s_dcache_inv\n\ts_wait_kmcnt 0x0" ::: "memory");
     const R4dChainRec* r = r4d_chain_rec();
     if (!r) return;
     if (threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0) {

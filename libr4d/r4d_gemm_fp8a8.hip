@@ -798,7 +798,9 @@ __device__ __forceinline__ void gemm_i8_kpar_body(R4D_I8KPAR_PARAMS) {
             aload(wave * kUG, ac);
             q4p = *(const uint4*)(Sa + ((size_t)rt * ngrp + wave) * 16u + acc_row(lane, 0));
         }
-        r4d_chain_wait_vec();
+        // Scalar body reads (the Sa scale loads) sit behind this wait, so it must be the
+        // variant that empties the scalar cache; wait_vec would leave them stale (chain_scalar_audit).
+        r4d_chain_wait();
     }
     if (wave < ngrp) {
         if (!CH::on) aload(wave * kUG, ac);
