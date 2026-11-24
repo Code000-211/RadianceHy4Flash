@@ -4009,20 +4009,24 @@ int Engine::load_weights() {
          * returns RAD_OK with `enabled() == false`. */
         /* Expert streaming X0.3: the heat engine's parameters from the environment, for replay
          * and A/B runs (RADIANCE_HEAT_DECAY, _HYSTERESIS, _MIN_GAIN, _MOVES, _CREDIT_CAP); the
-         * startup line of HeatEngine::init says what is in force. */
+         * startup line of HeatEngine::init says what is in force. min_gain is the one parameter the
+         * engine also decides for itself, from how much of the plan it was given stays resident
+         * (heat.h): naming it here, in a sweep, takes that decision away again. */
         HeatParams hp{};
         {
-            auto envf = [](const char* k, float* v) {
+            auto envf = [](const char* k, float* v) -> bool {
                 if (const char* e = std::getenv(k); e && *e) {
                     char* end = nullptr;
                     const float x = std::strtof(e, &end);
-                    if (end != e && x >= 0.0f) *v = x;
-                    else RAD_WARN("%s='%s' is not a number >= 0; ignored", k, e);
+                    if (end != e && x >= 0.0f) { *v = x; return true; }
+                    RAD_WARN("%s='%s' is not a number >= 0; ignored", k, e);
                 }
+                return false;
             };
+            hp.min_gain_adapts = true;
             envf("RADIANCE_HEAT_DECAY", &hp.decay);
             envf("RADIANCE_HEAT_HYSTERESIS", &hp.hysteresis);
-            envf("RADIANCE_HEAT_MIN_GAIN", &hp.min_gain);
+            if (envf("RADIANCE_HEAT_MIN_GAIN", &hp.min_gain)) hp.min_gain_adapts = false;
             envf("RADIANCE_HEAT_CREDIT_CAP", &hp.credit_cap);
             float mv = (float)hp.moves_per_step;
             envf("RADIANCE_HEAT_MOVES", &mv);

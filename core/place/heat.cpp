@@ -66,6 +66,9 @@ int HeatEngine::init(const Plan& plan, const HeatParams& params) {
     std::vector<std::vector<int32_t>> by_expert((size_t)n_layer_);
     std::vector<std::vector<int32_t>> other((size_t)n_layer_ + 1);
     int64_t movable = 0;
+    /* What the plan keeps resident, in bytes: the residency `resident_min_gain` reads. Units, not
+     * slots, since a rank holding half an expert per class would read as resident it is not. */
+    int64_t mov_bytes = 0, res_bytes = 0, res_units = 0;
     for (size_t u = 0; u < n; ++u) {
         const MoveUnit& mu = plan.units[u];
         tier_[u] = mu.tier;
@@ -74,7 +77,11 @@ int HeatEngine::init(const Plan& plan, const HeatParams& params) {
         bytes_[u] = mu.bytes;
         movable_[u] = mu.movable ? 1u : 0u;
         pinned_[u] = mu.pinned ? 1u : 0u;
-        if (mu.movable) ++movable;
+        if (mu.movable) {
+            ++movable;
+            mov_bytes += mu.bytes;
+            if (mu.tier == Tier::VRAM) { res_bytes += mu.bytes; ++res_units; }
+        }
         if (mu.layer < 0) {
             if (mu.movable) other[(size_t)n_layer_].push_back((int32_t)u);
             continue;
@@ -150,12 +157,25 @@ int HeatEngine::init(const Plan& plan, const HeatParams& params) {
         return RAD_OK;
     }
     enabled_ = true;
+    /* The bar from the plan: three quarters of the movable bytes resident is not the 40 %-residency
+     * TP1 shape the shipped 1.5 was tuned on (heat.h). A caller that named a number keeps it. */
+    std::string gain_note;
+    if (params_.min_gain_adapts) {
+        const double resident = mov_bytes > 0 ? (double)res_bytes / (double)mov_bytes : 0.0;
+        params_.min_gain = HeatParams::resident_min_gain((float)resident);
+        gain_note = " (min-gain from " + std::to_string((int)(resident * 100.0 + 0.5)) +
+                    " % of the movable bytes, " +
+                    std::to_string((int)(100.0 * (double)res_units / (double)(movable > 0 ? movable : 1) + 0.5)) +
+                    " % of its units, resident)";
+    } else {
+        gain_note = " (min-gain as named)";
+    }
     RAD_INFO("heat engine: %lld movable units, %d move%s a step, "
-             "decay %.3f hysteresis %.2f min-gain %.2f credit cap %.0f admit-heat %.1f",
+             "decay %.3f hysteresis %.2f min-gain %.2f credit cap %.0f admit-heat %.1f%s",
              (long long)movable, params_.moves_per_step,
              params_.moves_per_step == 1 ? "" : "s",
              (double)params_.decay, (double)params_.hysteresis, (double)params_.min_gain,
-             (double)params_.credit_cap, (double)params_.admit_heat);
+             (double)params_.credit_cap, (double)params_.admit_heat, gain_note.c_str());
     return RAD_OK;
 }
 

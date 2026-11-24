@@ -60,6 +60,25 @@ struct HeatParams {
      * lower values replay within 0.2 points of hit rate and promote a fifth more. */
     float min_gain = 1.5f;
 
+    /* Set by an engine that takes the bar from the plan it was given rather than from this default:
+     * a plan holding most of its movable bytes in VRAM is not the plan 1.5 was tuned on.
+     * HeatEngine::init applies `resident_min_gain` and says which value it settled on, in the line
+     * it already logs. Left false by everyone who names min_gain themselves -- a replay, an A/B run,
+     * RADIANCE_HEAT_MIN_GAIN -- so the number they asked for is the number that runs. */
+    bool min_gain_adapts = false;
+
+    /* The shipped bar for a plan that keeps `resident` of its movable bytes in VRAM: 3 activations
+     * at or above three quarters resident, the tuned 1.5 below it.
+     *
+     * 1.5 is a Qwen3.8-Flash-Next TP1 number, measured at 40 % residency, where a declined
+     * promotion costs a miss on a link that is otherwise idle. High residency pays for the same
+     * promotions differently: the sweep in notes/backlog/audit/E-memory-placement-kv.md §2.1, two
+     * R9700 at TP2, went from 1135-1183 promotions and 3.2-3.4 MiB of upstream a token to 407 and
+     * 1.2 at a decode rate inside run noise (301.4-302.0 against 297.6 and 306.1). Fewer copies is
+     * also less of the junction and shared-arm slowdown, and fewer quarantines. 6 costs 5 % at c1,
+     * so the tightening stops at 3. */
+    static constexpr float resident_min_gain(float resident) { return resident >= 0.75f ? 3.0f : 1.5f; }
+
     /* Swaps step() may propose per slab class each step, after every layer is credited. The value
      * and its reason are at RAD_PLACE_MOVES_PER_STEP, which also sizes the free slots a swap lands
      * in (shadow and turnover slots); a budget raised here without them is spent on

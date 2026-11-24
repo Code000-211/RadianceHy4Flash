@@ -701,6 +701,62 @@ TEST(heat_does_not_thrash_on_an_alternating_pattern) {
     CHECK(unguarded > 100);
 }
 
+/* The bar follows the plan (heat.h): 1.5 was tuned on a TP1 plan holding 40 % of its movable bytes
+ * resident, and a plan keeping three quarters of them resident tightens to 3. Whoever names a
+ * number keeps it, which is what the A/B sweeps and rad-heat-replay depend on. */
+TEST(heat_min_gain_follows_residency) {
+    CHECK_EQ(HeatParams::resident_min_gain(0.0f), 1.5f);
+    CHECK_EQ(HeatParams::resident_min_gain(0.7499f), 1.5f);
+    CHECK_EQ(HeatParams::resident_min_gain(0.75f), 3.0f);
+    CHECK_EQ(HeatParams::resident_min_gain(1.0f), 3.0f);
+
+    /* Shipped, the struct names nothing: a tool reading it sees the number it always saw. */
+    HeatParams shipped;
+    CHECK_EQ(shipped.min_gain, 1.5f);
+    CHECK(!shipped.min_gain_adapts);
+
+    /* A plan decides it. Both shapes are the same plan with its tiers written by hand, so the
+     * residency is what the test says and not what a slot stride happened to leave room for; the
+     * share is then read back from the plan, so the byte weighting is asserted too. */
+    float chose[2] = {0.0f, 0.0f};
+    for (int i = 0; i < 2; ++i) {
+        HeatFixture hf(8, 7);
+        int movable = 0;
+        for (const MoveUnit& mu : hf.plan.units) if (mu.movable) ++movable;
+        CHECK(movable >= 4);
+        const int keep = (int)((double)movable * (i == 0 ? 0.5 : 0.9));
+        int k = 0;
+        for (MoveUnit& mu : hf.plan.units)
+            if (mu.movable) { ++k; mu.tier = k <= keep ? Tier::VRAM : Tier::HostPinned; }
+
+        int64_t mov = 0, res = 0;
+        for (const MoveUnit& mu : hf.plan.units)
+            if (mu.movable) { mov += mu.bytes; if (mu.tier == Tier::VRAM) res += mu.bytes; }
+        CHECK(mov > 0);
+        const double share = (double)res / (double)mov;
+        CHECK_EQ(share >= 0.75, i == 1);         /* the two shapes land on the two sides of the bar */
+
+        HeatEngine h;
+        HeatParams hp;
+        hp.min_gain_adapts = true;
+        CHECK_OK(h.init(hf.plan, hp));
+        CHECK(h.enabled());
+        CHECK_EQ(h.params().min_gain, share >= 0.75 ? 3.0f : 1.5f);
+        chose[i] = h.params().min_gain;
+
+        /* The same plan with a bar named: the number asked for is the number that runs, and the
+         * default of the struct is not an adaptation. */
+        HeatEngine named;
+        HeatParams np;
+        np.min_gain = 2.25f;
+        CHECK_OK(named.init(hf.plan, np));
+        CHECK_EQ(named.params().min_gain, 2.25f);
+    }
+    /* The two shapes land on the two sides of the bar, or the test above proved nothing. */
+    CHECK_EQ(chose[0], 1.5f);
+    CHECK_EQ(chose[1], 3.0f);
+}
+
 /* A prefill chunk is credited as one capped histogram. Ten times the cap's selections credits a
  * tenth of each count, keeping the experts' order while one chunk cannot outweigh the decode steps
  * around it; a histogram under the cap is credited in full. */
