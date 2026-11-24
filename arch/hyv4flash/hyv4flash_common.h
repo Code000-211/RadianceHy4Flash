@@ -540,6 +540,14 @@ struct Lin : LinearFP8 {
         if (op_dual && n <= kDualMaxM) return dual_step(c, in, y, T, r0, rows, y0, codes_ready);
         LinearFP8::step(c, in, y, T, r0, rows, y0, codes_ready);
     }
+    /* The input's codes alone, for a caller whose epilogue reads them (the gated GEMM of a gated
+     * MLP): issued when this linear quantises its own input, nothing when they are fed. */
+    void quantise(RadCtx* c, const ActFP8& a, int64_t T, int64_t r0 = 0, int64_t rows = 0) const {
+        if (rows <= 0) rows = T - r0;
+        if (!i8 || !op_q || rows <= 0 || !a.q8 || !a.s8 || a.g8 <= 0) return;
+        RAD_ISSUE_N(c, op_q, rows, brow_slice(a.x, r0, rows, K), brow_slice(a.q8, r0, rows, K),
+                    brow_slice(a.s8, r0, rows, K / a.g8));
+    }
 };
 
 /* ------------------------------------------------------------------ debug taps

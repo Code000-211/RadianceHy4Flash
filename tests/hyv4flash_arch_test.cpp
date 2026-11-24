@@ -1778,6 +1778,106 @@ TEST(the_router_projection_joins_its_selection_where_a_library_serves_it) {
     }
 }
 
+/* K-23: the iqr-gptq recipe's FFN is a u4 trellis gate_up and a rotated int8 down, so the gate
+ * and up rows' GEMM carries the product's rotated int8 quantiser in its own epilogue
+ * (decl_gated_fold_iqr = gemm_nt_q_gated at i8a8h) for the rows libr4d's gemm_iqr_gated serves
+ * (M <= 16): layer 0's dense MLP and both MoE layers' shared expert. The gate_up + gated_had_quant
+ * pair stays declared beside it for the longer rows, and it writes the same two code buffers, so a
+ * decode step is one launch where the pair is two and the codes are the pair's own (docs/OPS.md,
+ * "gemm_nt_q_gated": byte-identical). Where the library serves no such row, the pair runs. */
+void iqr_ffn_encs(RadBuilder* b) {
+    bf16_encs(b);
+    b->encs.insert(b->encs.begin(), { { "ffn_down_shexp", enc_i8(true) },
+                                      { "ffn_gate_up_shexp", enc_trellis(RAD_U4, true) },
+                                      { "ffn_down.", enc_i8(true) },
+                                      { "ffn_gate_up.", enc_trellis(RAD_U4, true) } });
+}
+TEST(the_gate_and_up_rows_fold_the_quantiser_into_the_gemm) {
+    for (int host = 0; host < 2; ++host) {
+        /* n_embd 256: the row's K and N are whole 256s, and the mini preset's 128 wide trunk
+         * leaves none to declare (decl_gated_fold_iqr refuses that geometry). */
+        MetaKV mk = mini_meta(false, 128, 256);
+        RadBuilder b;
+        iqr_ffn_encs(&b);
+        if (host) b.undeclared.insert("gemm_nt_q_gated");
+        RadBuildCtx ctx = build_ctx();
+        REQUIRE_EQ(hyv4flash::declare(&b, mk.meta(), &ctx), RAD_OK);
+        const int folds = host ? 0 : 3;
+        CHECK_EQ(count_op(b, "gemm_nt_q_gated"), folds);
+        CHECK_EQ(count_op(b, "gated_had_quant_i8g"), 3);   /* the pair, for the rows past 16 */
+        for (int i = 0; i < folds; ++i) {
+            const RecOp* f = find_op(b, "gemm_nt_q_gated", i);
+            REQUIRE(f != nullptr);
+            const RecParam* m = param(f, "M");
+            REQUIRE(m != nullptr);
+            CHECK_EQ(m->kind, (int)RAD_P_RANGE);
+            CHECK_EQ(m->ival, 1);
+            CHECK_EQ(m->ihi, 16);
+            CHECK_EQ(pstr(f, "dtype"), std::string("i8a8h"));
+            CHECK_EQ(pstr(f, "act"), std::string("silu"));
+            CHECK_EQ(pint(f, "group"), 128);
+            CHECK_EQ(pint(f, "K"), 256);                     /* the trunk width */
+            CHECK_EQ(pint(f, "N") % 256, 0);
+            /* the weight's two halves, the input's codes and the product's: no bf16 plane */
+            REQUIRE_EQ(f->w.size(), (size_t)2);
+            REQUIRE_EQ(f->reads.size(), (size_t)2);
+            REQUIRE_EQ(f->writes.size(), (size_t)2);
+            const RecOp* a = find_op(b, "gated_had_quant_i8g", i);
+            REQUIRE(a != nullptr);
+            CHECK(a->writes == f->writes);
+        }
+        /* A decode-class step issues the fold, not the pair; the pair stays for the longer ones. */
+        std::vector<std::unique_ptr<Kit>> dec;
+        dec.push_back(kit(b, { 1 }, {}));
+        dec.push_back(kit(b, { 16 }, {}));
+        for (auto& k : dec) {
+            k->b.positions_h = k->pos.data();
+            RadCtx c{ .b = &b, .batch = &k->b };
+            hyv4flash::step(&c, &k->b);
+            CHECK(c.step_fail.empty());
+            CHECK_EQ(count_issued(b, c, "gemm_nt_q_gated"), folds);
+            CHECK_EQ(count_issued(b, c, "gated_had_quant_i8g"), host ? 3 : 0);
+            /* the codes still go through the gate_up's own quantiser where they are not fed */
+            CHECK_EQ(count_issued(b, c, "had_quant_act_i8g"), 3);
+        }
+        auto pf = kit(b, {}, { 17 });
+        pf->b.positions_h = pf->pos.data();
+        RadCtx pc{ .b = &b, .batch = &pf->b };
+        hyv4flash::step(&pc, &pf->b);
+        CHECK(pc.step_fail.empty());
+        CHECK_EQ(count_issued(b, pc, "gemm_nt_q_gated"), 0);
+        CHECK_EQ(count_issued(b, pc, "gated_had_quant_i8g"), 3);
+        every_weight_read(b);
+        steps_clean_at(b, 0, 1);
+    }
+}
+
+/* The fold over a row-split gate_up: it takes the shard's own share of the weight and half of the
+ * gate|up rows, so a 2-rank split halves the dense MLP's 512 columns and the shared expert's 512
+ * to a whole 256 each. (The shared widths are set to 512 for the split: the mini preset's 256 would
+ * halve to 128 gate|up columns a rank, which the shared expert's int8 down refuses.) */
+TEST(the_fold_follows_the_gate_ups_own_row_share) {
+    MetaKV mk = mini_meta(false, 128, 256);
+    mk.set("moe_intermediate_size", "256");
+    for (int world : { 1, 2 }) {
+        for (int rank = 0; rank < world; ++rank) {
+            RadBuilder b;
+            iqr_ffn_encs(&b);
+            RadBuildCtx ctx = build_ctx(rank, world);
+            G3Env g3env;
+            REQUIRE_EQ(hyv4flash::declare(&b, mk.meta(), &ctx), RAD_OK);
+            CHECK_EQ(count_op(b, "gemm_nt_q_gated"), 3);
+            CHECK_EQ(count_op(b, "gated_had_quant_i8g"), 3);
+            const RecOp* f = find_op(b, "gemm_nt_q_gated");
+            REQUIRE(f != nullptr);
+            CHECK_EQ(pint(f, "N"), world == 1 ? 512 : 256);
+            CHECK_EQ(pint(f, "K"), 256);
+            every_weight_read(b);
+            steps_clean_at(b, rank, world);
+        }
+    }
+}
+
 /* K-02 (P-14's switch): q_nope and q_rope read one q residual's codes, so where both are one IQR
  * form the plugin gives the pair one gemm_nt_q_dual a layer, at a decode step's GEMV only (M == 1,
  * kDualMaxM) -- the two launches' blocks in one grid, each part's blocks the blocks its own launch
@@ -1904,6 +2004,90 @@ TEST(the_q_projections_go_out_as_one_launch) {
             CHECK_EQ(issued(false), 2 * (3 - r.duals));
         }
     }
+}
+
+/* The handle a declared buffer was given, for a check on which of two pairs an op took: a rad_buf
+ * is the buffer's index in RadBuilder::bufs, from 1. */
+static rad_buf buf_handle(const RadBuilder& b, const std::string& name) {
+    for (size_t k = 0; k < b.bufs.size(); ++k)
+        if (b.bufs[k].name == name) return (rad_buf)(k + 1);
+    return 0;
+}
+
+/* K-23 where the gate_up's input codes are fed: a recipe whose latent linear is rotated int8 opens
+ * the MoE layer's input, so the trunk's junction quantises the feed-forward's input once (G-3b) and
+ * the shared expert's gate_up reads that pair (Lin::feed) with no quantiser of its own -- the shape
+ * a served u3/IQR build takes, layer 0's dense MLP being the only gate_up with nothing in front of
+ * it. The fold reads the pair the layer was given, and nothing writes that pair a second time. */
+void iqr_fed_ffn_encs(RadBuilder* b) {
+    iqr_ffn_encs(b);
+    b->encs.insert(b->encs.begin(), { { "ffn_latent_in", enc_i8(true) } });
+}
+TEST(the_gate_fold_reads_the_codes_a_fed_gate_up_is_given) {
+    MetaKV mk = mini_meta(false, 128, 256);
+    RadBuilder b;
+    iqr_fed_ffn_encs(&b);
+    RadBuildCtx ctx = build_ctx();
+    REQUIRE_EQ(hyv4flash::declare(&b, mk.meta(), &ctx), RAD_OK);
+    CHECK_EQ(count_op(b, "gemm_nt_q_gated"), 3);
+    CHECK_EQ(count_op(b, "gated_had_quant_i8g"), 3);        /* the pair, for the rows past 16 */
+    /* Layer 0's dense MLP quantises its own input into the untagged trunk pair; the MoE layers'
+     * feed-forward input is the junction's pair, which their latent linear and shared gate_up share. */
+    const rad_buf own = buf_handle(b, "trunk_codes.256.128.q8");
+    const rad_buf own_s = buf_handle(b, "trunk_codes.256.128.s8");
+    const rad_buf fed = buf_handle(b, "trunk_codes.junc_ffn_in.256.128.q8");
+    const rad_buf fed_s = buf_handle(b, "trunk_codes.junc_ffn_in.256.128.s8");
+    REQUIRE(own != 0);
+    REQUIRE(own_s != 0);
+    REQUIRE(fed != 0);
+    REQUIRE(fed_s != 0);
+    for (int i = 0; i < 3; ++i) {
+        const RecOp* f = find_op(b, "gemm_nt_q_gated", i);
+        REQUIRE(f != nullptr);
+        REQUIRE_EQ(f->reads.size(), (size_t)2);
+        REQUIRE_EQ(f->writes.size(), (size_t)2);
+        CHECK_EQ(pstr(f, "dtype"), std::string("i8a8h"));
+        /* the pair writes the same two code buffers the fold does */
+        const RecOp* a = find_op(b, "gated_had_quant_i8g", i);
+        REQUIRE(a != nullptr);
+        CHECK(a->writes == f->writes);
+        /* layer 0's fold reads the codes its own quantiser writes; a shared expert's fold reads the
+         * fed pair, and neither of the two ever reads the other's. */
+        CHECK_EQ(f->reads[0], i == 0 ? own : fed);
+        CHECK_EQ(f->reads[1], i == 0 ? own_s : fed_s);
+        CHECK(!in(f->reads, i == 0 ? fed : own));
+    }
+    /* The fed pair's writers are the trunk's junction quantisers, one a MoE layer: no gate_up
+     * quantises it a second time for the fold to read instead. */
+    int writers = 0;
+    for (const auto& o : b.ops)
+        if (in(o.writes, fed)) { ++writers; CHECK_EQ(o.op, std::string("rmsnorm_ihc_junction")); }
+    CHECK_EQ(writers, 2);
+    CHECK_EQ(count_op(b, "had_quant_act_i8g"), 1);          /* layer 0's gate_up, the only one */
+    every_weight_read(b);
+    steps_clean_at(b, 0, 1);
+    /* A decode-class step issues the fold and no pair, and the only input quantiser it issues is
+     * layer 0's gate_up: a fed gate_up leaves the codes to the trunk. */
+    for (int rows : { 1, 16 }) {
+        std::unique_ptr<Kit> k = kit(b, { rows }, {});
+        k->b.positions_h = k->pos.data();
+        RadCtx c{ .b = &b, .batch = &k->b };
+        hyv4flash::step(&c, &k->b);
+        CHECK(c.step_fail.empty());
+        CHECK_EQ(count_issued(b, c, "gemm_nt_q_gated"), 3);
+        CHECK_EQ(count_issued(b, c, "gated_had_quant_i8g"), 0);
+        CHECK_EQ(count_issued(b, c, "had_quant_act_i8g"), 1);
+    }
+    /* Past the rows the fold serves, the pair runs and writes the same codes. */
+    std::unique_ptr<Kit> pf = kit(b, {}, { 17 });
+    pf->b.positions_h = pf->pos.data();
+    RadCtx pc{ .b = &b, .batch = &pf->b };
+    hyv4flash::step(&pc, &pf->b);
+    CHECK(pc.step_fail.empty());
+    CHECK_EQ(count_issued(b, pc, "gemm_nt_q_gated"), 0);
+    CHECK_EQ(count_issued(b, pc, "gated_had_quant_i8g"), 3);
+    every_weight_read(b);
+    steps_clean_at(b, 0, 1);
 }
 
 /* q_nope and q_rope rotated int8 of one form at a q_lora of whole 128 groups: the q residual's norm
