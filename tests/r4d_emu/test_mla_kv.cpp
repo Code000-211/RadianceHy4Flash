@@ -3,11 +3,14 @@
  *
  *   - mla_project_kv, both modes, against libref's op within one bf16 ulp (a different sum order);
  *   - the law: a token's bytes are the same whatever M, `mb` (every value of the row's tunable),
- *     the chained form or the operand layout (16-byte fragments and global_load_tr_b128, or the
- *     element-by-element path a pitched operand takes) -- every row of every run equal to the
- *     same token run alone, at M 1, through the plain aligned path;
+ *     `stage` (K-50's kv_expand_staged, 16 waves over a token block staged in LDS, or kvp_body's
+ *     expand; which of the two ran is asserted by name), the chained form or the operand layout
+ *     (16-byte fragments and global_load_tr_b128, or the element-by-element path a pitched operand
+ *     takes) -- every row of every run equal to the same token run alone, at M 1, through the
+ *     plain aligned path;
  *   - mla_expand_gate byte-equal to mla_project_kv's expand followed by gate_mul (its fusion
- *     claim, r4d_fuse.cpp), on both paths and every `mb`.
+ *     claim, r4d_fuse.cpp), on both paths, every `mb` and both `stage` arms;
+ *   - the staged kernel on aligned operands whose pitches are wider than their widths.
  *
  * The emulator's WMMA sums in its own order (emu.cpp), not the card's: what is checked is that the
  * kernels compute every output from the same fragments in the same chain, which is what the law
@@ -24,6 +27,8 @@
 #include <dlfcn.h>
 #include <string>
 #include <vector>
+
+extern const char* emu_last_kernel;   /* the emulator's (emu/hip/hip_runtime.h): the last kernel launched */
 
 static const RadKernelInfo* libref_op(const char* op) {
     static void* h = nullptr;
@@ -120,11 +125,12 @@ static Draw draw(int64_t H, int64_t M, bool absorb, uint32_t seed) {
 }
 
 /* One run over rows [r0, r0 + n) of the draw; returns y [n, H * yw] packed. `skew` 1 puts every
- * operand off the 16-byte grid (odd pitches, a one-element offset), the element-by-element path. */
+ * operand off the 16-byte grid (odd pitches, a one-element offset), the element-by-element path;
+ * `wide` elements (a multiple of 8) widen every pitch and keep the operands on the grid. */
 static std::vector<uint16_t> project(const Draw& d, bool absorb, bool gate, int64_t r0, int64_t n, int mb,
-                                     int chain, bool skew, int* rc, int stage = 0) {
+                                     int chain, bool skew, int* rc, int stage = 0, int64_t wide = 0) {
     const int64_t H = d.H, xw = absorb ? kKd : kL, yw = absorb ? kL : kVd;
-    const int64_t o = skew ? 1 : 0, sp = skew ? 3 : 0;
+    const int64_t o = skew ? 1 : 0, sp = skew ? 3 : wide;
     Mat x(n, H * xw, H * xw + sp, o), w(H * (kKd + kVd), kL, kL + sp, o), y(n, H * yw, H * yw + sp, o),
         g(n, H * kVd, H * kVd + sp, o);
     for (int64_t i = 0; i < n; ++i)
@@ -238,13 +244,31 @@ int main() {
                     }
             /* K-50: the staged expansion (auto at four token tiles, aligned, unchained) and kvp_body's
              * (stage 1) at the prefill heights, expand with and without the gate: each row's bytes
-             * are the row alone's, so the two arms are byte-equal to each other */
+             * are the row alone's, so the two arms are byte-equal to each other. Which kernel ran is
+             * asserted, or a broken route would compare kvp_body with itself. */
             if (!absorb)
                 for (const int mb : { 0, 4 })
                     for (const bool gate : { false, true }) {
+                        const bool staged = mb == 4 || g.M > 16;   /* kvp_mb: four token tiles */
                         const auto on = project(d, false, gate, 0, g.M, mb, 0, false, &rc, 0);
                         const int rc_on = rc;
+                        const bool on_staged = std::strstr(emu_last_kernel, "kv_expand_staged") != nullptr;
                         const auto off = project(d, false, gate, 0, g.M, mb, 0, false, &rc, 1);
+                        const bool off_staged = std::strstr(emu_last_kernel, "kv_expand_staged") != nullptr;
+                        std::snprintf(w, sizeof w,
+                                      "expand%s heads %lld M %lld mb %d: stage 0 ran %s, stage 1 kvp_body's",
+                                      gate ? " + gate" : "", (long long)g.H, (long long)g.M, mb,
+                                      staged ? "kv_expand_staged" : "kvp_body's");
+                        ok(on_staged == staged && !off_staged, w);
+                        /* every pitch (x, w, g, y) 8 elements wider than its width, still on the grid */
+                        int rc_w = 0;
+                        const auto wide = project(d, false, gate, 0, g.M, mb, 0, false, &rc_w, 0, 8);
+                        std::snprintf(w, sizeof w,
+                                      "expand%s heads %lld M %lld mb %d: staged at pitches 8 past the widths "
+                                      "== unstaged, bit for bit",
+                                      gate ? " + gate" : "", (long long)g.H, (long long)g.M, mb);
+                        ok(rc_w == RAD_OK && rc == RAD_OK && wide == off &&
+                               (std::strstr(emu_last_kernel, "kv_expand_staged") != nullptr) == staged, w);
                         std::snprintf(w, sizeof w,
                                       "expand%s heads %lld M %lld mb %d: staged == unstaged, bit for bit",
                                       gate ? " + gate" : "", (long long)g.H, (long long)g.M, mb);

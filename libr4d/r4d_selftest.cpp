@@ -35509,7 +35509,7 @@ static void hy4_mla_project_kv_case(const Plugin& pl) {
             if (!std::equal(tail.begin(), tail.end(), alone.begin() + 5 * YW)) { same = false; where = "rows 5.."; }
             const auto pit = launch(row, 0, M, 0, 0, true, false);
             if (pit != alone) { same = false; where = "pitched"; }
-            ok(fmt("mla_project_kv %s heads %lld: a token's bytes do not depend on M, mb, the chained form or "
+            ok(fmt("mla_project_kv %s heads %lld: a token's bytes do not depend on M, mb, stage, the chained form or "
                    "the operand layout", mode, (long long)H).c_str(), same, where);
             if (ab) continue;
             /* the fused gate against gate_mul over the expansion */

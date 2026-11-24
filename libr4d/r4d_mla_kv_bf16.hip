@@ -18,8 +18,9 @@
 // in f32. A token's 16 products of a step and the accumulator it adds them to are its own, so its
 // bytes depend on its own input row only: not on M, on the tile it shares (a token column past M
 // reads the last row and is never stored), on `mb` (token tiles a wave, a rad-tune axis), on the
-// column tiles a wave takes or on the grid. A different sum order from the scalar kernel this
-// replaced (an fma chain): within one bf16 ulp of libref's, as that one was.
+// column tiles a wave takes, on `stage` (expand's staged kernel below or kvp_body's) or on the
+// grid. A different sum order from the scalar kernel this replaced (an fma chain): within one
+// bf16 ulp of libref's, as that one was.
 //
 // Fragments (gfx12 wave32): a lane holds row (A) / column (B) lane % 16 and the eight k
 // 8 * (lane / 16) + e. Absorb's A is the key block read across its rows, Wk[c][col] at c along
@@ -34,6 +35,12 @@
 // token tiles; expand: the workgroup takes one column tile, a wave a quarter of the contraction
 // and MB token tiles, the partial sums meeting in LDS. Each A fragment is loaded once for its MB
 // token tiles, each token fragment once for its NC column tiles, two chunks of steps in flight.
+//
+// Expand at four token tiles, aligned and unchained (K-50, kv_expand_staged; `stage` 1 keeps the
+// form above): a workgroup is sixteen waves, four column tiles by the four quarters. It loads its
+// 64 tokens' block into LDS once (all 64 KiB; the partial sums overlay it after a barrier), so a
+// head's block is read four times a call, not sixteen, and each wave runs the same fragments
+// through the same chain.
 //
 // Chained forms (r4d_chain.h): the aligned path at NC 1, chosen at decode heights (M <= 64).
 // mla_kv_split is a copy: k[i,h,0:kd] = kvb[i, h*(kd+vd) : +kd], k[i,h,kd:kd+r] = k_rope[i],
