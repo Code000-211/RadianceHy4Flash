@@ -275,6 +275,13 @@ struct Attn {
                                     RAD_SHARD_ROW, grp, { qsrc }, act(w.qa), w.q_nope));
         RAD_ARCH_TRY(q_rope.declare(b, nm, g, nm.f("blk.%d.attn_q_rope", l), H * R, s.q_lora,
                                     RAD_SHARD_ROW, grp, { qsrc }, act(w.qa), w.q_rope));
+        /* K-02 (P-14's switch, RADIANCE_HY4_FUSE_QPROJ=0 keeps the two launches): q_nope and
+         * q_rope over the one set of codes q_a's quantiser writes, in one launch at a decode step's
+         * GEMV, where each of the two is launch and ramp cost. Taken only where the two are one
+         * form and one K (declare_dual refuses the rest) and only at M == 1 (kDualMaxM); a wider
+         * pass keeps both Lins' own launches. */
+        if (dual_fuse_on()) RAD_ARCH_TRY(q_nope.declare_dual(b, q_rope, w.qa,
+                                                             w.q_nope, w.q_rope, T));
         q_nope.fed_codes = q_rope.fed_codes = nullptr;   /* `qcodes` moves with the layer */
 
         /* kv_a's rows are the latent then the shared rotary key (`kv_a_proj_with_mqa`). */

@@ -741,9 +741,29 @@ for it. `residual` present is the `fused_add_rms_norm` form.
 | `rmsnorm_quant_i8g` | `M` `n` `eps`:f64 `dtype` `wadd`:f64/opt | `x`, `residual`:inout?, `w`w → `q`, `scale`, `out_bf16`?; `w_post`w?, `scalar`w? |
 | `gelu_mul_quant_i8` | `M` `n` `dtype` | `gate_up` → `q`, `scale`, `out_bf16`? |
 | `gelu_mul_quant_i8g` | `M` `n` `dtype` | `gate_up` → `q`, `scale`, `out_bf16`? |
+| `gemm_nt_q_dual` | `M`(range) `N` `N2` `K` `group` `dtype` | `a`, `a_scale`, `b`w, `b_scale`w → `y`; `b2`w, `b2_scale`w → `y2` |
 
 `gelu_mul_quant_i8` is `gelu_mul` with `rmsnorm_quant_i8`'s quantiser on its pass, byte-identical
 to the pair.
+
+`gemm_nt_q_dual` is two GEMMs of one activation's codes over two weights of one encoding and one
+`K`, in one launch: `b` → `y` (`N` columns) and `b2` → `y2` (`N2`), both reading the one `a` and
+`a_scale`. The two launches' blocks are concatenated in one grid, each part decoding and folding
+exactly as it does alone, so both outputs are byte-identical to the pair of calls it replaces --
+which is what makes it a gain rather than a numerical path. One encoding is the pair's condition in
+full: a pair of two forms is not its subject, nor is a pair of two runs of a computed trellis, whose
+fold length differs -- the encoding carries the planes' runs and row-blocks, so the two differ there
+too. The two widths are the pair's own, which is why `N2` is a parameter of its own: each part's
+blocks are the blocks its own launch gives it, so each `N` is a multiple of that block -- 16
+columns, and 32 from 4096 columns up, where the block is two tiles. libr4d's row is `gemm_iqr_dual`:
+both weights IQR, one row (the GEMV, where the two launches are launch and ramp cost), a block of
+eight waves per part -- two of its 16-row tiles where that part's own launch takes four waves a
+tile, one where it takes eight. K-02: Hy4-flash's
+`q_nope` and `q_rope` read the one q residual's codes at 6144 and 2048 columns on a sparse layer
+(3.84 and 1.32 MiB of codes) or 12288 and 4096 on a sliding one (7.61 and 2.58 MiB), and a layer's
+two launches become one. A sparse layer is 32 heads unsharded and 16 a rank at TP2, a sliding one
+64 and 32, at 192 + 64 columns a head; the narrower pair is also what a sliding layer has at TP2
+and the wider one what it has at TP1.
 
 `gated_had_quant_i8g` and `rmsnorm_had_quant_i8g` are `gated_quant_fp8` and `rmsnorm_quant_fp8`
 with `had_quant_act_i8g`'s quantiser on their pass: the `group`-wide rotation of the bf16-rounded

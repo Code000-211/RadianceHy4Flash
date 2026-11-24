@@ -105,15 +105,16 @@ RadEncoding enc_nl64(int bits) {
     rad_enc_copy_str(e.transform, "fwht128");
     return e;
 }
-/* The rotated computed trellis under one f32 scale a row (IQR; tcq_code=mad). */
-RadEncoding enc_trellis(uint32_t codes, bool colf) {
+/* The rotated computed trellis under one f32 scale a row (IQR; tcq_code=mad), its run (libquant's
+ * tcq_rows: the rows a run of the plane's table) as given. */
+RadEncoding enc_trellis(uint32_t codes, bool colf, uint32_t run = 128) {
     RadEncoding e{};
     rad_enc_clear(&e);
     rad_enc_copy_str(e.scheme, "trellis");
     rad_enc_add_plane(&e, "codes", codes, 1, 1);
     rad_enc_add_plane(&e, "scale", RAD_F32, 1, 0);
     const int t = rad_enc_add_table(&e, "trellis", RAD_I8, 1 << 16, 1);
-    e.plane[t].block[0] = 128;
+    e.plane[t].block[0] = run;
     rad_enc_add_table(&e, "trellis.mad", RAD_U32, 2, 1);
     if (colf) rad_enc_add_plane(&e, "scale.col", RAD_F32, 0, 128);
     rad_enc_copy_str(e.transform, "fwht128");
@@ -1774,6 +1775,134 @@ TEST(the_router_projection_joins_its_selection_where_a_library_serves_it) {
         }
         every_weight_read(d.b);
         steps_clean_at(d.b, 0, r.world);
+    }
+}
+
+/* K-02 (P-14's switch): q_nope and q_rope read one q residual's codes, so where both are one IQR
+ * form the plugin gives the pair one gemm_nt_q_dual a layer, at a decode step's GEMV only (M == 1,
+ * kDualMaxM) -- the two launches' blocks in one grid, each part's blocks the blocks its own launch
+ * gives it, so both products are byte-identical (the row's oracle). Off with
+ * RADIANCE_HY4_FUSE_QPROJ=0, and never for a pair of two forms nor for two runs of the trellis --
+ * the run is the fold's length and the pair folds once. The pair's two Ns differ (the mini model's
+ * q_nope is H * qk_nope_head_dim wide, its q_rope H * qk_rope_head_dim), which is what the row's
+ * N2 is for. On an engine whose library does not declare the row the pair keeps its two launches,
+ * as on the switch's off arm: the fallback is the plain kernel's launches, not a refused declare.
+ *
+ * Which parts a block holds is the row's (`dual_block_rows`): a part is declared only where its own
+ * launch's blocks cover its N whole -- sixteen rows below 4096 columns, thirty-two from there up.
+ * The runs below reach each answer from both sides, since a part declared in blocks too wide is a
+ * fusion lost (the two launches, silently) and one declared in blocks too narrow is a launch the
+ * row refuses mid-chain: `q_nope` 48 and 4080 are whole in sixteen rows and not in thirty-two,
+ * `q_nope` 4112 is whole in sixteen and not in thirty-two with the wide launch's block, and
+ * `q_nope` 4096 is the edge itself. */
+TEST(the_q_projections_go_out_as_one_launch) {
+    /* `nope` and `swa_nope` are the two layer kinds' qk_nope_head_dim; the sparse layers carry four
+     * heads and the sliding ones eight, so a part's N is heads * that. */
+    struct Run { const char* what; bool same, off, host; uint32_t nope_run, rope_run;
+                 int64_t nope, swa_nope; int duals; };
+    const Run runs[] = {
+        { "one form, one run", true, false, false, 16, 16, 24, 24, 3 },
+        { "one form, no dual row", true, false, true, 16, 16, 24, 24, 0 },
+        { "one form, fused off", true, true, false, 16, 16, 24, 24, 0 },
+        { "two forms", false, false, false, 16, 16, 24, 24, 0 },
+        { "two runs", true, false, false, 16, 32, 24, 24, 0 },
+        { "a part of three sixteen-row blocks", true, false, false, 16, 16, 12, 12, 3 },
+        { "a part four thousand and eighty wide", true, false, false, 16, 16, 512, 510, 3 },
+        { "a part the wide block leaves a strip of", true, false, false, 16, 16, 520, 514, 2 },
+        { "a part at the wide launch's edge", true, false, false, 16, 16, 512, 512, 3 },
+    };
+    for (const Run& r : runs) {
+        fprintf(stderr, "run %s\n", r.what);
+        /* G3Env leaves a switch alone when the test has already set it: the on arm asks for the pair
+         * itself, the off arm for the two launches. */
+        setenv("RADIANCE_HY4_FUSE_QPROJ", r.off ? "0" : "1", 1);
+        RadBuilder b;
+        bf16_encs(&b);
+        b.encs.insert(b.encs.begin(),
+                      { { "attn_q_nope", enc_trellis(RAD_U5, true, r.nope_run) },
+                        { "attn_q_rope", r.same ? enc_trellis(RAD_U5, true, r.rope_run)
+                                                : enc_i8(true) } });
+        /* A CPU engine: no device-only fused row, this file's idiom for one. */
+        if (r.host) b.undeclared.insert("gemm_nt_q_dual");
+        /* K is the q_lora rank: a trellis weight takes K in whole 128-column runs of the table. */
+        MetaKV mk = mini_meta(/* wide */ true);
+        mk.set("q_lora_rank", "128");
+        mk.set("qk_nope_head_dim", std::to_string(r.nope).c_str());
+        mk.set("swa_qk_nope_head_dim", std::to_string(r.swa_nope).c_str());
+        /* The pair's widths a layer kind, as the plugin reads them off the heads: four sparse, eight
+         * sliding, and q_rope is H * qk_rope_head_dim (8) either way. */
+        const int64_t nope_n[2] = { 4 * r.nope, 8 * r.swa_nope };
+        const int64_t rope_n[2] = { 32, 64 };
+        auto is_pair_op = [&](const RecOp* o) {
+            if (o->op != "gemm_nt_q" || pint(o, "K") != 128) return false;
+            for (int i = 0; i < 2; ++i)
+                if (pint(o, "N") == nope_n[i] || pint(o, "N") == rope_n[i]) return true;
+            return false;
+        };
+        RadBuildCtx ctx = build_ctx();
+        G3Env g3env;
+        int rc = 0;
+        const std::string err = stderr_of([&] { rc = hyv4flash::declare(&b, mk.meta(), &ctx); });
+        unsetenv("RADIANCE_HY4_FUSE_QPROJ");
+        if (rc != RAD_OK) fputs(err.c_str(), stderr);
+        REQUIRE_EQ(rc, RAD_OK);
+        /* One dual a layer where the pair is one form and one run, and none otherwise. */
+        CHECK_EQ(count_op(b, "gemm_nt_q_dual"), r.duals);
+        /* No op reaches rad_decl_op that the library does not carry: the pair without the row
+         * declares its two Lins and nothing else, where asking would fail the declare. */
+        CHECK_EQ(join(b.asked_undeclared), std::string());
+        /* Both own GEMMs stay declared: the pair serves the GEMV's band and every wider pass keeps
+         * the Lins' launches, so neither weight loses its launch. */
+        int own = 0;
+        for (const auto& o : b.ops)
+            if (is_pair_op(&o)) {
+                ++own;
+                const RecParam* m = param(&o, "M");
+                REQUIRE(m != nullptr);
+                CHECK(m->ihi > 1);
+            }
+        CHECK_EQ(own, 6);
+        /* The dual carries one of the two layer kinds' widths and the one K, and is declared at the
+         * GEMV's height; each declared pair is one whose parts are whole in the blocks it takes. */
+        for (const auto& o : b.ops)
+            if (o.op == "gemm_nt_q_dual") {
+                const int64_t N = pint(&o, "N"), N2 = pint(&o, "N2");
+                int kind = -1;
+                for (int i = 0; i < 2; ++i)
+                    if (N == nope_n[i] && N2 == rope_n[i]) kind = i;
+                CHECK(kind >= 0);
+                const int64_t rows = N >= 4096 ? 32 : 16;
+                CHECK_EQ(N % rows, 0);
+                CHECK_EQ(N2 % rows, 0);
+                CHECK_EQ(pint(&o, "K"), 128);
+                const RecParam* m = param(&o, "M");
+                REQUIRE(m != nullptr);
+                CHECK_EQ(m->ihi, 1);
+            }
+        every_weight_read(b);
+        steps_clean_at(b, 0, 1);
+        /* A one-token decode step: the pair's launch where it is declared, and the two Lins' own
+         * launches (both parts, three layers) everywhere else -- the switch off, a form or a run
+         * apart, a library with no such row, a part whose N the row's blocks do not cover. */
+        {
+            auto k = kit(b, { 1 }, {}, 0);
+            k->b.positions_h = k->pos.data();
+            auto v = run_passes(b, hyv4flash::step, { k.get() }, 0, 1);
+            CHECK_PASSES(b, v);
+            auto issued = [&](bool dual) {
+                int n = 0;
+                for (const auto& i : v[0]->issues) {
+                    const RecOp* o = b.op_of(i.op);
+                    if (!o) continue;
+                    if (dual) n += o->op == "gemm_nt_q_dual";
+                    else n += is_pair_op(o);
+                }
+                return n;
+            };
+            CHECK_EQ(issued(true), r.duals);
+            /* Two parts a layer, three layers (sparse, sliding, sparse). */
+            CHECK_EQ(issued(false), 2 * (3 - r.duals));
+        }
     }
 }
 

@@ -3460,16 +3460,26 @@ ihc_pre (hc_head), rmsnorm (output_norm), gather_rows, logits_gemm
   the shared expert's gate_up (the feed-forward norm's output); the leader writes a pair of its own
   (`trunk_codes.<role>.*`). Where libr4d serves them, the q residual's norm writes q_b's rotated
   codes itself (`rmsnorm_had_quant_i8g`, q_a then writes `q_a_raw`) and the dense and shared MLPs'
-  gate writes their down's (`gated_had_quant_i8g`). MoeFP8's `router_fuse` runs the selection and
-  the expert sort as one `router_sigmoid_topk_scatter` at decode and verify heights. All
+  gate writes their down's (`gated_had_quant_i8g`). MoeFP8's `router_fuse` runs the
+  selection and the expert sort as one `router_sigmoid_topk_scatter` at decode and verify heights. All
   byte-identical (greedy tokens and logprobs equal on gpu-mini at TP1/TP2, drafter off and depth 5,
-  bf16, 128-group int8 and IQ8R + w4nl64 containers). The 128-group rotated quantisers
+  bf16, 128-group int8 and IQ8R + w4nl64 containers). The q residual's `q_nope` and `q_rope`, whose
+  codes are the one pair above, then go out as one launch at a decode step: `gemm_nt_q_dual` over the
+  two weights and their two widths, a concatenated grid of eight-wave blocks in which a part taking
+  four waves a tile carries two of its 16-row tiles and one taking eight one, so each part does what
+  the block of its own launch does and both products are the two launches' byte for byte
+  (`RADIANCE_HY4_FUSE_QPROJ`, `r4d_selftest`'s `gemm_iqr_dual` case comparing them at 6144/2048,
+  3072/1024 and 12288/4096, the last the one pair where both parts take four waves a tile; a pass
+  wider than one row stays two launches, as does a pair on an engine whose library carries no such
+  row). The 128-group rotated quantisers
   (`had_quant_act_i8g`, `rmsnorm_had_quant_i8g`, the experts' `had_quant_act_fp8`) run their
   chained forms (`chained` 1, `Geom::chain_q8`), since every GEMM around them chains. Launches of a
-  recorded gpu-mini decode pass: bf16 132 -> 129, int8 170 -> 148. Switches (default on):
+  recorded gpu-mini decode pass: bf16 132 -> 129, int8 170 -> 148, three fewer again with the q
+  pair in one launch (a layer's, 3 layers). Switches (default on):
   `RADIANCE_HY4_SHARE_CODES`, `RADIANCE_HY4_FUSED_QUANT`, `RADIANCE_HY4_ROUTER_FUSE`,
-  `RADIANCE_HY4_CHAIN_Q8`. Not fused: the attention norm and the feed-forward norm are the
-  junction's (`rmsnorm_ihc_junction`), and o_proj's input comes out of `mla_expand_gate`.
+  `RADIANCE_HY4_CHAIN_Q8`, `RADIANCE_HY4_FUSE_QPROJ`. Not fused: the attention norm and the
+  feed-forward norm are the junction's (`rmsnorm_ihc_junction`), and o_proj's input comes out of
+  `mla_expand_gate`.
   `ffn_latent_out`'s is the one fused producer that is not a norm or a gate: the routed MoE gather
   (`moe_gather_inv_i8g`, K-19) writes the sum's rotated int8 codes and scales in the launch that
   sums it, so that linear declares no `had_quant_act_i8g`. It needs the slot table, no shared arm

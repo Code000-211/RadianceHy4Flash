@@ -674,6 +674,9 @@ int r4d_rad_gemm_iqr_gated(const RadArgs*, RadStream);
 int64_t r4d_rad_gemm_iqr_gated_scratch(const RadArgs*);
 int r4d_rad_gemm_iqr_tiled(const RadArgs*, RadStream);
 int64_t r4d_rad_gemm_iqr_tiled_scratch(const RadArgs*);
+/* `gemm_nt_q_dual`: two IQR weights of one activation in one launch -- the two launches' blocks in
+ * one grid, each part's the blocks of its own launch (K-02: q_nope and q_rope at a decode step). */
+int r4d_rad_gemm_iqr_dual(const RadArgs*, RadStream);
 /* The routed experts as IQR weights, a run's rows against each decoded tile (r4d_moe_iqr.hip). */
 int r4d_rad_moe_gemm_iqr(const RadArgs*, RadStream);
 int r4d_rad_moe_gemm_iqr_mod4(const RadArgs*, RadStream);
@@ -729,6 +732,7 @@ int r4d_rad_sample_chain    (const RadArgs*, RadStream);
 R4D_HOOKS(fp8_block)
 R4D_HOOKS(i8_block)
 R4D_HOOKS(iqr)
+R4D_HOOKS(iqr_dual)
 R4D_HOOKS(iqr_logits)
 R4D_HOOKS(iqr_vocab)
 R4D_HOOKS(moe_iqr)
@@ -1137,6 +1141,7 @@ int r4d_fuse_gate_quant_fp8      (const RadParam*, int, uint64_t, int, RadFuseSt
 int r4d_fuse_gemm_nt_q_gated     (const RadParam*, int, uint64_t, int, RadFuseStep*);
 int r4d_fuse_gemm_nt_q_gated_mx  (const RadParam*, int, uint64_t, int, RadFuseStep*);
 int r4d_fuse_gemm_nt_q_gated_iqr (const RadParam*, int, uint64_t, int, RadFuseStep*);
+int r4d_fuse_gemm_nt_q_dual_iqr (const RadParam*, int, uint64_t, int, RadFuseStep*);
 int r4d_fuse_gdn_conv_recurrent_update(const RadParam*, int, uint64_t, int, RadFuseStep*);
 int r4d_fuse_qk_norm_rope_gate_kv_store(const RadParam*, int, uint64_t, int, RadFuseStep*);
 int r4d_fuse_qkv_norm_rope_kv_store(const RadParam*, int, uint64_t, int, RadFuseStep*);
