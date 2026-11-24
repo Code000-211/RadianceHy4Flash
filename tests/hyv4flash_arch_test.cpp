@@ -2832,6 +2832,481 @@ TEST(dfly2_reads_quantised_linears_as_the_trunk_does) {
     }
 }
 
+/* ------------------------------------------------------------------ D-02 (#88): the chain replayed
+ *
+ * The tests above read a tape's ops and counts. D-02 moves operands (every round's rows of z
+ * gathered and normalised in one launch, rounds reading row blocks of shared planes, the anchors'
+ * embeddings kept across the layers), so these replay a query pass's tape over symbolic values: a
+ * cell is a 64-bit name of the expression that produced it, operands resolved as the core resolves
+ * them (offset, rows, cols at the declared pitch). The ops the chain is made of are modelled by row
+ * (a copy keeps its cells, so a moved or merged launch gives the same cells exactly when it gives
+ * the same values); every other op is opaque, a function of all it reads. */
+namespace {
+struct Replay {
+    static uint64_t mix(uint64_t h, uint64_t v) {
+        h ^= v + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
+        h *= 0xff51afd7ed558ccdull;
+        return h ^ (h >> 33);
+    }
+    static uint64_t tag(const std::string& s) {
+        uint64_t h = 1469598103934665603ull;
+        for (unsigned char ch : s) h = (h ^ ch) * 1099511628211ull;
+        return h;
+    }
+    static uint64_t fold(const std::vector<uint64_t>& v) {
+        uint64_t h = tag("row");
+        for (uint64_t x : v) h = mix(h, x);
+        return h;
+    }
+    /* The modelled ops' values, which the test's own statement of the chain is written in. */
+    static uint64_t embed(uint64_t tok, int64_t c) { return mix(mix(tag("embed"), tok), (uint64_t)c); }
+    static uint64_t linear(const char* op, uint64_t w, uint64_t row, int64_t j) {
+        return mix(mix(mix(tag(op), w), row), (uint64_t)j);
+    }
+    static uint64_t silu_mul(uint64_t g, uint64_t u) { return mix(mix(tag("silu_mul"), g), u); }
+    static uint64_t add(uint64_t a, uint64_t b2) { return mix(mix(tag("add"), a), b2); }
+
+    /* An operand's cells, row major. */
+    struct View {
+        int64_t rows = 0, cols = 0;
+        std::vector<uint64_t*> at;       /* a buffer's cells */
+        std::vector<uint64_t>  own;      /* a raw operand's, a weight's or a cache's */
+        bool written = false, buf = false;
+        uint64_t get(int64_t r, int64_t c) const {
+            const size_t i = (size_t)(r * cols + c);
+            return buf ? *at[i] : own[i];
+        }
+        std::vector<uint64_t> row(int64_t r) const {
+            std::vector<uint64_t> v;
+            for (int64_t c = 0; c < cols; ++c) v.push_back(get(r, c));
+            return v;
+        }
+        std::vector<uint64_t> all() const {
+            std::vector<uint64_t> v;
+            for (int64_t r = 0; r < rows; ++r)
+                for (int64_t c = 0; c < cols; ++c) v.push_back(get(r, c));
+            return v;
+        }
+    };
+
+    const RadBuilder& b;
+    std::vector<std::vector<uint64_t>> mem;   /* by buffer handle */
+    std::vector<std::string> bad;
+    uint64_t spill = 0;
+    explicit Replay(const RadBuilder& bld) : b(bld), mem(bld.bufs.size() + 1) {
+        for (size_t h = 1; h <= b.bufs.size(); ++h) {
+            const RadBufDecl& d = b.bufs[h - 1].d;
+            int64_t n = 1;
+            for (uint32_t i = 0; i < d.rank; ++i) n *= d.shape[i];
+            /* what an earlier pass left there: a name of its own a cell */
+            const uint64_t t = tag("left in " + b.bufs[h - 1].name);
+            for (int64_t i = 0; i < n; ++i) mem[h].push_back(mix(t, (uint64_t)i));
+        }
+    }
+    View view(const RecOp& o, const RadOperand& od) {
+        View v;
+        if (od.kind == RAD_OPK_BUF) {
+            const RadBufDecl& d = b.bufs[od.handle - 1].d;
+            int64_t pitch = 1;
+            for (uint32_t i = 1; i < d.rank; ++i) pitch *= d.shape[i];
+            v.buf = true;
+            v.rows = od.rows > 0 ? od.rows : d.shape[0];
+            v.cols = od.cols > 0 ? od.cols : pitch;
+            v.written = in(o.writes, od.handle);
+            std::vector<uint64_t>& m = mem[od.handle];
+            for (int64_t r = 0; r < v.rows; ++r)
+                for (int64_t c = 0; c < v.cols; ++c) {
+                    const int64_t i = od.offset + r * pitch + c;
+                    if (i < 0 || (size_t)i >= m.size()) {
+                        bad.push_back(o.op + ": an operand past '" + b.bufs[od.handle - 1].name + "'");
+                        v.at.push_back(&spill);   /* keeps the view's size; `bad` fails the case */
+                        continue;
+                    }
+                    v.at.push_back(&m[(size_t)i]);
+                }
+        } else if (od.kind == RAD_OPK_RAW) {
+            v.rows = od.rows > 0 ? od.rows : 1;
+            v.cols = od.cols > 0 ? od.cols : 1;
+            for (int64_t i = 0; i < v.rows * v.cols; ++i)
+                v.own.push_back(od.dtype == RAD_I32 && od.raw
+                                    ? (uint64_t)(int64_t)((const int32_t*)od.raw)[i]
+                                    : mix(tag("raw"), (uint64_t)i));
+        } else if (od.kind == RAD_OPK_WEIGHT) {
+            v.rows = v.cols = 1;
+            v.own.push_back(tag("weight " + b.weights[od.handle - 1].name));
+        } else if (od.kind != RAD_OPK_NONE) {
+            v.rows = v.cols = 1;
+            v.own.push_back(mix(mix(tag("handle"), od.kind), mix((uint64_t)od.offset, (uint64_t)od.rows)));
+        }
+        return v;
+    }
+    void put(View& v, int64_t r, int64_t c, uint64_t x) { *v.at[(size_t)(r * v.cols + c)] = x; }
+
+    /* One issue. `after` sees it once its outputs are written. */
+    void issue(const RecIssue& is) {
+        const RecOp* op = b.op_of(is.op);
+        if (!op) { bad.push_back("a null op issued"); return; }
+        const RecOp& o = *op;
+        std::vector<View> v;
+        for (const RadOperand& od : is.opd) v.push_back(view(o, od));
+        auto need = [&](size_t n) {
+            if (v.size() >= n) return true;
+            bad.push_back(o.op + ": too few operands");
+            return false;
+        };
+        if (o.op == "iota") {
+            if (!need(1)) return;
+            const long long start = pint(&o, "start"), step = pint(&o, "step");
+            const RecParam* per = param(&o, "period");
+            for (int64_t i = 0; i < v[0].rows * v[0].cols; ++i)
+                *v[0].at[(size_t)i] = (uint64_t)(start + (per ? i % per->ival : i) * step);
+        } else if (o.op == "cast" && pstr(&o, "from") == pstr(&o, "to") && v.size() == 2 &&
+                   v[0].rows * v[0].cols == v[1].rows * v[1].cols) {   /* a copy, cell for cell */
+            const std::vector<uint64_t> x = v[0].all();
+            for (size_t i = 0; i < x.size(); ++i) *v[1].at[i] = x[i];
+        } else if (o.op == "embed_lookup") {
+            if (!need(3)) return;
+            for (int64_t r = 0; r < v[2].rows; ++r)
+                for (int64_t c = 0; c < v[2].cols; ++c) put(v[2], r, c, embed(v[0].get(r, 0), c));
+        } else if (o.op == "gather_rows") {
+            if (!need(3)) return;
+            for (int64_t r = 0; r < v[2].rows; ++r) {
+                const int64_t i = (int64_t)v[1].get(r, 0);
+                if (i < 0 || i >= v[0].rows || v[0].cols != v[2].cols) {
+                    bad.push_back("gather_rows: an index that is not a row of its source");
+                    return;
+                }
+                const std::vector<uint64_t> x = v[0].row(i);
+                for (int64_t c = 0; c < v[2].cols; ++c) put(v[2], r, c, x[(size_t)c]);
+            }
+        } else if (o.op == "scatter_rows") {
+            if (!need(3)) return;
+            for (int64_t r = 0; r < v[0].rows; ++r) {
+                const int64_t i = (int64_t)v[1].get(r, 0);
+                if (i < 0 || i >= v[2].rows) { bad.push_back("scatter_rows: a row out of range"); return; }
+                for (int64_t c = 0; c < v[0].cols; ++c) put(v[2], i, c, v[0].get(r, c));
+            }
+        } else if (o.op == "rmsnorm" || o.op == "gemm_nt" || o.op == "logits_gemm") {
+            if (!need(3)) return;
+            for (int64_t r = 0; r < v[2].rows; ++r) {
+                const uint64_t h = fold(v[0].row(r));   /* before the row is written: may be in place */
+                for (int64_t c = 0; c < v[2].cols; ++c)
+                    put(v[2], r, c, linear(o.op.c_str(), v[1].own[0], h, c));
+            }
+        } else if (o.op == "silu_mul") {
+            if (!need(2)) return;
+            for (int64_t r = 0; r < v[1].rows; ++r)
+                for (int64_t c = 0; c < v[1].cols; ++c)
+                    put(v[1], r, c, silu_mul(v[0].get(r, c), v[0].get(r, v[1].cols + c)));
+        } else if (o.op == "add") {
+            if (!need(3)) return;
+            for (int64_t r = 0; r < v[2].rows; ++r)
+                for (int64_t c = 0; c < v[2].cols; ++c)
+                    put(v[2], r, c, add(v[0].get(r, c), v[1].get(r, c)));
+        } else {
+            /* Opaque: each output cell a function of the op, its fixed parameters and everything
+             * it reads (an operand it only writes is not read). */
+            uint64_t h = tag(o.op);
+            for (const auto& p : o.p)
+                if (p.key != "M") h = mix(mix(h, tag(p.key + "=" + p.sval)), (uint64_t)p.ival);
+            for (size_t k = 0; k < v.size(); ++k)
+                if (!v[k].written || in(o.reads, is.opd[k].handle)) h = mix(h, fold(v[k].all()));
+            for (size_t k = 0; k < v.size(); ++k)
+                if (v[k].buf && v[k].written)
+                    for (size_t i = 0; i < v[k].at.size(); ++i)
+                        *v[k].at[i] = mix(mix(h, (uint64_t)k), (uint64_t)i);
+        }
+    }
+    /* A buffer's first `rows` rows. */
+    std::vector<uint64_t> rows_of(rad_buf h, int64_t rows) {
+        RecOp none;
+        return view(none, hyv4flash::brows(h, rows)).all();
+    }
+};
+
+/* A drafter declared as the server's: `seqs` drafting sequences at most. */
+struct DflyAt {
+    MetaKV mk;
+    RadBuilder b;
+    int rc = 0;
+    DflyAt(int depth, int world, int coupled, int64_t seqs, void (*encs)(RadBuilder*) = bf16_encs,
+           MetaKV m = dfly_meta())
+        : mk(std::move(m)) {
+        encs(&b);
+        RadBuildCtx ctx = spec_ctx(0, world, depth);
+        ctx.max_seqs = seqs;
+        ctx.draft_coupling = coupled;
+        const std::string err = stderr_of([&] { rc = hyv4flash::declare(&b, mk.meta(), &ctx); });
+        if (rc != RAD_OK) fputs(err.c_str(), stderr);
+    }
+    const hyv4flash::Dfly& df() const { return hyv4flash::models[0]->df; }
+    /* The query pass of `n` sequences at `blk` rows each, alone: what it reads of the trunk step
+     * is whatever that left. */
+    std::unique_ptr<RadCtx> query(int64_t n, int64_t blk, int world, Query** keep) {
+        *keep = new Query(b, n, blk, blk - 1);
+        auto c = std::make_unique<RadCtx>();
+        c->b = &b;
+        c->batch = &(*keep)->k->b;
+        c->world = world;
+        hyv4flash::step(c.get(), c->batch);
+        return c;
+    }
+};
+}  // namespace
+
+/* D-02: at every stream count the server runs (1, 2, 8, 16) and every depth to the configured one,
+ * full block and short, greedy and coupled, each chain round's corrected state is the header's
+ *
+ *   zc = z[k+1] + down(silu(gate(c)) * up(c)),   c = [hnorm(z[k+1]) | enorm(embed(prev))]
+ *
+ * over the rows the final norm wrote, prev the anchor's token and then each proposal, and proposal
+ * k is what the round's shortlist put first. Stated here from the modelled ops alone, so it holds
+ * the hoisted gather and norm, the rounds' row blocks and the kept anchor embeddings to the values
+ * the per-round launches gave. RADIANCE_HY4_DFLY_TEST_BREAK=chain_rows (every round reading round
+ * 0's rows) must fail it from the second round on. HY4_TEST_D02_DIGEST=1 prints a digest of every
+ * round's logits, shortlist and proposals a shape, to compare two trees (TP and int8 included,
+ * where the chain's linears are opaque here). */
+TEST(dfly2_chain_rounds_compute_the_headers_chain_at_every_served_shape) {
+    const bool digest = std::getenv("HY4_TEST_D02_DIGEST") != nullptr;
+    int64_t wrong = -1;   /* cells that differ from the header's; -1 until a run completes */
+    auto run = [&](int depth, int world, int coupled, int64_t n, int64_t blk, bool i8, bool broken) {
+        wrong = -1;
+        DflyAt d(depth, world, coupled, 16, i8 ? dfly_i8_encs : bf16_encs,
+                 i8 ? dfly_meta(1, true, 256) : dfly_meta());
+        REQUIRE_EQ(d.rc, RAD_OK);
+        const auto& df = d.df();
+        REQUIRE(df.served);
+        Query* qp = nullptr;
+        auto c = d.query(n, blk, world, &qp);
+        std::unique_ptr<Query> hold(qp);
+        if (!c->step_fail.empty()) fprintf(stderr, "%s\n", c->step_fail.c_str());
+        REQUIRE(c->step_fail.empty());
+        const int64_t rounds = blk - 1, E = df.E;
+        const RadBuilder& b = d.b;
+        Replay rp(b);
+        std::vector<uint64_t> Z, prev;   /* the final norm's rows; each sequence's previous token */
+        for (int64_t s = 0; s < n; ++s) prev.push_back((uint64_t)qp->k->tok[(size_t)(s * blk)]);
+        const uint64_t wh = Replay::tag("weight dfly.correct_hidden_norm.weight"),
+                       we = Replay::tag("weight dfly.correct_embed_norm.weight"),
+                       wg = Replay::tag("weight dfly.correct_gate.weight"),
+                       wu = Replay::tag("weight dfly.correct_up.weight"),
+                       wd = Replay::tag("weight dfly.correct_down.weight");
+        uint64_t dg = Replay::tag("digest");
+        int64_t heads = 0;
+        wrong = 0;
+        for (const RecIssue& is : c->issues) {
+            /* a round's head: its input against the header, before the head runs */
+            int64_t k = -1;
+            for (int64_t i = 0; i < rounds; ++i)
+                if (is.op == df.steps[(size_t)i].op_head) k = i;
+            if (k >= 0 && world == 1 && !i8) {
+                ++heads;
+                REQUIRE(!Z.empty());
+                const Replay::View zc = rp.view(*b.op_of(is.op), is.opd[0]);
+                REQUIRE_EQ(zc.rows, n);
+                REQUIRE_EQ(zc.cols, E);
+                for (int64_t s = 0; s < n; ++s) {
+                    const size_t row = (size_t)((s * blk + k + 1) * E);
+                    const std::vector<uint64_t> z(Z.begin() + (long)row, Z.begin() + (long)(row + E));
+                    std::vector<uint64_t> cc, pe, gu, act;
+                    for (int64_t j = 0; j < E; ++j) pe.push_back(Replay::embed(prev[(size_t)s], j));
+                    for (int64_t j = 0; j < E; ++j)
+                        cc.push_back(Replay::linear("rmsnorm", wh, Replay::fold(z), j));
+                    for (int64_t j = 0; j < E; ++j)
+                        cc.push_back(Replay::linear("rmsnorm", we, Replay::fold(pe), j));
+                    for (int64_t j = 0; j < df.Ew; ++j)
+                        act.push_back(Replay::silu_mul(Replay::linear("gemm_nt", wg, Replay::fold(cc), j),
+                                                       Replay::linear("gemm_nt", wu, Replay::fold(cc), j)));
+                    for (int64_t j = 0; j < E; ++j)
+                        wrong += zc.get(s, j) != Replay::add(z[(size_t)j],
+                                                             Replay::linear("gemm_nt", wd, Replay::fold(act), j));
+                }
+            }
+            rp.issue(is);
+            if (is.op == df.op_final) Z = rp.rows_of(df.z, n * blk);
+            for (int64_t i = 0; i < rounds; ++i) {
+                const auto& st = df.steps[(size_t)i];
+                if (is.op == st.op_head) dg = Replay::mix(dg, Replay::fold(rp.rows_of(df.logits, n)));
+                if (is.op == st.op_tok) {   /* the round's proposal, as it left the shortlist */
+                    const Replay::View t = rp.view(*b.op_of(is.op), is.opd[0]);
+                    dg = Replay::mix(dg, Replay::fold(rp.rows_of(df.cidx, n)));
+                    dg = Replay::mix(dg, Replay::fold(rp.rows_of(df.cval, n)));
+                    for (int64_t s = 0; s < n; ++s) {
+                        prev[(size_t)s] = t.get(s, 0);
+                        /* ... and where the core reads it: column i of the proposals */
+                        const Replay::View o = rp.view(*b.op_of(is.op), is.opd[1]);
+                        wrong += o.get(s, 0) != rp.rows_of(df.tokens, n)[(size_t)(s * depth + i)];
+                    }
+                }
+            }
+        }
+        for (size_t i = 0; i < rp.bad.size() && i < 4; ++i) fprintf(stderr, "    replay: %s\n", rp.bad[i].c_str());
+        CHECK_EQ(rp.bad.size(), (size_t)0);
+        if (world == 1 && !i8) CHECK_EQ(heads, rounds);
+        dg = Replay::mix(dg, Replay::fold(rp.rows_of(df.tokens, n)));
+        if (digest && !broken)
+            printf("    d02 digest depth %d world %d coupled %d n %lld block %lld %s: %016llx, %zu issues\n",
+                   depth, world, coupled, (long long)n, (long long)blk, i8 ? "int8" : "bf16",
+                   (unsigned long long)dg, c->issues.size());
+    };
+    for (int depth : { 1, 2, 3, 4, 5 })
+        for (int coupled : { 0, 1 })
+            for (int64_t n : { (int64_t)1, (int64_t)2, (int64_t)8, (int64_t)16 }) {
+                run(depth, 1, coupled, n, depth + 1, false, false);
+                CHECK_EQ(wrong, (int64_t)0);
+                if (depth >= 4) {
+                    run(depth, 1, coupled, n, 4, false, false);
+                    CHECK_EQ(wrong, (int64_t)0);
+                }
+                if (digest) {
+                    run(depth, 2, coupled, n, depth + 1, false, false);
+                    run(depth, 1, coupled, n, depth + 1, true, false);
+                    run(depth, 2, coupled, n, depth + 1, true, false);
+                }
+            }
+    /* the mutant: caught wherever there is a second round, harmless at depth 1 */
+    setenv("RADIANCE_HY4_DFLY_TEST_BREAK", "chain_rows", 1);
+    for (int64_t n : { (int64_t)1, (int64_t)2, (int64_t)16 }) {
+        run(5, 1, 0, n, 6, false, true);
+        CHECK(wrong > 0);
+        run(5, 1, 1, n, 4, false, true);
+        CHECK(wrong > 0);
+        run(1, 1, 0, n, 2, false, true);
+        CHECK_EQ(wrong, (int64_t)0);
+    }
+    unsetenv("RADIANCE_HY4_DFLY_TEST_BREAK");
+}
+
+/* D-02: what a query pass no longer launches. One gather and one norm for all the rounds' rows of
+ * z, the rounds' row indices in one plane; the block's embeddings written straight into the
+ * residual and the anchors' gathered once; no copy of the last round's proposal that nothing reads;
+ * and, where gate and up are int8 linears of one form, one quantiser a round for the two (up's
+ * GEMM reading the codes gate's wrote, at the round's rows). Per pass of r rounds that is
+ * 3 + 2 (r - 1) launches fewer than one launch a round and a block copy, and r more at int8. */
+TEST(dfly2_chain_launches_each_shared_step_once_a_pass) {
+    for (const bool i8 : { false, true })
+        for (int world : { 1, 2 })
+            for (int coupled : { 0, 1 })
+                for (int64_t n : { (int64_t)1, (int64_t)2, (int64_t)8, (int64_t)16 })
+                    for (int64_t blk : { (int64_t)6, (int64_t)4 }) {
+                        DflyAt d(5, world, coupled, 16, i8 ? dfly_i8_encs : bf16_encs,
+                                 i8 ? dfly_meta(1, true, 256) : dfly_meta());
+                        REQUIRE_EQ(d.rc, RAD_OK);
+                        const auto& df = d.df();
+                        REQUIRE(df.served);
+                        const RadBuilder& b = d.b;
+                        Query* qp = nullptr;
+                        auto c = d.query(n, blk, world, &qp);
+                        std::unique_ptr<Query> hold(qp);
+                        REQUIRE(c->step_fail.empty());
+                        const int64_t rounds = blk - 1, E = df.E;
+                        auto count = [&](rad_op h) {
+                            int64_t k = 0;
+                            for (const auto& is : c->issues) k += h && is.op == h;
+                            return k;
+                        };
+                        const auto q = issued_ops(b, *c);
+                        auto named = [&](const char* op) {
+                            return (int64_t)std::count(q.begin(), q.end(), std::string(op));
+                        };
+                        /* the hoisted pair, over every round's rows */
+                        CHECK_EQ(count(df.op_zk), (int64_t)1);
+                        CHECK_EQ(count(df.op_hn), (int64_t)1);
+                        CHECK_EQ(named("gather_rows"), (int64_t)3);   /* anchors, target hidden, chain */
+                        const RecIssue* zk = nullptr;
+                        const RecIssue* hn = nullptr;
+                        for (const auto& is : c->issues) {
+                            if (is.op == df.op_zk) zk = &is;
+                            if (is.op == df.op_hn) hn = &is;
+                        }
+                        REQUIRE(zk != nullptr && hn != nullptr);
+                        CHECK_EQ(zk->n, rounds * n);
+                        CHECK_EQ(zk->opd[1].rows, rounds * n);
+                        CHECK_EQ(hn->n, rounds * n);
+                        CHECK_EQ(hn->opd[2].cols, E);
+                        CHECK_EQ(hn->opd[2].offset, (int64_t)0);
+                        /* one row-index launch a round, each into its own rows of the plane */
+                        int64_t r = 0;
+                        for (const auto& is : c->issues)
+                            for (int64_t k = 0; k < rounds; ++k) {
+                                const auto& st = df.steps[(size_t)k];
+                                if (is.op != (blk == 6 ? st.op_rowk : st.op_rowk_lo)) continue;
+                                CHECK_EQ(is.opd[0].handle, df.rowk);
+                                CHECK_EQ(is.opd[0].offset, k * n);
+                                CHECK_EQ(is.opd[0].rows, n);
+                                ++r;
+                            }
+                        CHECK_EQ(r, rounds);
+                        /* the embeddings: the block's once, then one a round after the first */
+                        CHECK_EQ(named("embed_lookup"), rounds);
+                        /* the proposal copies: tokens every round, prev where a round follows */
+                        int64_t tok = 0, prev = 0;
+                        for (int64_t k = 0; k < rounds; ++k) {
+                            tok += count(df.steps[(size_t)k].op_tok);
+                            prev += count(df.steps[(size_t)k].op_prev);
+                        }
+                        CHECK_EQ(tok, rounds);
+                        CHECK_EQ(prev, rounds - 1);
+                        /* gate and up of a round read that round's rows of the shared input */
+                        if (!i8) {
+                            int64_t g = 0;
+                            for (const auto& is : c->issues)
+                                if (is.op == df.c_g.op || is.op == df.c_u.op) {
+                                    CHECK_EQ(is.opd[0].handle, df.ccat);
+                                    CHECK_EQ(is.opd[0].offset, (g / 2) * n * 2 * E);
+                                    CHECK_EQ(is.opd[0].rows, n);
+                                    ++g;
+                                }
+                            CHECK_EQ(g, 2 * rounds);
+                        } else {
+                            /* int8: one quantiser of the shared input a round, written and read at
+                             * the round's rows by both GEMMs */
+                            REQUIRE(df.c_g.q && df.c_u.q);
+                            CHECK_EQ(df.c_g.q8, df.c_u.q8);
+                            REQUIRE(df.c_g.lin.op_q != 0 && df.c_u.lin.op_q != 0);
+                            CHECK_EQ(count(df.c_g.lin.op_q), rounds);
+                            CHECK_EQ(count(df.c_u.lin.op_q), (int64_t)0);
+                            const int64_t K = 2 * E;
+                            int64_t kq = 0, kg = 0, ku = 0;
+                            for (const auto& is : c->issues) {
+                                if (is.op == df.c_g.lin.op_q) {
+                                    CHECK_EQ(is.opd[0].handle, df.ccat);
+                                    CHECK_EQ(is.opd[0].offset, kq * n * K);
+                                    CHECK_EQ(is.opd[1].handle, df.c_g.q8);
+                                    CHECK_EQ(is.opd[1].offset, kq * n * K);
+                                    ++kq;
+                                }
+                                if (is.op == df.c_g.lin.op) {
+                                    CHECK_EQ(is.opd[0].offset, kg * n * K);
+                                    ++kg;
+                                }
+                                if (is.op == df.c_u.lin.op) {
+                                    CHECK_EQ(kq, ku + 1);   /* behind this round's quantiser */
+                                    CHECK_EQ(is.opd[0].handle, df.c_g.q8);
+                                    CHECK_EQ(is.opd[0].offset, ku * n * K);
+                                    CHECK_EQ(is.opd[1].handle, df.c_g.s8);
+                                    ++ku;
+                                }
+                            }
+                            CHECK_EQ(kg, rounds);
+                            CHECK_EQ(ku, rounds);
+                            const RecBuf* q8 = find_b(b, b.bufs[df.c_g.q8 - 1].name);
+                            REQUIRE(q8 != nullptr);
+                            CHECK_EQ(q8->d.shape[0], (int64_t)(5 * 16));
+                        }
+                        /* the pass's launches: a fixed part and a part a round */
+                        const int64_t tp = world > 1 ? 1 : 0;
+                        const int64_t a_round = 15 + (i8 ? 2 : 0) + 3 * tp + coupled;
+                        const int64_t fixed = (int64_t)c->issues.size() - rounds * a_round;
+                        if (blk == 6) {
+                            Query* q4 = nullptr;
+                            auto c4 = d.query(n, 4, world, &q4);
+                            std::unique_ptr<Query> hold4(q4);
+                            CHECK_EQ((int64_t)c4->issues.size(), fixed + 3 * a_round);
+                        }
+                    }
+}
+
 /* §3.2: a dense trunk step clears the snapshot's counts (nsel 0: the row attended densely) instead
  * of copying, and a selecting one copies after qsa_select and before the layer's attention. */
 TEST(the_trunk_snapshots_its_selection_after_qsa_select_and_clears_it_on_a_dense_step) {
