@@ -7158,7 +7158,8 @@ static const RadKernelInfo kKernels[] = {
 { "gemm_bf16_nt_bias_tiled", "gemm_nt_bias", "gemm",
   "biased GEMM C = res + act(A @ W^T + bias) over 64-deep K tiles, the K tail staged as zeros, "
   "the activation and residual in the store: from 32 blocks of 128x128 the weight read straight "
-  "into registers and the activation staged through LDS, below that both staged at 64x64",
+  "into registers and the activation staged through LDS, below that both staged at 64x64; at "
+  "decode heights (M <= 64) either form in its chained form",
   "any M, N; K a multiple of 8; A rows 16-byte aligned; `res` may be the output itself",
   "bf16 A / W / C / res, bf16 or f32 bias, fp32 accumulate, three RNE roundings in the store",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
