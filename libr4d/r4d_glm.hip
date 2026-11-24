@@ -758,11 +758,12 @@ int router_sgemm_body(const RadArgs* a, RadStream stream) {
         R4D_RSG_I(R, C, U, OWN, NW, false);                                                        \
     } while (0)
     // Two rows by two columns to 16 rows -- the form gemm_nt_f32's law picks there --, eight rows by
-    // one column above, which is the form it picks between 17 and 63 rows too. Past 16 rows the
-    // fused row is served but not used by the MoE block (kMoeRouterFusedRows): on a R9700 the 1024
-    // thread block it needs above 16 rows was 2-3x the pair's time at 32 and 64 rows in the
-    // selftest's `--perfmoefuse` rows, while <= 16 rows was 1-8 us faster than the pair. Which form
-    // runs costs nothing either way: any form computes the same bytes, because the k order and the
+    // one column above, the form that law picks between 17 and 63 rows at a projection 128 columns
+    // or wider (narrower, it keeps two-by-two-to-16 there). The MoE block asks for this row only
+    // inside its band (kMoeSigmoidFusedRows): on a R9700 the 1024 thread block it needs above 16
+    // rows was 2-3x the pair's time at 32 and 64 rows in the selftest's `--perfmoefuse` rows, and at
+    // 16 rows, on a pass that folds no plane, level with it (21.3 against 21.2 us). Which form runs
+    // costs nothing either way: any form computes the same bytes, because the k order and the
     // butterfly are the tile's sums' (`gemm_nt_f32_tile_sums`), not the layout's, so the ranking
     // block's rows are the pair's whatever form each ran.
     if (m <= 16) {

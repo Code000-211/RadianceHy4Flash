@@ -65,14 +65,22 @@ namespace arch {
  * exists. */
 static const int64_t kMoeSortRows = 1024;
 
-/* The skinny bf16 GEMM's decode band, within which the fused router op reproduces that GEMM's
- * arithmetic; above it the router uses the tiled kernel and the unfused pair. It is also the band
- * the fusion was measured faster in: on a R9700 the selftest's `--perfmoefuse` rows put the fused
- * router at 14.0 / 15.7 / 21.2 us against the pair's 15.5 / 16.7 / 20.6 at 1 / 8 / 16 rows, and at
- * 12.5 / 15.7 / 21.0 against 18.5 / 21.5 / 25.8 there with the latent's codes folded in; at 32 and
- * 64 rows it was 117 and 136 us against the pair's 31.9 and 51.9, where the row's form needs a
- * block four times as wide. A lane can raise the band once stamps show the pair beaten there. */
-static const int64_t kMoeRouterFusedRows = 16;
+/* `router_gemm_topk_scatter`'s row bound: the skinny bf16 GEMM's decode band, within which the
+ * fused router reproduces that GEMM's arithmetic; above it the router uses the tiled kernel and the
+ * unfused pair. It bounds that row alone -- the sigmoid row below has its own, measured band. */
+static const int64_t kMoeRouterFusedRows = 64;
+
+/* The sigmoid fused row's (`router_gemm_sigmoid_scatter`) own band, from the selftest's
+ * `--perfmoefuse` on a R9700 (warm, 200 launches). A pass that folds the latent's codes into the
+ * launch beats the launches it replaces up to 16 rows: 13.7 and 13.6 us against the pair's 20.4 and
+ * 19.9 at 1 row, 15.6 and 15.6 against 21.6 and 21.4 at 8, 20.9 and 21.0 against 26.0 and 25.3 at
+ * 16 (the codes E4M3 and int8). A bare pass, with no plane to fold, stops at 8, where it was 13.8
+ * and 15.7 against the pair's 15.3 and 16.6; at 16 rows it was level with the pair (21.3 against
+ * 21.2), so that row is not in its band. Neither goes past 16: above that the row's form needs a
+ * block four times as wide and was 115 us against the pair's 32.3 at 32 rows. A lane can widen
+ * either once stamps show the pair beaten where the band ends. */
+static const int64_t kMoeSigmoidFusedRows = 16;
+static const int64_t kMoeSigmoidFusedBare = 8;
 
 /* ---- RADIANCE_DEBUG_ROUTING: prints token 0's routing weights once per layer.
  *
@@ -1780,13 +1788,14 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
      * Undeclared or unresolved, the two launches serve. */
     if (op_sigmoid_scatter && c.sigmoid_router && c.router_fuse &&
         rad_op_declared(b, "router_gemm_sigmoid_scatter")) {
-        sigmoid_gemm_rows = sigmoid_scatter_rows < kMoeRouterFusedRows ? sigmoid_scatter_rows
-                                                                      : kMoeRouterFusedRows;
+        /* The latent's own codes, when this pass writes them: the same op the separate quantiser
+         * launch is (`op_hq`), the same buffers and group, so the launch disappears rather than
+         * moving. Folding them also moves the row's band: they are what the fusion was measured
+         * faster by above 8 rows (`kMoeSigmoidFusedRows`). */
+        const bool hq_fold = op_hq != 0;
+        const int64_t band = hq_fold ? kMoeSigmoidFusedRows : kMoeSigmoidFusedBare;
+        sigmoid_gemm_rows = sigmoid_scatter_rows < band ? sigmoid_scatter_rows : band;
         if (sigmoid_gemm_rows > 0) {
-            /* The latent's own codes, when this pass writes them: the same op the separate
-             * quantiser launch is (`op_hq`), the same buffers and group, so the launch disappears
-             * rather than moving. */
-            const bool hq_fold = op_hq != 0;
             const RadParam gp[] = {
                 RAD_RANGE("M", 1, sigmoid_gemm_rows), RAD_INT("K", g.n_embd),
                 RAD_INT("n_expert", c.n_expert_all), RAD_INT("n_local", c.n_expert),
