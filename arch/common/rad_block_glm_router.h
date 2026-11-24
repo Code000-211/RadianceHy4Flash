@@ -28,6 +28,9 @@ struct GlmRouter {
     Wire w{};
     rad_weight projection = 0, correction = 0;
     rad_op op_project = 0, op_select = 0;
+    /* Whether `projection` is stored bf16 (Config::weight_bf16 and the checkpoint's encoding), as
+     * an op that fuses this projection is told. */
+    bool projection_bf16 = false;
     SplitF32Proj split{};
 
     int declare(RadBuilder* b, Names& nm, const Geom& geom, int layer, const char* name,
@@ -45,6 +48,7 @@ struct GlmRouter {
         RAD_ARCH_TRY(map_copy(b, pn, src.weight));
         RAD_ARCH_TRY(map_copy(b, cn, src.correction));
         const bool packed = c.weight_bf16 && weight_codes_dtype(b, pn, RAD_BF16) == RAD_BF16;
+        projection_bf16 = packed;
         projection = decl_w(b, pn, packed ? RAD_BF16 : RAD_F32, { c.experts, g.n_embd },
                             RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp_layer(layer));
         correction = decl_w(b, cn, RAD_F32, { c.experts }, RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE,
