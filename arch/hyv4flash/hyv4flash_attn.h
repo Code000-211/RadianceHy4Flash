@@ -610,18 +610,20 @@ struct Attn {
                     brow_slice(w.lat, DT, M, H * L));
     }
 
-    /* The selection form: decode-class rows [0, DT) stable, prefill rows [DT, T) fast. */
-    void selected(RadCtx* c, const StepPlan& p, rad_buf sel, rad_buf len) const {
+    /* The selection form: decode-class rows [0, DT) stable, prefill rows [DT, T) fast.
+     * P-09: `sel0` is the row `sel`'s window starts at (0 on the wire, the layer's base in the
+     * selection snapshot plane when the step wrote its selection straight there). */
+    void selected(RadCtx* c, const StepPlan& p, rad_buf sel, rad_buf len, int64_t sel0 = 0) const {
         const int64_t DT = p.DT, M = p.T - DT, L = s.kv_lora, R = a.qk_rope, H = a.heads,
                       K = s.ix_group_topk;
         if (DT > 0)
             RAD_ISSUE_N(c, op_sel, DT, brows(w.q_lat, DT), brows(w.q_rope, DT),
-                        kv_cache(kv, layer), brows(sel, DT), brows(len, DT), RAD_W(sinks),
-                        brows(w.lat, DT));
+                        kv_cache(kv, layer), brow_slice(sel, sel0, DT, K), brows(len, DT),
+                        RAD_W(sinks), brows(w.lat, DT));
         if (M > 0)
             RAD_ISSUE_N(c, op_sel_pf, M, brow_slice(w.q_lat, DT, M, H * L),
                         brow_slice(w.q_rope, DT, M, H * R), kv_cache(kv, layer),
-                        brow_slice(sel, DT, M, K), brow_slice(len, DT, M, 1), RAD_W(sinks),
+                        brow_slice(sel, sel0 + DT, M, K), brow_slice(len, DT, M, 1), RAD_W(sinks),
                         brow_slice(w.lat, DT, M, H * L));
     }
 
@@ -676,7 +678,7 @@ struct Attn {
      * tail_taps() the two taps behind them). */
     void core(RadCtx* c, const RadBatch* batch, const StepPlan& p, rad_buf sel, rad_buf len,
               rad_buf nsel, bool fused_tail, const RadBatch* queries,
-              const QueryRows& rows) const {
+              const QueryRows& rows, int64_t sel0 = 0, int64_t nsel0 = 0) const {
         const int64_t T = p.T;
         const auto* kb = kv_batch(batch, kv);
         auto act = [](rad_buf x) {
@@ -700,10 +702,11 @@ struct Attn {
                                      "has no kv_resolve for its selection");
                     return;
                 }
-                kv_resolve_issue(c, op_resolve, S, brows(sel, T), brows(nsel, T), kv, layer, T);
+                kv_resolve_issue(c, op_resolve, S, brow_slice(sel, sel0, T, s.ix_group_topk),
+                                 brow_slice(nsel, nsel0, T, 1), kv, layer, T);
             }
             if (selecting)
-                selected(c, p, sel, len);
+                selected(c, p, sel, len, sel0);
             else
                 paged(c, queries, p, !p.nonabs, rows);
             if (fused_q)

@@ -209,63 +209,88 @@ struct Dfly {
     }
 
     /* ---------------------------------------------------------------- the trunk's snapshots */
+    /* P-09: the snapshot layers' selections live in two layer-major planes, so a single-span
+     * step of a group that does not stream lets `qsa_select` write its layer's window directly
+     * (no post-copy), and a non-selecting step clears every layer's counts with one fill.
+     * Layer li's window starts at row `Snap::base` and is `g.max_tok` rows tall. */
     struct Snap {
         int layer = -1;
+        int li = 0;             /* the plane's layer slot (declare order) */
+        int64_t base = 0;       /* the plane row this layer's window starts at */
         int64_t width = 0;
-        rad_buf sel = 0, nsel = 0, ids = 0;   /* ids: taps only, the selection as group ids */
-        rad_op op_sel = 0, op_nsel = 0, op_zero = 0, op_ids = 0;
     };
     std::vector<Snap> snap;
+    rad_buf snap_sel = 0, snap_nsel = 0;      /* [L*T, G] i32 + [L*T] i32, PERSIST */
+    rad_buf snap_ids = 0;                     /* taps only, the selection as group ids */
+    rad_op op_sel = 0, op_nsel = 0, op_zero = 0, op_ids = 0;   /* shared by the layers */
+    int64_t snap_t = 0;                       /* the plane's rows a layer (g.max_tok) */
     const Snap* snap_of(int l) const {
         for (const Snap& sn : snap)
             if (sn.layer == l) return &sn;
         return nullptr;
     }
-    /* Declared right after layer l's indexer (its qsa_select writes `ix.selected`). */
+    /* P-09: the window a snapshot layer's `qsa_select` writes when the step is single-span and
+     * the group does not stream (the caller holds both step facts). */
+    SelOut snap_out(int l) const {
+        const Snap* sn = snap_of(l);
+        return SelOut{ snap_sel, snap_nsel, sn->base };
+    }
+    /* Declared right after layer l's indexer (its `qsa_select` may write the plane's window). */
     int declare_snap(RadBuilder* b, Names& nm, const Shape& s, const Geom& g, int l,
                      const IndexWire& iw) {
         if (!snaps(l)) return RAD_OK;
         const int64_t T = g.max_tok, G = s.ix_group_topk;
+        if (snap.empty()) {
+            snap_t = T;
+            const int64_t L = (int64_t)idx_set.size(), P = L * T;
+            snap_sel = decl_b(b, nm.f("dfly.sel_snap"), RAD_I32, { P, G }, RAD_BUF_PERSIST);
+            snap_nsel = decl_b(b, nm.f("dfly.nsel_snap"), RAD_I32, { P }, RAD_BUF_PERSIST);
+            if (!snap_sel || !snap_nsel) return RAD_E_INVAL;
+            op_sel = decl_copy(b, T, G, RAD_I32, iw.sel, snap_sel);
+            op_nsel = decl_copy(b, T, 1, RAD_I32, iw.nsel, snap_nsel);
+            op_zero = mk(b, "fill", { RAD_RANGE("M", 1, P), RAD_INT("n", 1), RAD_STR("dtype", "i32") },
+                         {}, {}, { snap_nsel });
+            HY4_NEED(op_sel && op_nsel, "cast (i32)");
+            HY4_NEED(op_zero, "fill (i32)");
+            if (taps_on() && iw.sel_ids) {
+                snap_ids = decl_b(b, nm.f("dfly.sel_snap_ids"), RAD_I32, { P, G }, RAD_BUF_PERSIST);
+                if (!snap_ids) return RAD_E_INVAL;
+                op_ids = decl_copy(b, T, G, RAD_I32, iw.sel_ids, snap_ids);
+                HY4_NEED(op_ids, "cast (i32)");
+            }
+        }
         Snap sn;
         sn.layer = l;
+        sn.li = (int)snap.size();
+        sn.base = sn.li * T;
         sn.width = G;
-        sn.sel = decl_b(b, nm.f("dfly.sel_snap.%d", l), RAD_I32, { T, G }, RAD_BUF_PERSIST);
-        sn.nsel = decl_b(b, nm.f("dfly.nsel_snap.%d", l), RAD_I32, { T }, RAD_BUF_PERSIST);
-        if (!sn.sel || !sn.nsel) return RAD_E_INVAL;
-        sn.op_sel = decl_copy(b, T, G, RAD_I32, iw.sel, sn.sel);
-        sn.op_nsel = decl_copy(b, T, 1, RAD_I32, iw.nsel, sn.nsel);
-        sn.op_zero = mk(b, "fill", { RAD_RANGE("M", 1, T), RAD_INT("n", 1), RAD_STR("dtype", "i32") },
-                        {}, {}, { sn.nsel });
-        HY4_NEED(sn.op_sel && sn.op_nsel, "cast (i32)");
-        HY4_NEED(sn.op_zero, "fill (i32)");
-        if (taps_on() && iw.sel_ids) {
-            sn.ids = decl_b(b, nm.f("dfly.sel_snap_ids.%d", l), RAD_I32, { T, G }, RAD_BUF_PERSIST);
-            if (!sn.ids) return RAD_E_INVAL;
-            sn.op_ids = decl_copy(b, T, G, RAD_I32, iw.sel_ids, sn.ids);
-            HY4_NEED(sn.op_ids, "cast (i32)");
-        }
         snap.push_back(sn);
         return RAD_OK;
     }
     /* Issued after layer l's Indexer::step, before its attention (whose kv_resolve may rewrite
-     * `ix.selected` in place). */
-    void snap_step(RadCtx* c, int l, const IndexWire& iw, bool select, QueryRows rows) const {
+     * `ix.selected` in place). `direct`: the step's `qsa_select` wrote the plane's window
+     * itself, so a selecting layer has nothing to copy (P-09). */
+    void snap_step(RadCtx* c, int l, const IndexWire& iw, bool select, QueryRows rows,
+                   bool direct) const {
         const Snap* sn = snap_of(l);
         if (!sn || !rows.n) return;
         if (select) {
+            if (direct) return;
             rows.spans([&](int64_t orig, int64_t compact, int64_t n) {
-                RAD_ISSUE_N(c, sn->op_sel, n, brow_slice(iw.sel, compact, n, sn->width),
-                            brow_slice(sn->sel, orig, n, sn->width));
-                RAD_ISSUE_N(c, sn->op_nsel, n, brow_slice(iw.nsel, compact, n, 1),
-                            brow_slice(sn->nsel, orig, n, 1));
-                if (sn->op_ids)
-                    RAD_ISSUE_N(c, sn->op_ids, n, brow_slice(iw.sel_ids, compact, n, sn->width),
-                                brow_slice(sn->ids, orig, n, sn->width));
+                RAD_ISSUE_N(c, op_sel, n, brow_slice(iw.sel, compact, n, sn->width),
+                            brow_slice(snap_sel, sn->base + orig, n, sn->width));
+                RAD_ISSUE_N(c, op_nsel, n, brow_slice(iw.nsel, compact, n, 1),
+                            brow_slice(snap_nsel, sn->base + orig, n, 1));
+                if (op_ids)
+                    RAD_ISSUE_N(c, op_ids, n, brow_slice(iw.sel_ids, compact, n, sn->width),
+                                brow_slice(snap_ids, sn->base + orig, n, sn->width));
             });
-        } else if (!break_nsel_keep) {
-            rows.spans([&](int64_t orig, int64_t, int64_t n) {
-                RAD_ISSUE_N(c, sn->op_zero, n, brow_slice(sn->nsel, orig, n, 1));
-            });
+        } else if (!break_nsel_keep && sn == &snap.front()) {
+            /* One fill clears every layer's counts (P-09). The rows outside this step's spans
+             * ride along: a row the step did not query cannot be an anchor of the draft pass
+             * that follows it, so no reader sees a difference from the per-span clear. */
+            RAD_ISSUE_N(c, op_zero, (int64_t)snap.size() * snap_t,
+                        brows(snap_nsel, (int64_t)snap.size() * snap_t));
         }
     }
 
@@ -646,14 +671,13 @@ struct Dfly {
         const int64_t half = (L + RO) / 2;
         for (int64_t i = 0; i < layers; ++i) {
             Layer& d = lay[(size_t)i];
-            const Snap* sn = snap_of(d.ixl);
-            if (!sn) return RAD_E_INVAL;
+            if (!snap_of(d.ixl)) return RAD_E_INVAL;   /* the draft layer's trunk selection */
             const int li = (int)i;
             d.op_tab = mk(b, "dfly_sel",
                           { RAD_RANGE("M", 1, Md), RAD_INT("blocks_in", s.ix_group_topk),
                             RAD_INT("blocks", W), RAD_INT("ratio", s.ix_pool),
                             RAD_INT("seqs", S) },
-                          {}, { sn->sel, sn->nsel }, { d.tab, d.len, d.cnt });
+                          {}, { snap_sel, snap_nsel }, { d.tab, d.len, d.cnt });
             HY4_NEED(d.op_tab, "dfly_sel");
             d.op_attn_norm = decl_rmsnorm(b, Md, E, s.eps, d.attn_norm, x, xn);
             RAD_ARCH_TRY(d.t_in.declare(b, nm, Md, "dfly.attn_in_norm", li, RAD_BF16, E, xn));
@@ -737,7 +761,7 @@ struct Dfly {
             HY4_NEED(d.op_gmul && d.op_add1 && d.op_add2 && d.op_silu, "gate_mul / add / silu_mul");
             /* Taps: the table as group indices (dfly_sel again over the group-id snapshot and an
              * identity table, the indexer tap's trick) and its lengths. */
-            if (taps_on() && sn->ids) {
+            if (taps_on() && snap_ids) {
                 if (!ident) {
                     ident_w = iw.blocks;
                     ident = decl_b(b, nm.f("dfly.identity"), RAD_I32, { S, ident_w }, RAD_BUF_PERSIST);
@@ -756,7 +780,7 @@ struct Dfly {
                                   { RAD_RANGE("M", 1, Md), RAD_INT("blocks_in", s.ix_group_topk),
                                     RAD_INT("blocks", W), RAD_INT("ratio", s.ix_pool),
                                     RAD_INT("seqs", S) },
-                                  {}, { sn->ids, sn->nsel, ident }, { d.tap_tab, tl });
+                                  {}, { snap_ids, snap_nsel, ident }, { d.tap_tab, tl });
                 HY4_NEED(d.op_tap_tab, "dfly_sel");
             }
         }
@@ -973,10 +997,12 @@ struct Dfly {
         const int64_t half = (L + RO) / 2;
         for (const Layer& d : lay) {
             const Snap* sn = snap_of(d.ixl);
-            RAD_ISSUE_N(c, d.op_tab, M, RAD_B(sn->sel), RAD_B(sn->nsel), src, bt, pos, cu,
+            RAD_ISSUE_N(c, d.op_tab, M, brow_slice(snap_sel, sn->base, snap_t, sn->width),
+                        brow_slice(snap_nsel, sn->base, snap_t, 1), src, bt, pos, cu,
                         brows(d.tab, M), brows(d.len, M), brows(d.cnt, M));
             if (d.op_tap_tab) {
-                RAD_ISSUE_N(c, d.op_tap_tab, M, RAD_B(sn->ids), RAD_B(sn->nsel), src,
+                RAD_ISSUE_N(c, d.op_tap_tab, M, brow_slice(snap_ids, sn->base, snap_t, sn->width),
+                            brow_slice(snap_nsel, sn->base, snap_t, 1), src,
                             bcol_at(ident, 0, ident_w, 0, ident_w, n), pos, cu,
                             brows(d.tap_tab, M), brows(d.t_len.buf, M), RAD_NONE);
             }
