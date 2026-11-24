@@ -317,6 +317,9 @@ foreach(t ${RAD_TESTS})
   endif()
 endforeach()
 
+# kernel_override_test's libraries: a kernel library and overrides of it (rad_add_kernel_override).
+add_subdirectory(override)
+
 # ================================================================== perf_ cases
 #
 # A case named perf_... asserts a wall-clock cost, which tests running beside it would distort. The

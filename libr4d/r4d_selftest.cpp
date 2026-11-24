@@ -3947,13 +3947,23 @@ static void attn_gq_fold_case(const Plugin& pl, int64_t S, bool bf16, bool i8 = 
     ok(name.c_str(), n_o == 0 && n_q == 0 && n_s == 0 && live > 0, msg);
 }
 
-/* libref's row for an op: libref.so beside the plugin under test. */
+/* libref's row for an op: libref.so beside the plugin under test, else the first one in a
+ * kernels/ of $RADIANCE_HOME. An override of the plugin (rad_add_kernel_override) sits in a home of
+ * its own with nothing beside it, ahead of the home libref is in. */
 static const RadKernelInfo* usel_libref_row(const char* op) {
     static void* ref = nullptr;
     if (!ref && g_plugin) {
         std::string path(g_plugin);
         path = path.substr(0, path.find_last_of('/') + 1) + "libref.so";
         ref = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
+        const char* homes = std::getenv("RADIANCE_HOME");
+        for (std::string rest(homes ? homes : ""); !ref && !rest.empty();) {
+            const size_t colon = rest.find(':');
+            const std::string home = rest.substr(0, colon);
+            rest = colon == std::string::npos ? std::string() : rest.substr(colon + 1);
+            if (!home.empty())
+                ref = dlopen((home + "/kernels/libref.so").c_str(), RTLD_NOW | RTLD_LOCAL);
+        }
     }
     if (!ref) return nullptr;
     auto count = (int (*)(void))dlsym(ref, "rad_kernel_count");

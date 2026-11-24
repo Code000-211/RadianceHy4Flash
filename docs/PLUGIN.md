@@ -15,7 +15,8 @@ against an installed radiance, and is found and ranked by what it declares, neve
 (libr4d only when given a HIP compiler) and requires the same result.
 
 §1-§9 cover kernel libraries, §10 a library for a new card, §11 and §12 architectures and
-quantisers, and §13 building, installing and the search path.
+quantisers, §13 building, installing and the search path, and §14 rebuilding one kernel of a
+library without the library.
 
 ---
 
@@ -510,3 +511,76 @@ matching nothing is warned about by name. Separate entries with commas or colons
 `$RADIANCE_KERNELS` follow this one rule, and an empty `$RADIANCE_KERNELS` counts as unset. A kernel library the list does not
 name is not loaded, so name every library you want, including the host library (`libavx`) and the
 reference (`libref`). With no list every library found loads, a reference library (§1) last.
+
+---
+
+## 14. One kernel at a time: an override of a library
+
+A kernel library is many translation units behind one row table, and work on one kernel changes
+one of them. `rad_add_kernel_override` builds that unit alone into a file that serves the whole
+library with the unit replaced, so neither the other units nor anything else is rebuilt:
+
+```cmake
+rad_add_kernel_override(mylib_override BASE mylib HIP_SOURCES mygemm.hip)
+```
+
+`BASE` is the library's target, or the path of a built `.so` of it. The result carries the
+library's file name and lands in a home of its own, `<build>/override_home/kernels/` (`HOME`
+changes it). Put that home ahead of the library's on the search path (§13) and it shadows the
+library; no `kernels:` list changes and no configuration names it:
+
+```sh
+RADIANCE_HOME=build/override_home:build/radiance_home radiance --config radiance.yaml
+```
+
+For libr4d the units are named at configure time (`libr4d/CMakeLists.txt`):
+
+```sh
+cmake -B build -DR4D_OVERRIDE_UNITS=r4d_gemm_iqr     # several: "a;b"
+cmake --build build --target libr4d_override         # compiles that unit and nothing else of libr4d
+```
+
+A lane run (`notes/backlog/CARDS.md` §1.1) takes the home as one of its `ENV=VAL` pairs:
+
+```sh
+scripts/backlog/lane.sh local 'scripts/backlog/run.sh k1 nospec.yaml c1,c8 \
+    RADIANCE_HOME=$RAD_REPO/build/override_home:$RAD_REPO/build/radiance_home'
+```
+
+`-DR4D_OVERRIDE_BASE=/path/to/libr4d.so` builds over a libr4d built elsewhere (an installation, a
+lane's baseline tree) instead of this tree's, so a tree that works on one kernel never compiles the
+other units.
+
+What the engine sees is the library: the same plugin name (so the tuning cache's rows apply), the
+same schemas, the same rows in the same order with the same constraints and priorities, the same
+per-row answers for `rad_kernel_concurrent`, `_collective`, `_chain` and `_reference`, and so the
+same selection. A row's hook (`launch`, `scratch`, `init`, ...) that the library takes from a
+symbol the override's units define is the units' instead; every other hook is the library's own
+code, in the library's own file, which the override loads as its dependency. Whatever a unit takes
+from the rest of the library (shared state, helpers of other units) resolves there. The version
+reads `<the library's>+override`, and at open the override prints the rows it serves itself:
+
+```
+rad-override: <override_home>/kernels/mylib.so serves 1 of the 3 rows of <home>/kernels/mylib.so with its own hooks: mygemm_m64
+```
+
+It refuses to open when that count is zero, and the library it shadows is not loaded in its place:
+a run over an override that changes nothing would be the library's numbers under another build's
+name.
+
+What an override is not:
+
+- **Not a change to the declaration.** Rows, constraints, priorities, layouts, shapes and fusion
+  claims are the library's as built. A change to one of those is a rebuild of the library (for
+  libr4d, its host sources: no device unit recompiles).
+- **Not a header change.** A header other units include changes them too. Name every unit that
+  includes it, or rebuild the library; an override of one of them alone runs the new unit beside
+  old copies of the same inline code.
+- **Not a second copy of the library's other units.** A call from one of the library's other units
+  into a function an overridden unit defines reaches the override's definition when the override
+  brought the library in (the reference is preemptible, as in a library linked with nothing
+  special) and the library's own when the library was loaded first or binds its references itself
+  (`-Bsymbolic`, hidden visibility). The rows' hooks are replaced either way.
+
+`tests/kernel_override_test.cpp` holds an override to these on the host, against a library linked
+both ways.
