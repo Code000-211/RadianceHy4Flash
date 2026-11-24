@@ -1033,13 +1033,15 @@ int ref_ihc_post_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out)
 }
 
 /* rmsnorm_ihc_junction: every optional operand passed (the add form, y and x stored); the next
- * connection's only with `tail` (default 1). */
+ * connection's only with `tail` (default 1), the Engram form's seven only with `engram` (P-07). */
 int ref_rmsnorm_ihc_junction_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const uint32_t D = act_dt(p, n_p), F = (uint32_t)RAD_F32;
     const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0), hc = gi(p, n_p, "hc", 0),
-                  rows = gi(p, n_p, "rows", 0), tail = gi(p, n_p, "tail", 1);
+                  rows = gi(p, n_p, "rows", 0), tail = gi(p, n_p, "tail", 1),
+                  engram = gi(p, n_p, "engram", 0);
     if (M <= 0 || n <= 0 || hc < 1 || hc > 16 || (tail && rows != 2 * hc && rows != hc))
         return RAD_E_UNSUPPORTED;
+    if (engram && (!tail || rows != 2 * hc)) return RAD_E_UNSUPPORTED;
     const bool post = rows == 2 * hc;
     Opd o;
     o.t(D, { M, n });                                 /* a, INOUT */
@@ -1064,6 +1066,17 @@ int ref_rmsnorm_ihc_junction_shape(const RadParam* p, int n_p, int operand, RadO
         o.t((uint32_t)RAD_F32, { M, n / 128 });       /* xs */    } else {
         o.skip();
         o.skip();
+    }
+    if (engram) {                                     /* P-07: engram_gate's operands */
+        o.t(D, { M, hc * n });                        /* eg_key */
+        o.t(D, { M, n });                             /* eg_val */
+        o.t((uint32_t)RAD_I32, { M });                /* eg_mask */
+        o.t(D, { hc * n });                           /* eg_w_key */
+        o.t(D, { hc * n });                           /* eg_w_query */
+        o.t(D, { n });                                /* eg_w_val */
+        o.t(D, { hc * n });                           /* eg_w_branch */
+    } else {
+        for (int i = 0; i < 7; ++i) o.skip();
     }
     return o.finish("rmsnorm_ihc_junction", operand, out);
 }

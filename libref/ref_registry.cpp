@@ -227,13 +227,16 @@ static const RadOperandSpec oIhcPre[] = { OPD("h"), WGT("fn"), WGT("scale"), WGT
     OUT("x"), OUT_O("post") };
 static const RadParamSpec pIhcPost[] = { P_INT("M"), P_INT("n"), P_INT("hc"), P_STR("dtype") };
 static const RadOperandSpec oIhcPost[] = { OPD("y"), OPD("post"), INOUT("h") };
-/* rmsnorm_ihc_junction (WP16.2): the same lists as libr4d's (r4d_rows.cpp). */
+/* rmsnorm_ihc_junction (WP16.2): the same lists as libr4d's (r4d_rows.cpp). The Engram form
+ * (`engram`, P-07) runs engram_gate's stage between ihc_post and ihc_pre. */
 static const RadParamSpec pIhcJunction[] = { P_INT("M"), P_INT("n"), P_INT("hc"), P_INT("rows"),
     P_F64("eps"), P_F64O("ihc_eps"), P_F64O("hc_eps"), P_F64O("post_mag"), P_INTO("tail"),
-    P_STR("dtype"), P_INTO("group") };
+    P_STR("dtype"), P_INTO("group"), P_INTO("engram"), P_F64O("eg_eps") };
 static const RadOperandSpec oIhcJunction[] = { INOUT("a"), OPD_O("b"), WGT("w_post"),
     INOUT("post"), INOUT("h"), WGT_O("fn"), WGT_O("scale"), WGT_O("base"), WGT_O("w_next"),
-    OUT_O("xn"), OUT_O("y"), OUT_O("x"), OUT_O("xq"), OUT_O("xs") };
+    OUT_O("xn"), OUT_O("y"), OUT_O("x"), OUT_O("xq"), OUT_O("xs"),
+    OPD_O("eg_key"), OPD_O("eg_val"), OPD_O("eg_mask"), WGT_O("eg_w_key"),
+    WGT_O("eg_w_query"), WGT_O("eg_w_val"), WGT_O("eg_w_branch") };
 static const RadParamSpec pMlaProjectKv[] = { P_INT("M"), P_INT("heads"), P_INT("k_dim"),
     P_INT("v_dim"), P_INT("latent_dim"), P_STR("mode"), P_STR("dtype") };
 static const RadParamSpec pMlaAttnPagedSink[] = { P_INT("M"), P_INT("heads"), P_INT("latent_dim"),

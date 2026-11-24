@@ -195,6 +195,7 @@ extern "C" int AVX_FN(avx_add)(const RadArgs*, RadStream);
 extern "C" int AVX_FN(avx_rmsnorm)(const RadArgs*, RadStream);
 extern "C" int AVX_FN(avx_swiglu_clamped)(const RadArgs*, RadStream);
 extern "C" int AVX_FN(avx_had_quant_act_i8g)(const RadArgs*, RadStream);
+extern "C" int AVX_FN(avx_engram_gate)(const RadArgs*, RadStream);
 AVX_KERNEL(rmsnorm_ihc_junction) {
     if (!a || a->n_t < 5) return RAD_E_INVAL;
     auto opd = [&](int i) -> const RadTensor* { return i < a->n_t ? rad_arg_in(a, i) : nullptr; };
@@ -202,9 +203,10 @@ AVX_KERNEL(rmsnorm_ihc_junction) {
     const RadTensor *fn = opd(5), *sc = opd(6), *bs = opd(7), *wn = opd(8), *xn = opd(9);
     const RadTensor *Y = opd(10), *X = opd(11);
     const int64_t n = p_int(a, "n", 0), hc = p_int(a, "hc", 0), rows = p_int(a, "rows", 0),
-                  tail = p_int(a, "tail", 1);
+                  tail = p_int(a, "tail", 1), engram = p_int(a, "engram", 0);
     if (!A || !wp || !post || !h) return RAD_E_INVAL;
     if (tail != 0 && tail != 1) return RAD_E_INVAL;
+    if (engram != 0 && engram != 1) return RAD_E_INVAL;
     if (tail && (!fn || !sc || !bs || !wn || !xn)) return RAD_E_INVAL;
     if (n < 1 || hc < 1 || A->rank != 2 || A->shape[0] < 1 || A->shape[1] != n) return RAD_E_SHAPE;
     const int64_t M = A->shape[0];
@@ -252,6 +254,20 @@ AVX_KERNEL(rmsnorm_ihc_junction) {
     if ((rc = run(AVX_FN(avx_rmsnorm), { A, wp, Y }, 3)) != RAD_OK) return rc;
     P(2, "hc", hc);
     if ((rc = run(AVX_FN(avx_ihc_post), { Y, post, h }, 3)) != RAD_OK) return rc;
+    /* P-07: the Engram's gate over the h ihc_post wrote, before ihc_pre reads it (`h` is the gate's
+     * inout stream tensor, its eighth operand). */
+    if (engram) {
+        if (!tail || rows != 2 * hc) return RAD_E_SHAPE;
+        const RadTensor *key = opd(14), *val = opd(15), *mask = opd(16), *wk = opd(17),
+                       *wq = opd(18), *wv = opd(19), *wb = opd(20);
+        if (!key || !val || !mask || !wk || !wq || !wv || !wb) return RAD_E_INVAL;
+        P(0, "M", M);
+        P(1, "n", n);
+        P(2, "hc", hc);
+        PF(3, "eps", (double)p_f32(a, "eg_eps", 0.0f));
+        if ((rc = run(AVX_FN(avx_engram_gate), { key, val, mask, wk, wq, wv, wb, h }, 4)) != RAD_OK)
+            return rc;
+    }
     if (!tail) return RAD_OK;
     const bool has_post = rows == 2 * hc;
     P(3, "rows", rows);
