@@ -1836,17 +1836,21 @@ TEST(an_engine_step_with_dfly2_is_lint_clean_and_the_query_pass_touches_no_trunk
     }
 }
 
-/* D-06 (#91): DFly2 also serves a short block (rad_drafter_short_block) of 4 rows, the anchor and 3
- * masks, which the core stages under load (--draft-short-from): 3 proposals, two chain rounds fewer
- * at depth 5. The draft is causal (dfly_sel gives a row the keys up to its own position), so the
- * short pass is the full pass's first rows. Declared only where the drafter's block is longer; the
- * query pass takes either block, finds each anchor row and each round's row at its block's own
- * stride, and runs one round a proposal (coupled: one draw a round); any other block is refused. */
-TEST(dfly2_serves_a_short_block_of_four_rows) {
+/* D-06 (#91), D-07 (#92): DFly2 serves every block of 2 .. its own rows a sequence. D-06's short
+ * block (rad_drafter_short_block) is 4 rows, the anchor and 3 masks, which the core stages under
+ * load (--draft-short-from); D-07 declares any length the core may stage a step's chain at
+ * (rad_drafter_any_block: the anchor and one row a round), so a chain runs the rounds the depth
+ * rule took on the last step instead of its whole block. The draft is causal (dfly_sel gives a row
+ * the keys up to its own position), so a shorter pass is the longer pass's first rows. The query
+ * pass takes any such block, finds each anchor row and each round's row at its block's own stride,
+ * and runs one round a proposal (coupled: one draw a round); any other block is refused. */
+TEST(dfly2_serves_every_block_from_one_round_up) {
     for (int depth : { 5, 4, 3 }) {
         DeclDfly d(depth);
         REQUIRE_EQ(d.rc, RAD_OK);
         CHECK_EQ(d.b.drafter_short, depth >= 4 ? (int64_t)4 : (int64_t)0);
+        /* D-07: the anchor and one row, at every depth. */
+        CHECK_EQ(d.b.drafter_any_block, (int64_t)2);
     }
     for (int world : { 1, 2 })
         for (int coupled : { 0, 1 }) {
@@ -1862,10 +1866,14 @@ TEST(dfly2_serves_a_short_block_of_four_rows) {
             const auto& df = hyv4flash::models[0]->df;
             REQUIRE(df.served);
             CHECK_EQ(b.drafter_short, (int64_t)4);
-            REQUIRE(df.op_row0_lo != 0);
-            CHECK_EQ(pint(b.op_of(df.op_row0), "step"), 6);
-            CHECK_EQ(pint(b.op_of(df.op_row0_lo), "step"), 4);
-            for (int64_t blk : { (int64_t)6, (int64_t)4 }) {
+            CHECK_EQ(b.drafter_any_block, (int64_t)2);
+            /* one anchor iota per block length, each at that length's stride */
+            REQUIRE_EQ(df.op_row0_v.size(), (size_t)7);
+            for (int64_t blk = 2; blk <= 6; ++blk) {
+                REQUIRE(df.op_row0_v[(size_t)blk] != 0);
+                CHECK_EQ(pint(b.op_of(df.op_row0_v[(size_t)blk]), "step"), blk);
+            }
+            for (int64_t blk = 2; blk <= 6; ++blk) {
                 const int64_t rounds = blk - 1;
                 auto trunk = kit(b, std::vector<int>(2, 6), {});
                 trunk->b.positions_h = trunk->pos.data();
@@ -1885,29 +1893,40 @@ TEST(dfly2_serves_a_short_block_of_four_rows) {
                 CHECK_EQ(count("logits_gemm"), rounds);
                 CHECK_EQ(count("row_topk"), rounds);
                 CHECK_EQ(count("mtp_couple_propose"), coupled ? rounds : 0);
-                /* each anchor and each round's row found at this block's stride */
-                int row0 = 0, row0_lo = 0, rowk = 0, rowk_lo = 0;
+                /* each anchor and each round's row found at this block's stride, and no other */
+                auto is_stride_op = [&](rad_op op) {
+                    if (!op) return false;
+                    for (rad_op v : df.op_row0_v)
+                        if (v && v == op) return true;
+                    for (const auto& st : df.steps)
+                        for (rad_op v : st.op_rowk_v)
+                            if (v && v == op) return true;
+                    return false;
+                };
+                int row0 = 0, rowk = 0, other = 0;
                 for (const auto& is : ps[2]->issues) {
-                    row0 += is.op == df.op_row0;
-                    row0_lo += is.op == df.op_row0_lo;
-                    for (const auto& st : df.steps) {
-                        rowk += is.op == st.op_rowk;
-                        rowk_lo += st.op_rowk_lo && is.op == st.op_rowk_lo;
-                    }
+                    if (!is_stride_op(is.op)) continue;
+                    if (is.op == df.op_row0_v[(size_t)blk]) { ++row0; continue; }
+                    bool mine = false;
+                    for (const auto& st : df.steps) mine = mine || is.op == st.op_rowk_v[(size_t)blk];
+                    if (mine) ++rowk;
+                    else ++other;
                 }
-                CHECK_EQ(row0, blk == 6 ? 1 : 0);
-                CHECK_EQ(row0_lo, blk == 4 ? 1 : 0);
-                CHECK_EQ(rowk, blk == 6 ? 5 : 0);
-                CHECK_EQ(rowk_lo, blk == 4 ? 3 : 0);
+                CHECK_EQ(row0, 1);
+                CHECK_EQ(rowk, rounds);
+                CHECK_EQ(other, 0);
             }
-            /* a block the drafter declared neither way is refused, by name */
-            auto trunk = kit(b, std::vector<int>(2, 6), {});
-            trunk->b.positions_h = trunk->pos.data();
-            auto ctxp = context_pass(b, *trunk);
-            Query bad(b, 2, 5, 4);
-            auto ps = run_passes(b, hyv4flash::step, { trunk.get(), ctxp.get(), bad.k.get() }, 0,
-                                 world);
-            CHECK(!ps[2]->step_fail.empty());
+            /* a block the drafter does not serve -- longer than its own, or no room to propose a
+             * token -- is refused, by name */
+            for (int64_t bad_blk : { (int64_t)7, (int64_t)1 }) {
+                auto trunk = kit(b, std::vector<int>(2, 6), {});
+                trunk->b.positions_h = trunk->pos.data();
+                auto ctxp = context_pass(b, *trunk);
+                Query bad(b, 2, bad_blk, bad_blk - 1);
+                auto ps = run_passes(b, hyv4flash::step, { trunk.get(), ctxp.get(), bad.k.get() }, 0,
+                                     world);
+                CHECK(!ps[2]->step_fail.empty());
+            }
         }
 }
 
