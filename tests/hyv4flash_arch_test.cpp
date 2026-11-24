@@ -1526,6 +1526,13 @@ void int8_trunk_encs(RadBuilder* b) {
                                       { "ffn_latent_out", enc_i8(true) },
                                       { "output.weight", enc_i8(false) } });
 }
+/* The same with the routed experts rotated int8 (`rot`), so the block quantises its own input and
+ * the router's launch can carry that quantiser (K-10). */
+void int8_experts_encs(RadBuilder* b) {
+    int8_trunk_encs(b);
+    b->encs.insert(b->encs.begin(), { { "ffn_gate_up_exps", enc_i8(true) },
+                                      { "ffn_down_exps", enc_i8(true) } });
+}
 /* The same on a CPU engine: no device-only fused rows. */
 void int8_trunk_encs_host(RadBuilder* b) {
     int8_trunk_encs(b);
@@ -1597,24 +1604,31 @@ void no_router_gemm_fuse_encs(RadBuilder* b) {
 /* K-10: the router's projection and the selection it feeds are one launch where a library serves
  * it (MoeFP8's op_sigmoid_gemm), so at a decode height neither the projection's own GEMM nor the
  * selection's row is issued; the wider passes -- and a library without the row -- keep the pair.
- * The row is declared once per MoE layer whatever the height, at this model's own widths. */
+ * The row is declared once per MoE layer whatever the height, at this model's own widths.
+ * `hq` is the latent's rotated group, which the same launch fills too: the row writes the codes the
+ * latent's quantiser would have written and no quantiser is issued for it (`hq_issued`), while a
+ * pass the row declines (prefill here) keeps that launch. The rotated-experts trunk is the one whose
+ * block quantises its own input (`rot`), so it is where the third plane has anything to fold. */
 TEST(the_router_projection_joins_its_selection_where_a_library_serves_it) {
     struct Run { const char* what; int dq, pq, world; bool plain, off;
-                 int fused, scatter, topk; };
+                 int fused, scatter, topk; int hq; bool rotexp; };
     /* Two MoE layers of the mini model (the third is dense). 96 rows stay inside the selection's
-     * own bound (top_k * rows <= 1024 at a declared 256) and past the fused row's 64. `plain` is
+     * own bound (top_k * rows <= 1024 at a declared 256) and past the fused row's band. `plain` is
      * the bf16 trunk, for the ranks the mini's quantised experts do not split over; `off` is a
      * library that does not serve the fused row at all. */
     const Run runs[] = {
-        { "decode 1 row", 1, 0, 1, false, false, 2, 0, 0 },
-        { "decode 6 rows", 6, 0, 1, false, false, 2, 0, 0 },
-        { "TP2 decode", 4, 0, 2, true, false, 2, 0, 0 },
-        { "prefill 96 rows", 0, 96, 1, false, false, 0, 2, 0 },
-        { "decode, no library row", 1, 0, 1, false, true, 0, 2, 0 },
+        { "decode 1 row", 1, 0, 1, false, false, 2, 0, 0, 0, false },
+        { "decode 6 rows", 6, 0, 1, false, false, 2, 0, 0, 0, false },
+        { "TP2 decode", 4, 0, 2, true, false, 2, 0, 0, 0, false },
+        { "prefill 96 rows", 0, 96, 1, false, false, 0, 2, 0, 0, false },
+        { "decode, rotated experts", 1, 0, 1, false, false, 2, 0, 0, 128, true },
+        { "prefill, rotated experts", 0, 96, 1, false, false, 0, 2, 0, 128, true },
+        { "decode, no library row", 1, 0, 1, false, true, 0, 2, 0, 0, false },
     };
     for (const Run& r : runs) {
         fprintf(stderr, "run %s\n", r.what);
-        Declared d(r.off ? no_router_gemm_fuse_encs : (r.plain ? bf16_encs : int8_trunk_encs),
+        Declared d(r.off ? no_router_gemm_fuse_encs
+                         : (r.plain ? bf16_encs : (r.rotexp ? int8_experts_encs : int8_trunk_encs)),
                   r.world, 0);
         REQUIRE_EQ(d.rc, RAD_OK);
         const RecOp* o = find_op(d.b, "router_gemm_sigmoid_scatter");
@@ -1631,6 +1645,10 @@ TEST(the_router_projection_joins_its_selection_where_a_library_serves_it) {
             CHECK(pflt(o, "route_scale") > 3.99 && pflt(o, "route_scale") < 4.0);
             CHECK_EQ(pstr(o, "dtype"), std::string("f32"));
             CHECK_EQ((int)o->w.size(), 2);            /* the projection and the correction */
+            /* The latent's codes ride in it where the pass has none to feed the routed arm. */
+            CHECK_EQ(pint(o, "hq_group"), r.hq);
+            CHECK_EQ(pstr(o, "hq_dtype"), std::string(r.hq ? "i8" : "f8e4m3"));
+            CHECK_EQ((int)o->writes.size(), r.hq ? 9 : 7);    /* the codes and scales are the last */
         }
         /* The projection's own GEMM is the one writing the router's logits. */
         const rad_buf lg = buf_named(d.b, "moe.router_logits");
@@ -1656,6 +1674,24 @@ TEST(the_router_projection_joins_its_selection_where_a_library_serves_it) {
         for (const auto& issue : c.issues)
             for (rad_op h : proj) issued_proj += issue.op == h;
         CHECK_EQ(issued_proj, r.fused ? 0 : 2);
+        /* The latent's quantiser: the one writing a buffer the fused row writes. Where the row runs,
+         * it is the row's third plane and nothing else is launched for those codes. */
+        if (r.hq) {
+            std::vector<rad_op> hq;
+            for (const RecOp& q : d.b.ops) {
+                if (q.op != "had_quant_act_i8g" && q.op != "had_quant_act_fp8") continue;
+                for (rad_buf wv : q.writes)
+                    if (std::find(o->writes.begin(), o->writes.end(), wv) != o->writes.end()) {
+                        hq.push_back((rad_op)(&q - d.b.ops.data() + 1));
+                        break;
+                    }
+            }
+            CHECK_EQ((int)hq.size(), 2);              /* one a MoE layer, the same pair of buffers */
+            int hq_issued = 0;
+            for (const auto& issue : c.issues)
+                for (rad_op h : hq) hq_issued += issue.op == h;
+            CHECK_EQ(hq_issued, r.fused ? 0 : 2);
+        }
         every_weight_read(d.b);
         steps_clean_at(d.b, 0, r.world);
     }
