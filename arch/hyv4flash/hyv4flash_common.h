@@ -350,6 +350,16 @@ inline bool router_fuse_on() {
     return !(e && *e && std::strcmp(e, "0") == 0);
 }
 
+/* The router's prefill projection on the bf16 WMMA tile (P-13 / F-19, Config::router_wmma). LOSSY:
+ * the same bf16 products and f32 accumulation, summed in the tile's order instead of the F32
+ * routing kernel's wave order, so a near-tie routing pick can flip on prefill rows (decode and
+ * verify rows keep the F32 kernel). Off unless RADIANCE_HY4_ROUTER_WMMA is set and not 0; the KL
+ * report is notes/backlog/lossy/P-13.md. */
+inline bool router_wmma_on() {
+    const char* e = std::getenv("RADIANCE_HY4_ROUTER_WMMA");
+    return e && *e && std::strcmp(e, "0") != 0;
+}
+
 /* The int8 codes a stored linear reads: none for a plain bf16 (or unknown) weight, else its K-wise
  * scale group and whether they are in the rotated (Hadamard) domain. */
 struct CodeForm {

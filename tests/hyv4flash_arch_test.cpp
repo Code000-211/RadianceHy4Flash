@@ -2664,3 +2664,80 @@ TEST(g3_junctions_write_the_codes_their_readers_take) {
     /* every junction that writes codes removes the quantiser behind it */
     CHECK(had_on < count_op(off.b, "had_quant_act_i8g"));
 }
+
+/* P-13 / F-19: the router's prefill projection on the bf16 WMMA tile, behind
+ * RADIANCE_HY4_ROUTER_WMMA and off unless asked. Only the column-split part (prefill rows) moves:
+ * its op becomes gemm_nt_f32_wmma with the tile's M range, while the unsplit projection every
+ * decode and verify row uses stays gemm_nt_f32 at M from 1. An f32-stored router weight and a
+ * part narrower than the tile's 16 columns keep gemm_nt_f32 as well. */
+TEST(p13_the_prefill_router_takes_the_wmma_row_only_when_asked) {
+    /* The recorded ops whose first weight is a bf16 router: layer 1's (blk.2's is f32). */
+    auto bf16_router_ops = [](const RadBuilder& b, const char* op) {
+        int n = 0;
+        for (const auto& o : b.ops) {
+            if (o.op != op || o.w.empty()) continue;
+            const auto& weight = b.weights.at(o.w[0] - 1);
+            if (weight.name.find(".glm_router.weight") == std::string::npos) continue;
+            if (weight.d.dtype == RAD_BF16) ++n;
+        }
+        return n;
+    };
+    auto every_router_wmma = [&](const RadBuilder& b) {
+        int n = 0;
+        for (const auto& o : b.ops) {
+            if (o.op != "gemm_nt_f32_wmma" || o.w.empty()) continue;
+            const auto& weight = b.weights.at(o.w[0] - 1);
+            if (weight.name.find(".glm_router.weight") == std::string::npos) continue;
+            CHECK_EQ(pint(&o, "weight_bf16"), 1);
+            CHECK_EQ(pint(&o, "K"), 128);            /* n_embd */
+            CHECK_EQ(pint(&o, "N"), 32);             /* 64 experts split over two ranks */
+            const RecParam* M = param(&o, "M");
+            CHECK(M && M->kind == RAD_P_RANGE);
+            CHECK_EQ(M ? M->ival : -1, 256);         /* GlmTp::kSplitRows, prefill rows only */
+            ++n;
+        }
+        return n;
+    };
+
+    /* Off is the default and declares no such op at all: the graph is the one without the row. */
+    unsetenv("RADIANCE_HY4_ROUTER_WMMA");
+    Declared off(bf16_encs, 2, 0, false, 128, 0, 0, 64);
+    REQUIRE_EQ(off.rc, RAD_OK);
+    CHECK_EQ(count_op(off.b, "gemm_nt_f32_wmma"), 0);
+    CHECK_EQ(bf16_router_ops(off.b, "gemm_nt_f32"), 2);   /* the layer's unsplit and split ops */
+
+    /* On moves the split part alone; the unsplit projection keeps its kernel and M from 1. */
+    setenv("RADIANCE_HY4_ROUTER_WMMA", "1", 1);
+    Declared on(bf16_encs, 2, 0, false, 128, 0, 0, 64);
+    unsetenv("RADIANCE_HY4_ROUTER_WMMA");
+    REQUIRE_EQ(on.rc, RAD_OK);
+    CHECK_EQ(every_router_wmma(on.b), 1);
+    CHECK_EQ(count_op(on.b, "gemm_nt_f32_wmma"), 1);
+    CHECK_EQ(bf16_router_ops(on.b, "gemm_nt_f32"), 1);
+    bool unsplit_from_one = false;
+    for (const auto& o : on.b.ops) {
+        if (o.op != "gemm_nt_f32" || o.w.empty()) continue;
+        const auto& weight = on.b.weights.at(o.w[0] - 1);
+        if (weight.name.find(".glm_router.weight") == std::string::npos) continue;
+        if (weight.d.dtype != RAD_BF16) continue;
+        const RecParam* M = param(&o, "M");
+        unsplit_from_one = M && M->kind == RAD_P_RANGE && M->ival == 1;
+    }
+    CHECK(unsplit_from_one);
+
+    /* One rank has no split to run, so the switch changes nothing there. */
+    setenv("RADIANCE_HY4_ROUTER_WMMA", "1", 1);
+    Declared one(bf16_encs, 1, 0, false, 128, 0, 0, 64);
+    unsetenv("RADIANCE_HY4_ROUTER_WMMA");
+    REQUIRE_EQ(one.rc, RAD_OK);
+    CHECK_EQ(count_op(one.b, "gemm_nt_f32_wmma"), 0);
+    CHECK_EQ(bf16_router_ops(one.b, "gemm_nt_f32"), 1);
+
+    /* Eight experts over two ranks is four columns a rank: below the tile's 16, so it stays. */
+    setenv("RADIANCE_HY4_ROUTER_WMMA", "1", 1);
+    Declared narrow(bf16_encs, 2, 0, true);
+    unsetenv("RADIANCE_HY4_ROUTER_WMMA");
+    REQUIRE_EQ(narrow.rc, RAD_OK);
+    CHECK_EQ(count_op(narrow.b, "gemm_nt_f32_wmma"), 0);
+    CHECK_EQ(bf16_router_ops(narrow.b, "gemm_nt_f32"), 2);
+}

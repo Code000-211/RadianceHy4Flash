@@ -226,6 +226,11 @@ struct MoeFP8 {
          * is bf16, or unknown (a builder with no model behind it); a checkpoint that stores the
          * router in f32 keeps the f32 weight and kernel path. The sigmoid router only. */
         bool router_weight_bf16 = false;
+        /* Run the router's prefill projection on the bf16 WMMA tile (GlmRouter::Config::wmma).
+         * LOSSY and off by default: the same products, a different f32 summation order, so a
+         * near-tie routing pick can flip; decode and verify rows are untouched. The sigmoid
+         * router only. */
+        bool router_wmma = false;
         /* The caller reduces the block's delta across ranks, because it applies more linear work
          * to it first (Nemotron-H's latent up-projection); no all-reduce is declared. */
         int     no_reduce = 0;
@@ -916,6 +921,7 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
         rc.top_k = c.top_k;
         rc.rows = c.rows;
         rc.weight_bf16 = c.router_weight_bf16;
+        rc.wmma = c.router_wmma;
         rc.norm = c.norm_topk;
         rc.route_scale = c.route_scale;
         rc.groups = c.n_group;

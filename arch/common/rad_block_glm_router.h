@@ -15,6 +15,11 @@ struct GlmRouter {
         /* Declare the projection weight as stored bf16 (gemm_nt_f32's `weight_bf16`) when its
          * stored encoding is bf16 or unknown; otherwise, or when false, it is declared f32. */
         bool weight_bf16 = false;
+        /* Run the column-split prefill projection on the bf16 WMMA tile (gemm_nt_f32_wmma).
+         * LOSSY: the same bf16 products and f32 accumulation, summed in the tile's order, so a
+         * near-tie routing pick can flip. Off by default; decode and verify rows keep
+         * gemm_nt_f32 whatever it says (notes/backlog/lossy/P-13.md). */
+        bool wmma = false;
         double route_scale = 2.5;
     };
     struct Src {
@@ -53,7 +58,7 @@ struct GlmRouter {
         op_project = declare_glm_projection(b, c.rows, c.experts, g.n_embd, projection, packed,
                                             w.input, w.logits);
         RAD_ARCH_TRY(split.declare(b, nm, g, name, c.rows, c.experts, g.n_embd, projection, w.input,
-                                   w.logits, packed));
+                                   w.logits, packed, c.wmma));
         if (c.groups > 1)
             op_select =
                 rw(b,

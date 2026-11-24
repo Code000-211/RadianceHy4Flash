@@ -92,12 +92,21 @@ struct GlmTp {
     }
 };
 
-/* Keep existing f32 projections' declarations identical, including their graph hashes. */
+/* Keep existing f32 projections' declarations identical, including their graph hashes.
+ *
+ * `wmma` declares the prefill tile's row (gemm_nt_f32_wmma) instead: gemm_nt_f32's bf16 operands
+ * and F32 output on the bf16 WMMA tile, which sums each 16-deep k step as one and so lands in a
+ * different last bit from the F32 routing kernel (LOSSY, opt-in: notes/backlog/lossy/P-13.md).
+ * The row serves M >= 128, so the range starts there and the band below it is not declared: a
+ * caller that wants today's kernel there declares without `wmma`. */
 inline rad_op declare_glm_projection(RadBuilder* b, int64_t rows, int64_t n, int64_t k,
-                                     rad_weight weight, bool packed, rad_buf input, rad_buf output) {
-    const RadParam params[] = { RAD_RANGE("M", 1, rows), RAD_INT("N", n), RAD_INT("K", k),
-                                RAD_STR("dtype", "bf16"), RAD_INT("weight_bf16", 1) };
-    return rw(b, rad_decl_op(b, "gemm_nt_f32", params, packed ? 5 : 4, &weight, 1),
+                                     rad_weight weight, bool packed, rad_buf input, rad_buf output,
+                                     bool wmma = false, int64_t wmma_min_rows = 128) {
+    const RadParam params[] = { RAD_RANGE("M", wmma ? wmma_min_rows : 1, rows), RAD_INT("N", n),
+                                RAD_INT("K", k), RAD_STR("dtype", "bf16"),
+                                RAD_INT("weight_bf16", 1) };
+    return rw(b, rad_decl_op(b, wmma ? "gemm_nt_f32_wmma" : "gemm_nt_f32", params, packed ? 5 : 4,
+                             &weight, 1),
               { input }, { output });
 }
 
@@ -108,14 +117,17 @@ inline rad_op declare_glm_projection(RadBuilder* b, int64_t rows, int64_t n, int
  * A replicated [n, k] F32 projection computed column-split: rank r runs the same gemm_nt_f32 on
  * rows [r*n/world, (r+1)*n/world) of the weight and a row-interleaved all_gather lays the slices
  * out as the full [M, n]. The kernel computes every output column independently of n and the
- * gather moves bytes, so each value is bit-identical to the replicated projection's. */
+ * gather moves bytes, so each value is bit-identical to the replicated projection's. (With `wmma`
+ * the part runs on the prefill tile, whose summation order the split does not change either: the
+ * gather still only moves bytes.) */
 struct SplitF32Proj {
     rad_buf part = 0;
     rad_op op_part = 0, op_gather = 0;
     int64_t cols = 0, k = 0, min_rows = 0, first_col = 0;
 
     int declare(RadBuilder* b, Names& nm, const Geom& g, const char* name, int64_t rows, int64_t n,
-                int64_t width, rad_weight weight, rad_buf input, rad_buf output, bool weight_bf16) {
+                int64_t width, rad_weight weight, rad_buf input, rad_buf output, bool weight_bf16,
+                bool wmma = false) {
         min_rows = GlmTp::kSplitRows;
         if (g.world < 2 || n % g.world || (n / g.world * 4) % 16) {
             min_rows = 0;
@@ -124,8 +136,13 @@ struct SplitF32Proj {
         cols = n / g.world;
         k = width;
         first_col = g.rank * cols;
+        /* The prefill tile reads W as bf16 in whole 64-element K stages, so only a stored-bf16
+         * projection of the width and expert count its row serves leaves this kernel. */
+        const bool tile = wmma && weight_bf16 && k >= 64 && k <= 16384 && k % 64 == 0 &&
+                          cols >= 16 && cols <= 512 && rows >= GlmTp::kSplitRows;
         part = decl_b(b, nm.f("%s.part", name), RAD_F32, { rows, cols });
-        op_part = declare_glm_projection(b, rows, cols, k, weight, weight_bf16, input, part);
+        op_part = declare_glm_projection(b, rows, cols, k, weight, weight_bf16, input, part, tile,
+                                         GlmTp::kSplitRows);
         op_gather = rw(
             b,
             RAD_OP(b, "all_gather",
