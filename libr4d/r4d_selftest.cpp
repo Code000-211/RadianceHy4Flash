@@ -34509,21 +34509,28 @@ static void ar_ihc_junction_case(const Plugin& pl, const std::vector<int>& devs,
     if (!ar_peer_path_ok(devs, world)) { skip(name, "no peer path between the cards (device.p2p)"); return; }
     const bool host = std::strstr(name, "_host") != nullptr;
     std::vector<IjCase> cs;
-    auto C = [&](int64_t M, int64_t n, bool add, bool ys, bool xs, bool tail, bool head) {
+    auto C = [&](int64_t M, int64_t n, bool add, bool ys, bool xs, bool tail, bool head,
+                 bool eg = false, bool egbf = false) {
         IjCase c; c.M = M; c.n = n; c.hc = 4; c.add = add; c.ys = ys; c.xs = xs; c.tail = tail; c.head = head;
+        c.eg = eg; c.egbf = egbf;
         cs.push_back(c);
     };
     C(1, 3072, false, false, false, true, false); C(1, 3072, true, true, true, true, false);
     C(6, 3072, true, false, false, true, false);  C(17, 512, false, true, false, true, true);
     C(3, 512, true, false, false, false, false);
+    /* P-07: the Engram form behind the same all-reduce -- the gate runs between ihc_post and
+     * ihc_pre on the folded h, so every rank must still leave the same bytes. Two weight dtypes. */
+    C(4, 3072, false, false, false, true, false, true, false);
+    C(3, 512, true, false, false, true, false, true, true);
     /* 256 rows: 256 blocks of 16 waves would sit on the full-card cliff, so the launch takes 255 */
     if (world == 2) { C(192, 3072, true, false, false, true, false); C(96, 3072, false, true, true, true, false);
                       C(256, 3072, false, false, false, true, false); }
     else C(32, 3072, true, false, false, true, false);
     for (const IjCase& c : cs) {
-        const std::string at = fmt(" M=%lld n=%lld%s%s%s%s", (long long)c.M, (long long)c.n,
+        const std::string at = fmt(" M=%lld n=%lld%s%s%s%s%s", (long long)c.M, (long long)c.n,
                                    c.add ? ", add" : "", c.tail ? "" : ", tail 0", c.head ? ", head form" : "",
-                                   c.ys || c.xs ? ", y / x stored" : "");
+                                   c.ys || c.xs ? ", y / x stored" : "",
+                                   c.eg ? (c.egbf ? ", engram, bf16 weights" : ", engram") : "");
         const bool big = c.M * c.n * 2 >= 512 * 1024;
         std::vector<ArIj> t((size_t)world);
         IjData shared = ij_data(c, (uint32_t)(c.M * 17 + c.n + c.add));
