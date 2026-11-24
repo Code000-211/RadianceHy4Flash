@@ -46,13 +46,28 @@ constexpr int kKeysWg  = kWaves * 16;   /* keys a workgroup */
     const int32_t* __restrict__ cu, const int32_t* __restrict__ nc, float* __restrict__ out,    \
     int nseq, int cols, int out_cols, int pages, long q_ld, long gate_ld, long key_ld,          \
     long bt_ld, long out_ld, float wscale
-__device__ __forceinline__ void idx_score_body(IDX_SCORE_PARAMS) {
+
+/* The row's sequence and the page of this lane's column, found before the step's keys: `cu` and
+ * `bt` are uploaded by the host (input operands, and no op of a pass writes an input), so a chained
+ * workgroup reads them in front of its wait and the poll covers the binary search's dependent round
+ * trips (K-29). `nc` is qsa_work's, so it stays behind the acquire, where the scalar wait covers
+ * it. */
+struct IdxScoreMeta {
+    int b;      /* this lane's key column */
+    int seq;    /* the row's sequence, -1 when the row is not in one */
+    int page;   /* the column's key page; read only when `live` */
+    bool live;  /* `b` is inside the table's columns and the row is in a sequence */
+};
+
+__device__ __forceinline__ IdxScoreMeta idx_score_meta(IDX_SCORE_PARAMS) {
 
     const int lane = threadIdx.x & (kWave - 1), wave = threadIdx.x >> 5;
-    const int half = lane >> 4, col = lane & 15;
+    const int col = lane & 15;
     const int m  = (int)blockIdx.x;
+    IdxScoreMeta s = { 0, -1, -1, false };
     const int b0 = (int)blockIdx.y * kKeysWg + wave * 16;
-    if (b0 >= out_cols) return;          /* wave-uniform; nothing below synchronises */
+    s.b = b0 + col;
+    if (b0 >= out_cols) return s;      /* wave-uniform: the body writes nothing either */
 
     /* The row's sequence: cu is nondecreasing, so a binary search for the last cu[i] <= m. */
     int lo = 0, hi = nseq;
@@ -60,12 +75,26 @@ __device__ __forceinline__ void idx_score_body(IDX_SCORE_PARAMS) {
         const int mid = (lo + hi) >> 1;
         if (cu[mid] <= m) lo = mid; else hi = mid;
     }
-    const int seq = (m >= cu[lo] && m < cu[lo + 1]) ? lo : -1;
+    s.seq = (m >= cu[lo] && m < cu[lo + 1]) ? lo : -1;
+    /* In bounds whenever it is read: `cols` is the block table's column count (or the row's). */
+    if (s.seq >= 0 && s.b < cols) { s.page = bt[(size_t)s.seq * bt_ld + s.b]; s.live = true; }
+    return s;
+}
+
+__device__ __forceinline__ void idx_score_body(IDX_SCORE_PARAMS, const IdxScoreMeta& meta) {
+
+    const int lane = threadIdx.x & (kWave - 1), wave = threadIdx.x >> 5;
+    const int half = lane >> 4, col = lane & 15;
+    const int m  = (int)blockIdx.x;
+    const int b0 = (int)blockIdx.y * kKeysWg + wave * 16;
+    if (b0 >= out_cols) return;          /* wave-uniform; nothing below synchronises */
+
+    const int seq = meta.seq;
     const int nlive = seq < 0 ? 0 : (nc[seq] < cols ? nc[seq] : cols);
 
     /* The key of this lane's column: its page, or page 0 (always present) when it has none. */
-    const int b = b0 + col;
-    const int page = (b < nlive) ? bt[(size_t)seq * bt_ld + b] : -1;
+    const int b = meta.b;
+    const int page = (meta.live && b < nlive) ? meta.page : -1;
     const bool ok  = page >= 0 && page < pages;
 
     /* A operand: head `col`'s query row. B operand: the key. Same fragment layout for both. */
@@ -101,9 +130,13 @@ __device__ __forceinline__ void idx_score_body(IDX_SCORE_PARAMS) {
 template <class CH>
 __global__ __launch_bounds__(kWaves * kWave)
 void idx_score_kernel(IDX_SCORE_PARAMS) {
+    /* K-29: the row's sequence and column page in front of the wait, which then covers their reads
+     * (see IdxScoreMeta). */
+    const IdxScoreMeta meta = idx_score_meta(q, gate, key, bt, cu, nc, out, nseq, cols, out_cols,
+                                            pages, q_ld, gate_ld, key_ld, bt_ld, out_ld, wscale);
     if (CH::on) r4d_chain_wait();
     idx_score_body(q, gate, key, bt, cu, nc, out, nseq, cols, out_cols, pages, q_ld, gate_ld,
-                   key_ld, bt_ld, out_ld, wscale);
+                   key_ld, bt_ld, out_ld, wscale, meta);
     if (CH::on) r4d_chain_done();
 }
 #undef IDX_SCORE_PARAMS
