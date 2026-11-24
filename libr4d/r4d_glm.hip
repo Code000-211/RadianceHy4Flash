@@ -228,16 +228,19 @@ int gemm_f32_body(const RadArgs* a, RadStream stream) {
      * steps is 2 to 2.5 times as fast as one step at N 288 up to 16 rows, and about 3 times at N 32
      * at every count below 64; at N 288 from 17 rows 8x1 with 8 steps is faster.
      * A projection of a few columns has too few waves for wide tiles at any M.
-     * From 256 rows and 128 columns (the router at prefill, N 128 a rank at TP4, 256 at TP2) the
-     * staged 8x8 form: x read from LDS as f32, a step of k 8 weight loads for 64 FMA where 8x4 has
-     * 12 loads for 32. It holds 16 waves a SIMD like 8x4 (8 KiB of LDS a workgroup); 16x8 needs
-     * 256 VGPRs and spills. Decode and verify heights keep the forms above. */
+     * At prefill heights (the router: N 128 a rank at TP4, 256 at TP2, 512 at TP1) the staged 8x8
+     * form: x read from LDS as f32, a step of k 8 weight loads for 64 FMA where 8x4 has 12 loads
+     * for 32. Staging x costs a fixed share a workgroup, so the narrower N needs more rows before it
+     * pays: from 256 rows at N 512, 384 at N 256 and 768 at N 128 (below those 8x4 was as fast or
+     * faster on gfx1201). It holds 16 waves a SIMD like 8x4 (8 KiB of LDS a workgroup); 16x8 and
+     * 16x4 drop to 8. Decode and verify heights keep the forms above. */
     const long rows = x.shape[0];
     const bool ch = r4d_geti_or(a, "chain", 0) != 0 && rows <= 64;   /* decode heights */
     if (n <= 8) return gemm_f32_tile<4, 1>(stream, x, w, y, n, k, ch);
     if (rows <= 16 || (rows < 64 && n < 128)) return gemm_f32_tile<2, 2, 16>(stream, x, w, y, n, k, ch);
     if (rows < 64) return gemm_f32_tile<8, 1, 8>(stream, x, w, y, n, k, ch);
-    if (rows >= 256 && n >= 128) return gemm_f32_lds<8, 8, 256>(stream, x, w, y, n, k);
+    const long lds_rows = n >= 512 ? 256 : n >= 256 ? 384 : 768;   /* where staging x pays */
+    if (n >= 128 && rows >= lds_rows) return gemm_f32_lds<8, 8, 256>(stream, x, w, y, n, k);
     return gemm_f32_tile<8, 4>(stream, x, w, y, n, k, ch);
 }
 // router_sigmoid_topk in one wave per row: p = sigmoid(logit), the top_k largest ranks p + bias

@@ -38106,9 +38106,9 @@ static void device_phase(const Plugin& pl) {
         /* The staged prefill form at the router's widths a rank (N 128 at TP4, 256 at TP2), K 3072,
          * x's rows contiguous and padded; and short of a whole stage, step and column group. */
         f32_forms(pl, 1024, 128, 3072, 0, false, 0);
-        f32_forms(pl, 300, 256, 3072, 0, false, 0);
+        f32_forms(pl, 400, 256, 3072, 0, false, 0);
         f32_forms(pl, 1024, 128, 3072, 0, false);
-        f32_forms(pl, 263, 130, 1000, 0, false, 0);
+        f32_forms(pl, 775, 130, 1000, 0, false, 0);
     }
     if (sel("dsa_score_fp8")) {
         dsa_score_check(pl, 1, 17);

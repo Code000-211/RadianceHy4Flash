@@ -3,7 +3,8 @@
  * shapes reach every one, with K past and short of whole groups of steps) must match the
  * arithmetic written out here bit for bit: lane l folds k = l, l+32, ... with fmaf, then the xor
  * butterfly over 16, 8, 4, 2, 1. Tail rows and columns and the pitch's padding stay untouched.
- * From 256 rows and 128 columns the staged form (x widened into LDS, 8 x 8 a wave) takes over; its
+ * From 768 rows at N 128-255, 384 at N 256-511 and 256 at N 512 or more the staged form (x widened
+ * into LDS, 8 x 8 a wave) takes over; its
  * shapes cover a K short of a whole stage and of a whole step, tail rows and columns, waves with
  * no columns, and x's pitch with and without 16-byte vectors.
  *
@@ -265,7 +266,8 @@ int main() {
         return fails ? 1 : 0;
     }
     // One wave an output (M 1), the 2x1, 4x1 (M under 16 or N up to 8), 4x4 and 8x4 tiles; from
-    // 256 rows and 128 columns the staged 8x8 form: x's pitch odd (staged a value at a time) and
+    // 768 rows at N 128-255, 384 at N 256-511 and 256 at N 512+ the staged 8x8 form, each side of
+    // each bound: x's pitch odd (staged a value at a time) and
     // a multiple of 8 (16 bytes at a time), K past and short of a whole stage of 256 and of a whole
     // step of 32, M no multiple of 8, and N no multiple of 32 (the last workgroup's last waves
     // have no columns) or of 8.
@@ -274,10 +276,10 @@ int main() {
         { 8, 288, 129, 134 },    { 33, 32, 512, 517 },    { 70, 36, 129, 134 },
         { 70, 4, 512, 517 },     { 7, 31, 129, 134 },     { 65, 13, 130, 135 },
         { 16, 288, 1056, 1061 }, { 24, 288, 1040, 1045 }, { 40, 36, 1024, 1029 },
-        { 1, 512, 3072, 3077 },  { 255, 128, 300, 305 },  { 256, 127, 300, 305 },
-        { 257, 128, 300, 305 },  { 263, 130, 600, 605 },  { 300, 256, 520, 520 },
-        { 300, 203, 264, 264 },  { 264, 136, 1000, 1000 }, { 256, 512, 96, 101 },
-        { 256, 128, 24, 24 },
+        { 1, 512, 3072, 3077 },  { 767, 128, 300, 305 },  { 768, 127, 300, 305 },
+        { 769, 128, 300, 305 },  { 775, 130, 600, 605 },  { 383, 256, 520, 520 },
+        { 400, 256, 520, 520 },  { 800, 203, 264, 264 },  { 776, 136, 1000, 1000 },
+        { 255, 512, 96, 101 },   { 256, 512, 96, 101 },   { 768, 128, 24, 24 },
     };
     for (const GemmCase& sh : shapes) {
         ++cases;
