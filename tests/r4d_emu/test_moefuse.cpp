@@ -8,6 +8,12 @@
  * wrapping over the waves, the sort's bound and its refusal past it. Pitch padding, guards past
  * every output and the gate's untouched rows show an overrun.
  *
+ * router_gemm_sigmoid_scatter (the block's projection fused in front of that selection) against
+ * gemm_nt_f32 then router_sigmoid_topk_scatter: the logits byte for byte as well, at the heights
+ * that reach every tile form and wave count of both, with a bf16 and an f32 router weight, tied
+ * ranks and a row of NaNs, slices and protected experts, the gate's fill and the inverse, and the
+ * refusal past the decode band.
+ *
  * moe_scatter_inv and moe_gather_inv: the small sort's kernel with the inverse against itself
  * without, and the inverse against the table the gather builds from `sorted`; then moe_gather's
  * kernel reading that inverse against its self-scan (T <= 512) or the prepass's table (above), at
@@ -559,6 +565,343 @@ void gather_sixteen_cases(std::mt19937& rng, int& cases, int& fails) {
     }
 }
 
+/* The router's projection and the selection it feeds in one launch (router_gemm_sigmoid_scatter),
+ * byte for byte against the two it replaces: gemm_nt_f32 then router_sigmoid_topk_scatter, which the
+ * two blocks above already hold to their own arithmetic. The heights reach every tile form and
+ * wave count the launcher picks (two rows by two columns to 16 rows, eight by one above; 8, 16 and
+ * 32 waves), at a bf16 and an f32 router weight, with tied ranks and a row of NaNs (a row of x),
+ * a slice with protected experts, the shared gate's fill and the inverse. The logits it writes are
+ * the unfused GEMM's byte for byte, pitch padding included, and the guards past every output and
+ * the gate's untouched rows show an overrun; a height past the decode band is refused. */
+struct FusedShape {
+    int M, K, ne, k, norm;
+    bool bf16w;
+    int mode; /* 0 random, 1 tied ranks, 2 NaN rows */
+    int nl, base;
+    bool gate, inv;
+    const char* protect;
+};
+
+void fused_router_cases(std::mt19937& rng, int& cases, int& fails) {
+    const FusedShape shapes[] = {
+        { 1, 512, 288, 8, 1, true, 0, 0, 0, true, false, nullptr },
+        { 2, 512, 288, 8, 1, true, 0, 0, 0, true, false, nullptr },
+        { 6, 1536, 288, 8, 1, true, 1, 0, 0, true, true, nullptr },
+        { 8, 512, 288, 8, 1, false, 0, 0, 0, true, true, nullptr },
+        { 9, 512, 288, 8, 1, true, 0, 0, 0, false, true, nullptr },
+        { 16, 512, 288, 8, 1, true, 2, 0, 0, true, true, nullptr },
+        { 17, 512, 288, 8, 1, false, 0, 0, 0, true, false, nullptr },
+        { 31, 512, 288, 8, 1, true, 0, 0, 0, true, true, nullptr },
+        { 32, 300, 288, 8, 1, true, 1, 0, 0, true, true, nullptr },
+        { 33, 512, 288, 8, 1, true, 0, 0, 0, true, false, nullptr },
+        { 48, 512, 288, 8, 1, false, 2, 0, 0, true, true, nullptr },
+        { 64, 512, 288, 8, 1, true, 0, 0, 0, true, true, nullptr },
+        { 24, 512, 288, 8, 1, true, 0, 144, 144, true, true, nullptr },
+        { 24, 512, 288, 8, 1, true, 1, 96, 32, true, true, "3,7,90" },
+        { 64, 512, 512, 16, 0, true, 0, 0, 0, false, false, nullptr },
+        { 9, 512, 512, 16, 1, false, 1, 0, 0, true, true, nullptr },
+        { 1, 288, 32, 32, 0, true, 1, 0, 0, true, false, nullptr },
+        { 5, 300, 300, 10, 1, true, 2, 0, 0, true, false, "0,299" },
+    };
+    constexpr float kLogPoison = -7.25f;
+    std::uniform_int_distribution<int> ud(-1000, 1000);
+    for (const FusedShape& sh : shapes) {
+        const int M = sh.M, K = sh.K, ne = sh.ne, k = sh.k, T = M * k;
+        const int nl = sh.nl ? sh.nl : ne, base = sh.base;
+        const long xp = K + 4, rwp = K + 2, yp = ne + 5, ip = k + 3, wp = k + 1, gp = 3;
+        std::vector<uint16_t> x((size_t)M * xp);
+        for (auto& v : x) v = f2b((float)ud(rng) / 256.f);
+        if (sh.mode == 2)
+            for (int r = 0; r < M; r += 2)
+                for (int c = 0; c < K; ++c) x[(size_t)r * xp + c] = 0x7fc0; /* NaN: every rank */
+        std::vector<float> wf, bias((size_t)ne * 2);
+        std::vector<uint16_t> wb;
+        if (sh.bf16w) {
+            wb.resize((size_t)ne * rwp);
+            for (auto& v : wb) v = f2b((float)ud(rng) / 2048.f);
+        } else {
+            wf.resize((size_t)ne * rwp);
+            for (auto& v : wf) v = (float)ud(rng) / 2048.f;
+        }
+        for (auto& v : bias)
+            v = sh.mode ? (float)(ud(rng) % 5) * 0.125f : (float)ud(rng) / 2000.f;
+        std::vector<int> prot;
+        if (sh.protect)
+            for (const char* q = sh.protect; *q;) {
+                char* end = nullptr;
+                prot.push_back((int)std::strtol(q, &end, 10));
+                q = *end == ',' ? end + 1 : end;
+            }
+
+        /* The row's operands: x, weight, bias, logits, ids, weights, sorted, off, cnt, gate?,
+         * inverse? */
+        RadTensor t[11]{};
+        auto mat = [](RadTensor& d, void* p, uint32_t dt, int r, int c, long ld) {
+            d.data = p;
+            d.dtype = dt;
+            d.rank = 2;
+            d.shape[0] = r;
+            d.shape[1] = c;
+            d.stride[0] = ld;
+            d.stride[1] = 1;
+        };
+        auto vec = [](RadTensor& d, void* p, long n) {
+            d.data = p;
+            d.dtype = RAD_I32;
+            d.rank = 1;
+            d.shape[0] = n;
+            d.stride[0] = 1;
+        };
+        mat(t[0], x.data(), RAD_BF16, M, K, xp);
+        mat(t[1], sh.bf16w ? (void*)wb.data() : (void*)wf.data(),
+            sh.bf16w ? (uint32_t)RAD_BF16 : (uint32_t)RAD_F32, ne, K, rwp);
+        t[2].data = bias.data();
+        t[2].dtype = RAD_F32;
+        t[2].rank = 1;
+        t[2].shape[0] = ne;
+        t[2].stride[0] = 2;
+        mat(t[3], nullptr, RAD_F32, M, ne, yp);
+        RadTensor& ids = t[4];
+        RadTensor& ew = t[5];
+        RadTensor& sorted = t[6];
+        RadTensor& off = t[7];
+        RadTensor& cnt = t[8];
+        RadTensor& gate = t[9];
+        RadTensor& inv = t[10];
+        mat(ids, nullptr, RAD_I32, M, k, ip);
+        mat(ew, nullptr, RAD_F32, M, k, wp);
+        vec(sorted, nullptr, T);
+        vec(off, nullptr, nl + 1);
+        vec(cnt, nullptr, nl);
+        mat(gate, nullptr, RAD_BF16, M, 1, gp);
+        vec(inv, nullptr, T);
+
+        RadParam p[11]{};
+        p[0] = { "M", RAD_P_INT, M };
+        p[1] = { "K", RAD_P_INT, K };
+        p[2] = { "n_expert", RAD_P_INT, ne };
+        p[3] = { "n_local", RAD_P_INT, nl };
+        p[4] = { "top_k", RAD_P_INT, k };
+        p[5] = { "weight_bf16", RAD_P_INT, sh.bf16w ? 1 : 0 };
+        p[6] = { "norm", RAD_P_INT, sh.norm };
+        p[7].key = "route_scale";
+        p[7].kind = RAD_P_F64;
+        p[7].dval = 2.5;
+        p[8].key = "dtype";
+        p[8].kind = RAD_P_STR;
+        p[8].sval = "f32";
+        p[9] = { "expert_base", RAD_P_INT, base };
+        p[10].key = "protect";
+        p[10].kind = RAD_P_STR;
+        p[10].sval = sh.protect;
+        const int n_p = sh.protect ? 11 : 10;
+
+        /* The two launches the row replaces: the projection, then the selection over its logits. */
+        std::vector<float> ref_lg((size_t)M * yp, kLogPoison), ref_w((size_t)M * wp, -7.25f);
+        std::vector<int32_t> ref_ids((size_t)M * ip, kPoison), ref_sorted((size_t)T + 4, kPoison),
+            ref_off((size_t)nl + 5, kPoison), ref_cnt((size_t)nl + 4, kPoison),
+            ref_inv((size_t)T + 4, kPoison);
+        std::vector<uint16_t> ref_gate((size_t)(M + 2) * gp, kGatePoison);
+        {
+            RadTensor g[3] = { t[0], t[1], t[3] };
+            g[2].data = ref_lg.data();
+            RadParam gq[5]{};
+            gq[0] = { "M", RAD_P_INT, M };
+            gq[1] = { "N", RAD_P_INT, ne };
+            gq[2] = { "K", RAD_P_INT, K };
+            gq[3].key = "dtype";
+            gq[3].kind = RAD_P_STR;
+            gq[3].sval = "bf16";
+            gq[4] = { "weight_bf16", RAD_P_INT, sh.bf16w ? 1 : 0 };
+            RadArgs ga{};
+            ga.t = g;
+            ga.n_t = 3;
+            ga.p = gq;
+            ga.n_p = 5;
+            ++cases;
+            const int rc = r4d_rad_gemm_nt_f32(&ga, nullptr);
+            if (rc != RAD_OK) {
+                std::printf("FAIL gemm_nt_f32 before the fused router at M=%d K=%d ne=%d (rc %d)\n",
+                            M, K, ne, rc);
+                ++fails;
+                continue;
+            }
+            RadTensor s[9] = { t[3], t[2], t[4], t[5], t[6], t[7], t[8], t[9], t[10] };
+            s[0].data = ref_lg.data();
+            s[2].data = ref_ids.data();
+            s[3].data = ref_w.data();
+            s[4].data = ref_sorted.data();
+            s[5].data = ref_off.data();
+            s[6].data = ref_cnt.data();
+            s[7].data = sh.gate ? ref_gate.data() : nullptr;
+            s[8].data = ref_inv.data();
+            RadArgs sa{};
+            sa.t = s;
+            sa.p = p;
+            sa.n_p = n_p;
+            sa.n_t = sh.inv ? 9 : (sh.gate ? 8 : 7);
+            const int src = r4d_rad_router_sigmoid_topk_scatter(&sa, nullptr);
+            if (src != RAD_OK) {
+                std::printf("FAIL router_sigmoid_topk_scatter before the fused router at M=%d (rc "
+                            "%d)\n",
+                            M, src);
+                ++fails;
+                continue;
+            }
+        }
+
+        for (int with_inv = 0; with_inv < (sh.inv ? 2 : 1); ++with_inv) {
+            std::vector<float> lg((size_t)M * yp, kLogPoison), w((size_t)M * wp, -7.25f);
+            std::vector<int32_t> ids2((size_t)M * ip, kPoison), sorted2((size_t)T + 4, kPoison),
+                off2((size_t)nl + 5, kPoison), cnt2((size_t)nl + 4, kPoison),
+                inv2((size_t)T + 4, kPoison);
+            std::vector<uint16_t> g2((size_t)(M + 2) * gp, kGatePoison);
+            RadTensor f[11];
+            std::memcpy(f, t, sizeof f);
+            f[3].data = lg.data();
+            f[4].data = ids2.data();
+            f[5].data = w.data();
+            f[6].data = sorted2.data();
+            f[7].data = off2.data();
+            f[8].data = cnt2.data();
+            f[9].data = sh.gate ? g2.data() : nullptr;
+            f[10].data = inv2.data();
+            RadArgs fa{};
+            fa.t = f;
+            fa.p = p;
+            fa.n_p = n_p;
+            fa.n_t = with_inv ? 11 : (sh.gate ? 10 : 9);
+            ++cases;
+            const int rc = r4d_rad_router_gemm_sigmoid_scatter(&fa, nullptr);
+            int bad = 0;
+            char why[16] = { 0 };
+            int nwhy = 0;
+            if (std::memcmp(lg.data(), ref_lg.data(), lg.size() * sizeof(float))) {
+                ++bad;
+                why[nwhy++] = 'l';
+            }
+            if (std::memcmp(ids2.data(), ref_ids.data(), ids2.size() * sizeof(int32_t))) {
+                ++bad;
+                why[nwhy++] = 'i';
+            }
+            if (std::memcmp(w.data(), ref_w.data(), w.size() * sizeof(float))) {
+                ++bad;
+                why[nwhy++] = 'w';
+            }
+            if (std::memcmp(sorted2.data(), ref_sorted.data(), sorted2.size() * 4)) {
+                ++bad;
+                why[nwhy++] = 's';
+            }
+            if (std::memcmp(off2.data(), ref_off.data(), off2.size() * 4)) {
+                ++bad;
+                why[nwhy++] = 'o';
+            }
+            if (std::memcmp(cnt2.data(), ref_cnt.data(), cnt2.size() * 4)) {
+                ++bad;
+                why[nwhy++] = 'c';
+            }
+            if (with_inv) {
+                if (std::memcmp(inv2.data(), ref_inv.data(), inv2.size() * 4)) {
+                    ++bad;
+                    why[nwhy++] = 'v';
+                }
+            } else {
+                for (int i = 0; i < T + 4; ++i)
+                    if (inv2[(size_t)i] != kPoison) {
+                        ++bad;
+                        why[nwhy++] = 'V';
+                        break;
+                    }
+            }
+            for (int r = 0; r < M + 2; ++r)
+                for (int c = 0; c < gp; ++c) {
+                    const uint16_t want = sh.gate && r < M && c == 0 ? 0x3f80 : kGatePoison;
+                    if (g2[(size_t)r * gp + c] != want) {
+                        ++bad;
+                        why[nwhy++] = 'g';
+                        r = M + 2;
+                        break;
+                    }
+                }
+            why[nwhy] = 0;
+            if (rc != RAD_OK || bad) {
+                std::printf(
+                    "FAIL router_gemm_sigmoid_scatter at M=%d K=%d ne=%d k=%d mode %d slice %d+%d "
+                    "%s weights%s%s%s%s (rc %d, %d mismatching outputs: %s)\n",
+                    M, K, ne, k, sh.mode, base, nl, sh.bf16w ? "bf16" : "f32",
+                    sh.protect ? " protect " : "", sh.protect ? sh.protect : "",
+                    sh.gate ? " gate" : "", with_inv ? " with inverse" : "", rc, bad, why);
+                ++fails;
+            }
+        }
+    }
+    /* Past the decode band: refused, nothing written. */
+    {
+        const int M = 65, K = 512, ne = 288, k = 8;
+        std::vector<uint16_t> x((size_t)M * K, 0x3f80);
+        std::vector<float> wh((size_t)ne * K, 0.f), bias((size_t)ne, 0.f),
+            lg((size_t)M * ne, kLogPoison), w((size_t)M * k, -7.25f);
+        std::vector<int32_t> ids((size_t)M * k, kPoison), sorted((size_t)M * k, kPoison),
+            off((size_t)ne + 1, kPoison), cnt((size_t)ne, kPoison);
+        RadTensor t[9]{};
+        auto mat = [](RadTensor& d, void* p, uint32_t dt, int r, int c) {
+            d.data = p;
+            d.dtype = dt;
+            d.rank = 2;
+            d.shape[0] = r;
+            d.shape[1] = c;
+            d.stride[0] = c;
+            d.stride[1] = 1;
+        };
+        auto vec = [](RadTensor& d, void* p, long n) {
+            d.data = p;
+            d.dtype = RAD_I32;
+            d.rank = 1;
+            d.shape[0] = n;
+            d.stride[0] = 1;
+        };
+        mat(t[0], x.data(), RAD_BF16, M, K);
+        mat(t[1], wh.data(), RAD_F32, ne, K);
+        t[2].data = bias.data();
+        t[2].dtype = RAD_F32;
+        t[2].rank = 1;
+        t[2].shape[0] = ne;
+        t[2].stride[0] = 1;
+        mat(t[3], lg.data(), RAD_F32, M, ne);
+        mat(t[4], ids.data(), RAD_I32, M, k);
+        mat(t[5], w.data(), RAD_F32, M, k);
+        vec(t[6], sorted.data(), M * k);
+        vec(t[7], off.data(), ne + 1);
+        vec(t[8], cnt.data(), ne);
+        RadParam p[10]{};
+        p[0] = { "M", RAD_P_INT, M };
+        p[1] = { "K", RAD_P_INT, K };
+        p[2] = { "n_expert", RAD_P_INT, ne };
+        p[3] = { "n_local", RAD_P_INT, ne };
+        p[4] = { "top_k", RAD_P_INT, k };
+        p[5] = { "weight_bf16", RAD_P_INT, 0 };
+        p[6] = { "norm", RAD_P_INT, 1 };
+        p[7].key = "route_scale";
+        p[7].kind = RAD_P_F64;
+        p[7].dval = 2.5;
+        p[8].key = "dtype";
+        p[8].kind = RAD_P_STR;
+        p[8].sval = "f32";
+        RadArgs a{};
+        a.t = t;
+        a.n_t = 9;
+        a.p = p;
+        a.n_p = 9;
+        ++cases;
+        const int rc = r4d_rad_router_gemm_sigmoid_scatter(&a, nullptr);
+        if (rc == RAD_OK || lg[0] != kLogPoison || ids[0] != kPoison || sorted[0] != kPoison) {
+            std::printf("FAIL router_gemm_sigmoid_scatter served M=%d past the decode band (rc "
+                        "%d)\n",
+                        M, rc);
+            ++fails;
+        }
+    }
+}
 }   // namespace
 
 int main() {
@@ -567,6 +910,7 @@ int main() {
     router_scatter_cases(rng, cases, fails);
     gather_inverse_cases(rng, cases, fails);
     gather_sixteen_cases(rng, cases, fails);
+    fused_router_cases(rng, cases, fails);
     std::printf("%d case(s), %d failure(s)\n", cases, fails);
     return fails ? 1 : 0;
 }
