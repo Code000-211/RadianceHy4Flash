@@ -1688,8 +1688,12 @@ TEST(the_router_projection_joins_its_selection_where_a_library_serves_it) {
          * row was level with the pair), a pass folding the latent's codes reaches 16, and above that
          * both keep the pair -- where the row's wider form was 3.5x the pair's time. All but the
          * first are prefill heights because the indexer's table is one entry a sequence, and one
-         * sequence of n tokens is the same pass height as n decode rows. */
+         * sequence of n tokens is the same pass height as n decode rows. The ninth row holds the
+         * bare cap from below as well as above: a cap anywhere in 9 to 15 would fuse there and the
+         * pair would not be issued, and it puts the folded row (band 16) at a second height. */
         { "decode 8 rows", 8, 0, 1, false, false, 2, 0, 0, 0, false },
+        { "prefill 9 rows", 0, 9, 1, false, false, 0, 2, 0, 0, false },
+        { "prefill 9 rows, rotated experts", 0, 9, 1, false, false, 2, 0, 0, 128, true },
         { "prefill 16 rows", 0, 16, 1, false, false, 0, 2, 0, 0, false },
         { "prefill 17 rows", 0, 17, 1, false, false, 0, 2, 0, 0, false },
         { "prefill 32 rows", 0, 32, 1, false, false, 0, 2, 0, 0, false },
