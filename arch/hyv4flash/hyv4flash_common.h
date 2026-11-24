@@ -100,6 +100,15 @@ inline rad_op mk(RadBuilder* b, const char* name, std::initializer_list<RadParam
                                  ws.size() ? ws.begin() : nullptr, (int)ws.size());
     return rw(b, h, reads, writes);
 }
+/* mk with the params assembled at run time: an op whose optional parameters exist only on some of
+ * its instances (the latent sinks' folded rotary) cannot write them in an initializer list. */
+inline rad_op mk_list(RadBuilder* b, const char* name, const std::vector<RadParam>& ps,
+                      std::initializer_list<rad_weight> ws, std::initializer_list<rad_buf> reads,
+                      std::initializer_list<rad_buf> writes) {
+    const rad_op h = rad_decl_op(b, name, ps.data(), (int)ps.size(),
+                                 ws.size() ? ws.begin() : nullptr, (int)ws.size());
+    return rw(b, h, reads, writes);
+}
 
 /* An op that must resolve: a graph with a hole would look servable. */
 #define HY4_NEED(h, what)                                                                      \
@@ -351,6 +360,13 @@ inline bool fuse_on(const char* name) {
  * the switch fuse_on's list names, now read here. */
 inline bool dual_fuse_on() { return fuse_on("RADIANCE_HY4_FUSE_QPROJ"); }
 
+/* K-03: q_a and the gate read one set of codes -- the attention input's, which q_a owns and the
+ * gate is fed from it -- and both are GEMVs at a decode step, while the gate's product is not read
+ * until `mla_expand_gate` (so it is off the critical path until then), which is the pair a launch
+ * wants: one `gemm_nt_q_dual` carries both where their encodings agree. Its own switch, so each
+ * pair's arm can be measured alone. Off with 0. */
+inline bool qa_gate_fuse_on() { return fuse_on("RADIANCE_HY4_FUSE_QA_GATE"); }
+
 /* The rows a pair's block covers of one part, off that part's own width: the GEMV takes four waves
  * a tile above 4096 columns and eight below (libr4d/r4d_gemm_iqr.hip), and a block of eight waves
  * is then two of its 16-row tiles or one. A part's N must be a whole number of them. */
@@ -539,6 +555,14 @@ struct Lin : LinearFP8 {
         const ActFP8 in = with_codes(a);
         if (op_dual && n <= kDualMaxM) return dual_step(c, in, y, T, r0, rows, y0, codes_ready);
         LinearFP8::step(c, in, y, T, r0, rows, y0, codes_ready);
+    }
+    /* The input's codes alone, for a caller whose epilogue reads them (the gated GEMM of a gated
+     * MLP): issued when this linear quantises its own input, nothing when they are fed. */
+    void quantise(RadCtx* c, const ActFP8& a, int64_t T, int64_t r0 = 0, int64_t rows = 0) const {
+        if (rows <= 0) rows = T - r0;
+        if (!i8 || !op_q || rows <= 0 || !a.q8 || !a.s8 || a.g8 <= 0) return;
+        RAD_ISSUE_N(c, op_q, rows, brow_slice(a.x, r0, rows, K), brow_slice(a.q8, r0, rows, K),
+                    brow_slice(a.s8, r0, rows, K / a.g8));
     }
 };
 

@@ -205,17 +205,31 @@ struct Params {
     }
 };
 
+/* The rotary a launch folds: the positions operand (null: q_rope arrives rotated) and rope's own
+ * parameters. */
+struct Rope {
+    const std::vector<int>* pos = nullptr;
+    int comps = 1; /* 3 for imrope's planes: the positions are [comps, rows] */
+    const char* mode = "gptj";
+    const char* sections = nullptr;
+    double theta = 10000.0, scale = 1.0;
+};
+
 /* `stable` -1 leaves the parameter out (its default, 0). `scratch_cut` shortens the scratch;
  * `scr` (if given) gets the scratch's words after the call: the split form writes its slots' parts
- * there, the fused form only the accumulator of a row and head (`kAccWords` floats). */
+ * there, the fused form only the accumulator of a row and head (`kAccWords` floats).
+ * `rope` passes the optional `rope_pos` operand (and its parameters); `qr` replaces the rotary
+ * operand's columns, so a folded launch can be compared with a rotated one. */
 int launch(const Problem& p, bool sel, int form, std::vector<uint16_t>& out, int stable = -1,
-           int64_t scratch_cut = 0, std::vector<uint32_t>* scr = nullptr) {
+           int64_t scratch_cut = 0, std::vector<uint32_t>* scr = nullptr,
+           const Rope* rope = nullptr, const std::vector<uint16_t>* qr = nullptr) {
     const int M = p.rows();
     out.assign((size_t)M * p.heads * L, 0xffff);
     auto& P = const_cast<Problem&>(p);
     std::vector<RadTensor> t;
     t.push_back(tens(P.q.data(), RAD_BF16, { M, p.heads, L }));
-    t.push_back(tens(P.qr.data(), RAD_BF16, { M, p.heads, R }));
+    t.push_back(tens(qr ? const_cast<uint16_t*>(qr->data()) : P.qr.data(), RAD_BF16,
+                     { M, p.heads, R }));
     t.push_back(tens(P.kv.data(), RAD_BF16, { p.pages, 1, p.bs, W }));
     Params ps;
     ps.i("M", M);
@@ -235,8 +249,21 @@ int launch(const Problem& p, bool sel, int form, std::vector<uint16_t>& out, int
     ps.i("block_size", p.bs);
     ps.f("scale", kScale);
     if (stable >= 0) ps.i("stable", stable);
+    if (rope && rope->pos) {
+        ps.f("rope_theta", rope->theta);
+        ps.f("rope_scale", rope->scale);
+        ps.v.push_back(RadParam{ "rope_mode", RAD_P_STR, 0, 0, rope->mode, 0.0 });
+        if (rope->sections) ps.v.push_back(
+            RadParam{ "rope_sections", RAD_P_STR, 0, 0, rope->sections, 0.0 });
+    }
     t.push_back(tens(P.sinks.data(), RAD_F32, { p.heads }));
     t.push_back(tens(out.data(), RAD_BF16, { M, p.heads, L }));
+    if (rope && rope->pos)
+        t.push_back(rope->comps > 1
+                        ? tens(const_cast<int*>(rope->pos->data()), RAD_I32,
+                               { rope->comps, (int64_t)rope->pos->size() / rope->comps })
+                        : tens(const_cast<int*>(rope->pos->data()), RAD_I32,
+                               { (int64_t)rope->pos->size() }));
     RadArgs a{};
     a.t = t.data();
     a.n_t = (int)t.size();
@@ -639,6 +666,111 @@ void stable_suite(std::mt19937& rng, bool quick) {
     }
 }
 
+/* `rope` over a copy of the projection's rotary columns: the launch a folded sink must equal. */
+int rope_apply(std::vector<uint16_t>& qr, int rows, int heads, const std::vector<int>& pos,
+               const Rope& rope) {
+    std::vector<RadTensor> t{ tens(qr.data(), RAD_BF16, { rows, heads, R }),
+                              rope.comps > 1
+                                  ? tens(const_cast<int*>(pos.data()), RAD_I32,
+                                         { rope.comps, (int64_t)pos.size() / rope.comps })
+                                  : tens(const_cast<int*>(pos.data()), RAD_I32,
+                                         { (int64_t)pos.size() }) };
+    std::vector<RadParam> p{ { "M", RAD_P_INT, rows, 0, nullptr, 0.0 },
+                             { "head_dim", RAD_P_INT, R, 0, nullptr, 0.0 },
+                             { "n_head", RAD_P_INT, heads, 0, nullptr, 0.0 },
+                             { "n_head_kv", RAD_P_INT, 0, 0, nullptr, 0.0 },
+                             { "theta", RAD_P_F64, 0, 0, nullptr, rope.theta },
+                             { "scale", RAD_P_F64, 0, 0, nullptr, rope.scale },
+                             { "mode", RAD_P_STR, 0, 0, rope.mode, 0.0 },
+                             { "rotary_dim", RAD_P_INT, R, 0, nullptr, 0.0 } };
+    if (rope.sections) p.push_back({ "sections", RAD_P_STR, 0, 0, rope.sections, 0.0 });
+    RadArgs a{};
+    a.t = t.data();
+    a.n_t = (int)t.size();
+    a.p = p.data();
+    a.n_p = (int)p.size();
+    return r4d_rad_rope(&a, nullptr);
+}
+
+/* The rotary folded into the sinks (`rope_pos`): the launch over the projection's raw columns is
+ * the `rope` launch followed by the sink, byte for byte -- that equality is the whole saving (one
+ * launch a layer less), and it is what the two kernels' shared angle has to hold. gptj's adjacent
+ * pairs on one position plane and imrope's three; a pairing whose partner is half a head away is
+ * refused rather than half applied. */
+void check_rope(std::mt19937& rng) {
+    for (bool sel : { false, true }) {
+        Problem p;
+        make_paged(p, { 1, 2 }, { 511, 60 }, 16, 4, 0, false, rng);
+        make_sel_from_paged(p);
+        const int M = p.rows();
+        const std::string tag = sel ? "sel" : "paged";
+        Rope gptj;
+        std::vector<int> pos(M);
+        for (int r = 0; r < M; ++r) pos[r] = 977 + 7 * r;
+        gptj.pos = &pos;
+        std::vector<uint16_t> want, rot = p.qr;
+        const bool rope_ok = rope_apply(rot, M, p.heads, pos, gptj) == RAD_OK;
+        const bool base = launch(p, sel, 0, want, 1, 0, nullptr, nullptr, &rot) == RAD_OK;
+        std::vector<uint16_t> got;
+        const bool fold = launch(p, sel, 0, got, 1, 0, nullptr, &gptj) == RAD_OK;
+        report(tag + " folded rotary == rope then sink (bytes)", rope_ok && base && fold && got == want);
+        /* imrope: three position planes, the sections the rope launch takes */
+        std::vector<int> planes((size_t)3 * M);
+        for (int c = 0; c < 3; ++c)
+            for (int r = 0; r < M; ++r) planes[(size_t)c * M + r] = 300 + 11 * r + 5 * c;
+        Rope imrope;
+        imrope.pos = &planes;
+        imrope.comps = 3;
+        imrope.mode = "imrope_gptj";
+        imrope.sections = "11 10 11";
+        std::vector<uint16_t> want3, rot3 = p.qr;
+        const bool rope3 = rope_apply(rot3, M, p.heads, planes, imrope) == RAD_OK;
+        const bool base3 = launch(p, sel, 0, want3, 1, 0, nullptr, nullptr, &rot3) == RAD_OK;
+        std::vector<uint16_t> got3;
+        const bool fold3 = launch(p, sel, 0, got3, 1, 0, nullptr, &imrope) == RAD_OK;
+        report(tag + " folded imrope == rope then sink (bytes)",
+               rope3 && base3 && fold3 && got3 == want3);
+        /* neox pairs a column with one half a head away: no lane holds both, refused */
+        Rope neox;
+        neox.pos = &pos;
+        neox.mode = "neox";
+        std::vector<uint16_t> tmp;
+        report(tag + " folded neox refused (RAD_E_UNSUPPORTED)",
+               launch(p, sel, 0, tmp, 1, 0, nullptr, &neox) == RAD_E_UNSUPPORTED);
+        /* a [3, M] plane with one-component positions is not a shape rope accepts either */
+        Rope bad;
+        bad.pos = &planes;
+        bad.comps = 3;
+        report(tag + " folded gptj with three planes refused (RAD_E_SHAPE)",
+               launch(p, sel, 0, tmp, 1, 0, nullptr, &bad) == RAD_E_SHAPE);
+        /* the fold is a row's own: two rows of one launch == one row each, position included */
+        if (!sel) {
+            for (int r = 0; r < 2; ++r) {
+                const int sq = r < p.cu[1] ? 0 : 1, at = r - p.cu[sq];
+                Problem one = p;
+                one.qlen = { 1 };
+                one.ctx = { p.ctx[sq] };
+                one.used = { p.used[sq] - p.qlen[sq] + at + 1 }; /* the row's own visible count */
+                one.cu = { 0, 1 };
+                one.bt.assign(p.bt.begin() + (size_t)r * p.blocks,
+                              p.bt.begin() + (size_t)(r + 1) * p.blocks);
+                one.q.assign(p.q.begin() + (size_t)r * p.heads * L,
+                             p.q.begin() + (size_t)(r + 1) * p.heads * L);
+                one.qr.assign(p.qr.begin() + (size_t)r * p.heads * R,
+                              p.qr.begin() + (size_t)(r + 1) * p.heads * R);
+                std::vector<int> onepos{ pos[r] };
+                Rope rp;
+                rp.pos = &onepos;
+                std::vector<uint16_t> solo;
+                const bool ok = launch(one, false, 0, solo, 1, 0, nullptr, &rp) == RAD_OK;
+                report("folded rotary row " + std::to_string(r) + " == its one-row launch",
+                       ok && std::equal(solo.begin(), solo.end(),
+                                        got.begin() + (size_t)r * p.heads * L));
+            }
+        }
+    }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -681,6 +813,7 @@ int main(int argc, char** argv) {
         check_paged_vs_sel("H16 w0 verify 8 at 530", p);
     }
     stable_suite(rng, quick);
+    check_rope(rng);
     check_edge(16, 512, 600, rng);
     if (!quick) check_edge(64, 512, 530, rng);
     /* The selection form on its own tables: scattered pages, holes, a zero length. */
