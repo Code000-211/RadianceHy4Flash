@@ -707,6 +707,7 @@ int r4d_rad_kv_store_streamed(const RadArgs*, RadStream);
 int r4d_rad_qsa_tail_store  (const RadArgs*, RadStream);
 int r4d_rad_qsa_work        (const RadArgs*, RadStream);
 int r4d_rad_idx_pool_gated  (const RadArgs*, RadStream);
+int r4d_rad_qsa_work_pool_tail(const RadArgs*, RadStream);   /* K-24: work + pool + the tail rows */
 int r4d_rad_idx_pool_gated_fp8(const RadArgs*, RadStream);
 int r4d_rad_idx_pool_gated_i8(const RadArgs*, RadStream);
 int r4d_rad_idx_score       (const RadArgs*, RadStream);
@@ -1102,6 +1103,7 @@ int r4d_shape_qsa_select         (const RadParam*, int, int operand, RadOpdDesc*
 int r4d_shape_kv_resolve         (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_qsa_tail_store     (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_qsa_work           (const RadParam*, int, int operand, RadOpdDesc*);
+int r4d_shape_qsa_work_pool_tail (const RadParam*, int, int operand, RadOpdDesc*);
 
 int r4d_shape_dflash_conv    (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_dflash_select  (const RadParam*, int, int operand, RadOpdDesc*);

@@ -2215,6 +2215,40 @@ extern "C" int r4d_shape_qsa_tail_store(const RadParam* p, int n_p, int operand,
     R4D_PICK(l);
 }
 
+/* K-24's fused key side: qsa_work's operands and the pool's, joined where the gather meets the
+ * arithmetic. `state` is the tail the gather reads and the store writes; `page`, `bpos` and `nc`
+ * are the work list's, sized by `work` as qsa_work sizes them. */
+extern "C" int r4d_shape_qsa_work_pool_tail(const RadParam* p, int n_p, int operand,
+                                            RadOpdDesc* out) {
+
+    const int64_t M = pi(p, n_p, "M");
+    const int64_t n = pi(p, n_p, "n");
+    const int64_t r = pi(p, n_p, "ratio", 4);
+    const int64_t g = pi(p, n_p, "ring", r);
+    const int64_t s = pi(p, n_p, "seqs", 1);
+    const int64_t W = pi(p, n_p, "work", 1);
+    if (n <= 0 || r <= 0 || g < r || s <= 0 || W <= 0) return RAD_E_UNSUPPORTED;
+    const uint32_t D = dt_act(p, n_p, "dtype");
+    const RadOpdDesc l[] = {
+        opd(D, M, n),                  /* k */
+        opd_idx(M, 1, M * r),          /* positions */
+        opd_idx(s + 1, 1, M + 1),      /* cu_seqlens; a drawn one is not ascending, see above */
+        opd(D, s, 1, g, n),            /* the tail state, [slots, heads, ring, n] */
+        opd_idx(s, 1, s),              /* the state row, one column */
+        opd_idx(s, W, W),              /* the block-key block table */
+        opd((uint32_t)RAD_F32, n, n),  /* wv */
+        opd((uint32_t)RAD_F32, n, n),  /* wg */
+        opd((uint32_t)RAD_F32, r, n),  /* ape */
+        opd((uint32_t)RAD_F32, n, 1),  /* gain */
+        opd_none(),                    /* rope: the one-component form */
+        opd((uint32_t)RAD_I32, W),     /* page */
+        opd((uint32_t)RAD_I32, W),     /* bpos */
+        opd((uint32_t)RAD_I32, s),     /* nc */
+        opd(D, W, 1, r, n / r),        /* cache: the pool's page, at most `work` of them */
+    };
+    R4D_PICK(l);
+}
+
 /* The QSA selection. `sel` is `topk + 1` wide: the extra slot is the partial page, without which
  * the newest tokens would be dropped. */
 extern "C" int r4d_shape_qsa_select(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
