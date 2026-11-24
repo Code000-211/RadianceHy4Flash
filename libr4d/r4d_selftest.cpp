@@ -23426,6 +23426,95 @@ static void f32_forms(const Plugin& pl, int64_t M, int64_t N, int64_t K, int ite
     }
 }
 
+/* gemm_nt_f32_wmma (P-13 / F-19): the router projection on the prefill tile against
+ * gemm_nt_f32 on the same operands and against the exact sum on the host.
+ *
+ * The tile sums each 16-deep k step as one instead of the F32 kernel's 32-strided lanes plus the
+ * fixed butterfly, so it is not byte-identical and must not be: bf16 x bf16 is exact in f32, the
+ * products are the same ones, and only the summation rounds. Both are held to (K + 16) * 2^-24 *
+ * sum|x*w| of the exact (f64) sum - each of the K terms enters one f32 add at a time (the WMMA's
+ * tree and the step adds together, at most K + 16 roundings) - and to each other by the same
+ * bound. That is the tolerance notes/backlog/lossy/P-13.md reports the KL behind. Weights rotate
+ * over copies past the last-level cache, as in f32_forms. */
+static void wmma_forms(const Plugin& pl, int64_t M, int64_t N, int64_t K, int iters, bool timed) {
+    const RadKernelInfo* tw = find(pl, "gemm_nt_f32_bf16_wmma");
+    const RadKernelInfo* tf = find(pl, "gemm_nt_f32_bf16");
+    if (!tw || !tf) { ok("gemm_nt_f32_wmma forms", false, "row absent"); return; }
+    const size_t wbytes = (size_t)N * (size_t)K * 2;
+    int copies = 1;
+    if (timed) {
+        copies = (int)(((size_t)256 << 20) / wbytes) + 1;
+        if (copies > 64) copies = 64;
+    }
+    void* d_x = dalloc((size_t)M * (size_t)K * 2);
+    void* d_w = dalloc(wbytes * (size_t)copies);
+    void* d_y = dalloc((size_t)M * (size_t)N * 4);
+    void* d_z = dalloc((size_t)M * (size_t)N * 4);
+    if (!d_x || !d_w || !d_y || !d_z) { ok("gemm_nt_f32_wmma forms", false, "allocation failed"); return; }
+    std::vector<uint16_t> x((size_t)M * (size_t)K), w((size_t)N * (size_t)K);
+    for (size_t i = 0; i < x.size(); ++i)
+        x[i] = h_to_bf16((float)((int)(st_mix32((uint32_t)i) % 2001) - 1000) / 1000);
+    for (size_t i = 0; i < w.size(); ++i)
+        w[i] = h_to_bf16((float)((int)(st_mix32((uint32_t)i + 0x51ed27u) % 2001) - 1000) / 8000);
+    st_memcpy(d_x, x.data(), x.size() * 2, hipMemcpyHostToDevice);
+    for (int c = 0; c < copies; ++c)
+        st_memcpy((uint8_t*)d_w + (size_t)c * wbytes, w.data(), wbytes, hipMemcpyHostToDevice);
+    std::vector<RadTensor> ts = { T(d_x, RAD_BF16, { M, K }), T(d_w, RAD_BF16, { N, K }),
+                                  T(d_y, RAD_F32, { M, N }) };
+    std::vector<RadParam> ps = { PI("M", M), PI("N", N), PI("K", K), PS("dtype", "bf16"),
+                                 PI("weight_bf16", 1) };
+    RadArgs a;
+    std::memset(&a, 0, sizeof(a));
+    a.t = ts.data(); a.n_t = 3; a.p = ps.data(); a.n_p = (int)ps.size(); a.world_size = 1;
+    if (timed) {
+        const double bytes = (double)wbytes + (double)M * K * 2 + (double)M * N * 4;
+        const double flop = 2.0 * (double)M * (double)N * (double)K;
+        std::printf("\ngemm_nt_f32_wmma  N=%lld K=%lld M=%lld  %.2f MiB weight, %d copies, %d iters\n",
+                    (long long)N, (long long)K, (long long)M, (double)wbytes / (1 << 20), copies,
+                    iters);
+        const double us = st_time_us([&](int i) {
+            ts[1].data = (uint8_t*)d_w + (size_t)(i % copies) * wbytes;
+            tw->launch(&a, nullptr);
+        }, iters, nullptr);
+        std::printf("  %-8s %9.1f us  %7.1f GB/s  %6.2f TFLOP/s\n", "wmma", us, bytes / (us * 1e3),
+                    flop / (us * 1e6));
+        ts[1].data = d_w;
+        return;
+    }
+    std::vector<float> yt((size_t)M * N), yf((size_t)M * N);
+    int rc = tw->launch(&a, nullptr);
+    if (rc == RAD_OK && st_stream_sync(nullptr) != hipSuccess) rc = RAD_E_DEVICE;
+    if (rc == RAD_OK) st_memcpy(yt.data(), d_y, yt.size() * 4, hipMemcpyDeviceToHost);
+    ts[2].data = d_z;
+    const int rc32 = tf->launch(&a, nullptr);
+    if (rc32 == RAD_OK && st_stream_sync(nullptr) != hipSuccess) rc = RAD_E_DEVICE;
+    if (rc == RAD_OK) st_memcpy(yf.data(), d_z, yf.size() * 4, hipMemcpyDeviceToHost);
+    double worst_t = 0, worst_f = 0, worst_d = 0, bound = 0;
+    if (rc == RAD_OK) {
+        for (int64_t row = 0; row < M; ++row)
+            for (int64_t c = 0; c < N; ++c) {
+                double exact = 0, mag = 0;
+                for (int64_t j = 0; j < K; ++j) {
+                    const double pr = (double)h_bf16(x[(size_t)(row * K + j)]) *
+                                      (double)h_bf16(w[(size_t)(c * K + j)]);
+                    exact += pr;
+                    mag += std::fabs(pr);
+                }
+                bound = std::max(bound, (double)(K + 16) * 5.9604645e-8 * mag);
+                const size_t i = (size_t)(row * N + c);
+                worst_t = std::max(worst_t, std::fabs((double)yt[i] - exact));
+                worst_f = std::max(worst_f, std::fabs((double)yf[i] - exact));
+                worst_d = std::max(worst_d, std::fabs((double)yt[i] - (double)yf[i]));
+            }
+    }
+    const bool good = rc == RAD_OK && rc32 == RAD_OK && worst_t <= bound && worst_f <= bound &&
+                      worst_d <= bound;
+    ok(fmt("gemm_nt_f32_wmma at M=%lld N=%lld K=%lld: within the reordering bound of the exact sum "
+           "and of gemm_nt_f32 (%.2e / %.2e / %.2e, bound %.2e)",
+           (long long)M, (long long)N, (long long)K, worst_t, worst_f, worst_d, bound).c_str(),
+       good, rc != RAD_OK ? fmt("rc=%d", rc) : good ? "" : "over the bound");
+}
+
 /* The vocabulary-weighted head at one shape against the int8 head (logits_gemm_i8) and the 6-bit
  * table head (logits_gemm_iqr) over the same rows: `spec` its classes as B:rows,B:rows (a rank's
  * share), K n_embd, M tokens. Codes and scales are random bytes (the time does not depend on
@@ -38082,6 +38171,14 @@ static void device_phase(const Plugin& pl) {
         f32_forms(pl, 1, 512, 3072, 0, false);
         f32_forms(pl, 256, 256, 129, 0, false);
     }
+    if (sel("gemm_nt_f32_bf16_wmma") || sel("gemm_nt_f32_bf16")) {
+        /* The router's prefill shapes: 288 / 2 and 288 / 4 columns (TP2, TP4), a row count past a
+         * whole 128-row tile and one that ends inside it, and the tile's own domain edges. */
+        for (int64_t rows : { 256, 257, 2048 })
+            for (int64_t cols : { 72, 144 }) wmma_forms(pl, rows, cols, 4096, 0, false);
+        wmma_forms(pl, 128, 16, 64, 0, false);
+        wmma_forms(pl, 512, 512, 256, 0, false);
+    }
     if (sel("dsa_score_fp8")) {
         dsa_score_check(pl, 1, 17);
         dsa_score_check(pl, 7, 257);
@@ -39767,7 +39864,10 @@ int main(int argc, char** argv) {
     if (perf_n) {
         if (!load(&pl, path)) return 1;
 #ifdef RAD_HAVE_HIP
-        if (perf_f32)     f32_forms(pl, perf_m, perf_n, perf_k, perf_it, true);
+        if (perf_f32) {
+            f32_forms(pl, perf_m, perf_n, perf_k, perf_it, true);
+            wmma_forms(pl, perf_m, perf_n, perf_k, perf_it, true);
+        }
         else if (perf_q)  q_perf(pl, perf_n, perf_k, perf_m, perf_it);
         else if (perf_vocab) vocab_perf(pl, vocab_spec, perf_k, perf_m, perf_it);
         else if (perf_wpa) wpa_perf(pl, perf_n, perf_k, perf_m, perf_it, perf_pb1);
