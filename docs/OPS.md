@@ -2645,7 +2645,7 @@ device code.
 | `ar_rmsnorm_quant_i8` | `M` `n` `eps`:f64 `world_size` `dtype` `wadd`:f64/opt `sp`/opt | `x`:inout, `residual`:inout?, `w`w → `q`, `scale`, `out_bf16`?; `w_post`w?, `scalar`w? |
 | `ar_rmsnorm_quant_i8g` | `M` `n` `eps`:f64 `world_size` `dtype` `wadd`:f64/opt | `x`:inout, `residual`:inout?, `w`w → `q`, `scale`, `out_bf16`?; `w_post`w?, `scalar`w? |
 | `ar_hc_write` | `M`(range) `n` `hc` `world_size` `dtype` `wire`/opt | `y`:inout, `inj`, `h`:inout |
-| `ar_rmsnorm_ihc_junction` | `M`(range) `n` `hc` `rows` `eps`:f64 `ihc_eps`:f64/opt `hc_eps`:f64/opt `post_mag`:f64/opt `tail`/opt `world_size` `dtype` `overlap`/opt | as `rmsnorm_ihc_junction`; `a` is the message (see "Hy4-flash") |
+| `ar_rmsnorm_ihc_junction` | `M`(range) `n` `hc` `rows` `eps`:f64 `ihc_eps`:f64/opt `hc_eps`:f64/opt `post_mag`:f64/opt `tail`/opt `world_size` `dtype` `overlap`/opt `engram`/opt `eg_eps`:f64/opt | as `rmsnorm_ihc_junction`; `a` is the message (see "Hy4-flash") |
 | `ar_gather_hc_write` | `M`(range) `n` `hc` `top_k` `world_size` `dtype` `act`/opt `wire`/opt | `y_expert`, `expert_w`, `sorted_tok`, `shared`?, `shared_gate`?, `y`:inout, `inj`, `h`:inout |
 | `ar_ln_had_quant_i8` | `M` `n` `eps`:f64 `group` `world_size` `dtype` `wadd`:f64/opt `wire`/opt | `x`, `residual`:inout?, `w`w → `q`, `scale`, `out_bf16`? |
 | `gdn_gated_norm_had_quant_i8` | `M` `n` `head_dim` `group` `eps`:f64 `dtype` `zgrp`/opt `zblk`/opt | `x`, `z`, `w`w → `q`, `scale` |
@@ -3761,7 +3761,7 @@ refuses the graph rather than resolving a similar op.
 |---|---|---|
 | `ihc_pre` | `M`(range) `n` `hc` `rows` `eps`:f64 `hc_eps`:f64 `post_mag`:f64/opt `dtype` | `h`, `fn`w, `scale`w, `base`w → `x`, `post`? |
 | `ihc_post` | `M`(range) `n` `hc` `dtype` | `y`, `post`, `h`:inout |
-| `rmsnorm_ihc_junction` | `M`(range) `n` `hc` `rows` `eps`:f64 `ihc_eps`:f64/opt `hc_eps`:f64/opt `post_mag`:f64/opt `tail`/opt `dtype` `group`/opt | `a`:inout, `b`?, `w_post`w, `post`:inout, `h`:inout, `fn`w?, `scale`w?, `base`w?, `w_next`w?, `xn`?, `y`?, `x`?, `xq`?, `xs`? |
+| `rmsnorm_ihc_junction` | `M`(range) `n` `hc` `rows` `eps`:f64 `ihc_eps`:f64/opt `hc_eps`:f64/opt `post_mag`:f64/opt `tail`/opt `dtype` `group`/opt `engram`/opt `eg_eps`:f64/opt | `a`:inout, `b`?, `w_post`w, `post`:inout, `h`:inout, `fn`w?, `scale`w?, `base`w?, `w_next`w?, `xn`?, `y`?, `x`?, `xq`?, `xs`?, `eg_key`?, `eg_val`?, `eg_mask`?, `eg_w_key`w?, `eg_w_query`w?, `eg_w_val`w?, `eg_w_branch`w? |
 | `mla_project_kv` | `M`(range) `heads` `k_dim` `v_dim` `latent_dim` `mode` `dtype` | `a`, `b`w → `y` |
 | `mla_expand_gate` | `M`(range) `heads` `k_dim` `v_dim` `latent_dim` `dtype` | `x`, `w`w, `g` → `y` |
 | `mla_expand_gate_had_quant_i8g` | `M`(range) `heads` `k_dim` `v_dim` `latent_dim` `group` `dtype` | `x`, `w`w, `g` → `q`, `scale`, `out_bf16`? |
@@ -3828,6 +3828,23 @@ its `replaces` hook; libref and libavx compose their own ops). `rows` 2 hc write
 weights into `post` (which ihc_post read first); `rows` hc is the head's collapse and leaves
 `post`. `tail` 0 stops behind ihc_post (fn .. xn absent): an Engram writes h in front of the next
 layer. `y` and `x` are the chain's intermediates, stored only when passed (the debug taps).
+
+`engram` 1 (P-07) is the Engram form: `engram_gate` runs between the `h` update and the `ihc_pre`
+sum, its seven operands behind `xs` (the gate updates `h` in place, `post`/`h` unchanged):
+
+```
+ihc_post(y, post, h)
+engram_gate(key, val, mask; w_key, w_query, w_val, w_branch, eg_eps)      h updated in place
+[ihc_pre(h) -> x, post]                                                   unchanged
+```
+
+The tail is 1 only (`xn` and the quantiser read the sum, which the gate changes). The gate is the
+`engram_gate` row of the same library, byte for byte, so the op is byte-identical to the junction
+with `tail` 0, `engram_gate`, then the junction with `tail` 1 (libr4d's `replaces` hook publishes
+that chain, `r4d_selftest` and `tests/r4d_emu` hold it to the chain bit for bit); the block takes a
+row of the batch, as the gate does. A layer's `ihc_pre` takes the form where the gate would
+otherwise run between two launches; `arch/hyv4flash` takes it only in front of an Engram layer that
+is not the last (else the connection is computed twice) and only with the debug taps off.
 
 `ar_rmsnorm_ihc_junction` (device-only, `world_size` 2 or 4, plus the junction's parameters and
 operands) is the exact `all_reduce` of `a` (after the add, which each rank applies to its own
