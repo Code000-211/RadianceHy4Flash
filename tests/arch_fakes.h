@@ -180,6 +180,7 @@ struct RadCtx {
     int             world = 1;
     std::vector<RecIssue> issues;
     std::vector<int>      routed_layers;
+    std::vector<RadRouting> routings;   /* each rad_route_report's record, beside routed_layers */
     std::string           step_fail;
     int                   lane = 0;     /* where the next issue goes */
     std::vector<RecJoin>  joins;
@@ -604,8 +605,8 @@ extern "C" int             rad_ctx_wgp_count(RadCtx*) { return 32; }
 extern "C" RadStream       rad_stream(RadCtx* c)     { return (RadStream)c; }
 extern "C" int             rad_stream_sync(RadStream s) { (void)s; return RAD_OK; }
 extern "C" int rad_route_report(RadCtx* c, int layer, const RadRouting* r) {
-    (void)r;
     c->routed_layers.push_back(layer);
+    c->routings.push_back(*r);
     return RAD_OK;
 }
 extern "C" int rad_route_table(RadBuilder* b, rad_buf table) {

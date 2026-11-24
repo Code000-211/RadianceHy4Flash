@@ -1515,6 +1515,58 @@ TEST(the_moe_gather_reads_the_sorts_inverse_table) {
     }
 }
 
+/* P-02: the routing counts live in the model's routing table (rad_route_table), a persistent
+ * [layers, n_expert] i32 buffer with a row a trunk layer, as qwen4exp_fp8's. Each router writes
+ * its layer's row and the report names that row, so no copy goes to the compute stream (the
+ * per-layer r4dchain_copy16) and no later buffer can alias the histogram. At two ranks of whole
+ * experts a rank counts its own share, in the front of a row at the model's pitch. */
+TEST(the_routing_counts_live_in_the_model_table_a_row_a_layer) {
+    struct Case { const char* what; bool wide; int world; int64_t n_expert, n_local; };
+    const Case cases[] = {
+        { "one rank", false, 1, 4, 4 },
+        { "two ranks, whole experts", true, 2, 8, 4 },
+    };
+    for (const Case& cs : cases) {
+        fprintf(stderr, "case %s\n", cs.what);
+        Declared d(bf16_encs, cs.world, 0, cs.wide);
+        REQUIRE_EQ(d.rc, RAD_OK);
+        const RadBuilder& b = d.b;
+        const rad_buf tab = buf_named(b, "moe.expert_counts");
+        REQUIRE(tab != 0);
+        CHECK_EQ(b.route_table, tab);
+        const RadBufDecl& bd = b.bufs[tab - 1].d;
+        CHECK_EQ(bd.dtype, (uint32_t)RAD_I32);
+        CHECK_EQ(bd.kind, (int)RAD_BUF_PERSIST);
+        REQUIRE_EQ(bd.rank, (uint32_t)2);
+        CHECK_EQ(bd.shape[0], (int64_t)3);          /* the trunk's layers; the dfly layers hold no experts */
+        CHECK_EQ(bd.shape[1], cs.n_expert);         /* the model's count, not this rank's share */
+        /* Every router op writes the table's rows through the declared buffer. */
+        int writers = 0;
+        for (const auto& o : b.ops)
+            if (in(o.writes, tab)) ++writers;
+        CHECK(writers > 0);
+
+        auto k = kit(b, { 1 }, {});
+        k->b.positions_h = k->pos.data();
+        RadCtx c{ .b = &d.b, .batch = &k->b };
+        hyv4flash::step(&c, &k->b);
+        CHECK(c.step_fail.empty());
+        CHECK_LINT(d.b, &c);
+        /* The report's counts are the table's row for its layer, n_local of them, and nothing is
+         * copied into it. */
+        REQUIRE_EQ(c.routed_layers.size(), (size_t)2);
+        CHECK_EQ(c.routed_layers[0], 1);
+        CHECK_EQ(c.routed_layers[1], 2);
+        REQUIRE_EQ(c.routings.size(), (size_t)2);
+        for (size_t i = 0; i < c.routings.size(); ++i) {
+            const int32_t* row = (const int32_t*)rad_buf_ptr(&c, tab) + c.routed_layers[i] * cs.n_expert;
+            CHECK(c.routings[i].expert_count == row);
+            CHECK_EQ(c.routings[i].n_expert, cs.n_local);
+        }
+        for (const auto& cp : c.copies) CHECK(cp.second != tab);
+    }
+}
+
 /* Trunk linears a recipe made int8 (rotated or not) or the u5 trellis read int8 codes from their
  * input's bf16 plane; the others stay bf16 GEMMs, and an int8 lm_head is read by logits_gemm at its
  * codes' dtype. Linears of one input and one code form share one quantiser (Lin::feed: q_a with
