@@ -630,6 +630,10 @@ list(APPEND R4D_EMU_HIP ${R4D_DIR}/r4d_ihc_bf16.hip ${R4D_DIR}/r4d_engram_bf16.h
 set(R4D_EMU_TESTS attn pick norm escale qsa lora f32 mhc kda mla moefuse kvres
                   dsa lili vit)
 list(APPEND R4D_EMU_TESTS attn_kv_sink hy4 mla_sink mla_kv)
+# The sampler (test_sample.cpp): each case in both thread orders (emu_reverse_order) against a
+# serial host oracle, so a result that depends on the order threads reach an LDS atomic in fails.
+list(APPEND R4D_EMU_HIP ${R4D_DIR}/r4d_sample_chain_f32.hip ${R4D_DIR}/r4d_sample_stages_f32.hip)
+list(APPEND R4D_EMU_TESTS sample)
 set(R4D_EMU_BUILT OFF)
 if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$")
   # No fiber switch for this ISA.
@@ -674,7 +678,7 @@ else()
                 ${R4D_EMU}/test_dsa.cpp ${R4D_EMU}/test_lili.cpp
                 ${R4D_EMU}/test_vit.cpp ${R4D_EMU}/test_attn_kv_sink.cpp
                 ${R4D_EMU}/test_hy4.cpp ${R4D_EMU}/test_mla_sink.cpp
-                ${R4D_EMU}/test_mla_kv.cpp)
+                ${R4D_EMU}/test_mla_kv.cpp ${R4D_EMU}/test_sample.cpp)
       get_filename_component(stem ${src} NAME_WE)
       set(lang "")
       if(src MATCHES "\\.hip$")
@@ -732,6 +736,8 @@ if(R4D_EMU_BUILT)
   # rounding, and that test needs it.
   # r4d_emu_mla_kv: the kv_b projections on WMMA against libref, their law and the fused gate.
   set_tests_properties(r4d_emu_mla_kv PROPERTIES LABELS "r4d_emu" TIMEOUT ${RAD_TEST_TIMEOUT})
+  add_test(NAME r4d_emu_sample COMMAND ${CMAKE_BINARY_DIR}/tests/r4d_emu_sample)
+  set_tests_properties(r4d_emu_sample PROPERTIES LABELS "r4d_emu" TIMEOUT ${RAD_TEST_TIMEOUT})
   set_tests_properties(r4d_emu_lora r4d_emu_kda r4d_emu_hy4 r4d_emu_mla_kv PROPERTIES
                        ENVIRONMENT "RADIANCE_HOME=${CMAKE_BINARY_DIR}/radiance_home")
   # A seeded random sweep, mostly prefill shapes on the WMMA kernel, which the emulator runs at
