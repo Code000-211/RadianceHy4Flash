@@ -2214,6 +2214,19 @@ static const RadOperandSpec oRouterSigmoidScatter[] = {
     { "expert_count", RAD_OPD_OUT, 0 }, { "gate", RAD_OPD_OUT, 1 },
     { "inverse", RAD_OPD_OUT, 1 }
 };
+/* The router's projection and the selection it feeds as one op: `logits` is the projection's output
+ * and the selection's read, so it is written here, and the rest is router_sigmoid_topk_scatter's. */
+static const RadParamSpec pRouterGemmSigmoidScatter[] = { P_INT("M"), P_INT("K"),
+    P_INT("n_expert"), P_INTO("n_local"), P_INT("top_k"), P_INTO("weight_bf16"), P_INT("norm"),
+    P_F64("route_scale"), P_STR("dtype"), P_INTO("expert_base"), P_STRO("protect") };
+static const RadOperandSpec oRouterGemmSigmoidScatter[] = {
+    { "x", RAD_OPD_IN, 0 },             { "weight", RAD_OPD_WEIGHT, 0 },
+    { "bias", RAD_OPD_WEIGHT, 0 },      { "logits", RAD_OPD_OUT, 0 },
+    { "ids", RAD_OPD_OUT, 0 },          { "weights", RAD_OPD_OUT, 0 },
+    { "sorted_tok", RAD_OPD_OUT, 0 },   { "expert_offset", RAD_OPD_OUT, 0 },
+    { "expert_count", RAD_OPD_OUT, 0 }, { "gate", RAD_OPD_OUT, 1 },
+    { "inverse", RAD_OPD_OUT, 1 }
+};
 /* `logit_softcap`'s, matching ref's `pMnCap` (spec §2.3). `cap` must be > 0; the op refuses a
  * non-positive cap (a division by zero in every lane). */
 static const RadParamSpec pMnCap[] = {
@@ -4003,6 +4016,14 @@ static const RadOpSchema kSchemas[] = {
            "`moe_scatter_inv`. Every output is the bytes the separate launches write, including a "
            "row with fewer finite ranks than top_k. Bounded by the sort's single-workgroup form: "
            "M * top_k <= 1024, refused above."),
+    SCHEMA("router_gemm_sigmoid_scatter", pRouterGemmSigmoidScatter, oRouterGemmSigmoidScatter,
+           "`gemm_nt_f32` (the router, N = n_expert) then `router_sigmoid_topk_scatter` over its "
+           "logits, in one launch: the workgroup whose arrival completes the grid ranks the "
+           "pass's rows, writes the ids and the weights and sorts them. Byte-identical to the "
+           "two launches it stands in for -- every block computes gemm_nt_f32's own tile, whose "
+           "arithmetic does not depend on the geometry that feeds it, and the ranking block runs "
+           "the selection's body over those logits. Decode only: M <= 64 and M * top_k within "
+           "the sort's single-workgroup form."),
     SCHEMA("router_topk", pRouterTopk, oRouterTopk,
            "softmax over ALL n_expert logits, then the top_k of them by value with ties to the "
            "lower expert id, then -- if `norm` -- the kept weights renormalised to sum to one. The "
@@ -5561,6 +5582,11 @@ static const RadConstraint cRouterSigmoidScatter[] = { C_GE("M", 1),        C_LE
                                                        C_GE("n_expert", 1), C_LE("n_expert", 512),
                                                        C_GE("top_k", 1),    C_LE("top_k", 32),
                                                        C_IN("dtype", "f32") };
+/* The selection's bounds and the f32 router GEMM's decode band. */
+static const RadConstraint cRouterGemmSigmoidScatter[] = {
+    C_GE("M", 1), C_LE("M", 64), C_GE("K", 1), C_GE("n_expert", 1), C_LE("n_expert", 512),
+    C_GE("top_k", 1), C_LE("top_k", 32), C_IN("dtype", "f32"),
+};
 /* The selection's bounds and the skinny GEMM's decode band: four 16-row tiles. */
 static const RadConstraint cRouterGemmTopkScatter[] = {
     C_GE("M", 1), C_LE("M", 64), C_DIV("K", 16), C_GE("n_expert", 1), C_LE("n_expert", 512),
@@ -9631,6 +9657,18 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   r4d_shape_router_sigmoid_topk_scatter, nullptr,
   /* `router_sigmoid_topk` + `moe_scatter` (+ `fill` with the gate) (r4d_fuse.cpp). */
   r4d_fuse_router_sigmoid_topk_scatter },
+{ "router_gemm_sigmoid_scatter_f32", "router_gemm_sigmoid_scatter", "moe",
+  "the f32 router GEMM, its sigmoid selection and the stable counting sort in one launch -- the "
+  "workgroup that finishes the grid ranks -- with the ungated shared gate's fill and the inverse",
+  "single group, M <= 64 and M*top_k <= 1024, experts <=512, top_k<=32",
+  "bf16 activation, bf16 or f32 weight, f32 bias, logits and weights; i32 ids, sorted slots, "
+  "offsets and counts; bf16 gate",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cRouterGemmSigmoidScatter), NOTUNE,
+  nullptr, nullptr, r4d_rad_router_gemm_sigmoid_scatter, nullptr, nullptr, nullptr,
+  r4d_shape_router_gemm_sigmoid_scatter, nullptr,
+  /* `gemm_nt_f32` + `router_sigmoid_topk_scatter` (r4d_fuse.cpp). */
+  r4d_fuse_router_gemm_sigmoid_scatter },
 { "router_topk_bf16", "router_topk", "moe",
   "softmax over a row of expert logits and the exact top-k of it, one wave a row",
   "n_expert <= 512, top_k <= min(n_expert, 32); bf16 logits and weights, i32 ids",
@@ -11907,9 +11945,9 @@ extern "C" const RadKernelInfo* rad_kernel_at(int i) {
  * gemm_mxfp4a8_decode's (and gemm_mxfp4a8_decode_shortk's, the same entry) and
  * gemm_mxfp4a8_gated_gemv's (and _gated_gemv_wide's) split partials are the op's scratch and their arrival counters are keyed
  * on the output alone; router_gemm_topk_scatter_bf16's arrival counter belongs to its op instance
- * (taken at init, one per declared op and band). Concurrent launches never share these, so those
- * five rows are concurrent. A new row with stream-ordered state belongs in the list above.
- *
+ * (taken at init, one per declared op and band), and router_gemm_sigmoid_scatter_f32's is keyed on
+ * the stream and its logits (r4d_glm.hip). Concurrent launches never share these, so those rows are
+ * concurrent. A new row with stream-ordered state belongs in the list above.
  *   lora_*              ordered on purpose: the core appends them behind the GEMM whose `y` they
  *                       update and refills the pools they read between steps with its own copies,
  *                       so they stay out of the replay's overlap analysis. */
