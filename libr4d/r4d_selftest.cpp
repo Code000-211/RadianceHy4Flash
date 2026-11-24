@@ -23344,10 +23344,13 @@ static void moefuse_perf(const Plugin& pl, int64_t rows, int iters) {
  * overrun or a missed tail shows as a byte difference. Timed, it also prints its time, its GB/s on
  * weight + input + output and its TFLOP/s; weights rotate over copies past the last-level cache,
  * as in bf16_perf. */
-static void f32_forms(const Plugin& pl, int64_t M, int64_t N, int64_t K, int iters, bool timed) {
+/* pad: x's pitch past K. 5 stages x a value at a time in the staged prefill form; 0 at a K that is
+ * a multiple of 8 stages it 16 bytes at a time, as the router's contiguous rows do. */
+static void f32_forms(const Plugin& pl, int64_t M, int64_t N, int64_t K, int iters, bool timed,
+                      int64_t pad = 5) {
     const RadKernelInfo* r = find(pl, "gemm_nt_f32_bf16");
     if (!r) { ok("gemm_nt_f32_bf16 forms", false, "row absent"); return; }
-    const int64_t xp = K + 5, yp = N + 3;
+    const int64_t xp = K + pad, yp = N + 3;
     const size_t wbytes = (size_t)N * (size_t)K * 4, ybytes = (size_t)M * (size_t)yp * 4;
     int copies = 1;
     if (timed) {
@@ -23411,8 +23414,8 @@ static void f32_forms(const Plugin& pl, int64_t M, int64_t N, int64_t K, int ite
     size_t first = 0;
     if (rc == RAD_OK && !same)
         while (first < got.size() && got[first] == want[first]) ++first;
-    ok(fmt("gemm_nt_f32 at M=%lld N=%lld K=%lld: byte-identical to the host arithmetic",
-           (long long)M, (long long)N, (long long)K).c_str(),
+    ok(fmt("gemm_nt_f32 at M=%lld N=%lld K=%lld%s: byte-identical to the host arithmetic",
+           (long long)M, (long long)N, (long long)K, pad == 5 ? "" : " (pitch K)").c_str(),
        same, rc != RAD_OK ? fmt("rc=%d", rc) : same ? "" : fmt("first byte %zu", first));
     if (!timed && same) {
         ts[1].dtype = RAD_BF16;
@@ -23425,8 +23428,9 @@ static void f32_forms(const Plugin& pl, int64_t M, int64_t N, int64_t K, int ite
         if (rc == RAD_OK && st_stream_sync(nullptr) != hipSuccess) rc = RAD_E_DEVICE;
         std::vector<uint8_t> packed_y(ybytes);
         if (rc == RAD_OK) st_memcpy(packed_y.data(), d_y, ybytes, hipMemcpyDeviceToHost);
-        ok(fmt("gemm_nt_f32 stored bf16 vs widened f32 at M=%lld N=%lld K=%lld",
-               (long long)M, (long long)N, (long long)K).c_str(), rc == RAD_OK && packed_y == got);
+        ok(fmt("gemm_nt_f32 stored bf16 vs widened f32 at M=%lld N=%lld K=%lld%s",
+               (long long)M, (long long)N, (long long)K, pad == 5 ? "" : " (pitch K)").c_str(),
+           rc == RAD_OK && packed_y == got);
     }
     if (timed && rc == RAD_OK) {
         const double bytes = (double)wbytes + (double)M * K * 2 + (double)M * N * 4;
@@ -38099,6 +38103,12 @@ static void device_phase(const Plugin& pl) {
         f32_forms(pl, 70, 13, 130, 0, false);
         f32_forms(pl, 1, 512, 3072, 0, false);
         f32_forms(pl, 256, 256, 129, 0, false);
+        /* The staged prefill form at the router's widths a rank (N 128 at TP4, 256 at TP2), K 3072,
+         * x's rows contiguous and padded; and short of a whole stage, step and column group. */
+        f32_forms(pl, 1024, 128, 3072, 0, false, 0);
+        f32_forms(pl, 300, 256, 3072, 0, false, 0);
+        f32_forms(pl, 1024, 128, 3072, 0, false);
+        f32_forms(pl, 263, 130, 1000, 0, false, 0);
     }
     if (sel("dsa_score_fp8")) {
         dsa_score_check(pl, 1, 17);
