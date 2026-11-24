@@ -267,6 +267,125 @@ __global__ __launch_bounds__(kvp_threads(ABSORB)) void kv_project_wmma(const uin
     if constexpr (CH::on) r4d_chain_done();
 }
 
+// ---------------------------------------------------------------- the staged expansion (K-50)
+// kvp_body's expand re-reads the tokens' latent block: each of a head's 16 column-tile workgroups
+// loads the same 64 tokens x 512 (64 KiB) as B fragments from global. This workgroup is sixteen
+// waves, four column tiles x the four contraction quarters, and the 64 tokens' 512 values are
+// loaded once into LDS (64 KiB, the quarter's 128 values a token side by side), so a head's block is
+// read 4 times a call rather than 16. Every wave then runs kvp_body's expand as it is: the same
+// weight fragments, the token fragments the same 16 bytes (from LDS, not global), one WMMA chain
+// of eight steps ascending a quarter, the quarters added in order ((p0 + p1) + p2) + p3 in f32 and
+// one rounding at the store (then the gate's product), so the bytes are kvp_body's at every M.
+// Only the aligned, unchained form with four token tiles (the prefill heights): the others stay on
+// kvp_body.
+// The LDS row of a token is its quarter's sixteen 16-byte pieces, the piece p at position p ^ (token
+// % 16): the 16 lanes of a fragment load name 16 tokens, and without the XOR they would all hit the
+// one bank group. The partial sums reuse the staging's bytes after a barrier.
+constexpr int kXsCT = 4, kXsMB = 4, kXsTok = 16 * kXsMB, kXsThreads = 32 * kXsCT * 4;
+
+template <bool GATE>
+__global__ __launch_bounds__(kXsThreads) void kv_expand_staged(
+    const uint16_t* __restrict__ x, const uint16_t* __restrict__ w, const uint16_t* __restrict__ g,
+    uint16_t* __restrict__ y, KvProjectMeta m) {
+    constexpr int S = 4, K = kLatent / S, KS = K / 16, KC = kvp_chunk<false, kXsMB, 1>(), NCH = KS / KC;
+    static_assert(KS % (2 * KC) == 0, "chunks in pairs");
+    static_assert(kLatent / 8 == 64 && K / 8 == 16, "a token's 64 pieces: 16 a quarter");
+    static_assert(sizeof(v8s) == 16, "16-byte pieces");
+    __shared__ v8s xs[S][kXsTok][16];   /* 64 KiB; the partial sums overlay it */
+    const int lane = threadIdx.x & 31, wave = threadIdx.x >> 5, head = blockIdx.y;
+    const int quarter = wave & 3, ct = wave >> 2;
+    const int o0 = ((int)blockIdx.x * kXsCT + ct) * 16, t0 = (int)blockIdx.z * kXsTok, kq = quarter * K;
+    const uint16_t* const wb = w + ((long)head * kRows + kKd) * m.wp + kq;
+    v8f acc[kXsMB];
+#pragma unroll
+    for (int r = 0; r < kXsMB; ++r)
+#pragma unroll
+        for (int e = 0; e < 8; ++e) acc[r][e] = 0.0f;
+    v8s a0[KC], a1[KC], b0[KC][kXsMB], b1[KC][kXsMB];
+    auto wload = [&](v8s (&a)[KC], int c) {
+#pragma unroll
+        for (int q = 0; q < KC; ++q) a[q] = kvp_wfrag<false, true>(wb, m.wp, o0, 16 * (c * KC + q), lane);
+    };
+    /* the token fragments of step (c * KC + q): piece 2 step + lane / 16 of the token's quarter */
+    auto xload = [&](v8s (&b)[KC][kXsMB], int c) {
+#pragma unroll
+        for (int q = 0; q < KC; ++q)
+#pragma unroll
+            for (int r = 0; r < kXsMB; ++r)
+                b[q][r] = xs[quarter][16 * r + (lane & 15)][(2 * (c * KC + q) + (lane >> 4)) ^ (lane & 15)];
+    };
+    auto step = [&](const v8s (&a)[KC], const v8s (&b)[KC][kXsMB]) {
+#pragma unroll
+        for (int q = 0; q < KC; ++q)
+#pragma unroll
+            for (int r = 0; r < kXsMB; ++r) acc[r] = kvp_wmma(a[q], b[q][r], acc[r]);
+    };
+    wload(a0, 0);   /* in flight while the block is staged */
+    /* 4096 pieces (token t, piece c of its 64), eight a thread, a token's 1 KiB read in a run; a
+     * token past M reads the last row, whose column is never stored */
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const int idx = (int)threadIdx.x + kXsThreads * i, t = idx >> 6, c = idx & 63;
+        const int tg = min(t0 + t, m.rows - 1);
+        xs[c >> 4][t][(c & 15) ^ (t & 15)] = *(const v8s*)(x + (long)tg * m.xr + (long)head * m.xh + 8 * c);
+    }
+    __syncthreads();
+    xload(b0, 0);
+#pragma unroll 1
+    for (int c = 0; c < NCH; c += 2) {
+        wload(a1, c + 1);
+        xload(b1, c + 1);
+        step(a0, b0);
+        if (c + 2 < NCH) {
+            wload(a0, c + 2);
+            xload(b0, c + 2);
+        }
+        step(a1, b1);
+    }
+    __syncthreads();   /* every wave's last fragment read is behind this: the partial sums reuse xs */
+    float(&part)[S][kXsCT][kXsMB][32][8] = *(float(*)[S][kXsCT][kXsMB][32][8])(&xs[0][0][0]);
+    static_assert(sizeof(part) <= sizeof(xs), "the partial sums fit the staging");
+#pragma unroll
+    for (int r = 0; r < kXsMB; ++r)
+#pragma unroll
+        for (int e = 0; e < 8; ++e) part[quarter][ct][r][lane][e] = acc[r][e];
+    __syncthreads();
+    /* wave `quarter` adds and stores token tile `quarter` of its column tile, as kvp_body's r % S */
+    const int r = quarter;
+    const long t = t0 + 16 * r + (lane & 15);
+    if (t >= m.rows) return;
+    const int c = o0 + 8 * (lane >> 4);
+    uint16_t o[8];
+#pragma unroll
+    for (int e = 0; e < 8; ++e) {
+        float v = part[0][ct][r][lane][e];
+#pragma unroll
+        for (int q = 1; q < S; ++q) v += part[q][ct][r][lane][e];
+        o[e] = f32_to_bf16(v);
+    }
+    if constexpr (GATE) {
+        const v8s gv = kvp_ld8<true>(g + t * m.gr + (long)head * kVd + c);
+#pragma unroll
+        for (int e = 0; e < 8; ++e)
+            o[e] = f32_to_bf16(bf16_to_f32(o[e]) * kvp_sigmoid(bf16_to_f32((uint16_t)gv[e])));
+    }
+    uint4 v;
+    v.x = (uint32_t)o[0] | (uint32_t)o[1] << 16;
+    v.y = (uint32_t)o[2] | (uint32_t)o[3] << 16;
+    v.z = (uint32_t)o[4] | (uint32_t)o[5] << 16;
+    v.w = (uint32_t)o[6] | (uint32_t)o[7] << 16;
+    *(uint4*)(y + t * m.yr + (long)head * m.yh + c) = v;
+}
+
+template <bool GATE>
+int kvp_emit_staged(RadStream s, unsigned heads, const uint16_t* x, const uint16_t* w, const uint16_t* g,
+                    uint16_t* y, const KvProjectMeta& m) {
+    static_assert(kVd % (16 * kXsCT) == 0, "the workgroups' column tiles divide the output");
+    const unsigned groups = (unsigned)((m.rows + kXsTok - 1) / kXsTok);
+    return R4D_EMIT(s, (kv_expand_staged<GATE>), dim3(kVd / (16 * kXsCT), heads, groups), dim3(kXsThreads), 0, x,
+                    w, g, y, m);
+}
+
 // ---------------------------------------------------------------- mla_expand_gate_had_quant_i8g
 // The expansion with the gate folded in (GATE, above) and, behind it, had_quant_act_i8g over the
 // [M, heads * v_dim] gated product: the codes attn_output's rotated int8 GEMM reads, in the launch that
@@ -418,7 +537,7 @@ int kvp_emit(RadStream s, unsigned heads, const uint16_t* x, const uint16_t* w, 
 }
 
 template <bool ABSORB, bool GATE>
-int kvp_pick(RadStream s, unsigned heads, int mb, bool vec, bool chain, const uint16_t* x,
+int kvp_pick(RadStream s, unsigned heads, int mb, bool vec, bool chain, bool stage, const uint16_t* x,
              const uint16_t* w, const uint16_t* g, uint16_t* y, const KvProjectMeta& m) {
     if (!vec) return kvp_emit<ABSORB, 1, 1, false, GATE, R4dUnchained>(s, heads, x, w, g, y, m);
     if (chain) {
@@ -428,6 +547,10 @@ int kvp_pick(RadStream s, unsigned heads, int mb, bool vec, bool chain, const ui
             case 4: return kvp_emit<ABSORB, 4, 1, true, GATE, r4dchain>(s, heads, x, w, g, y, m);
             default: return kvp_emit<ABSORB, 8, 1, true, GATE, r4dchain>(s, heads, x, w, g, y, m);
         }
+    }
+    /* expand at four token tiles: the workgroup stages the tokens' block once for four column tiles */
+    if constexpr (!ABSORB) {
+        if (stage && mb == 4) return kvp_emit_staged<GATE>(s, heads, x, w, g, y, m);
     }
     /* absorb: two column tiles a wave past decode heights, half the token fragments' traffic;
      * expand's split workgroup takes one */
@@ -522,10 +645,12 @@ static int kvp_launch(const RadArgs* a, RadStream s, const RadTensor* x, const R
                      (!gp || r4d_aligned(gp, 16));
     const int mb = kvp_mb(M, r4d_geti_or(a, "mb", 0));
     const bool chain = r4d_geti_or(a, "chain", 0) != 0 && M <= 64;
+    /* `stage` 1 keeps kvp_body's expand (the A/B arm); 0 stages wherever the form allows */
+    const bool stage = r4d_geti_or(a, "stage", 0) != 1;
     const unsigned H = (unsigned)h;
-    if (absorb) return kvp_pick<true, false>(s, H, mb, vec, chain, xp, wp, nullptr, yp, m);
-    if (gp) return kvp_pick<false, true>(s, H, mb, vec, chain, xp, wp, gp, yp, m);
-    return kvp_pick<false, false>(s, H, mb, vec, chain, xp, wp, nullptr, yp, m);
+    if (absorb) return kvp_pick<true, false>(s, H, mb, vec, chain, stage, xp, wp, nullptr, yp, m);
+    if (gp) return kvp_pick<false, true>(s, H, mb, vec, chain, stage, xp, wp, gp, yp, m);
+    return kvp_pick<false, false>(s, H, mb, vec, chain, stage, xp, wp, nullptr, yp, m);
 }
 
 extern "C" int r4d_rad_mla_project_kv(const RadArgs* a, RadStream s) {

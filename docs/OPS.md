@@ -3895,6 +3895,10 @@ The order is libref's; a kernel may sum in another as long as a token's result d
 row only, never on `M` or the launch's other rows (libr4d's WMMA law, `r4d_mla_kv_bf16.hip`:
 absorb in steps of 16 ascending, expand in four ascending quarters added in order; within one bf16
 ulp of libref). A tuned axis of such a kernel (libr4d's `mb`) moves no bit.
+libr4d's expand at four token tiles (prefill heights, aligned operands, not chained) is a workgroup of
+sixteen waves that stages the 64 tokens' latent block in LDS once for four column tiles, rather than
+each of a head's 16 column-tile workgroups loading it (K-50); its `stage` axis (1 = the unstaged form)
+moves no bit either.
 
 `mla_expand_gate` is `expand` followed by `gate_mul` over its output, `y[m, h*v_dim + c] =
 round(f32(round(expand[m,h,c])) * sigmoid(f32(g[m, h*v_dim + c])))`: the expansion is rounded to
