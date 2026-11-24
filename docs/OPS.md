@@ -3769,7 +3769,7 @@ refuses the graph rather than resolving a similar op.
 | `mla_attn_sel_sink` | `M`(range) `heads` `latent_dim` `rope_dim` `blocks` `block_size` `scale`:f64 `dtype` `stable`/opt | `q`, `q_rope`, `kv`, `bt`, `length`, `sinks`w → `out` |
 | `mla_row_norm_rope_store` | `M`(range) `latent` `rope_dim` `eps`:f64 `theta`:f64 `scale`:f64/opt `mode`/opt `sections`/opt `block_size` `dtype` | `row`:inout, `w`w, `positions`, `slot_mapping`, `kv_cache`:inout |
 | `mla_kv_split` | `M`(range) `heads` `k_dim` `v_dim` `rope_dim` `dtype` | `kvb`, `k_rope` → `k`, `v` |
-| `attn_kv_sink` | `M`(range) `N` `heads` `head_dim` `window` `scale`:f64 `dtype` | `q`, `k`, `v`, `cu_q`, `cu_k`, `sinks`w → `out` |
+| `attn_kv_sink` | `M`(range) `N` `heads` `head_dim` `window` `scale`:f64 `dtype` `bq`/opt | `q`, `k`, `v`, `cu_q`, `cu_k`, `sinks`w → `out` |
 | `gate_mul` | `M`(range) `n` `dtype` | `a`, `g` → `y` |
 | `idx_pool_gated` | `M`(range) `n` `ratio` `rotary_dim` `eps`:f64 `theta`:f64 `mode` `sections`/opt `block_size`/opt `dtype` | `k`, `wv`w, `wg`w, `ape`w, `gain`w, `pos`, `page`?, `cache`:inout? → `out`? |
 | `idx_pool_gated_fp8` | `M`(range) `n` `ratio` `rotary_dim` `eps`:f64 `theta`:f64 `mode` `sections`/opt `block_size`/opt `dtype` | `k`, `wv`w, `wg`w, `ape`w, `gain`w, `pos`, `page`?, `cache`:inout? → `q`?, `scale`? |
@@ -3934,7 +3934,10 @@ maximum is taken (libref shifts by the maximum of the scores and the sink).
   differ from the key width; `out` has the value's. libr4d's `attn_kv_sink_h256` serves keys and
   values of 256, bf16, any window and up to 65535 heads (bf16 Q.K, f16 P.V, the sink added to the
   denominator at the store); a sequence with `n_s < m_s` cannot be refused on the device and
-  gets zero rows.
+  gets zero rows. `bq` (64 or 128, default 128, `RAD_E_SHAPE` at anything else) is the query rows a
+  workgroup takes: a narrower one reads fewer keys it must mask at a sliding window, at the cost of
+  more workgroups, so it moves a row's key tile grid inside this op's prefill bound rather than
+  being byte-equal (`rad-tune` measures both at the model's shapes and picks per window).
 - **`mla_kv_split`** reorders the `kv_b` GEMM output `[N, heads*(k_dim+v_dim)]` and the rotated key
   part `[N, rope_dim]` into `k [N, heads, k_dim + rope_dim]` (the rope part the same for every head)
   and `v [N, heads, v_dim]`. A copy, converted to the outputs' dtype.

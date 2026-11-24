@@ -23886,23 +23886,31 @@ static void paged_perf(const Plugin& pl, int64_t Q, int64_t CTX, int iters) {
     dfree_all();
 }
 
-/* --perfkvsink [iters]: attn_kv_sink_h256 at Hy4-flash's prefill geometry, one sequence of M query
- * rows after a cached prefix: sliding layers (window 512, prefix up to 511) at 64 heads (TP1) and
- * 32 (TP2), sparse layers below the dense limit (window 0) at 32 and 16. FLOP counts the visible
- * (row, key) pairs only, 4 * 256 a pair (Q.K and P.V). */
-static void kv_sink_perf(const Plugin& pl, int iters) {
+/* --perfkvsink [iters] [rev]: attn_kv_sink_h256 at Hy4-flash's prefill geometry, one sequence of M
+ * query rows after a cached prefix: sliding layers (window 512, prefix up to 511) at 64 heads (TP1)
+ * and 32 (TP2), the two geometries `rad-kbench` records at N = 1024 (M = 1024, no prefix) at both
+ * head counts, sparse layers below the dense limit (window 0) at 32 and 16, each at both points of the
+ * `bq` axis (128 query rows a workgroup and 64; the axis exists for window 512, and window 0 is the
+ * control that should not gain). `rev` runs each geometry's 64 first, so an A/B whose two points sit
+ * in one process can be read in both orders. FLOP counts the visible (row, key) pairs only, 4 * 256 a
+ * pair (Q.K and P.V). */
+static void kv_sink_perf(const Plugin& pl, int iters, bool rev) {
     if (iters <= 0) iters = 20;
     const RadKernelInfo* r = find(pl, "attn_kv_sink_h256");
     if (!r) { std::printf("--perfkvsink: attn_kv_sink_h256 absent\n"); return; }
     struct G { const char* what; int64_t H, M, pre, window; };
     const G gs[] = {
-        { "sliding TP1", 64, 1024, 511, 512 }, { "sliding TP1", 64, 512, 0, 512 },
-        { "sliding TP1", 64, 2048, 0, 512 },   { "sliding TP2", 32, 1024, 511, 512 },
+        { "sliding TP1", 64, 1024, 511, 512 }, { "sliding TP1", 64, 1024, 0, 512 },
+        { "sliding TP1", 64, 512, 0, 512 },    { "sliding TP1", 64, 2048, 0, 512 },
+        { "sliding TP2", 32, 1024, 511, 512 }, { "sliding TP2", 32, 1024, 0, 512 },
         { "sparse TP1", 32, 2048, 0, 0 },      { "sparse TP1", 32, 1024, 1024, 0 },
         { "sparse TP1", 32, 512, 0, 0 },       { "sparse TP2", 16, 2048, 0, 0 },
     };
-    std::printf("attn_kv_sink_h256, %d launches each (warm)\n", iters);
-    for (const G& g : gs) {
+    const int64_t bqs[2] = { rev ? 64 : 128, rev ? 128 : 64 };
+    std::printf("attn_kv_sink_h256, %d launches each (warm), bq order %lld then %lld\n", iters,
+                (long long)bqs[0], (long long)bqs[1]);
+    for (const G& g : gs)
+      for (const int64_t bq : bqs) {
         const int64_t D = 256, N = g.M + g.pre, H = g.H;
         void* dq = dalloc((size_t)(g.M * H * D) * 2);
         void* dk = dalloc((size_t)(N * H * D) * 2);
@@ -23925,7 +23933,8 @@ static void kv_sink_perf(const Plugin& pl, int iters) {
                                       TI32({ 2 }, { 0, (int32_t)N }), T(ds, RAD_F32, { H }),
                                       T(dout, RAD_BF16, { g.M, H, D }) };
         std::vector<RadParam> ps = { PI("M", g.M), PI("N", N), PI("heads", H), PI("head_dim", D),
-                                     PI("window", g.window), PF("scale", 1.0 / 16.0), PS("dtype", "bf16") };
+                                     PI("window", g.window), PF("scale", 1.0 / 16.0), PS("dtype", "bf16"),
+                                     PI("bq", bq) };
         RadArgs a;
         std::memset(&a, 0, sizeof(a));
         a.t = ts.data(); a.n_t = (int)ts.size();
@@ -23943,9 +23952,9 @@ static void kv_sink_perf(const Plugin& pl, int iters) {
             pairs += (double)(g.window > 0 ? std::min<int64_t>(p + 1, g.window) : p + 1);
         }
         const double us = st_time_us([&](int) { r->launch(&a, nullptr); }, iters, nullptr);
-        std::printf("  %-12s heads %2lld  M %5lld  prefix %4lld  window %3lld  %8.3f ms  %6.1f TFLOP/s\n",
-                    g.what, (long long)H, (long long)g.M, (long long)g.pre, (long long)g.window,
-                    us / 1000.0, pairs * H * 4.0 * 256.0 / (us * 1e6));
+        std::printf("  %-12s bq %3lld  heads %2lld  M %5lld  prefix %4lld  window %3lld  %8.3f ms  %6.1f TFLOP/s\n",
+                    g.what, (long long)bq, (long long)H, (long long)g.M, (long long)g.pre,
+                    (long long)g.window, us / 1000.0, pairs * H * 4.0 * 256.0 / (us * 1e6));
         dfree_all();
     }
 }
@@ -27259,9 +27268,13 @@ static void sample_ngram_ban_case(const Plugin& pl) {
  * cached prefix of `pre` keys (n = pre + m), at a window or none, q/k/v/out at padded row and head
  * pitches with poisoned margins, and per-head sinks (`sink_big` puts one head's sink far above
  * its scores, where the sink carries nearly all the mass). A second check: changing every key and
- * value after a row's own position changes none of that row's output bytes (causality). */
+ * value after a row's own position changes none of that row's output bytes (causality).
+ *
+ * `bq` is the kernel's only axis (r4d_rows.cpp's tAttnKvSink): 128 query rows a workgroup (16 waves)
+ * or 64 (8). It moves the workgroup's key range and, where window + bq - 1 is not 16-aligned, a
+ * row's key tile grid, so the same bound is asked of both points. */
 static void attn_kv_sink_check(const Plugin& pl, std::vector<int64_t> qlen, std::vector<int64_t> pre,
-                               int64_t heads, int64_t window, bool sink_big) {
+                               int64_t heads, int64_t window, bool sink_big, int64_t bq = 128) {
     const char* what = "attn_kv_sink_h256";
     const auto* row = find(pl, what);
     if (!row || !g_plugin) {
@@ -27293,7 +27306,8 @@ static void attn_kv_sink_check(const Plugin& pl, std::vector<int64_t> qlen, std:
         N += qlen[(size_t)s] + pre[(size_t)s];
     }
     std::vector<RadParam> ps = { PI("M", M), PI("N", N), PI("heads", heads), PI("head_dim", D),
-                                 PI("window", window), PF("scale", 1.0 / 16.0), PS("dtype", "bf16") };
+                                 PI("window", window), PF("scale", 1.0 / 16.0), PS("dtype", "bf16"),
+                                 PI("bq", bq) };
     /* q, k, v, cu_q, cu_k, sinks, out; pitches multiples of 8 elements (the kernel's 16 bytes) */
     std::vector<RadTensor> host(7);
     host[0] = T(nullptr, RAD_BF16, { M, heads, D });
@@ -27348,8 +27362,9 @@ static void attn_kv_sink_check(const Plugin& pl, std::vector<int64_t> qlen, std:
     std::string shape;
     for (int64_t s = 0; s < S; ++s)
         shape += fmt("%s%lld+%lld", s ? "," : "", (long long)pre[(size_t)s], (long long)qlen[(size_t)s]);
-    std::string label = fmt("attn_kv_sink [%s] H=%lld window=%lld%s", shape.c_str(), (long long)heads,
-                            (long long)window, sink_big ? " big sink" : "");
+    std::string label = fmt("attn_kv_sink [%s] H=%lld window=%lld%s%s", shape.c_str(), (long long)heads,
+                            (long long)window, sink_big ? " big sink" : "",
+                            bq == 128 ? "" : fmt(" bq %lld", (long long)bq).c_str());
     if (!allocated) {
         ok(label.c_str(), false, "allocation failed");
         dlclose(ref);
@@ -35568,6 +35583,11 @@ static void device_phase(const Plugin& pl) {
         attn_kv_sink_check(pl, { 300 }, { 1748 }, 32, 0, true);
         attn_kv_sink_check(pl, { 1, 16, 130 }, { 2047, 0, 900 }, 32, 0, false);
         attn_kv_sink_check(pl, { 16, 1 }, { 2047, 2047 }, 16, 512, false);
+        attn_kv_sink_check(pl, { 64 }, { 511 }, 64, 512, false, 64);
+        attn_kv_sink_check(pl, { 200 }, { 900 }, 64, 512, true, 64);
+        attn_kv_sink_check(pl, { 1, 16, 64, 100 }, { 0, 0, 511, 37 }, 32, 512, false, 64);
+        attn_kv_sink_check(pl, { 129 }, { 0 }, 32, 0, false, 64);
+        attn_kv_sink_check(pl, { 128 }, { 64 }, 32, 128, false, 64);
     }
     if (sel("attn_vit_h72_bf16")) {
         const RadKernelInfo* r = find(pl, "attn_vit_h72_bf16");
@@ -38829,7 +38849,8 @@ static void usage(void) {
                 "                       q_len 1 ending a CTX-token context, the gated merge): the\n"
                 "                       decode kernel a row against the tiled form. R4D_USEL_SEL and\n"
                 "                       R4D_USEL_SEQU name dumps of a real chunk's qsa_sel / qsa_sequ.\n"
-                "  --perfkvsink [iters]: attn_kv_sink_h256 at Hy4-flash's prefill geometries\n"
+                "  --perfkvsink [iters] [rev]: attn_kv_sink_h256 at Hy4-flash's prefill geometries,\n"
+                "                       each at bq 128 and 64 (rev: 64 first)\n"
                 "  --perfattn M HEADS [iters]:  the head-128 dense attention over one M-row\n"
                 "                       sequence: attn_dense and attn_prefix_self without a prefix at\n"
                 "                       bf16 and int8 scores, bf16 and fp8 P.V, and quant_cols_fp8\n"
@@ -38940,6 +38961,7 @@ int main(int argc, char** argv) {
     int conv_it = 0;
     long long attn_m = 0, attn_h = 0;
     int kvs_it = 0;
+    bool kvs_rev = false;
     int attn_it = 5;
     long long pg_q = 0, pg_ctx = 0;
     long long us_t = 0, us_ctx = 0;
@@ -39225,6 +39247,7 @@ int main(int argc, char** argv) {
         } else if (!std::strcmp(argv[i], "--perfkvsink")) {
             kvs_it = 20;
             if (i + 1 < argc && argv[i + 1][0] != '-') kvs_it = (int)std::strtol(argv[++i], nullptr, 0);
+            if (i + 1 < argc && !std::strcmp(argv[i + 1], "rev")) { ++i; kvs_rev = true; }
         } else if (!std::strcmp(argv[i], "--perfattn")) {
             if (i + 2 >= argc) { usage(); return 2; }
             attn_m = std::strtoll(argv[++i], nullptr, 0);
@@ -39291,7 +39314,7 @@ int main(int argc, char** argv) {
     if (kvs_it > 0) {
         if (!load(&pl, path)) return 1;
 #ifdef RAD_HAVE_HIP
-        kv_sink_perf(pl, kvs_it);
+        kv_sink_perf(pl, kvs_it, kvs_rev);
 #else
         skip("attn_kv_sink timing", "built without HIP");
 #endif
