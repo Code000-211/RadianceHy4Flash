@@ -1463,10 +1463,12 @@ TEST(the_moe_gather_reads_the_sorts_inverse_table) {
         std::vector<std::string> undecl;
         int invg;    /* per MoE layer: moe_gather_inv (1) or moe_gather (0) */
         int writers; /* ops that write the inverse table: the fused selection and the separate
-                      * scatter above it (the block declares both, each for a size of pass) */
+                      * scatter above it (the block declares both, each for a size of pass), and
+                      * K-10's fused projection, which carries the selection's writes at a decode
+                      * height */
     };
     const Case cases[] = {
-        { "the fused selection", {}, 1, 4 },
+        { "the fused selection", {}, 1, 6 },
         { "the separate sort", { "router_sigmoid_topk_scatter" }, 1, 2 },
         { "no device rows", { "router_sigmoid_topk_scatter", "moe_scatter_inv", "moe_gather_inv" },
           0, 0 },
