@@ -424,7 +424,7 @@ int r4d_ihc_junction_args(const RadArgs* a, r4d_ihc::R4dIhcJunction* o) {
         if (t[IJ_MASK]->dtype != RAD_I32) return RAD_E_DTYPE;
         egeps = (float)r4d_getf(a, "eg_eps", 0);
         if (!std::isfinite(egeps) || egeps <= 0) return RAD_E_SHAPE;
-        const int wd = t[IJ_WK]->dtype;
+        const uint32_t wd = t[IJ_WK]->dtype;
         if (wd != RAD_F32 && wd != RAD_BF16) return RAD_E_DTYPE;
         for (int i = IJ_WK; i <= IJ_WB; ++i)
             if (t[i]->dtype != wd) return RAD_E_DTYPE;
