@@ -827,7 +827,7 @@ extern "C" int r4d_shape_router_gemm_sigmoid_scatter(const RadParam* p, int n_p,
         M * k > 1024)
         return RAD_E_UNSUPPORTED;
     const RadOpdDesc l[] = { opd((uint32_t)RAD_BF16, M, K),
-                             opd(pi(p, n_p, "weight_bf16", 1) ? (uint32_t)RAD_BF16
+                             opd(pi(p, n_p, "weight_bf16", 0) ? (uint32_t)RAD_BF16
                                                              : (uint32_t)RAD_F32, ne, K),
                              opd((uint32_t)RAD_F32, ne),
                              opd((uint32_t)RAD_F32, M, ne),

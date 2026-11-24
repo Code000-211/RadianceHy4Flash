@@ -422,18 +422,21 @@ __global__ void __launch_bounds__(NW * 32)
                 }
         }
     }
-    // The block's stores are made visible device-wide before its arrival is published; the block
-    // whose arrival completes the grid resets the counter for the next launch, acquires the other
-    // blocks' logits and ranks.
-    __syncthreads();
+    // The block's stores are made visible device-wide before its arrival is published: a per-thread
+    // fence, then the barrier, then one lane's fetch_add (as r4d_moe.hip's fused router and
+    // r4d_gemm_fp8a8.hip's split counter do it -- the other order leaves the fence unordered with
+    // respect to the arrival). The block whose arrival completes the grid resets the counter for
+    // the next launch, acquires the other blocks' logits and ranks.
     __threadfence();
+    __syncthreads();
     __shared__ r4d_moesort::ScatterLds<NW> sl;
     __shared__ unsigned int s_arrived;
     if (!threadIdx.x)
         s_arrived = __hip_atomic_fetch_add(ctr, 1u, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT);
     __syncthreads();
     if (s_arrived + 1u != gridDim.x * gridDim.y) return;
-    if (!threadIdx.x) atomicExch(ctr, 0u);
+    if (!threadIdx.x)
+        __hip_atomic_store(ctr, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
     __threadfence();
     router_sigmoid_scatter_fill<OWN, NW, INV>(sl, logits, bias, ids, weights, sorted, off, cnt, gate,
                                               inv, yp, bp, ip, wq, gp, m, n, n_local, k, norm,
@@ -649,9 +652,12 @@ int router_sgemm_body(const RadArgs* a, RadStream stream) {
         if (inv) R4D_RSG_I(R, C, U, OWN, NW, true);                                                \
         R4D_RSG_I(R, C, U, OWN, NW, false);                                                        \
     } while (0)
-    // The tile forms gemm_nt_f32's law picks at these heights: two rows by two columns to 16 rows,
-    // eight rows by one column above. Any of them computes the same bytes (the k order and the
-    // butterfly are the tile's, not the layout's), so the ranking block's rows are the pair's.
+    // Two rows by two columns to 16 rows, eight rows by one column above: the <2,2,16> and <8,1,8>
+    // forms of gemm_nt_f32 at these heights. They are not always the ones its law picks (at exactly
+    // 64 rows it picks <8,4>, and between 17 and 63 rows with ne < 128 it picks <2,2,16>), which
+    // costs nothing here: any form computes the same bytes, because the k order and the butterfly
+    // are the tile's sums' (`gemm_nt_f32_tile_sums`), not the layout's, so the ranking block's rows
+    // are the pair's whatever form each ran.
     if (m <= 16) {
         if (nw == 8) {
             if (ne <= 9 * 32) R4D_RSG(2, 2, 16, 9, 8u);
