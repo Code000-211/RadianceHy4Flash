@@ -623,10 +623,11 @@ set(R4D_EMU_HIP ${R4D_DIR}/r4d_attn_paged_window.hip ${R4D_DIR}/r4d_pair_argmax_
                 ${R4D_DIR}/r4d_vit_muse.hip)
 list(APPEND R4D_EMU_HIP ${R4D_DIR}/r4d_attn_kv_sink_h256.hip)
 list(APPEND R4D_EMU_HIP ${R4D_DIR}/r4d_ihc_bf16.hip ${R4D_DIR}/r4d_engram_bf16.hip
-                        ${R4D_DIR}/r4d_mla_kv_bf16.hip ${R4D_DIR}/r4d_dfly.hip)
+                        ${R4D_DIR}/r4d_mla_kv_bf16.hip ${R4D_DIR}/r4d_dfly.hip
+                        ${R4D_DIR}/r4d_idx_pool_gated_f32.hip)
 set(R4D_EMU_TESTS attn pick norm escale qsa lora f32 mhc kda mla moefuse kvres
                   dsa lili vit)
-list(APPEND R4D_EMU_TESTS attn_kv_sink hy4 mla_sink mla_kv)
+list(APPEND R4D_EMU_TESTS attn_kv_sink hy4 mla_sink mla_kv idxpool)
 set(R4D_EMU_BUILT OFF)
 if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$")
   # No fiber switch for this ISA.
@@ -670,7 +671,7 @@ else()
                 ${R4D_EMU}/test_dsa.cpp ${R4D_EMU}/test_lili.cpp
                 ${R4D_EMU}/test_vit.cpp ${R4D_EMU}/test_attn_kv_sink.cpp
                 ${R4D_EMU}/test_hy4.cpp ${R4D_EMU}/test_mla_sink.cpp
-                ${R4D_EMU}/test_mla_kv.cpp)
+                ${R4D_EMU}/test_mla_kv.cpp ${R4D_EMU}/test_idxpool.cpp)
       get_filename_component(stem ${src} NAME_WE)
       set(lang "")
       if(src MATCHES "\\.hip$")
@@ -707,7 +708,7 @@ else()
   endif()
 endif()
 if(R4D_EMU_BUILT)
-  foreach(t pick norm escale qsa lora f32 mhc kda mla moefuse kvres dsa lili vit hy4 mla_sink mla_kv)
+  foreach(t pick norm escale qsa lora f32 mhc kda mla moefuse kvres dsa lili vit hy4 mla_sink mla_kv idxpool)
     add_test(NAME r4d_emu_${t} COMMAND ${CMAKE_BINARY_DIR}/tests/r4d_emu_${t})
   endforeach()
   # Hy4-flash's non-absorbed prefill (attn_kv_sink_h256): about 4 s.
@@ -727,8 +728,11 @@ if(R4D_EMU_BUILT)
   # load one -- expand bit for bit, shrink to its bound. kda_update is held to libref's within
   # rounding, and that test needs it.
   # r4d_emu_mla_kv: the kv_b projections on WMMA against libref, their law and the fused gate.
+  # r4d_emu_idxpool: the compressed indexer's gated pool against libref, byte for byte, with the
+  # dead-page early-out's fixtures.
   set_tests_properties(r4d_emu_mla_kv PROPERTIES LABELS "r4d_emu" TIMEOUT ${RAD_TEST_TIMEOUT})
-  set_tests_properties(r4d_emu_lora r4d_emu_kda r4d_emu_hy4 r4d_emu_mla_kv PROPERTIES
+  set_tests_properties(r4d_emu_idxpool PROPERTIES LABELS "r4d_emu" TIMEOUT ${RAD_TEST_TIMEOUT})
+  set_tests_properties(r4d_emu_lora r4d_emu_kda r4d_emu_hy4 r4d_emu_mla_kv r4d_emu_idxpool PROPERTIES
                        ENVIRONMENT "RADIANCE_HOME=${CMAKE_BINARY_DIR}/radiance_home")
   # A seeded random sweep, mostly prefill shapes on the WMMA kernel, which the emulator runs at
   # about 2 s a case: `slow`. `r4d_emu_attn sweep 200` is a longer run by hand, a superset of it.

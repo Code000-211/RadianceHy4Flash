@@ -65,9 +65,29 @@ __device__ __forceinline__ void idx_pool_gated_body(IDX_POOL_PARAMS) {
     __shared__ float xs[GPW][kRatio][kN];
     __shared__ float ys[GPW][kN];
     __shared__ float rs[GPW];
+    __shared__ int closed;
 
     const int c  = (int)threadIdx.x;
     const int g0 = (int)blockIdx.x * GPW;
+
+    /* Nothing to do when no group of this workgroup lands in the cache and nothing is written beside
+     * it: at decode a sequence completes a block only every `ratio` steps and qsa_work marks the
+     * others page = -1, so three steps in four stop here instead of reading the weights. The page is
+     * this step's one only after the chain wait, which the caller has done. */
+    if (!out && !q8) {
+        if (!c) {
+            int any = 0;
+#pragma unroll
+            for (int g = 0; g < GPW; ++g) {
+                const int w = g0 + g;
+                const int pg = w < W ? page[w] : -1;
+                any |= pg >= 0 && pg < pages;
+            }
+            closed = any;
+        }
+        __syncthreads();
+        if (!closed) return;
+    }
 
     /* The raw keys, as f32: thread c holds channel c of every row. A group past W reads zeros. */
 #pragma unroll
@@ -129,6 +149,33 @@ __device__ __forceinline__ void idx_pool_gated_body(IDX_POOL_PARAMS) {
     }
     __syncthreads();
 
+    /* The rotation's factors depend on the group's position and this channel alone, so they are
+     * taken here: the f64 sum below runs on GPW threads and no others, so the other threads' pow,
+     * cos and sin go in its latency instead of standing behind it, and each thread keeps its
+     * groups' cosine and sine for the store. */
+    const int rc = c - (kN - rd);
+    float rcs[GPW], rsn[GPW];
+#pragma unroll
+    for (int g = 0; g < GPW; ++g) {
+        rcs[g] = 1.0f;
+        rsn[g] = 0.0f;
+    }
+    if (rc >= 0) {
+        const int i = rc >> 1;
+        const int comp = IMROPE ? imrope_comp(i, sec_h, sec_w) : 0;
+        const float inv_freq = (float)(1.0 / pow(theta, (double)(2 * i) / (double)rd));
+#pragma unroll
+        for (int g = 0; g < GPW; ++g) {
+            const int w = g0 + g;
+            if (w < W) {
+                const int pv = IMROPE ? pos[(size_t)w * pos_ld + comp] : pos[w];
+                const float ang = (float)pv * inv_freq;
+                rcs[g] = (float)cos((double)ang);
+                rsn[g] = (float)sin((double)ang);
+            }
+        }
+    }
+
     /* The mean square, in channel order and in f64, one thread a group: libref's sum exactly. */
     if (c < GPW) {
         double sq = 0.0;
@@ -142,25 +189,18 @@ __device__ __forceinline__ void idx_pool_gated_body(IDX_POOL_PARAMS) {
 #pragma unroll
     for (int g = 0; g < GPW; ++g)
         z[g] = FP8 ? gc * (ys[g][c] * rs[g]) : bf16_to_f32(f32_to_bf16(gc * (ys[g][c] * rs[g])));
-    __syncthreads();
 #pragma unroll
     for (int g = 0; g < GPW; ++g) ys[g][c] = z[g];
     __syncthreads();
 
     /* The rotation: channel c of the last rd takes pair i = (c - (n - rd)) / 2 and computes its own
-     * half of the pair from the two rounded values. */
-    const int rc = c - (kN - rd);
+     * half of the pair from the two rounded values, with the cosine and sine taken above. */
 #pragma unroll
     for (int g = 0; g < GPW; ++g) {
         const int w = g0 + g;
         float r = z[g];
         if (rc >= 0 && w < W) {
-            const int i = rc >> 1;
-            const int comp = IMROPE ? imrope_comp(i, sec_h, sec_w) : 0;
-            const int pv = IMROPE ? pos[(size_t)w * pos_ld + comp] : pos[w];
-            const float inv_freq = (float)(1.0 / pow(theta, (double)(2 * i) / (double)rd));
-            const float ang = (float)pv * inv_freq;
-            const float cs = (float)cos((double)ang), sn = (float)sin((double)ang);
+            const float cs = rcs[g], sn = rsn[g];
             const float x0 = ys[g][c & ~1], x1 = ys[g][(c & ~1) | 1];
             if (FP8) r = (rc & 1) ? x1 * cs + x0 * sn : x0 * cs - x1 * sn;
             else
