@@ -110,12 +110,13 @@ static Opd absent() { Opd o; o.absent = true; return o; }
  * them are the op's to write, so all of them are compared. */
 static std::vector<int64_t> offsets(const RadTensor& t) {
     std::vector<int64_t> o;
-    std::vector<int64_t> ix((size_t)t.rank, 0);
+    const int64_t rank = (int64_t)t.rank;
+    std::vector<int64_t> ix((size_t)rank, 0);
     for (;;) {
         int64_t off = 0;
-        for (uint32_t i = 0; i < t.rank; ++i) off += ix[i] * t.stride[i];
+        for (int64_t i = 0; i < rank; ++i) off += ix[(size_t)i] * t.stride[i];
         o.push_back(off);
-        int d = t.rank - 1;
+        int64_t d = rank - 1;
         for (; d >= 0; --d) {
             if (++ix[(size_t)d] < t.shape[d]) break;
             ix[(size_t)d] = 0;
