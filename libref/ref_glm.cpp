@@ -27,6 +27,12 @@ int ref_gemm_nt_f32(const RadArgs* a, RadStream) {
     return RAD_OK;
 }
 
+/* The prefill tile's row of the same projection (docs/OPS.md, gemm_nt_f32_wmma): the operands,
+ * the f32 accumulation and the output are gemm_nt_f32's, and only the summation order the device
+ * tile uses differs. The reference sums K ascending, which is the value that order is checked
+ * against. */
+int ref_gemm_nt_f32_wmma(const RadArgs* a, RadStream s) { return ref_gemm_nt_f32(a, s); }
+
 /* Single-group noaux_tc routing: correction changes selection, never the mixture weights. */
 int ref_router_sigmoid_topk(const RadArgs* a, RadStream) {
     if (!have(a, 4)) return RAD_E_INVAL;

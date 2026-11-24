@@ -80,6 +80,7 @@ int         avx_par_force(int threads);
     X(dsa_pool)                                                                                   \
     X(dsa_query)            X(dsa_query_i8)         X(idx_pool_gated_i8)                          \
     X(gemm_nt_f32)                                                                                \
+    X(gemm_nt_f32_wmma)                                                                           \
     X(mla_project)                                                                                \
     X(dsa_score)                                                                                  \
     X(mla_attn)                                                                                   \

@@ -1733,6 +1733,9 @@ static const RadOpSchema kSchemas[] = {
 { "gemm_nt", ARR(pGemm), ARR(oGemm), "y[M,N] = a[M,K] @ b[N,K]^T, f32 accumulate." },
 { "gemm_nt_f32", ARR(pGemmF32), ARR(oGemm),
   "BF16 activations times F32 or stored BF16 weights, F32 accumulation and output; preserves routing and index gate precision." },
+{ "gemm_nt_f32_wmma", ARR(pGemmF32), ARR(oGemm),
+  "gemm_nt_f32's operands and F32 output on the BF16 WMMA prefill tile: the same products, "
+  "summed in the tile's order, so a routing score can land in a different last bit" },
 { "gemm_nt_bias", ARR(pGemmBias), ARR(oGemmBias),
   "gemm_nt with a per-column bias added in f32, rounded to y's dtype; then, optionally, `act` of "
   "that (\"gelu\" exact, \"gelu_tanh\" the tanh approximation, \"none\"), rounded; then `res` "
@@ -2617,6 +2620,8 @@ SIMPLE("ref_dsa_query_i8", "dsa_query_i8", "attn", "normalized int8 index querie
        ref_dsa_query_i8),
 SIMPLE("ref_gemm_nt_f32", "gemm_nt_f32", "gemm", "F32 routing projection", DT_FLOAT,
        ref_gemm_nt_f32),
+SIMPLE("ref_gemm_nt_f32_wmma", "gemm_nt_f32_wmma", "gemm",
+       "F32 routing projection on the prefill tile", DT_FLOAT, ref_gemm_nt_f32_wmma),
 SIMPLE("ref_mla_attn_paged", "mla_attn_paged", "attn", "dense paged latent attention with a rotary part",
        DT_FLOAT, ref_mla_attn_paged),
 SIMPLE("ref_swiglu_step", "swiglu_step", "elem", "SwiGLU clipped after the SiLU", DT_FLOAT,

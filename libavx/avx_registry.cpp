@@ -1259,6 +1259,9 @@ static const RadOpSchema kSchemas[] = {
   "Per-head ReLU of FP8 dot products, then signed head gates and scales; invalid history is -inf." },
 { "gemm_nt_f32", ARR(pGemmF32), ARR(oGemm),
   "BF16 activations times F32 or stored BF16 weights, F32 accumulation and output; preserves routing and index gate precision." },
+{ "gemm_nt_f32_wmma", ARR(pGemmF32), ARR(oGemm),
+  "gemm_nt_f32's operands and F32 output on the BF16 WMMA prefill tile: the same products, "
+  "summed in the tile's order, so a routing score can land in a different last bit" },
 { "dsa_query", ARR(pMnD), ARR(oQuantFp8),
   "Normalized Hadamard, BF16 boundary and power-of-two E4M3 quantization per query head." },
 { "dsa_query_i8", ARR(pMnD), ARR(oQuantFp8),
@@ -1990,6 +1993,8 @@ SIMPLE("avx_dsa_query_i8", "dsa_query_i8", "attn", "normalized int8 index querie
        L(dsa_query_i8)),
 SIMPLE("avx_gemm_nt_f32", "gemm_nt_f32", "gemm", "F32 routing projection", DT_FLOAT,
        L(gemm_nt_f32)),
+SIMPLE("avx_gemm_nt_f32_wmma", "gemm_nt_f32_wmma", "gemm",
+       "F32 routing projection on the prefill tile", DT_FLOAT, L(gemm_nt_f32_wmma)),
 SIMPLE("avx_mla_project", "mla_project", "attn", "absorbed MLA projections", DT_FLOAT,
        L(mla_project)),
 SIMPLE("avx_swiglu_step", "swiglu_step", "elem", "SwiGLU clipped after the SiLU", DT_FLOAT,

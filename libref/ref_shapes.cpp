@@ -1728,14 +1728,22 @@ int ref_dequant_w4_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* ou
 
 /* ================================================================== gemm */
 
-int ref_gemm_nt_f32_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+/* gemm_nt_f32 and its prefill-tile row describe the same three operands. */
+static int ref_gemm_nt_f32_shape_named(const RadParam* p, int n_p, int operand, RadOpdDesc* out,
+                                       const char* name) {
     const int64_t M = gi(p, n_p, "M", 0), N = gi(p, n_p, "N", 0), K = gi(p, n_p, "K", 0);
     if (M < 1 || N < 1 || K < 1) return RAD_E_UNSUPPORTED;
     Opd o;
     o.t(RAD_BF16, { M, K });
     o.t(gi(p, n_p, "weight_bf16", 0) ? RAD_BF16 : RAD_F32, { N, K });
     o.t(RAD_F32, { M, N });
-    return o.finish("gemm_nt_f32", operand, out);
+    return o.finish(name, operand, out);
+}
+int ref_gemm_nt_f32_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    return ref_gemm_nt_f32_shape_named(p, n_p, operand, out, "gemm_nt_f32");
+}
+int ref_gemm_nt_f32_wmma_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    return ref_gemm_nt_f32_shape_named(p, n_p, operand, out, "gemm_nt_f32_wmma");
 }
 int ref_gemm_nt_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const uint32_t D = act_dt(p, n_p);

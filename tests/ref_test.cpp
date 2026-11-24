@@ -904,6 +904,33 @@ TEST(f32_projection_preserves_small_weight_differences_and_output_bits) {
     CHECK_EQ(y.at(1), 2.0002f - 2.0f);
 }
 
+TEST(the_prefill_tile_row_sums_the_projection_in_the_reference_order) {
+    /* gemm_nt_f32_wmma is the same projection: its bf16 products are exact in f32 and libref sums
+     * K ascending for both rows, so the two agree bit for bit. The tile's own order is what the
+     * device row spends and what tests/r4d_emu/test_f32.cpp bounds against this value. */
+    T x(RAD_BF16, { 128, 64 }), w(RAD_BF16, { 16, 64 });
+    std::vector<float> xv((size_t)128 * 64), wv((size_t)16 * 64);
+    for (size_t i = 0; i < xv.size(); ++i) xv[i] = (float)((int)(i * 37 % 19) - 9) / 8.f;
+    for (size_t i = 0; i < wv.size(); ++i) wv[i] = (float)((int)(i * 11 % 13) - 6) / 64.f;
+    x.f(xv);
+    w.f(wv);
+    T y32(RAD_F32, { 128, 16 }), ywmma(RAD_F32, { 128, 16 });
+    A a;
+    a.t(x).t(w).t(y32).i("M", 128).i("N", 16).i("K", 64).s("dtype", "bf16")
+        .i("weight_bf16", 1);
+    REQUIRE_EQ(run("gemm_nt_f32", a), RAD_OK);
+    A b;
+    b.t(x).t(w).t(ywmma).i("M", 128).i("N", 16).i("K", 64).s("dtype", "bf16")
+        .i("weight_bf16", 1);
+    REQUIRE_EQ(run("gemm_nt_f32_wmma", b), RAD_OK);
+    int64_t bad = 0;
+    for (int64_t i = 0; i < 128 * 16; ++i) {
+        const float a32 = y32.at(i), aw = ywmma.at(i);
+        bad += std::memcmp(&a32, &aw, sizeof a32) != 0;
+    }
+    CHECK_EQ(bad, 0LL);
+}
+
 TEST(dsa_pool_writes_paged_codes_and_scales_and_the_scorer_reads_them) {
     T kg(RAD_BF16, { 12, 256 }), ape(RAD_F32, { 4, 128 }), q(RAD_F8E4M3, { 3, 128 }),
         scales(RAD_F32, { 3, 1 });
@@ -1257,7 +1284,7 @@ TEST(op_vocabulary) {
     static const char* kOps[] = {
         "rmsnorm", "rmsnorm_p", "rmsnorm_add", "hc_enter", "hc_read", "hc_write", "hc_project",
         "mtp_enter",
-        "mhc_pre", "mhc_pre_partial", "mhc_pre_finish", "mhc_post", "mhc_contract", "swiglu_clamped", "router_sigmoid_topk", "dsa_pool", "dsa_query", "dsa_score", "mla_attn", "mla_project", "gemm_nt_f32",
+        "mhc_pre", "mhc_pre_partial", "mhc_pre_finish", "mhc_post", "mhc_contract", "swiglu_clamped", "router_sigmoid_topk", "dsa_pool", "dsa_query", "dsa_score", "mla_attn", "mla_project", "gemm_nt_f32", "gemm_nt_f32_wmma",
         "swiglu_step", "router_sigmoid_group_topk", "mla_attn_paged",
         /* Hy4-flash: independent hyper-connections, sink attention, the compressed indexer, Engram. */
         "ihc_pre", "ihc_post", "mla_project_kv", "mla_attn_paged_sink", "mla_attn_sel_sink",
@@ -10865,6 +10892,8 @@ std::vector<Geo> geometries() {
         G("dsa_query", "M", 3, a.i("M", R).i("n", 8).s("dtype", "bf16")),
         G("dsa_query_i8", "M", 3, a.i("M", R).i("n", 8).s("dtype", "bf16")),
         G("gemm_nt_f32", "M", 3, a.i("M", R).i("N", 20).i("K", 40).s("dtype", "bf16")),
+        G("gemm_nt_f32_wmma", "M", 3, a.i("M", R).i("N", 20).i("K", 40).s("dtype", "bf16")
+                                     .i("weight_bf16", 1)),
         G("swiglu_clamped", "M", 3, a.i("M", R).i("n", 8).d("limit", 0.5).s("dtype", "f32")),
         G("swiglu_step", "M", 3, a.i("M", R).i("n", 8).d("limit", 0.5).s("dtype", "f32")),
         G("router_sigmoid_group_topk", "M", 3, a.i("M", R).i("n_expert", 8).i("top_k", 2)
