@@ -396,12 +396,17 @@ extern "C" int r4d_fuse_router_sigmoid_topk_scatter(const RadParam* p, int n_p, 
  * (kernel: libr4d/r4d_glm.hip, router_gemm_sigmoid_scatter_kernel)
  *
  * Operands: [0] x  [1] weight  [2] bias  [3] logits  [4] ids  [5] weights  [6] sorted_tok
- *           [7] expert_offset  [8] expert_count  [9] gate?  [10] inverse?
+ *           [7] expert_offset  [8] expert_count  [9] gate?  [10] inverse?  [11] hq_q?  [12] hq_s?
  *
  * The block computes gemm_nt_f32's own tile ([M,K] x [ne,K], its k order and butterfly) and the
  * ranking block runs router_sigmoid_topk_scatter's body over those logits, so the two steps are
  * byte for byte this row's outputs and nothing else: the projection writes [3], the selection
  * reads it back and carries [2] and [4..8] as it does when it is a row of its own.
+ *
+ * With `hq_group` the launch also fills the latent's rotated codes [11] and [12] in the wave slots
+ * it is not using, the mapping had_quant_act_fp8 (E4M3, 128-wide) or had_quant_act_i8g (int8;
+ * group 256 is IQ8R's) takes of the same [0]: a third step whose `dtype` is the activation's, the
+ * only dtype either quantiser serves.
  */
 extern "C" int r4d_fuse_router_gemm_sigmoid_scatter(const RadParam* p, int n_p, uint64_t present,
                                                     int step, RadFuseStep* out) {
@@ -428,6 +433,14 @@ extern "C" int r4d_fuse_router_gemm_sigmoid_scatter(const RadParam* p, int n_p, 
         if (inv) return s.wire({ 3, 2, 4, 5, 6, 7, 8, 10 });
         if (gate) return s.wire({ 3, 2, 4, 5, 6, 7, 8, 9 });
         return s.wire({ 3, 2, 4, 5, 6, 7, 8 });
+    }
+    case 2: {
+        const int64_t hqg = pi(p, n_p, "hq_group", 0);
+        const char* const hqd = r4d_pgets(p, n_p, "hq_dtype");
+        if (hqg <= 0) return RAD_E_NOTFOUND;
+        Step q(out, hqd && !std::strcmp(hqd, "i8") ? "had_quant_act_i8g" : "had_quant_act_fp8");
+        q.pint("n", pi(p, n_p, "K")).pint("group", hqg).pstr("dtype", "bf16").mirror(p, n_p, "M");
+        return q.wire({ 0, 11, 12 });               /* x, codes, scales */
     }
     default:
         return RAD_E_NOTFOUND;

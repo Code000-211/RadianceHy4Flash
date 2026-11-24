@@ -817,7 +817,10 @@ extern "C" int r4d_shape_router_sigmoid_topk_scatter(const RadParam* p, int n_p,
 }
 /* The router's GEMM, its sigmoid selection and the sort over its ids in one launch (r4d_glm.hip):
  * gemm_nt_f32's [M,K] x [ne,K] then router_sigmoid_topk_scatter's five writes, with the shared
- * gate's fill and the inverse optional past them. Decode heights only, M * top_k inside the sort. */
+ * gate's fill and the inverse optional past them. Decode heights only, M * top_k inside the sort.
+ * `hq_group` > 0 adds the latent's own rotated codes (had_quant_act_fp8's or had_quant_act_i8g's,
+ * the 256-wide group is IQ8R's) in the wave slots the grid leaves idle: [M,K] codes and an f32 scale
+ * per (row, group), beside the 13 operands below. */
 extern "C" int r4d_shape_router_gemm_sigmoid_scatter(const RadParam* p, int n_p, int operand,
                                                      RadOpdDesc* out) {
     const int64_t M = pi(p, n_p, "M"), K = pi(p, n_p, "K"), ne = pi(p, n_p, "n_expert"),
@@ -825,6 +828,13 @@ extern "C" int r4d_shape_router_gemm_sigmoid_scatter(const RadParam* p, int n_p,
     const int64_t nl = pi(p, n_p, "n_local", ne);
     if (M < 1 || M > 64 || K < 1 || ne < 1 || ne > 512 || k < 1 || k > ne || nl < 1 || nl > ne ||
         M * k > 1024)
+        return RAD_E_UNSUPPORTED;
+    const int64_t hqg = pi(p, n_p, "hq_group", 0);
+    const char* const hqd = r4d_pgets(p, n_p, "hq_dtype");
+    const bool hqi8 = hqd && !std::strcmp(hqd, "i8");
+    if (hqg && ((hqg != R4D_FP8_BLOCK && hqg != R4D_I8_GROUP_WIDE) || K % hqg ||
+                hqd == nullptr || (!hqi8 && std::strcmp(hqd, "f8e4m3")) ||
+                (hqg == R4D_I8_GROUP_WIDE && !hqi8)))
         return RAD_E_UNSUPPORTED;
     const RadOpdDesc l[] = { opd((uint32_t)RAD_BF16, M, K),
                              opd(pi(p, n_p, "weight_bf16", 0) ? (uint32_t)RAD_BF16
@@ -837,7 +847,10 @@ extern "C" int r4d_shape_router_gemm_sigmoid_scatter(const RadParam* p, int n_p,
                              opd((uint32_t)RAD_I32, nl + 1),
                              opd((uint32_t)RAD_I32, nl),
                              opd((uint32_t)RAD_BF16, M, 1),
-                             opd((uint32_t)RAD_I32, M * k) };
+                             opd((uint32_t)RAD_I32, M * k),
+                             hqg ? opd(hqi8 ? (uint32_t)RAD_I8 : (uint32_t)RAD_F8E4M3, M, K)
+                                 : opd_none(),
+                             hqg ? opd((uint32_t)RAD_F32, M, K / hqg) : opd_none() };
     R4D_PICK(l);
 }
 extern "C" int r4d_shape_dsa_pool(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {

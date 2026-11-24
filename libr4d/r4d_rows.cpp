@@ -2214,18 +2214,22 @@ static const RadOperandSpec oRouterSigmoidScatter[] = {
     { "expert_count", RAD_OPD_OUT, 0 }, { "gate", RAD_OPD_OUT, 1 },
     { "inverse", RAD_OPD_OUT, 1 }
 };
-/* The router's projection and the selection it feeds as one op: `logits` is the projection's output
- * and the selection's read, so it is written here, and the rest is router_sigmoid_topk_scatter's. */
+/* The router's projection, the selection it feeds and the latent's rotated codes as one op:
+ * `logits` is the projection's output and the selection's read, so it is written here, the rest is
+ * router_sigmoid_topk_scatter's, and `hq_q` / `hq_s` are had_quant_act_fp8's or had_quant_act_i8g's
+ * codes and scales of `x` (absent when the pass already holds codes to feed the routed arm). */
 static const RadParamSpec pRouterGemmSigmoidScatter[] = { P_INT("M"), P_INT("K"),
     P_INT("n_expert"), P_INTO("n_local"), P_INT("top_k"), P_INTO("weight_bf16"), P_INT("norm"),
-    P_F64("route_scale"), P_STR("dtype"), P_INTO("expert_base"), P_STRO("protect") };
+    P_F64("route_scale"), P_STR("dtype"), P_INTO("expert_base"), P_STRO("protect"),
+    P_INTO("hq_group"), P_STRO("hq_dtype") };
 static const RadOperandSpec oRouterGemmSigmoidScatter[] = {
     { "x", RAD_OPD_IN, 0 },             { "weight", RAD_OPD_WEIGHT, 0 },
     { "bias", RAD_OPD_WEIGHT, 0 },      { "logits", RAD_OPD_OUT, 0 },
     { "ids", RAD_OPD_OUT, 0 },          { "weights", RAD_OPD_OUT, 0 },
     { "sorted_tok", RAD_OPD_OUT, 0 },   { "expert_offset", RAD_OPD_OUT, 0 },
     { "expert_count", RAD_OPD_OUT, 0 }, { "gate", RAD_OPD_OUT, 1 },
-    { "inverse", RAD_OPD_OUT, 1 }
+    { "inverse", RAD_OPD_OUT, 1 },      { "hq_q", RAD_OPD_OUT, 1 },
+    { "hq_s", RAD_OPD_OUT, 1 }
 };
 /* `logit_softcap`'s, matching ref's `pMnCap` (spec §2.3). `cap` must be > 0; the op refuses a
  * non-positive cap (a division by zero in every lane). */
@@ -9659,15 +9663,19 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   r4d_fuse_router_sigmoid_topk_scatter },
 { "router_gemm_sigmoid_scatter_f32", "router_gemm_sigmoid_scatter", "moe",
   "the f32 router GEMM, its sigmoid selection and the stable counting sort in one launch -- the "
-  "workgroup that finishes the grid ranks -- with the ungated shared gate's fill and the inverse",
-  "single group, M <= 64 and M*top_k <= 1024, experts <=512, top_k<=32",
+  "workgroup that finishes the grid ranks -- with the ungated shared gate's fill and the inverse, "
+  "and the latent's rotated codes in the wave slots the grid leaves idle",
+  "single group, M <= 64 and M*top_k <= 1024, experts <=512, top_k<=32; `hq_group` > 0 adds "
+  "had_quant_act_fp8's or had_quant_act_i8g's quantiser over K, which then needs group 128 (or "
+  "IQ8R's 256, int8) and K a multiple of it",
   "bf16 activation, bf16 or f32 weight, f32 bias, logits and weights; i32 ids, sorted slots, "
-  "offsets and counts; bf16 gate",
+  "offsets and counts; bf16 gate; with `hq_group`, the same codes and scales had_quant_act_fp8 or "
+  "had_quant_act_i8g write of the activation",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cRouterGemmSigmoidScatter), NOTUNE,
   nullptr, nullptr, r4d_rad_router_gemm_sigmoid_scatter, nullptr, nullptr, nullptr,
   r4d_shape_router_gemm_sigmoid_scatter, nullptr,
-  /* `gemm_nt_f32` + `router_sigmoid_topk_scatter` (r4d_fuse.cpp). */
+  /* `gemm_nt_f32` + `router_sigmoid_topk_scatter` (+ the quantiser with `hq_group`) (r4d_fuse.cpp). */
   r4d_fuse_router_gemm_sigmoid_scatter },
 { "router_topk_bf16", "router_topk", "moe",
   "softmax over a row of expert logits and the exact top-k of it, one wave a row",
@@ -12113,6 +12121,7 @@ extern "C" int rad_kernel_chain(int i) {
         "ihc_post_bf16", "gate_mul_bf16", "mla_attn_paged_sink_bf16", "mla_attn_sel_sink_bf16",
         "idx_pool_gated_f32", "idx_pool_gated_fp8", "idx_pool_gated_i8", "idx_score_bf16",
         "gemm_nt_f32_bf16", "router_sigmoid_topk_f32", "router_sigmoid_topk_scatter_f32",
+        "router_gemm_sigmoid_scatter_f32",
         "moe_scatter_i32", "moe_scatter_inv_i32", "swiglu_clamped_bf16",
         "engram_ids_i32", "engram_norm_bf16", "engram_gate_bf16", "embed_lookup_q_bf16",
         "quant_act_fp8_grp", "dequant_fp8_bf16", "logits_gemm_bf16", "logits_gemm_bf16_cols",
