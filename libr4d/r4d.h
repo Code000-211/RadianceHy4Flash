@@ -720,6 +720,11 @@ void r4d_moe_gemm_pin_fk(int pin);
 // class's width allow it), 1 never that tile, 2 always (refused where the shape cannot take it or
 // the launch is not the aligned form). Bit-identical.
 void r4d_moe_gemm_pin_down_tile(int pin);
+// Test hook: pins the column tiles a block of the down projection's 64-row form takes in turn
+// over one staged activation. 0 is the launcher's rule (two where the width is whole pairs of
+// 256-column tiles), 1 one tile a block, 2 or 3 that many (a prefill launch that is not the 64-row
+// block, or whose width is not whole blocks, is refused). Bit-identical.
+void r4d_moe_gemm_pin_down_ng(int pin);
 // Test hook: pins the gather's form. 0 is the launcher's rule, 1 a column a thread
 // (gather_kernel), 2 a wave a token and sixteen bytes a lane (gather_wide_kernel), 3 sixteen slots
 // with eight columns a lane (gather_kernel16, top_k = 16), each refused on a shape it cannot take.

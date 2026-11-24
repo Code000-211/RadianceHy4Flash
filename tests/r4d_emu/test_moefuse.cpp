@@ -20,7 +20,15 @@
  * height, the wide (256-column-wave) one at prefill with bf16 routing weights (and each pinned),
  * the kernel that ran named, the sums against the plain sixteen-slot form's launch and the codes
  * and scales the quantiser's arithmetic applied to the sums the op itself wrote -- the pair the
- * fusion replaces -- then every refusal of its quantising block. */
+ * fusion replaces -- then every refusal of its quantising block.
+ *
+ * moe_gemm_w4a8i8 through its published entry point at the sorted operand (the routed down
+ * projection, w4nl64a8i8h): the aligned 64-row block taking one, two and three 256-column tiles in
+ * turn over one staged activation (r4d_moe_gemm_pin_down_ng), the 32-row block and the launcher's
+ * rule, each byte for byte against the fold written out on the host -- runs around the blocks'
+ * bounds, an empty expert, a dropped tail, classes of unequal K and of unequal width (a walked
+ * tile past the narrower class, and a block wholly past it) -- then the kernel the rule named and
+ * the pin's refusals. */
 #include "rad_abi.h"
 #include "rad_plugin.h"
 #include "r4d_plugin.h"
@@ -44,6 +52,8 @@ constexpr uint16_t kGatePoison = 0x7e57;
 /* The published op's entry point and its form pin (libr4d/r4d_moe.hip), driven through their ABI
  * by the launcher case below. */
 extern "C" void r4d_moe_gather_pin_form(int form);
+extern "C" void r4d_moe_gemm_pin_down_mt(int pin);
+extern "C" void r4d_moe_gemm_pin_down_ng(int pin);
 
 RadParam pint(const char* k, int64_t v) {
     RadParam p{};
@@ -945,6 +955,149 @@ void gather_quant_launcher_cases(std::mt19937& rng, int& cases, int& fails) {
     }
 }
 
+/* The routed down projection at prefill, moe_gemm_q on the sorted operand at w4nl64a8i8h, as
+ * r4d_moe.hip's fold writes it: row i of expert e is the sum over e's 128-K blocks, in K order, of
+ * (s0 * w0 + s1 * w1) * a, s the int32 sums of a block's two 64-K groups, w each group's E4M3 scale
+ * times the format's 2^-13 and the int8 levels' unit, a the row's activation scale for the block;
+ * then one bf16 rounding. Columns past the expert's class and rows past the live count are zero. */
+struct DownShape {
+    int N[2], K[2];
+    std::vector<int> len;      /* routed rows an expert */
+    int drop;                  /* dropped slots after the last run */
+    int ng_ok[2];              /* whether two and three column tiles divide the width */
+    const char* rule;          /* what the launcher's rule runs, as R4D_EMIT spells its tail */
+};
+void down_walk_cases(std::mt19937& rng, int& cases, int& fails) {
+    const DownShape shapes[] = {
+        /* Hy4-flash's down at four ranks: 1536 x 384, six tiles a row of an entry */
+        { { 1536, 1536 }, { 384, 384 }, { 130, 0, 64, 17, 65, 1 }, 23, { 1, 1 }, "R4dUnchained, 2>)" },
+        /* classes of unequal K and width: a pair's second tile, and a whole block, past class 1 */
+        { { 1536, 768 }, { 256, 384 }, { 63, 70, 0, 129, 16, 96 }, 2, { 1, 1 }, "R4dUnchained, 2>)" },
+        { { 1024, 512 }, { 128, 256 }, { 33, 127, 64, 64, 2, 31 }, 7, { 1, 0 }, "R4dUnchained, 2>)" },
+        /* three tiles wide: no pair, so the rule keeps one tile a block */
+        { { 768, 768 }, { 256, 128 }, { 100, 5, 0, 66, 15, 80 }, 14, { 0, 1 }, "R4dUnchained, 1>)" },
+    };
+    const int top_k = 4;
+    auto ten = [](void* d, uint32_t dt, std::initializer_list<int64_t> shape) {
+        RadTensor t{};
+        t.data = d;
+        t.dtype = dt;
+        t.rank = (uint32_t)shape.size();
+        int i = 0;
+        for (int64_t v : shape) t.shape[i++] = v;
+        int64_t acc = 1;
+        for (i = (int)t.rank - 1; i >= 0; --i) { t.stride[i] = acc; acc *= t.shape[i]; }
+        return t;
+    };
+    for (const DownShape& sh : shapes) {
+        const int E = (int)sh.len.size(), N = std::max(sh.N[0], sh.N[1]), K = std::max(sh.K[0], sh.K[1]);
+        const int kb = K / 128;
+        std::vector<int32_t> off((size_t)E + 1, 0);
+        for (int e = 0; e < E; ++e) off[(size_t)e + 1] = off[(size_t)e] + sh.len[(size_t)e];
+        const int live = off[(size_t)E], T = (live + sh.drop + top_k - 1) / top_k * top_k;
+        std::vector<int32_t> sorted((size_t)T, -1);
+        for (int i = 0; i < live; ++i) sorted[(size_t)i] = (int32_t)(rng() % (uint32_t)T);
+        std::vector<int8_t> aq((size_t)T * K);
+        for (auto& v : aq) v = (int8_t)((int)(rng() % 255) - 127);
+        std::vector<float> as((size_t)T * kb);
+        for (auto& v : as) v = std::ldexp(1.0f + (float)(rng() % 256) / 256.0f, -7);
+        /* Each class's stacked planes: packed nibbles, and two E4M3 scales a (row, 128 of K). */
+        std::vector<uint8_t> w[2], ws[2];
+        const int nec[2] = { (E + 1) / 2, E / 2 };
+        for (int c = 0; c < 2; ++c) {
+            w[c].resize((size_t)nec[c] * sh.N[c] * sh.K[c] / 2);
+            for (auto& b : w[c]) b = (uint8_t)rng();
+            ws[c].resize((size_t)nec[c] * sh.N[c] * (sh.K[c] / 64));
+            for (auto& b : ws[c]) b = (uint8_t)(0x28u + rng() % 32u);    /* positive, normal */
+        }
+        /* The host fold. Element k of a packed row is a nibble of byte 4 * (k / 8) + k % 4, the low
+         * one for k % 8 < 4 (r4d_moe.hip's w4_expand); code c is level kW4nlI8[c], negated from 8. */
+        std::vector<uint16_t> want((size_t)T * N, 0);
+        const float sub = kW4G64Scale * kW4nlI8Unit;
+        for (int e = 0; e < E; ++e) {
+            const int c = e & 1, Nc = sh.N[c], Kc = sh.K[c];
+            const uint8_t* we = w[c].data() + (size_t)(e / 2) * Nc * Kc / 2;
+            const uint8_t* se = ws[c].data() + (size_t)(e / 2) * Nc * (Kc / 64);
+            for (int i = off[(size_t)e]; i < off[(size_t)e + 1]; ++i)
+                for (int n = 0; n < Nc; ++n) {
+                    float out = 0.0f;
+                    for (int b = 0; b < Kc / 128; ++b) {
+                        int32_t sum[2] = { 0, 0 };
+                        for (int k = b * 128; k < b * 128 + 128; ++k) {
+                            const uint8_t by = we[(size_t)n * (Kc / 2) + 4 * (k / 8) + k % 4];
+                            const int code = (k % 8 < 4) ? (by & 15) : (by >> 4);
+                            const int lvl = code < 8 ? kW4nlI8[code] : -kW4nlI8[code - 8];
+                            sum[(k % 128) / 64] += (int)aq[(size_t)i * K + k] * lvl;
+                        }
+                        const uint8_t* sc = se + (size_t)n * (Kc / 64) + 2 * b;
+                        float v = (float)sum[0] * (rad_fp8e4m3_to_f32(sc[0]) * sub);
+                        v += (float)sum[1] * (rad_fp8e4m3_to_f32(sc[1]) * sub);
+                        out += v * as[(size_t)i * kb + b];
+                    }
+                    want[(size_t)i * N + n] = rad_f32_to_bf16(out);
+                }
+        }
+        std::vector<uint16_t> y((size_t)T * N);
+        RadTensor t[9] = {
+            ten(aq.data(), RAD_I8, { T, K }), ten(as.data(), RAD_F32, { T, kb }),
+            ten(w[0].data(), R4D_DT_MOEW4, { nec[0], sh.N[0], sh.K[0] }),
+            ten(ws[0].data(), RAD_F8E4M3, { nec[0], sh.N[0], sh.K[0] / 64 }),
+            ten(sorted.data(), RAD_I32, { T }), ten(off.data(), RAD_I32, { E + 1 }),
+            ten(w[1].data(), R4D_DT_MOEW4, { nec[1], sh.N[1], sh.K[1] }),
+            ten(ws[1].data(), RAD_F8E4M3, { nec[1], sh.N[1], sh.K[1] / 64 }),
+            ten(y.data(), RAD_BF16, { T, N }) };
+        RadParam ps[11] = { pint("M", T / top_k), pint("N", sh.N[0]), pint("K", sh.K[0]),
+                            pint("N_odd", sh.N[1]), pint("K_odd", sh.K[1]), pint("parts", 1),
+                            pint("n_expert", E), pint("top_k", top_k), pint("group", 128), {}, {} };
+        ps[9].key = "a_order"; ps[9].kind = RAD_P_STR; ps[9].sval = "sorted";
+        ps[10].key = "dtype";  ps[10].kind = RAD_P_STR; ps[10].sval = "w4nl64a8i8h";
+        RadArgs a{};
+        a.t = t; a.n_t = 9;
+        a.p = ps; a.n_p = 11;
+        std::vector<uint32_t> scratch((size_t)r4d_rad_moe_gemm_w4a8_scratch(&a) / 4 + 1);
+        a.scratch = scratch.data();
+        a.scratch_bytes = (int64_t)(scratch.size() - 1) * 4;
+        /* (rows a block pin, column tiles pin): the 32-row block, the 64-row block at one to three
+         * tiles, and the rule (64 rows from 32 routed rows an expert, which every shape has). */
+        const int forms[5][2] = { { 2, 0 }, { 4, 1 }, { 4, 2 }, { 4, 3 }, { -1, 0 } };
+        for (const auto& f : forms) {
+            const bool refuse = f[1] >= 2 && !sh.ng_ok[f[1] - 2];
+            std::fill(y.begin(), y.end(), (uint16_t)0x42F6);        /* 123.0: an unwritten element */
+            r4d_moe_gemm_pin_down_mt(f[0]);
+            r4d_moe_gemm_pin_down_ng(f[1]);
+            const int rc = r4d_rad_moe_gemm_w4a8i8(&a, nullptr);
+            const std::string ran = emu_last_kernel;
+            r4d_moe_gemm_pin_down_mt(-1);
+            r4d_moe_gemm_pin_down_ng(0);
+            ++cases;
+            if (refuse) {
+                if (rc != RAD_E_UNSUPPORTED) {
+                    ++fails;
+                    std::printf("FAIL down %dx%d rows-pin %d tiles-pin %d: rc %d, want a refusal\n",
+                                N, K, f[0], f[1], rc);
+                }
+                continue;
+            }
+            size_t diff = 0, first = 0;
+            for (size_t i = 0; i < y.size(); ++i)
+                if (y[i] != want[i] && !diff++) first = i;
+            /* The pinned tile count, and the rule's, by the kernel that ran. */
+            const std::string tail = f[0] == 2 ? "R4dUnchained>)"
+                                   : f[0] < 0 ? sh.rule
+                                   : "R4dUnchained, " + std::to_string(f[1]) + ">)";
+            const bool named = ran.size() >= tail.size() &&
+                               !ran.compare(ran.size() - tail.size(), tail.size(), tail);
+            if (rc != RAD_OK || diff || !named) {
+                ++fails;
+                std::printf("FAIL down %dx%d rows-pin %d tiles-pin %d: rc %d, %zu of %zu elements differ "
+                            "from the host fold (first row %zu column %zu), kernel %s (want ...%s)\n",
+                            N, K, f[0], f[1], rc, diff, y.size(), first / (size_t)N, first % (size_t)N,
+                            ran.c_str(), tail.c_str());
+            }
+        }
+    }
+}
+
 }   // namespace
 
 int main() {
@@ -955,6 +1108,7 @@ int main() {
     gather_sixteen_cases(rng, cases, fails);
     gather_quant_cases(rng, cases, fails);
     gather_quant_launcher_cases(rng, cases, fails);
+    down_walk_cases(rng, cases, fails);
     std::printf("%d case(s), %d failure(s)\n", cases, fails);
     return fails ? 1 : 0;
 }

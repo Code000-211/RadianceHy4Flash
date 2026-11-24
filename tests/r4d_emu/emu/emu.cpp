@@ -307,9 +307,31 @@ emu_v8f emu_wmma_fp8(emu_v2i a, emu_v2i b, emu_v8f c) {
     std::memcpy(pb.v, &b, 8);
     return emu_wmma(g_qa, g_qb, pa, pb, c, [](uint8_t v) { return g_fp8.v[v]; });
 }
-emu_v8i emu_wmma_iu8(bool, emu_v2i, bool, emu_v2i, emu_v8i, bool) {
-    std::fprintf(stderr, "emu: v_wmma_i32_16x16x16_iu8 is not emulated\n");
-    std::abort();
+/* v_wmma_i32_16x16x16_iu8 (gfx12): the fp8 form's layout, each operand's bytes signed or unsigned by
+ * its flag, exact int32 sums (so in any order). The clamped form is not emulated. */
+emu_v8i emu_wmma_iu8(bool sa, emu_v2i a, bool sb, emu_v2i b, emu_v8i c, bool clamp) {
+    if (clamp) {
+        std::fprintf(stderr, "emu: v_wmma_i32_16x16x16_iu8 with clamp is not emulated\n");
+        std::abort();
+    }
+    const int t = (int)S.f[S.cur].tid.x, w = t >> 5, l = t & 31;
+    const unsigned par = S.xparity[t]++ & 1u;
+    std::memcpy(g_qa[w][par][l], &a, 8);
+    std::memcpy(g_qb[w][par][l], &b, 8);
+    wmma_whole_wave(w);
+    wave_barrier(w);
+    const int N = l & 15, h = l >> 4;
+    emu_v8i d = c;
+    for (int k = 0; k < 16; ++k) {
+        const int slot = 16 * (k >> 3), el = k & 7;
+        const uint8_t bb = g_qb[w][par][N + slot][el];
+        const int bv = sb ? (int)(int8_t)bb : (int)bb;
+        for (int e = 0; e < 8; ++e) {
+            const uint8_t ab = g_qa[w][par][8 * h + e + slot][el];
+            d[e] += (sa ? (int)(int8_t)ab : (int)ab) * bv;
+        }
+    }
+    return d;
 }
 unsigned emu_ballot(bool p) {
     int l;
