@@ -15,12 +15,22 @@
  *
  * sample_topk and sample_logprobs: the per-group histograms of the radix select against a brute
  * force (descending logit, ties to the lower id), in both orders: vector and scalar loads, tie
- * groups that need the id pass, -inf entries, top-1, greedy rows, the pair plane. */
+ * groups that need the id pass, -inf entries, top-1, greedy rows, the pair plane.
+ *
+ * tests/halo_emu/test_sample.cpp includes this file with SAMPLE_HALO defined: the sample_chain
+ * cases on libhalo's copy of the kernel (its stage kernels already count per wave group). */
 #include "rad_abi.h"
 #include "rad_plugin.h"
 #include "rad_sample.h"
+#ifdef SAMPLE_HALO
+#include "halo.h"
+#include "halo_plugin.h"
+typedef HaloSpecDraw R4DSpecDraw;
+#define r4d_rad_sample_chain halo_rad_sample_chain
+#else
 #include "r4d.h"
 #include "r4d_plugin.h"
+#endif
 #include <hip/hip_runtime.h>
 #include <algorithm>
 #include <cmath>
@@ -290,6 +300,7 @@ static void test_chain() {
 }
 
 /* ------------------------------------------------------------------ sample_topk, sample_logprobs */
+#ifndef SAMPLE_HALO
 
 struct TopkOut { std::vector<int32_t> ci; std::vector<float> cv; std::vector<uint32_t> pr; int rc; };
 
@@ -422,9 +433,13 @@ static void test_topk() {
     }
 }
 
+#endif
+
 int main() {
     test_chain();
+#ifndef SAMPLE_HALO
     test_topk();
+#endif
     std::printf("sample: %d check(s), %d failure(s)\n", cases, fails);
     return fails != 0;
 }
