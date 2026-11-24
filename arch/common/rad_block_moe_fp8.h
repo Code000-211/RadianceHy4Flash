@@ -66,8 +66,13 @@ namespace arch {
 static const int64_t kMoeSortRows = 1024;
 
 /* The skinny bf16 GEMM's decode band, within which the fused router op reproduces that GEMM's
- * arithmetic; above it the router uses the tiled kernel and the unfused pair. */
-static const int64_t kMoeRouterFusedRows = 64;
+ * arithmetic; above it the router uses the tiled kernel and the unfused pair. It is also the band
+ * the fusion was measured faster in: on a R9700 the selftest's `--perfmoefuse` rows put the fused
+ * router at 14.0 / 15.7 / 21.2 us against the pair's 15.5 / 16.7 / 20.6 at 1 / 8 / 16 rows, and at
+ * 12.5 / 15.7 / 21.0 against 18.5 / 21.5 / 25.8 there with the latent's codes folded in; at 32 and
+ * 64 rows it was 117 and 136 us against the pair's 31.9 and 51.9, where the row's form needs a
+ * block four times as wide. A lane can raise the band once stamps show the pair beaten there. */
+static const int64_t kMoeRouterFusedRows = 16;
 
 /* ---- RADIANCE_DEBUG_ROUTING: prints token 0's routing weights once per layer.
  *
@@ -425,10 +430,12 @@ struct MoeFP8 {
     /* `router_gemm_sigmoid_scatter`: the projection above and that selection in one launch, up to
      * `sigmoid_gemm_rows` tokens (the decode band and the sort's bound). Resolved, it stands in for
      * both `glm_router.project` and `op_sigmoid_scatter`; otherwise, or for larger passes, the two
-     * launches run. */
+     * launches run. With `sigmoid_gemm_hq` it also writes the latent's rotated codes in the wave
+     * slots the grid leaves idle, standing in for `op_hq` as well (K-10). */
     rad_op  op_sigmoid_gemm = 0;
     int64_t sigmoid_gemm_rows = 0;
     bool    sigmoid_gemm_gate = false;
+    bool    sigmoid_gemm_hq = false;
     /* The rotated re-quantisation of the block input, declared only when `expert_rot` is set and
      * the caller does not already write `w.hr`. */
     rad_op op_hq = 0;
@@ -1776,12 +1783,18 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
         sigmoid_gemm_rows = sigmoid_scatter_rows < kMoeRouterFusedRows ? sigmoid_scatter_rows
                                                                       : kMoeRouterFusedRows;
         if (sigmoid_gemm_rows > 0) {
+            /* The latent's own codes, when this pass writes them: the same op the separate
+             * quantiser launch is (`op_hq`), the same buffers and group, so the launch disappears
+             * rather than moving. */
+            const bool hq_fold = op_hq != 0;
             const RadParam gp[] = {
                 RAD_RANGE("M", 1, sigmoid_gemm_rows), RAD_INT("K", g.n_embd),
                 RAD_INT("n_expert", c.n_expert_all), RAD_INT("n_local", c.n_expert),
                 RAD_INT("top_k", c.top_k), RAD_INT("weight_bf16", glm_router.projection_bf16),
                 RAD_INT("norm", c.norm_topk), RAD_F64("route_scale", c.route_scale),
                 RAD_STR("dtype", "f32"), RAD_INT("expert_base", c.expert_base),
+                RAD_INT("hq_group", hq_fold ? gin_g : 0),
+                RAD_STR("hq_dtype", a8 ? "i8" : "f8e4m3"),
                 RAD_STR("protect", prot_list),
             };
             const int n_gp = (int)(sizeof(gp) / sizeof(gp[0])) - (prot_list ? 0 : 1);
@@ -1789,14 +1802,19 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
             op_sigmoid_gemm = rad_decl_op(b, "router_gemm_sigmoid_scatter", gp, n_gp, gw, 2);
             if (op_sigmoid_gemm) {
                 const rad_buf rd[1] = { w.h.x };
-                rad_buf wr[8] = { w.logits, w.ids, w.ew, w.sorted, w.eoff, w.ecnt };
+                rad_buf wr[10] = { w.logits, w.ids, w.ew, w.sorted, w.eoff, w.ecnt };
                 int n_wr = 6;
                 if (sigmoid_scatter_gate) wr[n_wr++] = w.sgate;
                 if (scatter_inv) wr[n_wr++] = w.inv;
+                if (hq_fold) {
+                    wr[n_wr++] = gin_q;
+                    wr[n_wr++] = gin_s;
+                }
                 rad_op_reads (b, op_sigmoid_gemm, rd, 1);
                 rad_op_writes(b, op_sigmoid_gemm, wr, n_wr);
             }
             sigmoid_gemm_gate = op_sigmoid_gemm && sigmoid_scatter_gate;
+            sigmoid_gemm_hq = op_sigmoid_gemm && hq_fold;
         }
     }
 
@@ -1939,7 +1957,9 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
                     brow_slice(w.ew, r0, rows, k), brows(w.sorted, rows * k),
                     brows(w.eoff, ne + 1), ecnt,
                     sigmoid_gemm_gate ? brow_slice(w.sgate, r0, rows, 1) : RAD_NONE,
-                    scatter_inv ? brows(w.inv, rows * k) : RAD_NONE);
+                    scatter_inv ? brows(w.inv, rows * k) : RAD_NONE,
+                    sigmoid_gemm_hq ? brow_slice(gin_q, r0, rows, g.n_embd) : RAD_NONE,
+                    sigmoid_gemm_hq ? brow_slice(gin_s, r0, rows, g.n_embd / gin_g) : RAD_NONE);
     } else if (sfused) {
         glm_router.project(c_, r0, rows, r0);
         RAD_ISSUE_N(c_, op_sigmoid_scatter, rows, brow_slice(w.logits, r0, rows, ne_all),
@@ -1983,7 +2003,8 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
     /* The rotated quantisation of the input, when the experts are rotated and the caller did not
      * write it. Unrotated, the GEMM reads `h`'s pair. */
     const bool rot = c.expert_rot != 0;
-    if (op_hq)
+    /* ...unless the fused router's grid filled them, which it does only in the launch it takes. */
+    if (op_hq && !(sgfused && sigmoid_gemm_hq))
         RAD_ISSUE_N(c_, op_hq, rows, brow_slice(w.h.x, r0, rows, g.n_embd),
                     brow_slice(gin_q, r0, rows, g.n_embd),
                     brow_slice(gin_s, r0, rows, g.n_embd / gin_g));
