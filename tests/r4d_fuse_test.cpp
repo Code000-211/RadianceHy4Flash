@@ -178,4 +178,59 @@ TEST(qsa_work_pool_tail_imrope_sections_reach_the_pool) {
     CHECK_EQ(sval(s[1], "sections"), std::string("[24,20,20]"));
 }
 
+/* ---------------------------------------------------------------- the row's operand descriptions
+ *
+ * rad-kbench draws a row's inputs from its `opd_shape` hook and hands them to the kernel
+ * (tools/opshapes.cpp, and `--op` in replay mode), and the fusion oracle compares the fused launch
+ * with its chain over those buffers (core/runtime/oracle.cpp), so a description the kernel refuses
+ * is a row no tool can run at that geometry, whatever the plugin wires by hand. These are the
+ * descriptions r4d_qsa_work_pool_tail_bf16.hip checks before it launches: a `mode` that changes an
+ * operand's rank or presence has to show up here too, which is what the M-RoPE half pins.
+ */
+TEST(qsa_work_pool_tail_describes_the_operands_its_kernel_accepts) {
+    for (int im = 0; im < 2; ++im) {
+        Geo g = Geo().decode();
+        for (int i = 0; i < g.n; ++i)
+            if (!strcmp(g.p[i].key, "mode")) g.p[i].sval = im ? "imrope_gptj" : "gptj";
+        RadOpdDesc d[kN_OPD];
+        for (int i = 0; i < kN_OPD; ++i)
+            REQUIRE_EQ(r4d_shape_qsa_work_pool_tail(g(), g.n, i, &d[i]), RAD_OK);
+
+        /* k: [M, n], the width the kernel's block copy is compiled for. */
+        CHECK_EQ(d[kK].rank, 2u);
+        CHECK_EQ(d[kK].shape[1], 128);
+        /* positions and cu_seqlens: drawn as runs, not uniform draws. The work list's bounds come
+         * off the positions (`lo`, `hi`, and the `k` row a block reads), and a token at a position
+         * the step does not hold sends the gather past `k`'s rows. */
+        CHECK((d[kPos].flags & RAD_OPD_F_IDX_CU) != 0);
+        CHECK((d[kCu].flags & RAD_OPD_F_IDX_CU) != 0);
+        /* state: [slots, 1, ring, n] */
+        CHECK_EQ(d[kState].rank, 4u);
+        CHECK_EQ(d[kState].shape[1], 1);
+        CHECK_EQ(d[kState].shape[2], 7);
+        CHECK_EQ(d[kState].shape[3], 128);
+        /* gain: one dense row, not an [n, 1] column. */
+        CHECK_EQ(d[kGain].rank, 1u);
+        CHECK_EQ(d[kGain].shape[0], 128);
+        /* page: one i32 a work item. */
+        CHECK_EQ(d[kPage].rank, 1u);
+        CHECK_EQ(d[kPage].dtype, (uint32_t)RAD_I32);
+        /* bpos: one position a work item, or the group's three components under M-RoPE. */
+        CHECK_EQ(d[kBpos].rank, im ? 2u : 1u);
+        CHECK_EQ(d[kBpos].shape[0], 1 /* work */);
+        if (im) CHECK(d[kBpos].shape[1] >= 3);
+        /* rope: absent under gptj, the step's three planes under M-RoPE (the kernel refuses a null
+         * plane there). */
+        CHECK_EQ((d[kRope].flags & RAD_OPD_F_ABSENT) != 0, im == 0);
+        if (im) {
+            CHECK_EQ(d[kRope].rank, 2u);
+            CHECK(d[kRope].shape[0] >= 3);
+        }
+        /* cache: the pool's page, [work, 1, ratio, n / ratio]. */
+        CHECK_EQ(d[kCache].rank, 4u);
+        CHECK_EQ(d[kCache].shape[1], 1);
+        CHECK_EQ(d[kCache].shape[2] * d[kCache].shape[3], 128);
+    }
+}
+
 RAD_TEST_MAIN()

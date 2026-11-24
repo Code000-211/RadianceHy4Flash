@@ -2229,20 +2229,32 @@ extern "C" int r4d_shape_qsa_work_pool_tail(const RadParam* p, int n_p, int oper
     const int64_t W = pi(p, n_p, "work", 1);
     if (n <= 0 || r <= 0 || g < r || s <= 0 || W <= 0) return RAD_E_UNSUPPORTED;
     const uint32_t D = dt_act(p, n_p, "dtype");
+    /* The kernel tells its two position forms apart by `mode` (r4d_qsa_work_pool_tail_bf16.hip):
+     * under M-RoPE `bpos` carries the group's three components (`qsa_work`'s [work, 3]) and the
+     * rotary plane is an operand, while under gptj each work item has one position and the step has
+     * no plane. Describing the gptj form under imrope would hand the kernel a shape it refuses.
+     */
+    const char* mode = rad_param_gets(p, n_p, "mode", "gptj");
+    const bool im = !std::strcmp(mode, "imrope") || !std::strcmp(mode, "imrope_gptj");
     const RadOpdDesc l[] = {
         opd(D, M, n),                  /* k */
-        opd_idx(M, 1, M * r),          /* positions */
-        opd_idx(s + 1, 1, M + 1),      /* cu_seqlens; a drawn one is not ascending, see above */
+        /* Positions and cu_seqlens drawn as runs (`RAD_OPD_F_IDX_CU`, 0 .. M), which is the one
+         * batch a drawn case can make legal here: the work list's bounds come off the positions
+         * (`lo`, `hi`, and the `k` row a block reads is `t0 + first - p0`), so a token at a
+         * position the step does not hold sends the gather past `k`'s rows -- measured on gfx1201
+         * as a GPU memory fault in rad-kbench's draw of a uniform one. */
+        opd_idx(M, 1, M, -1, RAD_OPD_F_IDX_CU),
+        opd_idx(s + 1, 1, M + 1, -1, RAD_OPD_F_IDX_CU),
         opd(D, s, 1, g, n),            /* the tail state, [slots, heads, ring, n] */
         opd_idx(s, 1, s),              /* the state row, one column */
         opd_idx(s, W, W),              /* the block-key block table */
         opd((uint32_t)RAD_F32, n, n),  /* wv */
         opd((uint32_t)RAD_F32, n, n),  /* wg */
         opd((uint32_t)RAD_F32, r, n),  /* ape */
-        opd((uint32_t)RAD_F32, n, 1),  /* gain */
-        opd_none(),                    /* rope: the one-component form */
+        opd((uint32_t)RAD_F32, n),     /* gain: one row, as the kernel reads it */
+        im ? opd_idx(3, M, M) : opd_none(),   /* rope: the step's three planes, or none */
         opd((uint32_t)RAD_I32, W),     /* page */
-        opd((uint32_t)RAD_I32, W),     /* bpos */
+        im ? opd_idx(W, 3, M) : opd_idx(W, 0, M),   /* bpos: [work, 3] under M-RoPE */
         opd((uint32_t)RAD_I32, s),     /* nc */
         opd(D, W, 1, r, n / r),        /* cache: the pool's page, at most `work` of them */
     };
