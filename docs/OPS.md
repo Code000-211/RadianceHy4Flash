@@ -2167,6 +2167,7 @@ The VAEs' convolutions are `conv3d_ndhwc` with `tpad` and the audio VAE's `conv2
 | `moe_scatter` | `M`(range) `n_expert` `top_k` `expert_base`/opt `protect`:str/opt | `expert_ids` → `sorted_tok`, `expert_offset`, `expert_count` |
 | `router_topk_scatter` | `M`(range) `n_expert` `n_local`/opt `top_k` `norm` `dtype` `expert_base`/opt `protect`:str/opt | `logits` → `expert_ids`, `expert_w`, `sorted_tok`, `expert_offset`, `expert_count` |
 | `router_gemm_topk_scatter` | `M`(range) `K` `n_expert` `n_local`/opt `top_k` `norm` `dtype` `expert_base`/opt `protect`:str/opt | `a`, `b`w, `gate_b`w? → `logits`, `expert_ids`, `expert_w`, `sorted_tok`, `expert_offset`, `expert_count`, `gate`? |
+| `router_gemm_sigmoid_scatter` | `M`(range) `K` `n_expert` `n_local`/opt `top_k` `weight_bf16`/opt `norm` `route_scale`:f64 `dtype` `expert_base`/opt `protect`:str/opt | `x`, `weight`w, `bias`w → `logits`, `ids`, `weights`, `sorted_tok`, `expert_offset`, `expert_count`, `gate`?, `inverse`? |
 | `moe_gemm` | `M`(range) `N` `K` `n_expert` `top_k` `a_order` `dtype` | `a`, `w`wt, `sorted_tok`, `expert_offset` → `y` |
 | `router_sigmoid_topk` | `M`(range) `n_expert` `top_k` `norm` `route_scale`:f64 `dtype` | `logits`, `bias`w → `ids`, `weights` |
 | `router_sigmoid_group_topk` | `M`(range) `n_expert` `top_k` `n_group` `topk_group` `norm` `route_scale`:f64 `dtype` | `logits`, `bias`w → `ids`, `weights` |
@@ -2361,6 +2362,16 @@ separate launches write, including a row with fewer than `top_k` non-NaN ranks (
 whose empty slots carry expert 0 into the sort as `ids` does (`r4d_selftest`). Bounded like
 `router_topk_scatter` (`M * top_k <= 1024`, one workgroup) and refused past it. With `inverse` the
 sort is `moe_scatter_inv`'s.
+
+**`router_gemm_sigmoid_scatter`** (device-only) is `gemm_nt_f32` -- the router's `x` `[M, K]` by
+`weight` `[n_expert, K]`, `weight_bf16` telling how the weight is stored -- and
+`router_sigmoid_topk_scatter` over the logits it writes, in one launch. Every block computes its
+share of the projection with `gemm_nt_f32`'s own tile, whose per-lane k order and butterfly do not
+depend on the geometry that feeds it, so `logits` is that GEMM's bytes; the workgroup whose arrival
+completes the grid then reads them back and ranks the pass's rows, so `ids`, `weights`, the sort,
+the ungated shared gate's fill and the inverse are that launch's bytes too. `logits` is written and
+read inside this launch. Decode only: `M` up to 64 and `M * top_k` inside the sort's single
+workgroup (at most 1024), and a pass past either is refused rather than served at another cost.
 
 **`moe_scatter_inv`** and **`moe_gather_inv`** (device-only) are `moe_scatter` and `moe_gather`
 with the gather's slot table passed between them. `inverse` `[M * top_k]` holds, for slot
