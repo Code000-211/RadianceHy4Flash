@@ -1586,6 +1586,79 @@ TEST(quantised_trunk_linears_share_one_quantiser_an_input) {
     }
 }
 
+/* A library that serves neither the router's projection nor its selection fused. */
+void no_router_gemm_fuse_encs(RadBuilder* b) {
+    int8_trunk_encs(b);
+    b->undeclared.insert("router_gemm_sigmoid_scatter");
+}
+
+/* K-10: the router's projection and the selection it feeds are one launch where a library serves
+ * it (MoeFP8's op_sigmoid_gemm), so at a decode height neither the projection's own GEMM nor the
+ * selection's row is issued; the wider passes -- and a library without the row -- keep the pair.
+ * The row is declared once per MoE layer whatever the height, at this model's own widths. */
+TEST(the_router_projection_joins_its_selection_where_a_library_serves_it) {
+    struct Run { const char* what; int dq, pq, world; bool plain, off;
+                 int fused, scatter, topk; };
+    /* Two MoE layers of the mini model (the third is dense). 96 rows stay inside the selection's
+     * own bound (top_k * rows <= 1024 at a declared 256) and past the fused row's 64. `plain` is
+     * the bf16 trunk, for the ranks the mini's quantised experts do not split over; `off` is a
+     * library that does not serve the fused row at all. */
+    const Run runs[] = {
+        { "decode 1 row", 1, 0, 1, false, false, 2, 0, 0 },
+        { "decode 6 rows", 6, 0, 1, false, false, 2, 0, 0 },
+        { "TP2 decode", 4, 0, 2, true, false, 2, 0, 0 },
+        { "prefill 96 rows", 0, 96, 1, false, false, 0, 2, 0 },
+        { "decode, no library row", 1, 0, 1, false, true, 0, 2, 0 },
+    };
+    for (const Run& r : runs) {
+        fprintf(stderr, "run %s\n", r.what);
+        Declared d(r.off ? no_router_gemm_fuse_encs : (r.plain ? bf16_encs : int8_trunk_encs),
+                  r.world, 0);
+        REQUIRE_EQ(d.rc, RAD_OK);
+        const RecOp* o = find_op(d.b, "router_gemm_sigmoid_scatter");
+        if (r.off) {
+            CHECK(o == nullptr);
+        } else {
+            REQUIRE(o != nullptr);
+            CHECK_EQ(count_op(d.b, "router_gemm_sigmoid_scatter"), 2);
+            CHECK_EQ(pint(o, "K"), 128);             /* n_embd */
+            CHECK_EQ(pint(o, "n_expert"), 4);
+            CHECK_EQ(pint(o, "top_k"), 2);
+            CHECK_EQ(pint(o, "weight_bf16"), 1);     /* the mini's router weight is bf16 */
+            CHECK_EQ(pint(o, "norm"), 1);
+            CHECK(pflt(o, "route_scale") > 3.99 && pflt(o, "route_scale") < 4.0);
+            CHECK_EQ(pstr(o, "dtype"), std::string("f32"));
+            CHECK_EQ((int)o->w.size(), 2);            /* the projection and the correction */
+        }
+        /* The projection's own GEMM is the one writing the router's logits. */
+        const rad_buf lg = buf_named(d.b, "moe.router_logits");
+        REQUIRE(lg != 0);
+        std::vector<rad_op> proj;
+        for (size_t i = 0; i < d.b.ops.size(); ++i) {
+            const RecOp& p = d.b.ops[i];
+            bool writes_lg = false;
+            for (rad_buf w : p.writes) writes_lg |= w == lg;
+            if (p.op == "gemm_nt_f32" && writes_lg) proj.push_back((rad_op)(i + 1));
+        }
+        CHECK_EQ((int)proj.size(), 2);
+        auto k = kit(d.b, std::vector<int>((size_t)r.dq, 1),
+                     r.pq ? std::vector<int>{ r.pq } : std::vector<int>{});
+        RadCtx c{ .b = &d.b, .batch = &k->b };
+        hyv4flash::step(&c, &k->b);
+        CHECK(c.step_fail.empty());
+        CHECK_LINT(d.b, &c);
+        CHECK_EQ(count_issued(d.b, c, "router_gemm_sigmoid_scatter"), r.fused);
+        CHECK_EQ(count_issued(d.b, c, "router_sigmoid_topk_scatter"), r.scatter);
+        CHECK_EQ(count_issued(d.b, c, "router_sigmoid_topk"), r.topk);
+        int issued_proj = 0;
+        for (const auto& issue : c.issues)
+            for (rad_op h : proj) issued_proj += issue.op == h;
+        CHECK_EQ(issued_proj, r.fused ? 0 : 2);
+        every_weight_read(d.b);
+        steps_clean_at(d.b, 0, r.world);
+    }
+}
+
 /* q_nope and q_rope rotated int8 of one form at a q_lora of whole 128 groups: the q residual's norm
  * writes their codes in its pass (rmsnorm_had_quant_i8g) from q_a's raw output, so neither has a
  * quantiser; on a CPU engine q_nope quantises the normed residual once and q_rope reads its codes. */
