@@ -3474,6 +3474,12 @@ state   = the chunk's last `ring` keys, when the chunk fits
 - **It is `qsa_work` + `idx_pool_gated` + `qsa_tail_store` byte for byte**, and the caller may issue
   it where it issued those three. `page`, `bpos` and `nc` are `qsa_work`'s, `cache` is the pool's,
   and `state` is the store's.
+- **It declares that chain**, so the repository's fusion oracle (`r4d_selftest`, rad-kbench's fusion
+  check) runs the three unfused ops over the same inputs and memcmps the result: `qsa_work` with
+  its `stage` a temporary, the pool over that temporary with `bpos` as its positions and no `out`,
+  then the store. A geometry whose step could outgrow the tail bound below is declined there (the
+  hook cannot see per-sequence row counts, and the kernel left those rows to the caller), and so is
+  a geometry without `cache`, which has nowhere for the pooled key to go.
 - **The three ops' operands keep their meanings.** `k` and `state` are the gather's two sources,
   `rope` is `qsa_work`'s M-RoPE planes, `page`/`bpos`/`nc` its outputs. The pool's `page` is not an
   operand here: the item's destination comes off `bt` and `page`, both already in hand.

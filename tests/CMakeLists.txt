@@ -49,7 +49,9 @@ set(RAD_TESTS_WITH_LEGACY chatparse_test chatparse_gemma4_test)
 # r4d_ar_links_test checks libr4d's header-only link reader, so it needs only the include path.
 # relayout_iqr_test holds the IQR relayout to the stored form r4d_iqr.h describes, so it also
 # compiles r4d_iqr_layout.cpp.
-set(RAD_TESTS_WITH_R4D_HOST relayout_parity_test r4d_ar_links_test relayout_iqr_test)
+# r4d_fuse_test holds the chains libr4d's fused rows declare (r4d_fuse.cpp) to their steps' ops and
+# operands, so it compiles r4d_fuse.cpp too.
+set(RAD_TESTS_WITH_R4D_HOST relayout_parity_test r4d_ar_links_test relayout_iqr_test r4d_fuse_test)
 # Their relayouts' vector loops, at every CPU level (libr4d/r4d_hsimd.h), built for these tests
 # whether or not libr4d itself is.
 include(${CMAKE_SOURCE_DIR}/cmake/RadSimdLevels.cmake)
@@ -238,6 +240,11 @@ foreach(t ${RAD_TESTS})
     endif()
     if(n STREQUAL relayout_iqr_test)
       target_sources(${n} PRIVATE ${CMAKE_SOURCE_DIR}/libr4d/r4d_iqr_layout.cpp)
+    endif()
+    # r4d_fuse_test calls libr4d's `replaces` hooks: the chains a fused row publishes, which is
+    # what r4d_selftest and rad-kbench's fusion oracle declare and run (abi/rad_abi.h, RadFuseFn).
+    if(n STREQUAL r4d_fuse_test)
+      target_sources(${n} PRIVATE ${CMAKE_SOURCE_DIR}/libr4d/r4d_fuse.cpp)
     endif()
   elseif(n IN_LIST RAD_TESTS_WITH_PACK)
     add_executable(${n} ${t} ${CMAKE_SOURCE_DIR}/arch/minimaxh3/rad_ref2va_pack.cpp)

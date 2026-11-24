@@ -10110,7 +10110,9 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
 /* K-24: the three above joined -- qsa_work's gather, this pool and the tail's store -- so a decode
  * step is one launch where it was three. One workgroup an item of the work list, four from 16
  * items up. Nothing rounded differently: the same gather, the same shared arithmetic and the same
- * row copy, hence the same bytes. */
+ * row copy, hence the same bytes. It declares that chain (r4d_fuse_qsa_work_pool_tail), so a caller
+ * runs the three unfused ops beside it and memcmps the result -- over the row's own tail bound,
+ * where the kernel leaves the store to the caller, the chain declines the geometry instead. */
 { "qsa_work_pool_tail_bf16", "qsa_work_pool_tail", "attn",
   "the indexer's key side in one launch: gather the blocks this step completes out of `k` and the "
   "tail state, pool each into its group key, and park the chunk's last `ring` keys in the tail",
@@ -10123,7 +10125,7 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cQsaWorkPoolTail), NOTUNE,
   nullptr, nullptr, r4d_rad_qsa_work_pool_tail, nullptr, nullptr, nullptr,
-  r4d_shape_qsa_work_pool_tail },
+  r4d_shape_qsa_work_pool_tail, nullptr, r4d_fuse_qsa_work_pool_tail },
 
 /* The Hy4-flash indexer's score: 16 heads of relu(q . key) per group key, one wave a row against 16
  * keys on WMMA (heads as the tile's rows), summed in libref's order. */
