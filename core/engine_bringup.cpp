@@ -1660,6 +1660,11 @@ int Engine::declare() {
     short_from_    = cfg_.draft_short_from >= 0 ? cfg_.draft_short_from : (tree_ ? 2 : 0);
     drafter_short_ = drafter_.kind == RAD_DRAFT_BLOCK && short_from_ > 0
                    ? p0.drafter_short_block : 0;
+    /* The block a step's chain is staged at (rad_drafter_any_block, D-07): only a chain's, and it
+     * runs only with the depth rule (block_shape), which is the one thing that knows the rounds a
+     * step will verify before its block is proposed. A tree's nodes are not a prefix of a shorter
+     * pass's, so a tree keeps its block. */
+    drafter_any_block_ = drafter_.kind == RAD_DRAFT_BLOCK && !tree_ ? p0.drafter_any_block : 0;
     if (cfg_.draft_short_from > 0 && drafter_.kind == RAD_DRAFT_NONE)
         RAD_WARN("--draft-short-from %lld: this deployment runs no drafter, so there is no block "
                  "to shorten", (long long)cfg_.draft_short_from);
@@ -1685,6 +1690,11 @@ int Engine::declare() {
         RAD_INFO("speculation: '%s' proposes a tree of %d node(s); each verify follows the deepest "
                  "path the target agrees with, and that path's K and V move into place",
                  drafter_.name, drafter_.depth);
+    if (drafter_any_block_ && cfg_.draft_depth_adaptive)
+        RAD_INFO("speculation: '%s' serves any block of %lld..%lld row(s), so a step's chain runs "
+                 "the rounds the depth rule took on the last step plus one, not the whole block",
+                 drafter_name_.c_str(), (long long)drafter_any_block_,
+                 (long long)(drafter_.block > 0 ? drafter_.block : drafter_.depth + 1));
     if (cfg_.spec_ngram > 0 && drafter_.kind != RAD_DRAFT_NONE) {
         RAD_ERR("--spec-ngram drafts by prompt lookup alone, and this container declares the draft "
                 "head '%s'; serve it with --num-speculative-tokens N, where prompt lookup fills in "

@@ -613,6 +613,11 @@ private:
     /* The block drafter's shorter block (rad_drafter_short_block), 0 when it has none or will not
      * run it (--draft-short-from 0, or auto for a chain). */
     int64_t              drafter_short_ = 0;
+    /* The shortest block the drafter serves besides its own (rad_drafter_any_block), 0 when it
+     * serves only its own and its short one. With it the chain is staged at the rounds the depth
+     * rule can take (D-07, block_shape); a tree keeps its whole block, whose nodes are not a
+     * prefix of a shorter pass's. */
+    int64_t              drafter_any_block_ = 0;
     bool                 short_on_ = false;     /* the short block runs now (block_shape) */
     /* --draft-short-from resolved at bring-up (auto: 0 for a chain, 2 for a tree). */
     int64_t              short_from_ = 0;

@@ -1067,15 +1067,34 @@ void Engine::block_shape(int* block, int* steps) {
     /* Its short block under load (rad_drafter_short_block): the same anchor convention, so as many
      * fewer proposals as rows. The load is the step just run's, which the next step, the one these
      * proposals are for, mostly repeats (Scheduler::short_block_on). */
-    if (drafter_short_ <= 0) return;
-    short_on_ = Scheduler::short_block_on(short_on_, sched_.decoded_seqs(), short_from_);
-    if (short_on_) {
-        /* A tree (rad_drafter_tree) grows a tree of its own over the shorter pass, at most its
-         * draft positions of nodes (DFlash2 attends across its block, so the short pass is not the
-         * full pass's prefix); the verify takes that many. */
-        if (tree_) *steps = std::min(*steps, (int)drafter_short_ - 1);
-        else       *steps -= *block - (int)drafter_short_;
-        *block  = (int)drafter_short_;
+    if (drafter_short_ > 0) {
+        short_on_ = Scheduler::short_block_on(short_on_, sched_.decoded_seqs(), short_from_);
+        if (short_on_) {
+            /* A tree (rad_drafter_tree) grows a tree of its own over the shorter pass, at most its
+             * draft positions of nodes (DFlash2 attends across its block, so the short pass is not
+             * the full pass's prefix); the verify takes that many. */
+            if (tree_) *steps = std::min(*steps, (int)drafter_short_ - 1);
+            else       *steps -= *block - (int)drafter_short_;
+            *block  = (int)drafter_short_;
+        }
+    }
+    /* The rounds the depth rule can take (D-07, L5b): a block drafter that serves any block
+     * (rad_drafter_any_block) proposes its chain whole in one pass, so a round past the depth the
+     * rule takes this step is a head pass and a correction the verify never reads. The last step's
+     * decision counts the rounds this one runs, one round past its deepest row
+     * (Scheduler::chain_rounds), never below the rounds the rule always takes or the shortest chain
+     * the drafter serves. It is a function of the past, like the rule's own statistic, so a token
+     * is never different; a step whose rule grows by more than one round drafts and verifies a
+     * shorter prefix, which is fewer tokens a step. A greedy row has no law and takes the whole
+     * block, so a step that drafts only for greedy requests keeps the block at the declared depth
+     * (the first decision is the whole block, and a later one grows it back by a round a step). */
+    if (drafter_any_block_ > 0 && depth_cfg_.on) {
+        const int rounds = (int)Scheduler::chain_rounds(*steps, depth_last_, depth_cfg_.min,
+                                                        drafter_any_block_);
+        if (rounds < *steps) {
+            *steps = rounds;
+            *block = rounds + 1;
+        }
     }
 }
 
