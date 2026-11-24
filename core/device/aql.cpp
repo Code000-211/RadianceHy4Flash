@@ -811,6 +811,16 @@ void dump_queues(const char* where) {
         }
         RAD_ERR("  device %d queue %p: written %" PRIu64 ", read %" PRIu64 " -> %s", s->ord,
                 (void*)s->q, wr, rd, what.c_str());
+        /* DIAG(hy4-tp2-hang): the chain accounting at the stall — distinguishes a counter that is
+         * genuinely short (a kernel's blocks never counted) from a host read that lags. */
+        RAD_ERR("    chain: issued=%llu seen=%llu ctr=%llu flush_target=%llu flush_out=%d "
+                "gates=%u peer=%u plain=%u prev_chain=%d slot_need[rd]=%llu",
+                (unsigned long long)s->chain_issued, (unsigned long long)s->chain_seen,
+                (unsigned long long)__atomic_load_n(s->chain_ctr, __ATOMIC_RELAXED),
+                (unsigned long long)s->flush_target, (int)s->flush_out,
+                (unsigned)s->gates.load(), (int)s->peer_inflight,
+                (int)s->plain_inflight, (int)s->prev_chained,
+                (unsigned long long)s->slot_need[rd & s->mask]);
     }
     if (g_dump_lanes) g_dump_lanes();
 }
