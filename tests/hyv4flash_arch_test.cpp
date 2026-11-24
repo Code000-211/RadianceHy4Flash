@@ -512,6 +512,42 @@ TEST(k24_the_key_side_is_one_op_and_its_tail_store_only_past_the_ring) {
     }
 }
 
+/* K-24, the other side of the same switch: the fused key side is one library's row, not a property
+ * of the model, so a library that does not carry it (libref, libavx, a libr4d older than the
+ * kernel) must still get a hyv4flash that declares -- and it declares the three ops, which are the
+ * reference path (docs/OPS.md). The fused op is asked for only where one serves it
+ * (rad_op_declared), which is why hyv4flash_convert_test declares on the host backend at all. */
+TEST(k24_a_library_without_the_fused_key_side_keeps_the_three_ops) {
+    RadBuilder b;
+    bf16_encs(&b);
+    b.undeclared.insert("qsa_work_pool_tail");
+    auto mk = mini_meta();
+    auto ctx = build_ctx();
+    REQUIRE_EQ(hyv4flash::declare(&b, mk.meta(), &ctx), RAD_OK);
+    const auto& last = hyv4flash::models[0]->layers.back();
+    CHECK_EQ(last.ix.op_front, (rad_op)0);
+    REQUIRE(last.ix.op_work != 0);
+    REQUIRE(last.ix.op_pool != 0);
+    REQUIRE(last.ix.op_tail != 0);
+    auto k = kit(b, {}, { 1 });
+    RadCtx c{ .b = &b, .batch = &k->b };
+    hyv4flash::step(&c, &k->b);
+    CHECK(c.step_fail.empty());
+    CHECK_LINT(b, &c);
+    CHECK_EQ(issue_of(b, c, "qsa_work_pool_tail"), nullptr);
+    const RecIssue* w = issue_of(b, c, "qsa_work");
+    const RecIssue* p = issue_of(b, c, "idx_pool_gated");
+    REQUIRE(w != nullptr);
+    REQUIRE(p != nullptr);
+    /* the pool is issued over the work list qsa_work filled in, which is what the fused op does in
+     * shared memory instead */
+    CHECK(w->opd[7].handle == p->opd[0].handle);
+    CHECK(p->opd[5].handle == w->opd[9].handle);   /* its positions are qsa_work's bpos */
+    CHECK(p->opd[6].handle == w->opd[8].handle);   /* and its page, qsa_work's page */
+    /* and the tail's rows are copied beside them, as before K-24 */
+    CHECK(issue_of(b, c, "qsa_tail_store") != nullptr);
+}
+
 TEST(compact_dense_prefill_keeps_full_keys_and_restores_gather_indices) {
     Declared d;
     REQUIRE_EQ(d.rc, RAD_OK);

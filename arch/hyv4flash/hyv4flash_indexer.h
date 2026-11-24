@@ -168,8 +168,12 @@ struct Indexer {
          * and the tail rows qsa_tail_store would copy -- is one op, one launch a step where there
          * were three (qsa_work, idx_pool_gated, qsa_tail_store). The fp8 and int8 indexers keep the
          * three: they pool through the Hadamard into packed codes rather than into the bf16 cache.
-         * A tapped program keeps them too, since its tap reads qsa_work's `stage`. */
-        const bool fused_key_side = !s.ix_fp8 && !taps_on();
+         * A tapped program keeps them too, since its tap reads qsa_work's `stage`. A kernel library
+         * that does not carry this row -- libref, libavx, a libr4d older than it -- keeps them as
+         * well: `rad_op_declared` says whether one does, so the architecture still declares there
+         * (the three ops are the reference path, docs/OPS.md). */
+        const bool fused_key_side =
+            !s.ix_fp8 && !taps_on() && rad_op_declared(b, "qsa_work_pool_tail");
         if (fused_key_side) {
             op_front = s.mrope
                 ? mk(b, "qsa_work_pool_tail",
@@ -188,7 +192,11 @@ struct Indexer {
                        RAD_INT("block_size", r), RAD_STR("dtype", "bf16") },
                      { wv, wg, ape, pool_gain }, { w.tk }, { w.page, w.bpos, w.nc });
             HY4_NEED(op_front, "qsa_work_pool_tail");
-        } else {
+            /* Declared, but a library may not serve this geometry (rad_op_resolved); the three-op
+             * path below is the answer there as it is where the op is missing altogether. */
+            if (!rad_op_resolved(b, op_front)) op_front = 0;
+        }
+        if (!op_front) {
             op_work = mk(b, "qsa_work",
                          { RAD_RANGE("M", 1, T), RAD_INT("n", D), RAD_INT("ratio", r),
                            RAD_INT("ring", w.ring), RAD_INT("seqs", g.max_seqs),

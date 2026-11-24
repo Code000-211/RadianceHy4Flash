@@ -3206,6 +3206,8 @@ kernels), and libavx all five for the host path. `kv_resolve` sits between the l
 attention when the group's KV streams; it is described below, after `qsa_select`.
 `qsa_work_pool_tail` is not a sixth step: it is `qsa_work`, `idx_pool_gated` and `qsa_tail_store`
 in one launch for the exact key path, and has no libref row of its own (the three are its oracle).
+An architecture asks for it only where a loaded library serves it (`rad_op_declared`,
+`abi/rad_builder.h`), so the reference and host backends keep the three.
 
 ### `qsa_block_key`
 
@@ -3491,7 +3493,7 @@ state   = the chunk's last `ring` keys, when the chunk fits
   every gather of the step. A caller that cannot bound a chunk keeps `qsa_tail_store` uncondition-
   ally; a wrong bound is silent.
 - **The fp8 and int8 indexers and a tapped step keep the three ops**, because they read `qsa_work`'s
-  staged keys, and this op writes none.
+  staged keys, and this op writes none; so does a library that does not carry it.
 
 ### GLM-5.3's indexer and latent attention
 
