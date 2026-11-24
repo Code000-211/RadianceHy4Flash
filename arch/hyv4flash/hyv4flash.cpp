@@ -1270,6 +1270,7 @@ static StepPlan plan(const Model& m, const RadBatch* batch) {
 static bool head_reads_all_rows(const RadBatch* batch, const StepPlan& p) {
     return batch->n_out == p.T && p.D == p.S && p.DT == p.T;
 }
+
 /* The compact pass reads its rows [0, DT) as the batch's decode rows: paged() hands them the
  * batch's block table, seqused and decode bounds, and the stable instance. The derivation keeps
  * every decode row (d_prefill_tail); a tail whose kept rows do not start with exactly those runs
@@ -1545,6 +1546,12 @@ static int probe(const RadModelMeta* meta, RadArchProbe* out) {
     out->draft_depth_fixed = top(meta, "dfly_num_hidden_layers", 0) > 0 ? 1 : 0;
     out->chain_pays = RAD_CHAIN_ALWAYS;
     out->kv_stream_ok = 1;
+    /* S-02: whether this step can run the trunk over a layer range and resume the next sub-step
+     * from a persistent set. S-02a only wires the report: the step still runs the whole trunk and
+     * declares no such set (RadBuildCtx::layer_slices), so it must say 0 and a --chunk-slices
+     * request keeps m = 1. S-02b declares the set and reports 1 here when the trunk can stop
+     * between two layers (no taps, no calibration window). */
+    out->slice_layers_ok = 0;
     /* declare() honours RadBuildCtx::shape_probe (probe_model above): the core sizes the arena's
      * levels, lends their tops to the expert slab and arms the prefill stager. */
     {   /* RADIANCE_HY4_SHAPE_PROBE=0: no sizing declares (an A/B switch, hy4-perf). */

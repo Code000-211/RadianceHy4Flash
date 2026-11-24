@@ -135,7 +135,8 @@ void router_scatter_cases(std::mt19937& rng, int& cases, int& fails) {
         { 100, 288, 8, 0, 0, 0, 0, nullptr, true },    { 128, 288, 8, 1, 0, 0, 0, nullptr, true },
         { 24, 288, 8, 1, 0, 144, 144, nullptr, true }, { 24, 288, 8, 1, 1, 96, 32, "3,7,90", true },
         { 48, 512, 8, 1, 0, 0, 0, nullptr, true },     { 32, 32, 32, 0, 1, 0, 0, nullptr, true },
-        { 5, 300, 10, 1, 2, 0, 0, "0,299", true },
+        { 8, 512, 16, 1, 0, 0, 0, nullptr, true },     { 9, 512, 16, 1, 1, 0, 0, nullptr, true },
+        { 16, 512, 16, 1, 2, 0, 0, nullptr, true },    { 5, 300, 10, 1, 2, 0, 0, "0,299", true },
     };
     std::uniform_int_distribution<int> ud(-1000, 1000);
     for (const RouterShape& sh : shapes) {

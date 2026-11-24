@@ -38953,8 +38953,9 @@ static void usage(void) {
                 "             one card, here and in the eight-rank exact all-reduces' cases.\n"
                 "  --perfmhcpre M [iters]:  mhc_pre (whole, partials alone, finish alone) and\n"
                 "             mhc_post at GLM's shape, 16-byte rows against pitched ones.\n"
-                "  --perfrouter M [iters]:  router_sigmoid_topk at GLM's shape (288 experts, top 8),\n"
-                "             the wave-per-row select timed.\n"
+                "  --perfrouter M [iters] [ne k]:  router_sigmoid_topk, the wave-per-row select\n"
+                "             timed at GLM's shape (288 experts, top 8) unless ne and k are given\n"
+                "             (Hy4-flash's 512 experts, top 16).\n"
                 "  --perfmoefuse M [iters]:  GLM's decode fusions of the MoE block at M token\n"
                 "             rows (288 experts, top 8, TP8 widths), each against the separate\n"
                 "             launches it replaces: time of both and a byte comparison of every\n"
@@ -39043,7 +39044,7 @@ int main(int argc, char** argv) {
     const char* ar8_w = nullptr;
     long long mhc_m = 0;
     int mhc_it = 200;
-    long long rt_m = 0;
+    long long rt_m = 0, rt_ne = 288, rt_k = 8;
     int rt_it = 200;
     long long mf_m = 0;
     int mf_it = 200;
@@ -39260,6 +39261,10 @@ int main(int argc, char** argv) {
             if (i + 1 >= argc) { usage(); return 2; }
             rt_m = std::strtoll(argv[++i], nullptr, 0);
             if (i + 1 < argc && argv[i + 1][0] != 0x2d) rt_it = (int)std::strtol(argv[++i], nullptr, 0);
+            if (i + 2 < argc && argv[i + 1][0] != 0x2d && argv[i + 2][0] != 0x2d) {
+                rt_ne = std::strtoll(argv[++i], nullptr, 0);
+                rt_k = std::strtoll(argv[++i], nullptr, 0);
+            }
         } else if (!std::strcmp(argv[i], "--perfmoefuse")) {
             if (i + 1 >= argc) { usage(); return 2; }
             mf_m = std::strtoll(argv[++i], nullptr, 0);
@@ -39525,7 +39530,7 @@ int main(int argc, char** argv) {
     if (rt_m) {
         if (!load(&pl, path)) return 1;
 #ifdef RAD_HAVE_HIP
-        router_select(pl, rt_m, 288, 8, 1, false, rt_it);
+        router_select(pl, rt_m, rt_ne, rt_k, 1, false, rt_it);
         dfree_all();
 #else
         skip("router timing", "built without HIP");

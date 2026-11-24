@@ -10323,3 +10323,589 @@ TEST(a_block_drafters_rows_are_issued_ahead_with_their_own_prefix_unless_a_seque
     }
 }
 
+
+/* ================================================================== a chunk planned in layer slices (S-02) */
+
+/* A trunk of `L` layers whose plugin reports it can run the trunk over a layer range
+ * (RadArchProbe::slice_layers_ok, which the engine reads into cfg.slice_layers_ok), a decoder, and a
+ * chunk of up to 512 rows: the mixed step a chunk group starts on. No state checkpoints, so a
+ * prompt's chunk is a whole 512 rows and its last one emits the token (a tail snapshot would cut
+ * the last quantum off it). */
+static void slice_fixture(Fixture& f, int64_t slices, int32_t L = 8) {
+    f.build(16384, 64, 512, 16384, /*windowed=*/false, /*linear=*/false);
+    f.prog.meta.n_layers = L;
+    f.cfg.checkpoint_interval = 0;
+    f.cfg.chunk_slices = slices;
+    f.cfg.slice_layers_ok = true;
+}
+
+/* A decoder (its prompt already committed, so it decodes) beside a `prompt`-row chunk, stepped
+ * once. The chunk is a multiple of the quantum: the step's budget is cfg.max_tok rows and the
+ * decode row takes one, so a 496-row prompt is what a chunk completes. The learned step costs are seeded between the two steps, standing in for step_finished. */
+static const RadBatch* slice_start(Fixture& f, uint64_t* dec, uint64_t* chunk, int prompt = 496,
+                                   double chunk_s = 0.0, double decode_s = 0.0) {
+    *dec = f.submit(100, 512);
+    if (!f.sch.step()) return nullptr;
+    f.commit_plain(11);
+    if (chunk_s > 0.0) f.sch.note_step_cost(true, chunk_s);
+    if (decode_s > 0.0) f.sch.note_step_cost(false, decode_s);
+    *chunk = f.submit(prompt, 64);
+    return f.sch.step();
+}
+
+/* Drive the chunk group the open step belongs to to its last slice: plan the next sub-step ahead,
+ * commit this one, promote. Checks every sub-step's layer range and the plan it becomes. */
+static void run_group(Fixture& f, int32_t m, int32_t L) {
+    for (int32_t j = 0; j < m; ++j) {
+        const RadBatch* nb = f.sch.step_next();
+        if (j + 1 < m) {
+            REQUIRE(nb != nullptr);
+            CHECK_EQ(nb->layer_lo, (int32_t)(((int64_t)(j + 1) * L) / m));
+            CHECK_EQ(nb->layer_hi, (int32_t)(((int64_t)(j + 2) * L) / m));
+            CHECK_EQ(nb->n_seq, 2);          /* the frozen decode row, the chunk row */
+            CHECK_EQ(f.sch.next_prefill_first_layer(/*next_plan=*/true),
+                     j + 2 == m ? 0 : nb->layer_hi);
+        } else {
+            /* nothing left to slice: no step is planned ahead of the group's last sub-step */
+            CHECK(nb == nullptr);
+        }
+        f.commit_plain(20 + j);
+        if (j + 1 < m) {
+            f.sch.promote_next();
+            CHECK_EQ(f.sch.plan().slice_j, j + 1);
+            CHECK_EQ(f.sch.plan().slice_last, j + 1 == m - 1);
+            CHECK_EQ(f.sch.plan().layer_lo, nb->layer_lo);
+            CHECK_EQ(f.sch.plan().layer_hi, nb->layer_hi);
+        }
+    }
+}
+
+TEST(a_chunk_beside_a_decoder_is_planned_as_layer_slices) {
+    Fixture f;
+    slice_fixture(f, /*slices=*/4);
+    CHECK_OK(f.start());
+    uint64_t d = 0, p = 0;
+    const RadBatch* b = slice_start(f, &d, &p);
+    REQUIRE(b != nullptr);
+
+    const StepPlan& pl = f.sch.plan();
+    CHECK_EQ(pl.phase, RAD_PHASE_MIXED);
+    CHECK_EQ(pl.slice_m, 4);
+    CHECK_EQ(pl.slice_j, 0);
+    CHECK_EQ(pl.layer_lo, 0);
+    CHECK_EQ(pl.layer_hi, 2);          /* 8 layers over 4 slices */
+    CHECK(!pl.slice_last);
+    /* the frozen decode row first, the chunk last, and the chunk plans no token yet */
+    REQUIRE_EQ((int)pl.e.size(), 2);
+    CHECK(!pl.e[0].is_prefill);
+    CHECK(pl.e[0].produces_token);
+    CHECK(pl.e[1].is_prefill);
+    CHECK(!pl.e[1].produces_token);
+    const int32_t rows = pl.e[1].n_tokens;
+    CHECK(rows >= 128);
+    CHECK_EQ(f.sch.metrics().steps_sliced, (int64_t)1);
+    CHECK_EQ(f.sch.metrics().substeps, (int64_t)1);
+    /* the batch carries the range, and no checkpoint is staged before the last slice */
+    CHECK_EQ(b->layer_lo, 0);
+    CHECK_EQ(b->layer_hi, 2);
+    CHECK_EQ(b->n_checkpoints, 0);
+    /* the pass after this one starts where this one ended */
+    CHECK_EQ(f.sch.next_prefill_first_layer(), 2);
+
+    /* the chunk's own commit waits for the last slice */
+    for (int32_t j = 0; j < 4; ++j) {
+        const RadBatch* nb = f.sch.step_next();
+        if (j < 3) {
+            REQUIRE(nb != nullptr);
+            CHECK_EQ(nb->layer_lo, (int32_t)(((int64_t)(j + 1) * 8) / 4));
+            CHECK_EQ(nb->layer_hi, (int32_t)(((int64_t)(j + 2) * 8) / 4));
+            CHECK_EQ(nb->n_seq, 2);
+        } else {
+            CHECK(nb == nullptr);
+        }
+        f.commit_plain(12 + j);
+        CHECK_EQ(f.sch.find(p)->n_computed, j == 3 ? (int64_t)rows : (int64_t)0);
+        /* the token comes on the last slice, not before it */
+        CHECK_EQ(f.sch.find(p)->output.size(), j == 3 ? (size_t)1 : (size_t)0);
+        if (j < 3) f.sch.promote_next();
+    }
+    CHECK_EQ(f.sch.metrics().substeps, (int64_t)4);
+    /* the group is over: the chunk emitted one token, the decoder one a sub-step, and the chunk's
+     * rows were counted as prefill tokens once */
+    CHECK_EQ(f.sch.find(p)->output.size(), (size_t)1);
+    CHECK_EQ(f.sch.find(d)->output.size(), (size_t)5);
+    CHECK_EQ(f.sch.metrics().prefill_tokens, (int64_t)(100 + rows));
+    CHECK_EQ(f.sch.next_prefill_first_layer(), 0);
+    /* and the step after the group is planned normally */
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_EQ(f.sch.plan().slice_m, 0);
+}
+
+/* The m law (§2.2): --chunk-slices N fixes m; auto derives it from the learned costs, the target
+ * and the cost share. The layer boundaries are L_j = (j * L) / m. */
+TEST(the_slice_count_follows_the_m_law) {
+    struct Case {
+        const char* name;
+        int64_t slices;          /* cfg.chunk_slices: N, auto (-1), off (0) */
+        int32_t layers;          /* the trunk */
+        int32_t slice_ok;        /* the plugin's report (cfg.slice_layers_ok) */
+        double  chunk_s, decode_s;
+        int64_t target_ms, cost_pct;
+        int     prompt;
+        int32_t want;            /* m, or 0 for "not sliced" */
+    };
+    const Case cases[] = {
+        { "fixed 4",               4, 8, 1, 0.0,   0.0,    150, 10, 496, 4 },
+        { "fixed 8 capped by L",   8, 3, 1, 0.0,   0.0,    150, 10, 496, 3 },
+        { "auto: C 565 ms",       -1, 8, 1, 0.565, 0.0135, 150, 10, 496, 4 },
+        { "auto: C 1.2 s",        -1, 8, 1, 1.2,   0.0135, 150, 10, 496, 8 },
+        { "auto: D 50 ms",        -1, 8, 1, 0.565, 0.05,   150, 10, 496, 2 },
+        { "auto: cost_pct 0",     -1, 8, 1, 0.565, 0.0135, 150,  0, 496, 0 },
+        { "auto: target 600 ms",  -1, 8, 1, 0.565, 0.0135, 600, 10, 496, 0 },
+        { "auto: unmeasured",     -1, 8, 1, 0.0,   0.0,    150, 10, 496, 0 },
+        { "one layer",             4, 1, 1, 0.0,   0.0,    150, 10, 496, 0 },
+        { "no slice set",          4, 8, 0, 0.0,   0.0,    150, 10, 496, 0 },
+        { "off",                   0, 8, 1, 0.0,   0.0,    150, 10, 496, 0 },
+        { "64-row chunk",          4, 8, 1, 0.0,   0.0,    150, 10,  64, 0 },
+    };
+    for (const Case& c : cases) {
+        Fixture f;
+        slice_fixture(f, c.slices, c.layers);
+        f.cfg.chunk_slice_target_ms = c.target_ms;
+        f.cfg.chunk_slice_cost_pct = c.cost_pct;
+        f.cfg.slice_layers_ok = c.slice_ok != 0;
+        CHECK_OK(f.start());
+        uint64_t d = 0, p = 0;
+        const RadBatch* b = slice_start(f, &d, &p, c.prompt, c.chunk_s, c.decode_s);
+        if (b == nullptr || f.sch.plan().slice_m != c.want) fprintf(stderr, "  case: %s\n", c.name);
+        REQUIRE(b != nullptr);
+        CHECK_EQ(f.sch.plan().slice_m, c.want);
+        CHECK_EQ(f.sch.metrics().steps_sliced, c.want >= 2 ? (int64_t)1 : (int64_t)0);
+        if (c.want >= 2) {
+            /* the whole trunk, in m ranges of at least one layer each */
+            run_group(f, c.want, c.layers);
+            CHECK_EQ(f.sch.find(p)->n_computed, (int64_t)f.sch.find(p)->prompt.size());
+            CHECK_EQ(f.sch.find(p)->output.size(), (size_t)1);
+        }
+    }
+}
+
+/* --chunk-slices asks, but the scheduler plans by the plugin's report (RadArchProbe::slice_layers_ok,
+ * which Engine::declare reads into cfg.slice_layers_ok): a model whose trunk cannot be stopped
+ * between two layers keeps m = 1, runs the chunk whole, and the scheduler says why at init. */
+TEST(a_model_that_reports_no_layer_range_is_never_sliced) {
+    Fixture f;
+    slice_fixture(f, /*slices=*/4);
+    f.cfg.slice_layers_ok = false;              /* the plugin's RadArchProbe::slice_layers_ok = 0 */
+    const std::string logged = info_of([&] { CHECK_OK(f.start()); });
+    CHECK(has(logged, "no resumable layer range"));
+
+    uint64_t d = 0, p = 0;
+    const RadBatch* b = slice_start(f, &d, &p);
+    REQUIRE(b != nullptr);
+    CHECK_EQ(f.sch.plan().phase, RAD_PHASE_MIXED);
+    CHECK_EQ(f.sch.plan().slice_m, 0);
+    CHECK_EQ(f.sch.metrics().steps_sliced, (int64_t)0);
+    /* nothing is planned ahead of it: the one step runs the whole chunk */
+    CHECK(f.sch.step_next() == nullptr);
+    CHECK_EQ(f.sch.next_prefill_first_layer(), 0);
+    int32_t rows = 0;
+    for (const auto& e : f.sch.plan().e)
+        if (e.is_prefill) rows += (int32_t)e.n_tokens;
+    REQUIRE(rows > 0);
+    f.commit_plain(12);
+    CHECK_EQ(f.sch.find(p)->n_computed, (int64_t)rows);
+    CHECK_EQ(f.sch.find(p)->output.size(), (size_t)1);
+    CHECK_EQ(f.sch.metrics().substeps, (int64_t)0);
+}
+
+/* A prefill-only step is never sliced (there is no decoder to hand it to), and nor is one carrying
+ * two chunks: one group is the unit. */
+TEST(only_a_mixed_step_with_one_chunk_is_sliced) {
+    {
+        Fixture f;
+        slice_fixture(f, 4);
+        CHECK_OK(f.start());
+        const uint64_t p = f.submit(512, 64);
+        REQUIRE(f.sch.step() != nullptr);
+        CHECK_EQ(f.sch.plan().phase, RAD_PHASE_PREFILL);
+        CHECK_EQ(f.sch.plan().slice_m, 0);
+        CHECK_EQ(f.sch.metrics().steps_sliced, (int64_t)0);
+        CHECK_EQ(f.sch.find(p)->n_computed, (int64_t)0);
+    }
+    {
+        Fixture f;
+        slice_fixture(f, 4);
+        CHECK_OK(f.start());
+        const uint64_t d = f.submit(100, 512);
+        REQUIRE(f.sch.step() != nullptr);
+        f.commit_plain(11);
+        const uint64_t a = f.submit(512, 64);
+        const uint64_t b = f.submit(512, 64);
+        REQUIRE(f.sch.step() != nullptr);
+        CHECK_EQ(f.sch.plan().phase, RAD_PHASE_MIXED);
+        CHECK_EQ(f.sch.plan().slice_m, 0);      /* two chunks: no group */
+        CHECK_EQ(f.sch.metrics().steps_sliced, (int64_t)0);
+        CHECK_EQ(f.sch.find(a)->n_computed, (int64_t)0);
+        CHECK_EQ(f.sch.find(b)->n_computed, (int64_t)0);
+        CHECK_EQ(f.sch.find(d)->output.size(), (size_t)1);
+    }
+}
+
+/* A decoder that finishes inside the group keeps its slot, its blocks and its place in the batch:
+ * the chunk's row base may not move under it, and it is reaped once the last slice has committed. */
+TEST(a_decoder_that_finishes_inside_a_group_keeps_its_place_until_the_last_slice) {
+    Fixture f;
+    slice_fixture(f, 4);
+    CHECK_OK(f.start());
+    const uint64_t d = f.submit(100, 2);      /* its second token ends it */
+    REQUIRE(f.sch.step() != nullptr);
+    f.commit_plain(11);
+    REQUIRE_EQ(f.sch.find(d)->output.size(), (size_t)1);
+    const uint64_t p = f.submit(496, 64);
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_EQ(f.sch.plan().slice_m, 4);
+
+    for (int32_t j = 0; j < 4; ++j) {
+        const RadBatch* nb = f.sch.step_next();
+        if (j < 3) {
+            REQUIRE(nb != nullptr);
+            /* the same two rows in the same order: the chunk's base does not move */
+            REQUIRE_EQ(nb->n_seq, 2);
+            CHECK_EQ((int)nb->q_lens[0], 1);
+            CHECK_EQ(nb->layer_lo, (int32_t)(((int64_t)(j + 1) * 8) / 4));
+        }
+        f.commit_plain(12 + j);               /* the first slice's token ends d */
+        if (j == 0) {
+            /* the server drains the finished sink and reaps, which the group defers: the slot,
+             * its blocks and its place in the batch are still the next sub-step's */
+            CHECK_EQ(f.sch.reap(d), RAD_OK);
+        }
+        /* it keeps its place until the group's last sub-step, whose commit lands the reap */
+        CHECK_EQ(f.sch.find(d) != nullptr, j < 3);
+        if (j < 3) f.sch.promote_next();
+    }
+    CHECK(f.sch.find(d) == nullptr);
+    CHECK_EQ(f.sch.find(p)->output.size(), (size_t)1);
+}
+
+/* ------------------------------------------------------------------ what the group freezes */
+/* A group's decode rows are planned the way a decode step plans its row. After the previous
+ * sub-step committed, the decoder's token is the last committed one, on the host, at n_computed;
+ * while a sub-step is issued ahead of that commit it is not on the host yet, so the card owns the
+ * row (as a plain ahead decode row's) and ctx_len is only the position ceiling. One position too
+ * far reads token 0 - a token the sequence never held - and a position it never reached. */
+TEST(a_group_s_decoders_are_planned_at_the_token_they_committed) {
+    Fixture f;
+    slice_fixture(f, /*slices=*/4);
+    CHECK_OK(f.start());
+    uint64_t d = 0, p = 0;
+    const RadBatch* b = slice_start(f, &d, &p);
+    REQUIRE(b != nullptr);
+
+    /* the mixed step's own plan: the committed token at its own position */
+    CHECK_EQ(f.sch.plan().e[0].ctx_len, 100);
+    CHECK(!f.sch.plan().e[0].dev);
+    CHECK_EQ(b->token_ids[0], 11);
+    CHECK_EQ(b->positions[0], 100);
+
+    /* the next sub-step, issued ahead of this one's commit: token and position are the card's
+     * (the plugin's advance restages both from the StepSlot), and dev_tok names its row */
+    const RadBatch* nb = f.sch.step_next();
+    REQUIRE(nb != nullptr);
+    CHECK_EQ(f.sch.next_plan().slice_j, 1);
+    CHECK(f.sch.next_plan().e[0].dev);
+    CHECK_EQ(f.sch.next_plan().e[0].ctx_len, 101);
+    CHECK_EQ(f.sch.next_plan().e[0].dev_tok, 0);
+    f.commit_plain(20);
+    f.sch.promote_next();
+    f.commit_plain(21);
+
+    /* the sub-step after that, planned after the commit instead of ahead: the token it just
+     * committed, at the position it committed at, not one past either */
+    const RadBatch* b2 = f.sch.step();
+    REQUIRE(b2 != nullptr);
+    CHECK_EQ(f.sch.plan().slice_j, 2);
+    CHECK(!f.sch.plan().e[0].dev);
+    CHECK_EQ(f.sch.plan().e[0].ctx_len, 102);
+    CHECK_EQ(f.sch.plan().e[0].dev_tok, 0);
+    CHECK_EQ(b2->token_ids[0], 21);
+    CHECK_EQ(b2->positions[0], 102);
+    REQUIRE_EQ(f.sch.find(d)->output.size(), (size_t)3);
+    (void)p;
+}
+
+/* The checkpoint at the end of a chunk is the chunk read through every layer. Before the last
+ * sub-step the layers above layer_hi have not written this chunk's keys and values, so the
+ * snapshot is neither taken nor published then: a lookup in between must not adopt a partial
+ * slot. */
+TEST(a_group_s_checkpoint_is_taken_and_committed_on_its_last_slice) {
+    Fixture f;
+    f.build(/*blocks=*/4096, /*states=*/64, /*max_tok=*/1024, /*max_ctx=*/4096);
+    f.prog.meta.n_layers = 8;
+    f.cfg.checkpoint_interval = 512;         /* the 512-row prompt ends on it */
+    f.cfg.chunk_slices = 4;
+    f.cfg.slice_layers_ok = true;
+    CHECK_OK(f.start());
+    const uint64_t d = f.submit(100, 512);
+    REQUIRE(f.sch.step() != nullptr);
+    f.commit_plain(11);
+    const uint64_t p = f.submit(512, 64);
+    const RadBatch* b = f.sch.step();
+    REQUIRE(b != nullptr);
+
+    const StepPlan& pl = f.sch.plan();
+    CHECK_EQ(pl.slice_m, 4);
+    REQUIRE_EQ((int)pl.e.size(), 2);
+    CHECK_EQ(pl.e[1].n_tokens, 512);         /* ends on the 256 interval: the chunk's last row */
+    CHECK_EQ(pl.e[1].ckpt_tok, 511);
+    CHECK(pl.e[1].ckpt_slot >= 0);
+    CHECK_EQ(f.pc.reserved, 1);              /* the slot is the group's from planning */
+    CHECK_EQ(f.pc.committed.size(), (size_t)0);
+    CHECK_EQ(b->n_checkpoints, 0);
+
+    for (int32_t j = 0; j < 4; ++j) {
+        const RadBatch* nb = f.sch.step_next();
+        if (j + 1 < 4) {
+            REQUIRE(nb != nullptr);
+            /* only the group's last sub-step stages the snapshot */
+            CHECK_EQ(nb->n_checkpoints, j + 1 == 3 ? 1 : 0);
+            CHECK_EQ(f.sch.next_plan().e[1].ckpt_slot >= 0, j + 1 == 3);
+        } else {
+            CHECK(nb == nullptr);            /* the last sub-step: nothing left to slice */
+        }
+        f.commit_plain(20 + j);
+        /* nothing is published before the last sub-step's commit */
+        CHECK_EQ(f.pc.committed.size(), (size_t)(j + 1 == 4 ? 1 : 0));
+        if (j + 1 < 4) f.sch.promote_next();
+    }
+    REQUIRE_EQ(f.pc.committed.size(), (size_t)1);
+    CHECK_EQ(f.pc.committed[0], 512);
+    CHECK_EQ(f.sch.find(p)->output.size(), (size_t)1);
+    CHECK_EQ(f.sch.find(d)->output.size(), (size_t)5);
+}
+
+/* A chunk that restores from a prefix hit is one whole pass: the restore is consumed by the
+ * chunk's first (and only) pass, so a slice would start every sub-step from the same snapshot
+ * and write the same positions again. */
+TEST(a_chunk_that_restores_from_a_prefix_hit_is_never_sliced) {
+    Fixture f;
+    f.build(/*blocks=*/16384, /*states=*/64, /*max_tok=*/512, /*max_ctx=*/16384,
+            /*windowed=*/false, /*linear=*/true);
+    f.prog.meta.n_layers = 8;
+    f.cfg.checkpoint_interval = 256;         /* a recurrent hit resumes at a snapshot */
+    f.cfg.chunk_slices = 4;
+    f.cfg.slice_layers_ok = true;
+    CHECK_OK(f.start());
+    const uint64_t d = f.submit(100, 512);
+    REQUIRE(f.sch.step() != nullptr);
+    f.commit_plain(11);
+
+    f.pc.seed(304);                          /* the attention blocks match 304 tokens deep ... */
+    f.pc.lin = 256;                          /* ... the last snapshot is at 256 */
+    f.pc.src = 3;
+    const uint64_t p = f.submit(1000, 64);
+    REQUIRE(f.sch.step() != nullptr);
+    const StepPlan& pl = f.sch.plan();
+    REQUIRE_EQ((int)pl.e.size(), 2);
+    REQUIRE(pl.e[1].ckpt_restore >= 0);
+    CHECK_EQ(pl.slice_m, 0);
+    (void)d;
+    (void)p;
+}
+
+/* A checkpoint inside the chunk would be a position whose state the remaining sub-steps have not
+ * written yet (a window's tail snapshot): the chunk runs whole, so its state is whole at it. */
+TEST(a_checkpoint_inside_a_chunk_is_never_sliced) {
+    Fixture f;
+    f.build(/*blocks=*/4096, /*states=*/64, /*max_tok=*/2048, /*max_ctx=*/4096,
+            /*windowed=*/true, /*linear=*/false);
+    f.cfg.chunk_slices = 4;
+    f.cfg.slice_layers_ok = true;
+    f.cfg.checkpoint_interval = 2048;        /* no interval snapshot inside a 1000-row chunk */
+    CHECK_OK(f.start());
+    const uint64_t d = f.submit(100, 512);
+    REQUIRE(f.sch.step() != nullptr);
+    f.commit_plain(11);
+    const uint64_t p = f.submit(1000, 64);
+    REQUIRE(f.sch.step() != nullptr);
+    const StepPlan& pl = f.sch.plan();
+    REQUIRE_EQ((int)pl.e.size(), 2);
+    REQUIRE(pl.e[1].ckpt_slot >= 0);
+    REQUIRE(pl.e[1].ckpt_tok + 1 < pl.e[1].n_tokens);
+    CHECK_EQ(pl.slice_m, 0);
+    (void)d;
+    (void)p;
+}
+
+/* The group freezes its decoders' rows, so a draft in flight would have its verify window's
+ * positions recomputed by every sub-step: a draft beside a chunk leaves the chunk whole. */
+TEST(a_draft_beside_a_chunk_leaves_the_chunk_whole) {
+    Fixture f;
+    slice_fixture(f, /*slices=*/4);
+    f.cfg.n_spec = 4;
+    CHECK_OK(f.start());
+    const uint64_t d = f.submit(100, 512);
+    REQUIRE(f.sch.step() != nullptr);
+    f.commit_plain(11);
+
+    int32_t draft[4] = { 21, 22, 23, 24 };
+    CHECK_OK(f.sch.set_draft(d, draft, 4));
+    const uint64_t p = f.submit(496, 64);
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_EQ(f.sch.plan().n_spec, 4);
+    CHECK_EQ(f.sch.plan().slice_m, 0);
+    (void)p;
+}
+
+/* The embedding rows are scattered into the token rows once, on the group's first sub-step; the
+ * plugin carries them to the rest. The chunk's rows are the same on every sub-step. */
+TEST(a_group_scatters_its_media_on_the_first_slice_only) {
+    Fixture f;
+    media_fixture(f, /*max_tok=*/512, /*bidi=*/0);
+    f.prog.meta.n_layers = 8;
+    f.cfg.chunk_slices = 4;
+    f.cfg.slice_layers_ok = true;
+    f.cfg.checkpoint_interval = 0;           /* the chunk is the whole prompt, not cut short */
+    CHECK_OK(f.start());
+    const uint64_t d = f.submit(100, 64);
+    REQUIRE(f.sch.step() != nullptr);
+    f.commit_plain(11);
+
+    const uint64_t p = f.add(with_run(f, 400, 200, 100, mm::Kind::Image));
+    CHECK(p != 0);
+    const RadBatch* b = f.sch.step();
+    REQUIRE(b != nullptr);
+    CHECK_EQ(f.sch.plan().slice_m, 4);
+    CHECK_EQ(b->n_tok, 401);                 /* the chunk's 400 rows and the decoder's */
+    CHECK_EQ(b->n_mm_rows, 100);
+    const int64_t n_tok = b->n_tok;
+
+    for (int32_t j = 1; j < 4; ++j) {
+        const RadBatch* nb = f.sch.step_next();
+        if (j < 3) {
+            REQUIRE(nb != nullptr);
+            CHECK_EQ(nb->n_tok, n_tok);
+            CHECK_EQ(nb->n_mm_rows, 0);
+        }
+        f.commit_plain(20 + j);
+        if (j < 3) f.sch.promote_next();
+    }
+    (void)d;
+    (void)p;
+}
+
+/* Nothing is admitted inside a group: a newcomer waits for the last sub-step, and the chunk's
+ * rows and blocks stay what they were. */
+TEST(admission_waits_for_a_group_s_last_slice) {
+    Fixture f;
+    slice_fixture(f, /*slices=*/4);
+    CHECK_OK(f.start());
+    const uint64_t d = f.submit(100, 64);
+    REQUIRE(f.sch.step() != nullptr);
+    f.commit_plain(11);
+    const uint64_t p = f.submit(496, 64);
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_EQ(f.sch.plan().slice_m, 4);
+
+    const uint64_t q = f.submit(64, 8);
+    CHECK_EQ((int)f.sch.find(q)->state, (int)ReqState::Waiting);
+    f.commit_plain(20);
+    const RadBatch* nb = f.sch.step();
+    REQUIRE(nb != nullptr);
+    CHECK_EQ(f.sch.plan().slice_j, 1);
+    REQUIRE_EQ(nb->n_seq, 2);                /* the group's rows, not the newcomer's */
+    CHECK_EQ((int)f.sch.find(q)->state, (int)ReqState::Waiting);
+
+    f.commit_plain(21);
+    REQUIRE(f.sch.step() != nullptr);        /* sub-step 2 */
+    CHECK_EQ(f.sch.plan().slice_j, 2);
+    CHECK_EQ((int)f.sch.find(q)->state, (int)ReqState::Waiting);
+    f.commit_plain(22);
+    REQUIRE(f.sch.step() != nullptr);        /* sub-step 3, the last */
+    CHECK_EQ(f.sch.plan().slice_j, 3);
+    CHECK(f.sch.plan().slice_last);
+    CHECK_EQ((int)f.sch.find(q)->state, (int)ReqState::Waiting);
+
+    f.commit_plain(23);                      /* the last sub-step ends the group */
+    REQUIRE(f.sch.step() != nullptr);        /* and only now is the newcomer planned */
+    CHECK_EQ((int)f.sch.find(q)->state, (int)ReqState::Running);
+    CHECK_EQ(f.sch.plan().slice_m, 0);
+    (void)d;
+    (void)p;
+}
+
+/* A preemption inside a group would hand the blocks its remaining sub-steps write to the next
+ * sequence: the fleet's room check waits for the group, then goes through again. */
+TEST(preemption_waits_for_a_group_s_last_slice) {
+    Fixture f;
+    slice_fixture(f, /*slices=*/4);
+    CHECK_OK(f.start());
+    const uint64_t d = f.submit(100, 64);
+    REQUIRE(f.sch.step() != nullptr);
+    f.commit_plain(11);
+    const uint64_t p = f.submit(496, 64);
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_EQ(f.sch.plan().slice_m, 4);
+
+    const int64_t free0 = f.kv.free_blocks(0);
+    CHECK_EQ(f.sch.preempt_until([] { return false; }), 0);
+    CHECK_EQ((int)f.sch.find(d)->state, (int)ReqState::Running);
+    CHECK_EQ(f.sch.metrics().preemptions, (int64_t)0);
+    CHECK_EQ(f.kv.free_blocks(0), free0);
+
+    f.commit_plain(20);
+    const RadBatch* nb = f.sch.step();
+    REQUIRE(nb != nullptr);
+    CHECK_EQ(nb->n_seq, 2);                  /* the group's next sub-step, still */
+    f.commit_plain(21);
+    REQUIRE(f.sch.step() != nullptr);        /* sub-step 2 */
+    f.commit_plain(22);
+    REQUIRE(f.sch.step() != nullptr);        /* sub-step 3 */
+    f.commit_plain(23);                      /* the group is over */
+
+    CHECK_EQ(f.sch.preempt_until([] { return false; }), 2);   /* both runners, as outside */
+    (void)p;
+}
+
+/* A cancel inside a group is recorded and acted on at its end: the row keeps its place (the
+ * chunk's rows below it read the same state) and its blocks until the last sub-step commits. */
+TEST(a_cancel_mid_group_keeps_the_decoder_s_row_until_the_last_slice) {
+    Fixture f;
+    slice_fixture(f, /*slices=*/4);
+    CHECK_OK(f.start());
+    const uint64_t d = f.submit(100, 64);
+    REQUIRE(f.sch.step() != nullptr);
+    f.commit_plain(11);
+    const uint64_t p = f.submit(496, 64);
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_EQ(f.sch.plan().slice_m, 4);
+
+    const int64_t free0 = f.kv.free_blocks(0);
+    CHECK_OK(f.sch.cancel(d));
+    CHECK_EQ((int)f.sch.find(d)->state, (int)ReqState::Cancelled);
+    CHECK_EQ(f.kv.free_blocks(0), free0);    /* still the group's: the next sub-step writes it */
+    /* the server drains the closed request and reaps it, which the group defers */
+    CHECK_EQ(f.sch.reap(d), RAD_OK);
+
+    f.commit_plain(20);                      /* the cancelled row commits nothing */
+    REQUIRE_EQ(f.sch.find(d)->output.size(), (size_t)1);
+    const RadBatch* nb = f.sch.step();
+    REQUIRE(nb != nullptr);
+    REQUIRE_EQ(nb->n_seq, 2);                /* it keeps its place */
+    CHECK_EQ(f.sch.plan().e[0].seq, d);
+    CHECK_EQ(f.kv.free_blocks(0), free0);
+
+    f.commit_plain(21);
+    REQUIRE(f.sch.step() != nullptr);        /* sub-step 2 */
+    CHECK_EQ(f.sch.plan().e[0].seq, d);
+    CHECK(f.sch.find(d) != nullptr);         /* held: its row is still planned */
+    f.commit_plain(22);
+    REQUIRE(f.sch.step() != nullptr);        /* sub-step 3 */
+    CHECK_EQ(f.kv.free_blocks(0), free0);
+
+    f.commit_plain(23);                      /* the last sub-step lets it go */
+    CHECK(f.sch.find(d) == nullptr);
+    CHECK(f.kv.free_blocks(0) > free0);
+    CHECK_EQ(f.sch.find(p)->output.size(), (size_t)1);
+}

@@ -1073,7 +1073,10 @@ const RadBatch* BatchBuilder::build(const StepPlan& plan, const IKVManager& kv, 
                 s.h_rope[2 * n_tok + k + j] = v[2];
                 if (v[1] != v[0] || v[2] != v[0]) rope_mixed = 1;
             }
-            if (e.req && e.req->media && !e.req->media->items.empty()) {
+            if (e.req && e.req->media && !e.req->media->items.empty() &&
+                !(plan.slice_m > 0 && plan.slice_j > 0)) {
+                /* (S-02) The chunk's media rows are scattered on the group's first sub-step only:
+                 * the plugin holds them once, and a later sub-step must not scatter them again. */
                 /* Wait until the last upload from the staging has run. */
                 if (mm_ev_live_) {
                     if (rad_event_sync(mm_ev_) < 0) return nullptr;
@@ -1334,6 +1337,8 @@ const RadBatch* BatchBuilder::build(const StepPlan& plan, const IKVManager& kv, 
         RadBatch& B = o.batch[r];
         B.phase = plan.phase;
         B.step = step;
+        B.layer_lo = plan.layer_lo;
+        B.layer_hi = plan.layer_hi;
         B.n_tok = n_tok;
         B.n_seq = n_seq;
         B.token_ids = on_rank(base, b0, s.d_tok);
@@ -1396,9 +1401,9 @@ const RadBatch* BatchBuilder::build(const StepPlan& plan, const IKVManager& kv, 
         B.enc_max_seg = 0;
         B.enc_seg_h = nullptr;
         B.enc_seg_w = nullptr;
-        B.n_checkpoints = n_ck;
-        B.checkpoint_tok = n_ck ? on_rank(base, b0, s.d_cktok) : nullptr;
-        B.checkpoint_slot = n_ck ? on_rank(base, b0, s.d_ckslot) : nullptr;
+        B.n_checkpoints = plan.slice_m > 0 && !plan.slice_last ? 0 : n_ck;
+        B.checkpoint_tok = B.n_checkpoints ? on_rank(base, b0, s.d_cktok) : nullptr;
+        B.checkpoint_slot = B.n_checkpoints ? on_rank(base, b0, s.d_ckslot) : nullptr;
         B.ckpt_cut = ck_cut;
         B.ckpt_cu = ck_cut > 0 ? on_rank(base, b0, s.d_ckcu) : nullptr;
         B.n_ahead = n_ahead;

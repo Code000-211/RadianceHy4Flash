@@ -3552,6 +3552,54 @@ TEST(the_stager_stages_the_next_steps_first_layers_and_never_the_draft_head) {
     CHECK(!st.staged());
     for (int l = 0; l < kL; ++l) CHECK(at_home(l));
     CHECK_EQ(m.stats().stage_overflow, (uint64_t)0);
+
+    /* Inside a chunk group the next pass starts at its slice's first layer (S-02): the early set
+     * is [first, first + lead) counted from that layer, and the pass that starts there adopts it
+     * where it lies instead of staging it again. */
+    b.n_tok = 128;
+    st.set_ring(st.ring_full());
+    const int first = std::min<int>(lead, (kL - 1) / 2);
+    REQUIRE(first >= 1 && first + lead <= kL - 1);
+    st.set_next_prefill(true, first);
+    CHECK(st.begin_pass(&b));
+    /* the slice runs the trunk's layers [first, kL - 1), whose ops start at 2*first + 1 */
+    for (int h = 2 * first + 1; h < n_ops; ++h) {
+        bool resync = false;
+        CHECK_OK(st.before_op(h, compute, &resync));
+        if (h >= 2 && h % 2 == 0) {
+            const int l = (h - 2) / 2;
+            CHECK(in_ring(l));
+            CHECK(copies_hold_the_pool(l));
+        }
+        CHECK_OK(st.after_op(h, compute));
+    }
+    CHECK_OK(st.end_pass(compute));
+    for (int l = 0; l < kL; ++l) CHECK(l >= first && l < first + lead ? in_ring(l) : at_home(l));
+    for (int l = first; l < first + lead; ++l) CHECK(copies_hold_the_pool(l));
+
+    /* The pass that begins at that layer takes them as they are: its first op copies nothing,
+     * where the same pass from home has to stage the layers it starts with. */
+    auto units_at_first_op = [&]() {
+        st.set_next_prefill(false);
+        CHECK(st.begin_pass(&b));
+        const uint64_t before = m.stats().staged_units;
+        bool resync = false;
+        CHECK_OK(st.before_op(2 * first + 1, compute, &resync));
+        const uint64_t staged = m.stats().staged_units - before;
+        CHECK(in_ring(first));
+        CHECK_OK(st.after_op(2 * first + 1, compute));
+        for (int h = 2 * first + 2; h < n_ops; ++h) {
+            CHECK_OK(st.before_op(h, compute, &resync));
+            CHECK_OK(st.after_op(h, compute));
+        }
+        CHECK_OK(st.end_pass(compute));
+        for (int l = 0; l < kL; ++l) CHECK(at_home(l));
+        return staged;
+    };
+    const uint64_t warm = units_at_first_op();
+    const uint64_t cold = units_at_first_op();
+    CHECK_EQ(warm, (uint64_t)0);
+    CHECK(cold > 0);
     CHECK_OK(rad_stream_sync(m.transfer_stream()));
     rad_stream_destroy(compute);
 }

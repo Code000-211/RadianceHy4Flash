@@ -226,14 +226,27 @@ TEST(the_span_pass_field_is_appended_past_the_build_contexts_end) {
 }
 
 /* ABI 43: a checkpoint inside the step. The probe's flag takes the tail padding behind gen_shape
- * (the probe keeps its 128 bytes); the batch's cut and bounds sit past its old end. */
+ * (the probe keeps its 128 bytes until ABI 44 appends past it); the batch's cut and bounds sit past
+ * its old end. */
 TEST(the_checkpoint_cut_fields_are_appended_past_the_old_ends) {
     CHECK_EQ(offsetof(RadArchProbe, ckpt_snap_ok), (size_t)124);
-    CHECK_EQ(sizeof(RadArchProbe), (size_t)128);
     CHECK_EQ(offsetof(RadBatch, ckpt_cut), (size_t)480);
     CHECK_EQ(offsetof(RadBatch, ckpt_cu), (size_t)488);
+}
+
+/* ABI 44: a chunk planned as layer-sliced sub-steps, and the prefill tail's host mirror. The probe's
+ * slicing flag is appended past the old 128-byte probe, the build context's declared slice set past
+ * span_pass_step, and the batch's tail mirror and layer range past the checkpoint cut -- all read at
+ * these offsets by a plugin built against these headers. */
+TEST(the_slice_layer_fields_are_appended_past_the_old_ends) {
+    CHECK_EQ(offsetof(RadArchProbe, slice_layers_ok), (size_t)128);
+    CHECK_EQ(sizeof(RadArchProbe), (size_t)136);
+    CHECK_EQ(offsetof(RadBuildCtx, layer_slices), (size_t)204);
+    CHECK_EQ(sizeof(RadBuildCtx), (size_t)208);
     CHECK_EQ(offsetof(RadBatch, prefill_tail_h), (size_t)496);
-    CHECK_EQ(sizeof(RadBatch), (size_t)504);
+    CHECK_EQ(offsetof(RadBatch, layer_lo), (size_t)504);
+    CHECK_EQ(offsetof(RadBatch, layer_hi), (size_t)508);
+    CHECK_EQ(sizeof(RadBatch), (size_t)512);
 }
 
 RAD_TEST_MAIN()

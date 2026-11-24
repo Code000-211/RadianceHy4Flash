@@ -66,6 +66,7 @@ static void router_cases(std::mt19937& rng, int& cases, int& fails) {
                              { 20, 288, 8, 1, true }, { 48, 288, 8, 1, false },
                              { 6, 288, 8, 1, true },  { 5, 8, 8, 0, true },
                              { 5, 32, 32, 0, true },  { 7, 300, 8, 1, false },
+                             { 4, 512, 16, 1, false }, { 5, 512, 16, 1, true },
                              { 3, 512, 32, 1, true } };
     std::uniform_int_distribution<int> ud(-1000, 1000);
     for (const Shape& sh : shapes) {

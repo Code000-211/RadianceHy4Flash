@@ -128,10 +128,11 @@ int gemm_f32_body(const RadArgs* a, RadStream stream) {
 // router_sigmoid_topk in one wave per row: p = sigmoid(logit), the top_k largest ranks p + bias
 // in descending order, equal ranks to the lower expert, as a serial scan with a strict `>` takes
 // them. Lane l holds experts l, l+32, ... as 64-bit keys: the rank's order-preserving bits (-0
-// folded to +0) over ~e, so equal ranks order to the lower expert. Round j takes the largest key
-// below round j-1's winner and parks it on lane j (top_k <= 32). `total` sums the selected p in
-// round order, mult = norm ? factor / (total + 1e-20) : factor, and a weight is p * mult. A NaN
-// rank is never selected.
+// folded to +0) over ~e, so equal ranks order to the lower expert. A lane sorts its own keys once
+// and round j takes the largest remaining head and parks it on lane j (top_k <= 32). `total` sums
+// the selected p in round order, mult = norm ? factor / (total + 1e-20) : factor, and a weight is
+// p * mult. A NaN rank is never selected: its key is 0, which sorts below every rank key and so is
+// only taken once the wave's ranks have run out, the last round the scan did with `below = 0`.
 // OWN is a template bound because the keys are registers; a lane-derived trip count would index
 // them divergently, which gfx12 lowers to a v_movrels loop.
 __device__ __forceinline__ unsigned long long router_rank_key(float rank, int e) {
@@ -154,6 +155,59 @@ __device__ __forceinline__ unsigned long long router_wave_max(unsigned long long
     b = b > o ? b : o;
     return b;
 }
+// Batcher's odd-even mergesort of 16 keys, descending: 63 compare-exchanges in 10 dependent stages
+// (Knuth, TAOCP 5.2.2, Figure 51), independent compare-exchanges side by side and so 10 deep where
+// an insertion into a 16-entry list would be 16. A lane holds at most 16 experts, so one network
+// serves both OWN bounds; a slot past the lane's keys holds 0, which sorts to the tail.
+#define R4D_ROUTER_CS(a, b)                                                                        \
+    do {                                                                                           \
+        const unsigned long long hi = t[a] > t[b] ? t[a] : t[b];                                   \
+        t[b] = t[a] > t[b] ? t[b] : t[a];                                                          \
+        t[a] = hi;                                                                                 \
+    } while (0)
+__device__ __forceinline__ void router_sort16_desc(unsigned long long (&t)[16]) {
+    R4D_ROUTER_CS(0, 1); R4D_ROUTER_CS(2, 3); R4D_ROUTER_CS(0, 2); R4D_ROUTER_CS(1, 3);
+    R4D_ROUTER_CS(1, 2); R4D_ROUTER_CS(4, 5); R4D_ROUTER_CS(6, 7); R4D_ROUTER_CS(4, 6);
+    R4D_ROUTER_CS(5, 7); R4D_ROUTER_CS(5, 6); R4D_ROUTER_CS(0, 4); R4D_ROUTER_CS(2, 6);
+    R4D_ROUTER_CS(2, 4); R4D_ROUTER_CS(1, 5); R4D_ROUTER_CS(3, 7); R4D_ROUTER_CS(3, 5);
+    R4D_ROUTER_CS(1, 2); R4D_ROUTER_CS(3, 4); R4D_ROUTER_CS(5, 6); R4D_ROUTER_CS(8, 9);
+    R4D_ROUTER_CS(10, 11); R4D_ROUTER_CS(8, 10); R4D_ROUTER_CS(9, 11); R4D_ROUTER_CS(9, 10);
+    R4D_ROUTER_CS(12, 13); R4D_ROUTER_CS(14, 15); R4D_ROUTER_CS(12, 14); R4D_ROUTER_CS(13, 15);
+    R4D_ROUTER_CS(13, 14); R4D_ROUTER_CS(8, 12); R4D_ROUTER_CS(10, 14); R4D_ROUTER_CS(10, 12);
+    R4D_ROUTER_CS(9, 13); R4D_ROUTER_CS(11, 15); R4D_ROUTER_CS(11, 13); R4D_ROUTER_CS(9, 10);
+    R4D_ROUTER_CS(11, 12); R4D_ROUTER_CS(13, 14); R4D_ROUTER_CS(0, 8); R4D_ROUTER_CS(4, 12);
+    R4D_ROUTER_CS(4, 8); R4D_ROUTER_CS(2, 10); R4D_ROUTER_CS(6, 14); R4D_ROUTER_CS(6, 10);
+    R4D_ROUTER_CS(2, 4); R4D_ROUTER_CS(6, 8); R4D_ROUTER_CS(10, 12); R4D_ROUTER_CS(1, 9);
+    R4D_ROUTER_CS(5, 13); R4D_ROUTER_CS(5, 9); R4D_ROUTER_CS(3, 11); R4D_ROUTER_CS(7, 15);
+    R4D_ROUTER_CS(7, 11); R4D_ROUTER_CS(3, 5); R4D_ROUTER_CS(7, 9); R4D_ROUTER_CS(11, 13);
+    R4D_ROUTER_CS(1, 2); R4D_ROUTER_CS(3, 4); R4D_ROUTER_CS(5, 6); R4D_ROUTER_CS(7, 8);
+    R4D_ROUTER_CS(9, 10); R4D_ROUTER_CS(11, 12); R4D_ROUTER_CS(13, 14);
+}
+#undef R4D_ROUTER_CS
+// The k largest of the wave's keys, in the order the strict scan takes them: lane j gets the j-th
+// and the others get 0. Each lane's keys are sorted once, so a round is one wave max and the drop
+// of the winner's head, not a compare-select over OWN keys ahead of it. Keys are unique (the low
+// word is ~e), so at most one lane holds the round's winner and equal 0 heads are the tail, which
+// the scan's `below = 0` round also could not take.
+template <int OWN>
+__device__ __forceinline__ unsigned long long router_select_topk(
+    const unsigned long long (&key)[OWN], int lane, int k) {
+    unsigned long long t[16];
+#pragma unroll
+    for (int i = 0; i < 16; ++i) t[i] = i < OWN ? key[i] : 0ull;
+    router_sort16_desc(t);
+    unsigned long long mine = 0;
+    for (int j = 0; j < k; ++j) {
+        const unsigned long long best = router_wave_max(t[0]);
+        if (lane == j) mine = best;
+        if (best == t[0] && best) {
+#pragma unroll
+            for (int i = 0; i < 15; ++i) t[i] = t[i + 1];
+            t[15] = 0ull;
+        }
+    }
+    return mine;
+}
 // One row in one wave, from any grid: the standalone select and the fused one below run this. A
 // lane below `k` returns its slot's expert as written to `ids`.
 template <int OWN>
@@ -169,18 +223,7 @@ __device__ __forceinline__ int router_sigmoid_row(const float* logits, const flo
         p[i] = 1.0f / (1.0f + expf(-logits[(long)r * lp + s]));
         key[i] = e < ne ? router_rank_key(p[i] + bias[(long)s * bp], e) : 0ull;
     }
-    unsigned long long below = ~0ull, mine = 0;
-    for (int j = 0; j < k; ++j) {
-        unsigned long long best = 0;
-#pragma unroll
-        for (int i = 0; i < OWN; ++i) {
-            const unsigned long long c = key[i] < below ? key[i] : 0ull;
-            best = c > best ? c : best;
-        }
-        best = router_wave_max(best);
-        if (lane == j) mine = best;
-        below = best;
-    }
+    unsigned long long mine = router_select_topk<OWN>(key, lane, k);
     const int e = mine ? (int)~(uint32_t)mine : 0;
     float chosen = 0;
 #pragma unroll
@@ -256,19 +299,7 @@ __global__ void __launch_bounds__(128)
         const int e = lane + 32 * i;
         key[i] = e < ne && ((kept >> (e / gs)) & 1u) ? router_rank_key(rank[i], e) : 0ull;
     }
-    unsigned long long mine = 0;
-    below = ~0ull;
-    for (int j = 0; j < k; ++j) {
-        unsigned long long best = 0;
-#pragma unroll
-        for (int i = 0; i < OWN; ++i) {
-            const unsigned long long c = key[i] < below ? key[i] : 0ull;
-            best = c > best ? c : best;
-        }
-        best = router_wave_max(best);
-        if (lane == j) mine = best;
-        below = best;
-    }
+    unsigned long long mine = router_select_topk<OWN>(key, lane, k);
     const int e = mine ? (int)~(uint32_t)mine : 0;
     float chosen = 0;
 #pragma unroll
