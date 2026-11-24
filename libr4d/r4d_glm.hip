@@ -172,17 +172,17 @@ __global__ void __launch_bounds__(128)
     gemm_nt_f32_lds_body<R, C, KC, VX>(x, w, y, xp, wp, yp, m, n, k);
 }
 
-/* The staged form for verify heights (17-63 rows at N >= 256). Its grid is the 8x1 form's: a wave
- * a column, four columns and 8 rows a workgroup. The 8 rows' x is staged once a workgroup, 256
- * values of k at a time and transposed: the 8 rows' bf16 at one k are 16 bytes, so a step of k
- * costs a wave one weight load from memory and one LDS read for 8 FMA, where the 8x1 form loads a
- * weight and 8 values of x from memory. Thread t stages k = 2t, 2t+1 of a stage: VX 2 with one
- * 4-byte load a row (x 4-byte aligned, its pitch and K even), VX 1 with two 2-byte loads a row.
- * Two buffers, so a stage costs one barrier,
- * and the next stage's x and weights load while this stage's FMAs run. Lane l still folds k = l,
- * l+32, ... ascending with fmaf, then the same butterfly: byte-identical to every tile form. Tail
- * lanes (j >= K) skip the FMA; loads past K read a clamped address whose value is never used. Rows
- * past M read a clamped row and are not stored; waves past N stage and wait, and store nothing. */
+/* The staged form for verify heights (17-63 rows at N >= 512, 32-63 at N 256-511). Its grid is the
+ * 8x1 form's: a wave a column, four columns and 8 rows a workgroup. The 8 rows' x is staged once a
+ * workgroup, 256 values of k at a time and transposed: the 8 rows' bf16 at one k are 16 bytes, so a
+ * step of k costs a wave one weight load from memory and one LDS read for 8 FMA, where the 8x1 form
+ * loads a weight and 8 values of x from memory. Thread t stages k = 2t, 2t+1 of a stage: VX 2 with
+ * one 4-byte load a row (x 4-byte aligned, its pitch and K even), VX 1 with two 2-byte loads a row.
+ * Two buffers, so a stage costs one barrier, and the next stage's x and weights load while this
+ * stage's FMAs run. Lane l still folds k = l, l+32, ... ascending with fmaf, then the same
+ * butterfly: byte-identical to every tile form. Tail lanes (j >= K) skip the FMA; loads past K read
+ * a clamped address whose value is never used. Rows past M read a clamped row and are not stored;
+ * waves past N stage and wait, and store nothing. */
 template <int VX, class W>
 __device__ __forceinline__ void
     gemm_nt_f32_xt_body(const uint16_t* x, const W* w, float* y, long xp, long wp, long yp,
@@ -366,13 +366,17 @@ int gemm_f32_body(const RadArgs* a, RadStream stream) {
      * At verify heights (17-63 rows) from N 256 the 8x1 form's grid with x staged transposed in
      * LDS: a step of k is one weight load and one LDS read a wave for 8 FMA, where 8x1 loads 8
      * values of x and a weight from memory. It holds 16 waves a SIMD (8 KiB of LDS). At N 128 it
-     * was 2-21 % slower than 8x1 at every verify height (gfx1201, K 3072), so N 128-255 keeps 8x1. */
+     * was 2-21 % slower than 8x1 at every verify height (gfx1201, K 3072), and at N 256 about 3 %
+     * slower at 17 and 24 rows, faster from 32; at N 512 it was faster at every height. So it takes
+     * N 512 (the widest the entry takes) from 17 rows and N 256-511 from 32; the rest keeps 8x1. */
     const long rows = x.shape[0];
     const bool ch = r4d_geti_or(a, "chain", 0) != 0 && rows <= 64;   /* decode heights */
     if (n <= 8) return gemm_f32_tile<4, 1>(stream, x, w, y, n, k, ch);
     if (rows <= 16 || (rows < 64 && n < 128)) return gemm_f32_tile<2, 2, 16>(stream, x, w, y, n, k, ch);
-    if (rows < 64 && n >= 256) return gemm_f32_xt(stream, x, w, y, n, k, ch);
-    if (rows < 64) return gemm_f32_tile<8, 1, 8>(stream, x, w, y, n, k, ch);   /* N 128-255 */
+    constexpr long xt_wide_n = 512, xt_n = 256, xt_rows = 32;   /* the verify form's bounds */
+    if (rows < 64 && (n >= xt_wide_n || (n >= xt_n && rows >= xt_rows)))
+        return gemm_f32_xt(stream, x, w, y, n, k, ch);
+    if (rows < 64) return gemm_f32_tile<8, 1, 8>(stream, x, w, y, n, k, ch);
     const long lds_rows = n >= 512 ? 256 : n >= 256 ? 384 : 768;   /* where staging x pays */
     if (n >= 128 && rows >= lds_rows) return gemm_f32_lds<8, 8, 256>(stream, x, w, y, n, k);
     return gemm_f32_tile<8, 4>(stream, x, w, y, n, k, ch);

@@ -7,8 +7,9 @@
  * into LDS, 8 x 8 a wave) takes over; its
  * shapes cover a K short of a whole stage and of a whole step, tail rows and columns, waves with
  * no columns, and x's pitch with and without 16-byte vectors.
- * At verify heights (17-63 rows, N 256 or more) the verify staged form (x staged transposed into
- * LDS, a wave a column): its shapes cover each row bound, the N bound (N 255 and 128 stay on 8x1),
+ * At verify heights (17-63 rows at N 512 or more, 32-63 at N 256-511) the verify staged form (x
+ * staged transposed into LDS, a wave a column): its shapes cover each row bound, each N bound (N
+ * 128 and 255 stay on 8x1, N 256 from 32 rows, N 511 stays on 8x1 at 17 and 31, N 512 does not),
  * K one stage, short of a step and past whole stages, M no multiple of 8, N no multiple of 4
  * (waves with no column), and x's pitch even (4-byte staging) and odd, and an odd K (2-byte
  * staging).
@@ -278,8 +279,9 @@ int main() {
     // each bound: x's pitch odd (staged a value at a time) and
     // a multiple of 8 (16 bytes at a time), K past and short of a whole stage of 256 and of a whole
     // step of 32, M no multiple of 8, and N no multiple of 32 (the last workgroup's last waves
-    // have no columns) or of 8. At 17-63 rows and N 256+ the verify staged form: N 256 against
-    // N 255 and 128 (8x1) at 17, 32 and 63 rows (16 and 64 are the 2x2 and 8x4 controls), K one
+    // have no columns) or of 8. At 17-63 rows the verify staged form from N 512, and at N 256-511
+    // from 32 rows: N 128 and 255 (8x1) at 17, 32 and 63 rows, N 256 at 17 and 31 (8x1) and at 32
+    // and 63, N 511 (8x1) and 512 at 17 and 31 (16 and 64 are the 2x2 and 8x4 controls), K one
     // stage, past whole stages, short of a step and under one step, N no multiple of 4, x's pitch
     // even and odd and K odd; N 127 stays on 2x2.
     const GemmCase shapes[] = {
@@ -293,10 +295,12 @@ int main() {
         { 255, 512, 96, 101 },   { 256, 512, 96, 101 },   { 768, 128, 24, 24 },
         { 17, 128, 3072, 3072 }, { 32, 128, 3072, 3080 }, { 63, 128, 3072, 3077 },
         { 17, 255, 3072, 3072 }, { 32, 255, 3072, 3080 }, { 63, 255, 3072, 3077 },
-        { 17, 256, 3072, 3072 }, { 32, 256, 3072, 3080 }, { 63, 256, 3072, 3077 },
-        { 40, 512, 520, 520 },   { 24, 258, 600, 602 },   { 33, 259, 24, 24 },
-        { 20, 256, 256, 258 },   { 48, 264, 4098, 4098 }, { 63, 512, 1000, 1005 },
-        { 30, 259, 513, 513 },   { 24, 130, 600, 602 },   { 33, 203, 24, 24 },
+        { 17, 256, 3072, 3072 }, { 31, 256, 3072, 3077 }, { 32, 256, 3072, 3080 },
+        { 63, 256, 3072, 3077 }, { 17, 511, 3072, 3072 }, { 31, 511, 3072, 3080 },
+        { 17, 512, 3072, 3072 }, { 31, 512, 3072, 3080 },
+        { 40, 512, 520, 520 },   { 24, 512, 600, 602 },   { 33, 259, 24, 24 },
+        { 20, 512, 256, 258 },   { 48, 264, 4098, 4098 }, { 63, 512, 1000, 1005 },
+        { 30, 512, 513, 513 },   { 24, 130, 600, 602 },   { 33, 203, 24, 24 },
         { 16, 256, 3072, 3072 }, { 64, 256, 3072, 3072 }, { 40, 127, 3072, 3072 },
     };
     for (const GemmCase& sh : shapes) {
