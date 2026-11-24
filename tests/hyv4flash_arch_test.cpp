@@ -663,6 +663,7 @@ TEST(the_head_reads_final_hidden_when_every_row_outputs) {
     CHECK_LINT(d.b, &mc);
     CHECK_EQ(count_issued(d.b, mc, "gather_rows"), 1);
     CHECK_EQ(count_issued(d.b, mc, "logits_gemm"), 1);
+}
 /* K-49: the rotaries that turn over a whole prefill chunk are declared under the row-form name.
  * `rope_rows` is the same op with the same parameters -- one thread per (token, pair) looping the
  * heads, so one `sincosf` a (token, pair) instead of one a (token, head, pair) -- byte-identical,

@@ -1260,6 +1260,7 @@ static StepPlan plan(const Model& m, const RadBatch* batch) {
  * the gather before the head is an identity copy; the head can read final_hidden directly. */
 static bool head_reads_all_rows(const RadBatch* batch, const StepPlan& p) {
     return batch->n_out == p.T && p.D == p.S && p.DT == p.T;
+}
 /* The compact pass reads its rows [0, DT) as the batch's decode rows: paged() hands them the
  * batch's block table, seqused and decode bounds, and the stable instance. The derivation keeps
  * every decode row (d_prefill_tail); a tail whose kept rows do not start with exactly those runs
