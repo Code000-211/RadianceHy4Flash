@@ -26,18 +26,21 @@ __device__ __forceinline__ int rope_comp(int mode, uint32_t i, const int* sec, i
     *j = i - (uint32_t)start;
     return c;
 }
-__device__ __forceinline__ void rope_turn(const int32_t* __restrict__ pos, uint32_t m, uint32_t i,
-                                          int den, uint32_t nfreq, float theta, float rscale,
-                                          int mode, const int* sec, int n_sec, uint32_t plane,
-                                          RadYarn yarn, RadLlama3 l3, float* c, float* s) {
-    const float div = rscale != 0.0f ? rscale : 1.0f;
-    const float p0 = (float)pos[m] / div;
+/* The angle for pair i from a position source: `at(c)` is component c's position over rscale
+ * (pos[c * plane + m] / div), asked for component 0 and, with a component pitch, for the one
+ * rope_comp picks. rope_turn reads it from `pos`; rope_turn_at from a RopePos read earlier (K-29). */
+template <class At>
+__device__ __forceinline__ void rope_turn_by(At at, uint32_t i, int den, uint32_t nfreq,
+                                             float theta, int mode, const int* sec, int n_sec,
+                                             uint32_t plane, RadYarn yarn, RadLlama3 l3, float* c,
+                                             float* s) {
+    const float p0 = at(0);
     float inv = 1.0f / powf(theta, (float)(2 * i) / (float)den);
     float p = p0;
     if (plane) {
         uint32_t j = i;
         const int comp = rope_comp(mode, i, sec, n_sec, &j);
-        p = (float)pos[(size_t)comp * plane + m] / div;
+        p = at(comp);
         if (mode == 4)
             inv = 1.0f / powf(theta, (float)(2 * j) / (float)(2 * sec[comp]));
     }
@@ -50,4 +53,39 @@ __device__ __forceinline__ void rope_turn(const int32_t* __restrict__ pos, uint3
     const float ang = p * inv;
     sincosf(ang, s, c);
     if (yarn.factor != 0.0f) { *c *= yarn.magnitude; *s *= yarn.magnitude; }
+}
+__device__ __forceinline__ void rope_turn(const int32_t* __restrict__ pos, uint32_t m, uint32_t i,
+                                          int den, uint32_t nfreq, float theta, float rscale,
+                                          int mode, const int* sec, int n_sec, uint32_t plane,
+                                          RadYarn yarn, RadLlama3 l3, float* c, float* s) {
+    const float div = rscale != 0.0f ? rscale : 1.0f;
+    rope_turn_by([&](int comp) { return (float)pos[(size_t)comp * plane + m] / div; }, i, den,
+                 nfreq, theta, mode, sec, n_sec, plane, yarn, l3, c, s);
+}
+
+/* The step's rotary position for one token, read once (K-29): p[0] is pos[m] and, with a component
+ * pitch, p[c] is pos[c * plane + m] for the mode's components (rope_comp's, at most `n_comp`).
+ * rope_turn_at takes it instead of reading `pos` itself, so that a chained block can read it in
+ * front of its wait (r4d_chain.h) and the wait covers the round trip. Both values are rope_turn's
+ * own expression, so the bytes are the same whichever side of the wait the read happens. */
+struct RopePos { float p[3]; };
+__device__ __forceinline__ RopePos rope_pos(const int32_t* __restrict__ pos, uint32_t m,
+                                            uint32_t plane, float rscale, int n_comp) {
+    const float div = rscale != 0.0f ? rscale : 1.0f;
+    RopePos r;
+    r.p[0] = (float)pos[m] / div;
+    r.p[1] = r.p[0];
+    r.p[2] = r.p[0];
+    /* Only the components the mode indexes: a table has as many rows as the mode has sections
+     * (r4d_rad_rope), so a two-section axial table has no third row to read. */
+    if (plane && n_comp > 1) r.p[1] = (float)pos[(size_t)plane + m] / div;
+    if (plane && n_comp > 2) r.p[2] = (float)pos[(size_t)2 * (size_t)plane + m] / div;
+    return r;
+}
+__device__ __forceinline__ void rope_turn_at(const RopePos& rp, uint32_t i, int den,
+                                             uint32_t nfreq, float theta, int mode, const int* sec,
+                                             int n_sec, uint32_t plane, RadYarn yarn, RadLlama3 l3,
+                                             float* c, float* s) {
+    rope_turn_by([&](int comp) { return rp.p[comp]; }, i, den, nfreq, theta, mode, sec, n_sec,
+                 plane, yarn, l3, c, s);
 }

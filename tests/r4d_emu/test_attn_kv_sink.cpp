@@ -7,7 +7,11 @@
  *   - the absorbed form: keys and values expanded from a latent through per-head matrices (bf16,
  *     as kv_b and mla_kv_split produce them) against the f64 latent-space attention the absorbed
  *     kernel computes, within 5e-3 of a row's norm (PLAN WP6c);
- *   - a malformed sequence (n_s < m_s) writes zero rows, and the launch's refusals. */
+ *   - a malformed sequence (n_s < m_s) writes zero rows, and the launch's refusals;
+ *   - the `bq` axis: the same geometries at 64 query rows a workgroup (8 waves, 256 threads, where
+ *     128 rows are 16 waves and 512), each against the f64 reference inside the op's bound and the
+ *     two against each other inside twice that bound, since a narrower workgroup starts its key
+ *     tiles lower and the points are not byte-equal by design. */
 #include "rad_abi.h"
 #include "rad_plugin.h"
 #include "r4d_plugin.h"
@@ -82,7 +86,7 @@ void check(bool c, const std::string& what) {
 
 /* The operands of one launch, dense [rows, heads, 256] planes (16-byte aligned by the vector). */
 struct Op {
-    int H = 0, window = 0, M = 0, N = 0;
+    int H = 0, window = 0, M = 0, N = 0, bq = 128;
     std::vector<int> qlen, pre;
     std::vector<uint16_t> q, k, v, out;
     std::vector<int32_t> cuq, cuk;
@@ -110,12 +114,13 @@ struct Op {
                            tens(cuk.data(), RAD_I32, { (int64_t)cuk.size() }), tens(sinks.data(), RAD_F32, { H }),
                            tens(out.data(), RAD_BF16, { M, H * D }) };
         RadParam p[] = { pint("M", M), pint("N", N), pint("heads", H), pint("head_dim", D),
-                         pint("window", window), pf64("scale", 1.0 / 16.0), pstr("dtype", "bf16") };
+                         pint("window", window), pf64("scale", 1.0 / 16.0), pstr("dtype", "bf16"),
+                         pint("bq", bq) };
         RadArgs a{};
         a.t = t;
         a.n_t = 7;
         a.p = p;
-        a.n_p = 7;
+        a.n_p = 8;
         a.world_size = 1;
         return r4d_rad_attn_kv_sink_h256(&a, nullptr);
     }
@@ -183,9 +188,10 @@ void fill_random(Op& o, float qa, float ka, float va) {
 }
 
 void case_random(const std::string& name, int H, int window, std::vector<int> ql, std::vector<int> pr,
-                 float swamp = 0.0f) {
+                 float swamp = 0.0f, int bq = 128) {
     Op o;
     o.shape(H, window, ql, pr);
+    o.bq = bq;
     fill_random(o, 2.0f, 2.0f, 4.0f);
     if (swamp != 0.0f) o.sinks[0] = swamp;
     const int rc = o.run();
@@ -315,6 +321,65 @@ void case_malformed() {
     check(rc == RAD_OK && zero0 && set1, "n_s < m_s: that sequence's rows are zero, the next written");
 }
 
+/* The `bq` axis (r4d_attn_kv_sink_h256.hip, r4d_rows.cpp's tAttnKvSink): 128 query rows a workgroup
+ * (16 waves, 512 threads) or 64 (8 waves, 256). A workgroup reads window + bq - 1 keys from its
+ * first row's window start, so 64 rows mask less at window 512. A row's key tile grid starts at its
+ * workgroup's lowest visible key, so where bq - 1 is not a multiple of 16 the two points pair the
+ * K/V fragments differently and are not byte-equal (at window 512 and a 16-aligned span they are).
+ * Each must stay inside the op's prefill bound against libref (2e-3 + 8e-3|w| an element, 5e-3 a
+ * row's relative L2 error), and they are checked against each other too: two answers inside that
+ * bound differ by at most twice it, 4e-3 + 1.6e-2|w| an element and 1e-2 a row. */
+void compare_bq(const Op& x, const Op& y, const std::string& name) {
+    bool elem = true;
+    double worst = 0, max_abs = 0;
+    for (int r = 0; r < x.M; ++r)
+        for (int h = 0; h < x.H; ++h) {
+            double num = 0, den = 0;
+            for (int c = 0; c < D; ++c) {
+                const size_t e = ((size_t)r * x.H + h) * D + c;
+                const double g = bf(x.out[e]), w = bf(y.out[e]), d = std::fabs(g - w);
+                elem = elem && std::isfinite(g) && std::isfinite(w) && d <= 4e-3 + 1.6e-2 * std::fabs(w);
+                max_abs = std::max(max_abs, d);
+                num += d * d;
+                den += w * w;
+            }
+            if (den > 0) worst = std::max(worst, std::sqrt(num / den));
+        }
+    char buf[160];
+    std::snprintf(buf, sizeof buf, " (max |err| %.3g, worst row %.3g)", max_abs, worst);
+    check(elem && worst <= 1e-2, name + buf);
+}
+
+void case_bq_axis() {
+    struct G { int H, window; std::vector<int> ql, pr; const char* what; };
+    const G gs[] = {
+        { 2, 512, { 64 }, { 511 }, "64 rows, window 512, one tile" },
+        { 2, 512, { 200 }, { 900 }, "200 rows, window 512, a partial last tile" },
+        { 1, 512, { 513 }, { 0 }, "window edge: 513 rows, window 512" },
+        { 2, 512, { 1, 16, 64, 100 }, { 0, 0, 511, 37 }, "ragged, window 512" },
+        { 1, 0, { 129 }, { 0 }, "window 0: the axis moves the grid, not the mask" },
+        { 1, 128, { 128 }, { 64 }, "a window narrower than the tile" },
+    };
+    for (const G& g : gs) {
+        Op a;
+        a.shape(g.H, g.window, g.ql, g.pr);
+        fill_random(a, 2.0f, 2.0f, 4.0f);
+        Op b = a;
+        b.bq = 64;
+        const int rc0 = a.run(), rc1 = b.run();
+        const std::string name = std::string("bq axis: ") + g.what;
+        if (rc0 != RAD_OK || rc1 != RAD_OK) {
+            check(false, name + " rc " + std::to_string(rc0) + "/" + std::to_string(rc1));
+            continue;
+        }
+        std::vector<double> want;
+        reference(a, want);
+        compare(a, want, name + ", bq 128 vs libref");
+        compare(b, want, name + ", bq 64 vs libref");
+        compare_bq(a, b, name + ", bq 64 vs 128");
+    }
+}
+
 void case_refusals() {
     Op o;
     o.shape(2, 0, { 3 }, { 0 });
@@ -324,7 +389,8 @@ void case_refusals() {
                            tens(o.cuk.data(), RAD_I32, { 2 }), tens(o.sinks.data(), RAD_F32, { 2 }),
                            tens(o.out.data(), RAD_BF16, { o.M, 2, D }) };
         std::vector<RadParam> p = { pint("M", o.M), pint("N", o.N), pint("heads", 2), pint("head_dim", D),
-                                    pint("window", 0), pf64("scale", 1.0 / 16.0), pstr("dtype", "bf16") };
+                                    pint("window", 0), pf64("scale", 1.0 / 16.0), pstr("dtype", "bf16"),
+                                    pint("bq", 128) };
         edit(t, p);
         RadArgs a{};
         a.t = t;
@@ -345,6 +411,8 @@ void case_refusals() {
           "refusals: a key pitch off 16 bytes");
     check(launch([](RadTensor* t, std::vector<RadParam>&) { t[4].shape[0] = 3; }) == RAD_E_SHAPE,
           "refusals: cu_k longer than cu_q");
+    check(launch([](RadTensor*, std::vector<RadParam>& p) { p[7].ival = 96; }) == RAD_E_SHAPE,
+          "refusals: bq 96 (the axis is 64 or 128)");
 }
 
 }  // namespace
@@ -366,7 +434,10 @@ int main() {
     case_absorbed(2, 0, { 17, 50 }, { 0, 90 });
     case_random("1024 rows after 511, window 512", 1, 512, { 1024 }, { 511 });
     case_random("300 rows after 1748, window 0", 1, 0, { 300 }, { 1748 });
+    case_random("513 rows, window 512, bq 64", 1, 512, { 513 }, { 0 }, 0.0f, 64);
+    case_random("ragged, window 512, bq 64", 2, 512, { 1, 16, 64, 100 }, { 0, 0, 511, 37 }, 0.0f, 64);
     case_malformed();
+    case_bq_axis();
     std::printf("%s (%d failed)\n", fails ? "FAIL" : "PASS", fails);
     return fails ? 1 : 0;
 }

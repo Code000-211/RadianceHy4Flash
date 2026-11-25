@@ -81,10 +81,18 @@ scripts/backlog/lane.sh --env iks-A               # what a lane exports: port, m
   `RAD_IDLE_WAIT_S` s, a decode-only request that makes the experts ask for VRAM back, the same prefix again
   (the resume) and a cold prefill of the same size, with `/stats` and `/sessions` read at each step: the
   host tier's `prefix-cache-mib` check, X-01) and `long8` (the item's multi-session case: eight
-  conversations of `RAD_LONG8_CHARS` characters at once, then the same idle, demand and return passes).
+  conversations of `RAD_LONG8_CHARS` characters at once, then the same idle, demand and return passes), and
+  `lctxN` (`N` conversations of `RAD_LCTX_CHARS` characters — the default 190,000 is the 58,903-token
+  conversation of §1.3 — filled by a one-token wave and then decoded for `RAD_LCTX_NTOK` tokens: the long-context
+  decode stamps at one and four decoders, `lctx1` and `lctx4`, whose two waves land in the JSON as their own
+  phases).
   `greedy` is the merge bar's first clause: three prompts and a 5.7K arrival at temperature 0 with
   `ignore_eos` off, each as `gen` / `chars` / `sha256` of the text itself, so two arms' JSON compare byte for
-  byte (S-01b).
+  byte (S-01b). `stress` is sustained concurrent load (issue #251): `RAD_STRESS_WAVES` waves (40) of eight
+  requests at once, `RAD_STRESS_CHARS` characters of context each (39,500: ~12K tokens) decoded for
+  `RAD_STRESS_NTOK` tokens (96), a fresh wave and then the same eight prompts again; it counts failed requests
+  and a server that stops (`ok` / `err` / `server_dead`) instead of raising, so a run that hangs still writes
+  its JSON. Run it on one iks lane at a time: two lanes under it leave the host 3 GiB of memory.
   Both `idle` and `long8` read the experts' side of the same views, because that is what the freed VRAM is for:
   `expert_units` and `slab_mib` are the residency and the lent VRAM the experts hold, `lend_mib` the most
   the KV pool lets them borrow, and `routed` / `routed_res` the demand's hit rate. It prints each phase as JSON and writes
@@ -95,11 +103,19 @@ scripts/backlog/lane.sh --env iks-A               # what a lane exports: port, m
 - **`bench.py <port> <tag> <out-dir>`** the served benchmark (decode, prefill, cold/warm, `--reps`, `--temp`), and
   **`prompts.py`** holds the prompts and the code corpus both tools send: they are read from the tree the tools sit
   in (`RAD_SRC` overrides), never from a copy on the measuring host, so a lane's prompt is the same text everywhere.
-- **`layer.py <stamps.csv> <probe.json> <phase> <rec> [<li>]`**, **`agg.py <stamps.csv> <probe.json> [--top N]`**,
+  The 5.7K arrival of `greedy` is cut from that corpus, so two arms on **different trees** send different text as soon as
+  the change adds, removes or edits a file the walk reads (`libr4d/`, `arch/hyv4flash/`, `core/`, `libavx/` …), and the bar's
+  byte comparison then fails on the prompt, not on the arms: a cross-tree A/B pins one corpus for both arms with
+  `RAD_SRC=<one tree>` (K-24 lost a measurement round to this). The three fixed `greedy` prompts are unaffected.
+- **`layer.py <stamps.csv> <probe.json> <phase> <rec> [<li>]`**, **`agg.py <stamps.csv> <probe.json> [--top N] [--match RE]`**,
   **`attr.py <stamps.csv> <probe.json> [--top N]`**: the per-layer and per-op tables from a run's stamps. They are
   plain CPU tools over those two files (run them as `python3 scripts/backlog/agg.py …`; they are 644 in the tree),
   so they run wherever the files are: on the lane, or here over a file copied back from iks with `scp
-  iks:moebius-gpu/<name>/src/runs/<lane>/<tag>/<tag>.stamps.csv .`. They need a demangler, and iks has no
+  iks:moebius-gpu/<name>/src/runs/<lane>/<tag>/<tag>.stamps.csv .`. They read the phases that carry a stamped
+  window; a composite phase (`longctx`, `idle`, `long8`) and a gap probe (`stallN`) carry none, so they are named
+  and skipped, and the waves the composite ran are what the tables come from. `agg.py --match RE` prints only the
+  kernels of that name and their sum per step — the read of one term, e.g. `--match 'qsa_select|idx_score'` for
+  K-25's two terms at long context. They need a demangler, and iks has no
   `c++filt`: `demangle.py` takes `c++filt` or `llvm-cxxfilt` from `PATH`, else the `llvm-cxxfilt` next to the
   compiler the tree was built with (`build/CMakeCache.txt`), which is where the ROCm SDK keeps it. The iks trees'
   `runs/` are not kept between calls (the tree is unpacked fresh each call), so copy back what a card needs.
@@ -324,7 +340,7 @@ but the tier, which is what the A/B measures.
 Merge when all three hold:
 
 1. The output is byte-identical, or inside the item's stated bound (ORD / PF; see the field key at the top of the backlog's §3).
-2. The kernel, op or step the item targets is measurably faster in ms (AQL stamps, rad-kbench or profile-ops) on its lane.
+2. The kernel, op or step the item targets is measurably faster in ms (AQL stamps, rad-kbench or profile-ops), before and after on one machine (§6 step 3).
 3. End-to-end tok/s or TTFT is not worse beyond noise.
 
 A kernel gain whose end-to-end effect is inside noise still merges: gains compound.
@@ -366,22 +382,39 @@ A worker without access to the lanes can still do a card, and measures it as far
    - the plugin lints (`hyv4flash_arch_test`)
    - the scheduler tests (`sched_test`)
    - every ctest that runs without a card
-3. With a GPU, measure the change yourself: before (the PR's merge base) and after (the PR's head) on the same machine,
-   same settings, at least three runs each, interleaved. Take the rows the item's merge bar (§2) names: the stamps,
-   `rad-kbench` or `profile-ops` rows of the targeted kernel, op or step, and the output parity (§2.1). Put them in the PR
-   body under `## Measurement`, with:
-   - the commit ids of before and after,
-   - the GPUs (model, count, TP), power cap, ROCm / driver version,
+3. With a GPU, measure the change yourself: before (the PR's merge base) and after (your code commit) on the same
+   machine, same settings, at least three runs each, interleaved. Take the rows the item's merge bar (§2) names: the
+   stamps, `rad-kbench` or `profile-ops` rows of the targeted kernel, op or step, and the output parity (§2.1). Write
+   them to `notes/backlog/measurements/<item>.md` (for example `K-47.md`) and commit that file to the PR, with:
+   - the commit ids of before and after (after is the commit of the code you measured; the commit that adds this file
+     comes on top of it and changes nothing else),
+   - who measured, the GPUs (model, count, TP), power cap, ROCm / driver version,
    - the container and the `ngram-placement` you ran with (any placement is fine on your machine),
-   - the raw output of each run (in a `<details>` block), not only a summary.
-   Numbers from your machine are compared with each other only, never with a lane's baseline.
-4. Push a branch and open a PR. Title it `[measured] <item>: <subject>` when step 3 covers the item's whole merge bar,
-   `[needs lane] <item>: <subject>` when it does not (no GPU, or the bar needs the u3 served A/B you cannot run). A
-   `[needs lane]` PR lists the GPU checks from the item's "Verify" part and the rows still owed.
-5. The review checks the measurement: the commit ids match the PR's base and head, before and after come from one
-   machine, the rows are the ones §2 asks for, the raw output carries the numbers. When it holds, the review records
-   `MEASURED: contributor (<GPUs>): <numbers>` and the PR merges by §2 without a lane. Otherwise the review asks for the
-   missing rows, or records `MEASURED: owed` and a lane measures the PR here.
+   - the raw lines of each run for the rows the bar names (not only a summary). Keep the file under 40 KB: the
+     review reads the PR as text and refuses larger files.
+   Numbers from your machine are compared with each other only, never with another machine's.
+4. Push a branch and open a PR whose title or body holds `Fixes #<issue>`. Title it `[measured] <item>: <subject>`
+   when the file covers the item's whole merge bar, `[needs testing] <item>: <subject>` when it does not (no GPU).
+5. **Write `/done` as a comment on the item's issue** (not on the PR): only that starts the review, and only the PR's
+   author can. After every push you want reviewed, write `/done` again. A PR gets at most three review rounds, so
+   push your fixes and the measurement together where you can.
+6. The review reads the PR's diff and files and the issue's title and body, nothing else. It checks the code and the
+   measurement file: the rows are the ones §2 asks for, before and after come from one machine, the raw lines carry
+   the numbers. When both hold it approves and the PR merges at once. When only the measurement is missing, the issue
+   gets the label `ready-for-testing` (§6.1).
+
+### 6.1 Testing a `ready-for-testing` issue
+
+No lane on the Moebius server measures anything. Anyone with a free GPU can measure a change that waits on the label
+`ready-for-testing`, without writing code:
+
+1. Check out the PR's head and its merge base (`git merge-base origin/<base> <head>`).
+2. Measure both as step 3 above says.
+3. Post the result as a comment on the issue, starting with a `## Measurement` heading.
+
+For an own card, the board picks it up within the hour: the Reviewer checks it, and the change merges, or the issue is
+told what is missing. For a PR from outside, the PR's author commits the posted measurement as
+`notes/backlog/measurements/<item>.md` and writes `/done`; the board reminds them on the issue.
 
 Items whose whole value is a measurement (marked "lane required" in their issue) need a lane from the start. Lossy items
 keep §3.

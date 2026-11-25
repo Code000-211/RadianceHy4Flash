@@ -56,6 +56,13 @@ namespace rad {
 struct VramFacts {
     int64_t capacity   = 0;   /* RadDeviceProps::vram_bytes -- totalGlobalMem */
     int64_t free       = 0;   /* RadDeviceProps::vram_free, measured now */
+    /* What of the memory NOT in `free` is device code: the bytes of the code objects this card has
+     * loaded, and how many modules they came from (DeviceBackend::code_resident). A module loads
+     * whole at its first kernel, so a build carrying kernel forms the model never launches holds
+     * VRAM for all of them -- the share of `already held` M-14 measures before anyone trims. 0
+     * where the backend loads no device code, which leaves the receipt's line out. */
+    int64_t code_bytes   = 0;
+    int     code_modules = 0;
     int64_t arena      = 0;   /* arena_plan_bytes() for this rank's program, total incl. scratch */
     int64_t staging    = 0;   /* BatchBuilder::device_bytes(): the step slab and the media staging,
                                * and TierExec::device_bytes() when a KV tier is configured */
@@ -104,6 +111,10 @@ struct VramFacts {
  * device that reports no capacity, because the placement and pool reports want the totals. */
 struct VramBudget {
     int64_t capacity = 0, already_held = 0, headroom = 0, arena = 0, staging = 0;
+    /* Of already_held, the part that is device code, and the modules it came from: the max over the
+     * ranks, so the line a lane reads names the worst card. 0 where no backend could say. */
+    int64_t code_bytes = 0;
+    int     code_modules = 0;
     int64_t drift = 0;                /* kDriverDrift: what already_held moves by after it is read */
     int64_t queues = 0;               /* n_queues * queue_bytes, from the rank that needs most */
     int64_t prefetch = 0;             /* the expert prefetch's ring and buffers */

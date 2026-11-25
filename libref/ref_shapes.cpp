@@ -2729,6 +2729,11 @@ int ref_row_topk_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out)
     return o.finish("row_topk", operand, out);
 }
 
+/* x is the f32 plane (`dtype` f32); the rest is row_topk's. */
+int ref_cast_row_topk_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    return ref_row_topk_shape(p, n_p, operand, out);
+}
+
 int ref_row_topk_merge_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const int64_t M = gi(p, n_p, "M", 0), R = gi(p, n_p, "R", 0);
     const int64_t W = gi(p, n_p, "world_size", 1);
