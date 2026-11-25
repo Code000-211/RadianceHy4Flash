@@ -884,7 +884,10 @@ extern "C" int r4d_shape_mla_attn_paged_sink(const RadParam* p, int n_p, int ope
                                 opd_idx(1, 0, 0, ctx),
                                 opd_idx(2, 0, M + 1, -1, (uint32_t)RAD_OPD_F_IDX_CU),
                                 opd((uint32_t)RAD_F32, h),
-                                opd((uint32_t)RAD_BF16, M, h, L) };
+                                opd((uint32_t)RAD_BF16, M, h, L),
+                                /* the folded rotary's positions (optional): this geometry is the
+                                 * one without them, so q_rope arrives rotated */
+                                opd_none() };
     R4D_PICK(list);
 }
 /* mla_attn_sel_sink: mla_attn's per-row tables with the rotary query and the sinks. */
@@ -900,7 +903,8 @@ extern "C" int r4d_shape_mla_attn_sel_sink(const RadParam* p, int n_p, int opera
                                 opd_idx(M, B, pages),
                                 opd_idx(M, 0, 0, B * bs),
                                 opd((uint32_t)RAD_F32, h),
-                                opd((uint32_t)RAD_BF16, M, h, L) };
+                                opd((uint32_t)RAD_BF16, M, h, L),
+                                opd_none() };             /* the folded rotary's positions */
     R4D_PICK(list);
 }
 extern "C" int r4d_shape_dsa_score(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {

@@ -280,8 +280,14 @@ int ref_hc_project(const RadArgs* a, RadStream) {
     const int64_t n  = p_int(a, "n", 0);
     const int64_t hc = p_int(a, "hc", 0);
     const float   sc = p_f32(a, "scale", 1.0f);
+    /* vsep 0: one direction shared by every stream. vsep n: a per-stream table [hc, n], where
+     * stream c reads row c (Hy4's four hyper-connection streams carry the refusal signal
+     * differently, so a per-stream package gives each its own vector). */
+    const int64_t vsep = p_int(a, "vsep", 0);
+    if (vsep != 0 && vsep != n) return RAD_E_INVAL;
+    const int64_t vrows = vsep != 0 ? hc : 1;
     if (n <= 0 || hc <= 1) return RAD_E_SHAPE;
-    if (numel(v) < n) return RAD_E_SHAPE;
+    if (numel(v) < vrows * n) return RAD_E_SHAPE;
     const int64_t hn = hc * n;
 
     const int64_t rows = rows_of(h, hn);
@@ -295,7 +301,7 @@ int ref_hc_project(const RadArgs* a, RadStream) {
         const int64_t r = k / hc, c = k % hc;
         if (ld_int(on->dtype, on->data, offlin(on, r)) == 0) continue;
         const int64_t hb = rowoff(h, r, hn), hs = laststride(h);
-        const int64_t vb = rowoff(v, 0, n), vl = laststride(v);
+        const int64_t vb = rowoff(v, vsep != 0 ? c : 0, n), vl = laststride(v);
         double acc = 0.0;
         for (int64_t i = 0; i < n; ++i)
             acc += (double) ldt(h, hb + (c * n + i) * hs) * (double) ldt(v, vb + i * vl);

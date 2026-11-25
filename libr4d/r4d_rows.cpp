@@ -589,8 +589,8 @@ static const RadOperandSpec oGdnConvRecurrentUpdateHad[] = {
 
 /* The control vector's projection (r4d_hc_bf16.hip, with the other gated-residual kernels): a bf16
  * stream, one unit f32 direction for every stream, an int32 switch per row. */
-static const RadParamSpec pHcProject[] = { P_INT("M"), P_INT("n"), P_INT("hc"), P_F64("scale"),
-                                           P_STR("dtype") };
+static const RadParamSpec pHcProject[] = { P_INT("M"), P_INT("n"), P_INT("hc"), P_INTO("vsep"),
+                                           P_F64("scale"), P_STR("dtype") };
 static const RadOperandSpec oHcProject[] = {
     { "h", RAD_OPD_INOUT, 0 }, { "v", RAD_OPD_IN, 0 }, { "on", RAD_OPD_IN, 0 },
 };
@@ -1955,6 +1955,29 @@ static const RadOperandSpec oGemmNtQGated[] = {
     { "scale",    RAD_OPD_OUT,    0 },
     { "out_bf16", RAD_OPD_OUT,    1 },
 };
+/* Two IQR weights of one activation's codes, read in one launch -- a decode step's `q_nope` and
+ * `q_rope`. Its own op rather than a flag on `gemm_nt_q` -- an op's operand count is fixed -- with
+ * gemm_nt_q's operands as the prefix and the second weight's after them, so the first part reads
+ * exactly as it does alone. The two weights are one form and one K but not one N: the second's N
+ * is `N2`, and each part's blocks are its own launch's, which is why the two Ns are separate. */
+static const RadParamSpec pGemmNtQDual[] = {
+    { "M",     RAD_P_INT, RAD_REQUIRED },
+    { "N",     RAD_P_INT, RAD_REQUIRED },
+    { "N2",    RAD_P_INT, RAD_REQUIRED },
+    { "K",     RAD_P_INT, RAD_REQUIRED },
+    { "group", RAD_P_INT, RAD_REQUIRED },
+    { "dtype", RAD_P_STR, RAD_REQUIRED },
+};
+static const RadOperandSpec oGemmNtQDual[] = {
+    { "a",        RAD_OPD_IN,     0 },
+    { "a_scale",  RAD_OPD_IN,     0 },
+    { "b",        RAD_OPD_WEIGHT, 0 },
+    { "b_scale",  RAD_OPD_WEIGHT, 0 },
+    { "y",        RAD_OPD_OUT,    0 },
+    { "b2",       RAD_OPD_WEIGHT, 0 },
+    { "b2_scale", RAD_OPD_WEIGHT, 0 },
+    { "y2",       RAD_OPD_OUT,    0 },
+};
 /* The same fold over an OCP-MXFP4 gate_up weight, which gemm_nt_q reads with a per-row reference
  * exponent (`b_ref`). A schema of its own, since an op's operand count is fixed for the plugins
  * built against it. */
@@ -2173,7 +2196,9 @@ static const RadParamSpec pMlaAttnPagedSink[] = { P_INT("M"),          P_INT("he
                                                   P_INT("latent_dim"), P_INT("rope_dim"),
                                                   P_INT("block_size"), P_INT("window"),
                                                   P_F64("scale"),      P_STR("dtype"),
-                                                  P_INTO("stable") };
+                                                  P_INTO("stable"),    P_F64O("rope_theta"),
+                                                  P_F64O("rope_scale"), P_STRO("rope_mode"),
+                                                  P_STRO("rope_sections") };
 static const RadOperandSpec oMlaAttnPagedSink[] = { { "q", RAD_OPD_IN, 0 },
                                                     { "q_rope", RAD_OPD_IN, 0 },
                                                     { "kv", RAD_OPD_IN, 0 },
@@ -2181,19 +2206,23 @@ static const RadOperandSpec oMlaAttnPagedSink[] = { { "q", RAD_OPD_IN, 0 },
                                                     { "seqused", RAD_OPD_IN, 0 },
                                                     { "cu_seqlens", RAD_OPD_IN, 0 },
                                                     { "sinks", RAD_OPD_WEIGHT, 0 },
-                                                    { "out", RAD_OPD_OUT, 0 } };
+                                                    { "out", RAD_OPD_OUT, 0 },
+                                                    { "rope_pos", RAD_OPD_IN, 1 } };
 static const RadParamSpec pMlaAttnSelSink[] = { P_INT("M"),          P_INT("heads"),
                                                 P_INT("latent_dim"), P_INT("rope_dim"),
                                                 P_INT("blocks"),     P_INT("block_size"),
                                                 P_F64("scale"),      P_STR("dtype"),
-                                                P_INTO("stable") };
+                                                P_INTO("stable"),    P_F64O("rope_theta"),
+                                                P_F64O("rope_scale"), P_STRO("rope_mode"),
+                                                P_STRO("rope_sections") };
 static const RadOperandSpec oMlaAttnSelSink[] = { { "q", RAD_OPD_IN, 0 },
                                                   { "q_rope", RAD_OPD_IN, 0 },
                                                   { "kv", RAD_OPD_IN, 0 },
                                                   { "bt", RAD_OPD_IN, 0 },
                                                   { "length", RAD_OPD_IN, 0 },
                                                   { "sinks", RAD_OPD_WEIGHT, 0 },
-                                                  { "out", RAD_OPD_OUT, 0 } };
+                                                  { "out", RAD_OPD_OUT, 0 },
+                                                  { "rope_pos", RAD_OPD_IN, 1 } };
 static const RadOperandSpec oMlaAttn[] = { { "q", RAD_OPD_IN, 0 },
                                            { "kv", RAD_OPD_IN, 0 },
                                            { "bt", RAD_OPD_IN, 0 },
@@ -3468,7 +3497,11 @@ static const RadOpSchema kSchemas[] = {
            "q_rope.rope_j); out = sum exp(s_j) latent_j / (sum exp(s_j) + exp(sink[h])): the sink joins the "
            "softmax once and carries no value. No visible key gives zero. `stable` 1 (optional, default 0) "
            "asks that a row's bytes not depend on the launch (M, its other rows); a row-independent "
-           "kernel ignores it."),
+           "kernel ignores it. `rope_pos` (optional) is the rotary's positions, indexed by the row of "
+           "this launch (the operand is this launch's rows, a view of a whole step's array): with it "
+           "the fragment is turned here from q_rope's raw columns (`rope_theta`, `rope_scale`, "
+           "`rope_mode` gptj or imrope_gptj, `rope_sections`), so the rows need no `rope` launch; "
+           "without it q_rope arrives rotated."),
     SCHEMA("mla_attn_sel_sink", pMlaAttnSelSink, oMlaAttnSelSink,
            "mla_attn's per-query page table and visible length with a rotary part and a sink: tokens "
            "[0, length[r]) of table row bt[r]. The score, the sink and `stable` are "
@@ -3948,10 +3981,11 @@ static const RadOpSchema kSchemas[] = {
            "the block-scaled fp8 form of the block input and its Hadamard-rotated twin."),
     SCHEMA("hc_project", pHcProject, oHcProject,
            "the control vector's projection (llama.cpp's `--cvec-mode project`): for each of the "
-           "hc streams of a row whose `on` flag is 1, h[s] -= scale * (h[s] . v) * v, v that "
-           "layer's unit direction -- the same v for every stream -- and scale its stored norm. A "
-           "row whose flag is 0 is neither read nor written, so an unprojected request's stream is "
-           "the stock model's."),
+           "hc streams of a row whose `on` flag is 1, h[s] -= scale * (h[s] . v_s) * v_s, v_s that "
+           "layer's unit direction for stream s -- one direction for every stream when `vsep` is "
+           "0, or a per-stream table [hc, n] when `vsep` is n -- and scale its stored norm. A row "
+           "whose flag is 0 is neither read nor written, so an unprojected request's stream is the "
+           "stock model's."),
     SCHEMA("hc_write", pHcPlain, oHcWrite,
            "the write half: h[s] += inj[s] * y, into the UNNORMED stream."),
     SCHEMA("mtp_enter", pMtpEnter, oMtpEnter,
@@ -4096,6 +4130,11 @@ static const RadOpSchema kSchemas[] = {
            "column reported so a rank's slice reports global ids, and `pairs` is the [M, R, 2] "
            "(int32 id, float value) plane an all_gather moves; a slot the row could not fill "
            "reports id -1 there and column 0 in `idx`, which is the unsharded contract unchanged."),
+    SCHEMA("cast_row_topk", pRowTopk, oRowTopk,
+           "row_topk over an f32 plane rounded to bf16, as `cast` f32 -> bf16 rounds it (to "
+           "nearest even, the cast's NaN rule included): the bytes of `cast` then row_topk at "
+           "dtype bf16, without the cast's launch or its bf16 plane. `dtype` is the plane's, f32; "
+           "`val` reports the rounded values."),
     SCHEMA("row_topk_merge", pRowTopkMerge, oRowTopkMerge,
            "the R largest of world_size all-gathered per-rank candidate sets, in the same "
            "descending (idx, val) form the single-rank top-R produces. `gathered` is "
@@ -4173,6 +4212,14 @@ static const RadOpSchema kSchemas[] = {
            "columns) and optionally the bf16 product, and no [M, 2n] tensor is ever written. "
            "Byte-identical to the two ops it replaces, which is what makes it substitutable "
            "rather than a second numerical path."),
+    SCHEMA("gemm_nt_q_dual", pGemmNtQDual, oGemmNtQDual,
+           "two GEMMs of ONE activation's codes over two weights of one encoding and one K, in one "
+           "launch: `b` -> `y` (N columns) and `b2` -> `y2` (N2 columns), the same [M, K] `a` and "
+           "its scales read twice. The two launches' blocks are concatenated in one grid, each "
+           "part doing exactly what its own launch does -- a part taking four waves a tile puts "
+           "two of its 16-row tiles in a block, one taking eight one -- so both outputs are "
+           "byte-identical to the pair of `gemm_nt_q` calls it replaces. A decode step's launch: "
+           "the pair costs one launch and one ramp instead of two."),
     SCHEMA("gate_quant_fp8", pGateQuantFp8, oGateQuantFp8,
            "the same, with the gate in its own operand rather than packed beside x."),
     SCHEMA("gate_had_quant_i8g", pGateQuantFp8, oGateQuantFp8,
@@ -5676,6 +5723,10 @@ static const RadConstraint cMoeGatherQ8[] = {
 static const RadConstraint cRowTopK[] = {
     C_DIV("N", 8), C_GE("M", 1), C_GE("R", 1), C_LE("R", 32), C_IN("dtype", "bf16"),
 };
+/* cast_row_topk: row_topk's over the f32 plane `cast` would narrow. */
+static const RadConstraint cCastRowTopK[] = {
+    C_DIV("N", 8), C_GE("M", 1), C_GE("R", 1), C_LE("R", 32), C_IN("dtype", "f32"),
+};
 static const RadConstraint cRowTopKMerge[] = {
     C_GE("M", 1), C_GE("R", 1), C_LE("R", 32), C_GE("world_size", 1), C_IN("dtype", "bf16"),
 };
@@ -5813,6 +5864,17 @@ static const RadConstraint cGemmNtQGatedIqr[] = {
 static const RadConstraint cGemmNtIqrTiled[] = {
     C_DIV("K", 256), C_DIV("N", R4D_FP8_BLOCK), C_EQ("group", R4D_FP8_BLOCK),
     C_IN("dtype", "i8a8 i8a8h"),
+};
+/* Two IQR weights of one input in one launch (K-02's q_nope and q_rope). One token a step: the
+ * GEMV, where the pair is two launches' launch and ramp cost, and the one band both parts' blocks
+ * are laid out for -- wider passes keep both Lins' own launches. Both weights one encoding, hence
+ * one K; each N a multiple of its own launch's block and its own: 16 columns, and 32 from 4096
+ * columns up, where that launch's block is two tiles and the two halves of a block are its. The
+ * constraint below holds the 16 every N needs; a wide part's 32 is the launch's, which refuses a
+ * pair outside its block before it emits (`dual_launch`). */
+static const RadConstraint cGemmNtQIqrDual[] = {
+    C_LE("M", 1), C_DIV("K", 256), C_DIV("N", 16), C_DIV("N2", 16),
+    C_EQ("group", R4D_FP8_BLOCK), C_IN("dtype", "i8a8 i8a8h"),
 };
 /* libr4d's `K DIV 4`, renamed to docs/OPS.md's `n` as in every quantiser row here. */
 static const RadConstraint cQuantActFp8[] = {
@@ -9474,6 +9536,23 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   /* The byte-identity claim above, as a chain of two rows of this plugin (r4d_fuse.cpp). */
   r4d_fuse_gemm_nt_q_gated_iqr },
 
+{ "gemm_iqr_dual", "gemm_nt_q_dual", "gemm",
+  "two IQR weights of one activation's codes in one launch: the two GEMV grids concatenated, one "
+  "eight-wave block size, a part that takes four waves a tile carrying two of its 16-row tiles in "
+  "a block and a part that takes eight one, each tile folded over its own waves as its own launch "
+  "folds it (K-02's q_nope and q_rope)",
+  "M == 1; both weights one encoding and one K; K a multiple of 256, each N of 16 and of a "
+  "trellis's run (of 32 from 4096 columns up, where its launch's block is two tiles)",
+  "i8 A with an f32 scale per (row, 128 K) read by both, W and W2 an IQR form's codes with their "
+  "scales, bf16 C and C2. Byte-identical to the two gemm_iqr_nt_m64 launches it replaces -- each "
+  "part's blocks are the blocks of its own launch",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cGemmNtQIqrDual), NOTUNE,
+  nullptr, nullptr, r4d_rad_gemm_iqr_dual, nullptr,
+  r4d_rad_layout_iqr_dual, r4d_rad_relayout_iqr_dual, nullptr, r4d_rad_unrelayout_iqr_dual,
+  /* The byte-identity claim above, as a chain of two rows of this plugin (r4d_fuse.cpp). */
+  r4d_fuse_gemm_nt_q_dual_iqr },
+
 { "gemm_iqr_tiled", "gemm_nt_q", "gemm",
   "the prefill GEMM over an IQR weight: the call decodes the weight's codes into the int8 fragment "
   "plane in its scratch, once, and runs gemm_i8a8_tiled (or its rb8 / rb32 fold on a tcq_rb "
@@ -9880,11 +9959,22 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
 
 { "rowtopk_bf16", "row_topk", "select",
   "exact per-row top-R of a bf16 matrix, descending, ties to the lower column",
-  "any M, N a multiple of 8, R <= 32; two launches, caller-sized partial buffer",
+  "any M, N a multiple of 8, R <= 32; one launch at R <= 16 (stage 2 in the last wave), two "
+  "above; caller-sized partial buffer",
   "bf16 in, f32 values + i32 columns out",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cRowTopK), ROW(tTopk), nullptr,
   nullptr, nullptr, r4d_rad_rowtopk, r4d_rad_rowtopk_scratch, nullptr, nullptr,
+  r4d_shape_row_topk },
+
+{ "cast_rowtopk_f32", "cast_row_topk", "select",
+  "rowtopk_bf16 over an f32 matrix rounded to bf16 as it is read: cast f32 -> bf16 then row_topk, "
+  "in one or two launches and no bf16 plane",
+  "rowtopk_bf16's: any M, N a multiple of 8, R <= 32; one launch at R <= 16, two above",
+  "f32 in, f32 values (bf16-rounded) + i32 columns out",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cCastRowTopK), ROW(tTopk), nullptr,
+  nullptr, nullptr, r4d_rad_cast_rowtopk, r4d_rad_rowtopk_scratch, nullptr, nullptr,
   r4d_shape_row_topk },
 
 { "logit_rerank_i8", "logit_rerank", "select",
@@ -12041,7 +12131,7 @@ extern "C" int rad_kernel_chain(int i) {
          * selector */
         "sample_temp_f32", "sample_topk_f32", "sample_merge_topk_f32", "sample_pick_f32",
         "ar_gather_4rank", "gemm_w8a8_nt_m64", "rowtopk_bf16", "rowtopk_merge",
-        "dflash_select_bf16", "dflash_tree_bf16",
+        "cast_rowtopk_f32", "dflash_select_bf16", "dflash_tree_bf16",
         /* the weight read beside a collective (its blocks add before reading, r4d_prefetch.hip) */
         "prefetch",
         /* Flash-Next's decode pass: the connection's fused read, the fused router and the
@@ -12049,7 +12139,8 @@ extern "C" int rad_kernel_chain(int i) {
          * trellis's GEMV and 16-token tile, plain and gated, and the 128-group gated and gate
          * quantisers (the gated one for E4M3 codes too, which the w4 experts read) */
         "hc_read_e4m3", "router_gemm_topk_scatter_bf16", "moe_gemm_iqr", "moe_gemm_iqr_mod4",
-        "gemm_iqr_nt_m64", "gemm_iqr_gated", "gated_had_quant_i8g", "gate_had_quant_i8g",
+        "gemm_iqr_nt_m64", "gemm_iqr_dual", "gemm_iqr_gated", "gated_had_quant_i8g",
+        "gate_had_quant_i8g",
         /* G-3: the clamped SwiGLU with the rotated int8 quantiser on its pass */
         "swiglu_clamped_had_quant_i8g",
                 "gdn_conv_recurrent_update_k128_v128_bf16", "gdn_conv_recurrent_update_had_k128_v128_bf16",

@@ -126,8 +126,8 @@ static const RadParamSpec pHcWrite[] = { P_INT("M"), P_INT("n"), P_INT("hc"), P_
 /* The control vector's projection (libref/ref_hc.cpp, core/cvec.h): one unit direction per layer and a
  * per-row switch. `v` is f32 whatever the stream's dtype is, because the engine uploads the table
  * in f32; `on` is an int32 row mask (core derive.cpp's `projection_on_rows`). */
-static const RadParamSpec pHcProject[] = { P_INT("M"), P_INT("n"), P_INT("hc"), P_F64("scale"),
-                                           P_STR("dtype") };
+static const RadParamSpec pHcProject[] = { P_INT("M"), P_INT("n"), P_INT("hc"), P_INTO("vsep"),
+                                           P_F64("scale"), P_STR("dtype") };
 static const RadOperandSpec oHcProject[] = { INOUT("h"), OPD("v"), OPD("on") };
 static const RadOperandSpec oHcEnter[] = { OPD("x"), OUT("h") };
 static const RadOperandSpec oHcWrite[] = { OPD("y"), OPD("inj"), INOUT("h") };
@@ -238,14 +238,17 @@ static const RadParamSpec pMlaProjectKv[] = { P_INT("M"), P_INT("heads"), P_INT(
     P_INT("v_dim"), P_INT("latent_dim"), P_STR("mode"), P_STR("dtype") };
 static const RadParamSpec pMlaAttnPagedSink[] = { P_INT("M"), P_INT("heads"), P_INT("latent_dim"),
     P_INT("rope_dim"), P_INT("block_size"), P_INT("window"), P_F64("scale"), P_STR("dtype"),
-    P_INTO("stable") };
+    P_INTO("stable"), P_F64O("rope_theta"), P_F64O("rope_scale"), P_STRO("rope_mode"),
+    P_STRO("rope_sections") };
 static const RadOperandSpec oMlaAttnPagedSink[] = { OPD("q"), OPD("q_rope"), OPD("kv"),
-    OPD("block_table"), OPD("seqused"), OPD("cu_seqlens"), WGT("sinks"), OUT("out") };
+    OPD("block_table"), OPD("seqused"), OPD("cu_seqlens"), WGT("sinks"), OUT("out"),
+    OPD_O("rope_pos") };
 static const RadParamSpec pMlaAttnSelSink[] = { P_INT("M"), P_INT("heads"), P_INT("latent_dim"),
     P_INT("rope_dim"), P_INT("blocks"), P_INT("block_size"), P_F64("scale"), P_STR("dtype"),
-    P_INTO("stable") };
+    P_INTO("stable"), P_F64O("rope_theta"), P_F64O("rope_scale"), P_STRO("rope_mode"),
+    P_STRO("rope_sections") };
 static const RadOperandSpec oMlaAttnSelSink[] = { OPD("q"), OPD("q_rope"), OPD("kv"), OPD("bt"),
-    OPD("length"), WGT("sinks"), OUT("out") };
+    OPD("length"), WGT("sinks"), OUT("out"), OPD_O("rope_pos") };
 static const RadParamSpec pMlaKvSplit[] = { P_INT("M"), P_INT("heads"), P_INT("k_dim"),
     P_INT("v_dim"), P_INT("rope_dim"), P_STR("dtype") };
 static const RadOperandSpec oMlaKvSplit[] = { OPD("kvb"), OPD("k_rope"), OUT("k"), OUT("v") };
@@ -1479,7 +1482,11 @@ static const RadOpSchema kSchemas[] = {
   "q_rope.rope_j); out = sum exp(s_j) latent_j / (sum exp(s_j) + exp(sink[h])): the sink joins the "
   "softmax once and carries no value. No visible key gives zero. `stable` 1 (optional, default 0) "
   "asks that a row's bytes not depend on the launch (M, its other rows); a row-independent "
-  "kernel ignores it." },
+  "kernel ignores it. `rope_pos` (optional) is the rotary's positions, indexed by the row of "
+  "this launch (the operand is this launch's rows, a view of a whole step's array): with it "
+  "the fragment is turned here from q_rope's raw columns (`rope_theta`, `rope_scale`, "
+  "`rope_mode` gptj or imrope_gptj, `rope_sections`), so the rows need no `rope` launch; "
+  "without it q_rope arrives rotated." },
 { "mla_attn_sel_sink", ARR(pMlaAttnSelSink), ARR(oMlaAttnSelSink),
   "mla_attn's per-query page table and visible length with a rotary part and a sink: tokens "
   "[0, length[r]) of table row bt[r]. The score, the sink and `stable` are "
@@ -1941,6 +1948,10 @@ static const RadOpSchema kSchemas[] = {
   "Exact per-row top-R, descending, ties to the lower column. `vocab_off` shifts every column it "
   "reports, so a rank's slice reports GLOBAL ids; `pairs` is the [M, R, 2] (int32 id, float value) "
   "plane an all_gather moves, with id -1 for a slot the row could not fill." },
+{ "cast_row_topk", ARR(pRowTopk), ARR(oRowTopk),
+  "row_topk over an f32 plane rounded to bf16, as `cast` f32 -> bf16 rounds it (to nearest even, "
+  "the cast's NaN rule included): the bytes of `cast` then row_topk at dtype bf16, without the "
+  "cast's launch or its bf16 plane. `dtype` is the plane's, f32; `val` reports the rounded values." },
 { "row_topk_merge", ARR(pRowTopkMerge), ARR(oRowTopkMerge),
   "The R largest of world_size all-gathered per-rank candidate sets, in the same descending "
   "(idx, val) form the single-rank top-R produces. `gathered` is [M, world_size * R, 2] pairs, "
@@ -2911,6 +2922,7 @@ SIMPLE("ref_kv_resolve", "kv_resolve", "attn",
 SIMPLE("ref_dflash_conv", "dflash_conv", "draft",
        "DFlash2 grouped dynamic depthwise convolution", DT_FLOAT, ref_dflash_conv),
 SIMPLE("ref_row_topk", "row_topk", "moe", "exact per-row top-R", DT_FLOAT, ref_row_topk),
+SIMPLE("ref_cast_row_topk", "cast_row_topk", "moe", "row_topk over an f32 plane rounded to bf16 (cast then row_topk)", "f32 in, f32 values + i32 columns out", ref_cast_row_topk),
 SIMPLE("ref_row_topk_merge", "row_topk_merge", "moe", "the global top-R of the gathered per-rank candidate sets", DT_FLOAT, ref_row_topk_merge),
 SIMPLE("ref_pair_argmax", "pair_argmax", "moe", "the global top-1 of a row of gathered (id, value) pairs, one id a row", DT_FLOAT, ref_pair_argmax),
 ROWL("ref_logit_rerank", "logit_rerank", "moe",
