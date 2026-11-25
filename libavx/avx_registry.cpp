@@ -205,14 +205,17 @@ static const RadParamSpec pMlaProjectKv[] = { P_INT("M"), P_INT("heads"), P_INT(
     P_INT("v_dim"), P_INT("latent_dim"), P_STR("mode"), P_STR("dtype") };
 static const RadParamSpec pMlaAttnPagedSink[] = { P_INT("M"), P_INT("heads"), P_INT("latent_dim"),
     P_INT("rope_dim"), P_INT("block_size"), P_INT("window"), P_F64("scale"), P_STR("dtype"),
-    P_INTO("stable") };
+    P_INTO("stable"), P_F64O("rope_theta"), P_F64O("rope_scale"), P_STRO("rope_mode"),
+    P_STRO("rope_sections") };
 static const RadOperandSpec oMlaAttnPagedSink[] = { OPD("q"), OPD("q_rope"), OPD("kv"),
-    OPD("block_table"), OPD("seqused"), OPD("cu_seqlens"), WGT("sinks"), OUT("out") };
+    OPD("block_table"), OPD("seqused"), OPD("cu_seqlens"), WGT("sinks"), OUT("out"),
+    OPD_O("rope_pos") };
 static const RadParamSpec pMlaAttnSelSink[] = { P_INT("M"), P_INT("heads"), P_INT("latent_dim"),
     P_INT("rope_dim"), P_INT("blocks"), P_INT("block_size"), P_F64("scale"), P_STR("dtype"),
-    P_INTO("stable") };
+    P_INTO("stable"), P_F64O("rope_theta"), P_F64O("rope_scale"), P_STRO("rope_mode"),
+    P_STRO("rope_sections") };
 static const RadOperandSpec oMlaAttnSelSink[] = { OPD("q"), OPD("q_rope"), OPD("kv"), OPD("bt"),
-    OPD("length"), WGT("sinks"), OUT("out") };
+    OPD("length"), WGT("sinks"), OUT("out"), OPD_O("rope_pos") };
 static const RadParamSpec pMlaKvSplit[] = { P_INT("M"), P_INT("heads"), P_INT("k_dim"),
     P_INT("v_dim"), P_INT("rope_dim"), P_STR("dtype") };
 static const RadOperandSpec oMlaKvSplit[] = { OPD("kvb"), OPD("k_rope"), OUT("k"), OUT("v") };
@@ -1198,7 +1201,11 @@ static const RadOpSchema kSchemas[] = {
   "q_rope.rope_j); out = sum exp(s_j) latent_j / (sum exp(s_j) + exp(sink[h])): the sink joins the "
   "softmax once and carries no value. No visible key gives zero. `stable` 1 (optional, default 0) "
   "asks that a row's bytes not depend on the launch (M, its other rows); a row-independent "
-  "kernel ignores it." },
+  "kernel ignores it. `rope_pos` (optional) is the rotary's positions, indexed by the row of "
+  "this launch (the operand is this launch's rows, a view of a whole step's array): with it "
+  "the fragment is turned here from q_rope's raw columns (`rope_theta`, `rope_scale`, "
+  "`rope_mode` gptj or imrope_gptj, `rope_sections`), so the rows need no `rope` launch; "
+  "without it q_rope arrives rotated." },
 { "mla_attn_sel_sink", ARR(pMlaAttnSelSink), ARR(oMlaAttnSelSink),
   "mla_attn's per-query page table and visible length with a rotary part and a sink: tokens "
   "[0, length[r]) of table row bt[r]. The score, the sink and `stable` are "

@@ -269,18 +269,21 @@ struct Dfly {
     }
     /* Issued after layer l's Indexer::step, before its attention (whose kv_resolve may rewrite
      * `ix.selected` in place). `direct`: the step's `qsa_select` wrote the plane's window
-     * itself, so a selecting layer has nothing to copy (P-09). */
+     * itself, so a selecting layer copies only the tap's group ids (P-09). */
     void snap_step(RadCtx* c, int l, const IndexWire& iw, bool select, QueryRows rows,
                    bool direct) const {
         const Snap* sn = snap_of(l);
         if (!sn || !rows.n) return;
         if (select) {
-            if (direct) return;
+            if (direct && !op_ids) return;
             rows.spans([&](int64_t orig, int64_t compact, int64_t n) {
-                RAD_ISSUE_N(c, op_sel, n, brow_slice(iw.sel, compact, n, sn->width),
-                            brow_slice(snap_sel, sn->base + orig, n, sn->width));
-                RAD_ISSUE_N(c, op_nsel, n, brow_slice(iw.nsel, compact, n, 1),
-                            brow_slice(snap_nsel, sn->base + orig, n, 1));
+                if (!direct) {
+                    RAD_ISSUE_N(c, op_sel, n, brow_slice(iw.sel, compact, n, sn->width),
+                                brow_slice(snap_sel, sn->base + orig, n, sn->width));
+                    RAD_ISSUE_N(c, op_nsel, n, brow_slice(iw.nsel, compact, n, 1),
+                                brow_slice(snap_nsel, sn->base + orig, n, 1));
+                }
+                /* the tap's group ids (`op_tap_select`) always land on the wire */
                 if (op_ids)
                     RAD_ISSUE_N(c, op_ids, n, brow_slice(iw.sel_ids, compact, n, sn->width),
                                 brow_slice(snap_ids, sn->base + orig, n, sn->width));

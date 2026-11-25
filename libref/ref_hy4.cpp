@@ -322,6 +322,74 @@ void mla_sink_one(const RadTensor& q, const RadTensor& qr, const RadTensor& kv, 
 
 bool sink_vector_ok(const RadTensor& sinks, int64_t H) { return sinks.rank == 1 && numel(&sinks) >= H; }
 
+/* The rotary folded into a latent sink, or nothing: with `rope_pos` (the sink's optional operand)
+ * the sink's `q_rope` operand holds the projection's raw columns and the rotation is applied before
+ * the score, so the caller needs no `rope` launch for these rows. The rotation is `rope` itself over
+ * a copy of those columns, so the folded form is the launch's bytes and there is one expression.
+ * `pos` is [rows] or [n_comp, rows] -- a view of the caller's positions, which may carry a whole
+ * step's. gptj's adjacent pairings only: the sink turns the fragment a lane owns, which is what the
+ * device kernel can do, and anything else is refused rather than half applied. */
+int sink_rope(const RadArgs* a, int nt, const RadTensor& src, int64_t rows, int64_t H, int64_t R,
+              std::vector<uint16_t>* buf, RadTensor* dst) {
+    if (a->n_t <= nt || !a->t[nt].data) return RAD_OK; /* q_rope arrives rotated */
+    const RadTensor& p = a->t[nt];
+    if (p.dtype != RAD_I32) return RAD_E_DTYPE;
+    const char* mode = p_str(a, "rope_mode", "gptj");
+    if (std::strcmp(mode, "gptj") != 0 && std::strcmp(mode, "imrope_gptj") != 0)
+        return RAD_E_UNSUPPORTED;
+    RadTensor pv = p;
+    if (p.rank >= 2) {
+        if (p.stride[1] != 1 || p.shape[1] < rows) return RAD_E_SHAPE;
+        pv.shape[1] = rows;
+    } else {
+        if (numel(&p) < rows) return RAD_E_SHAPE;
+        pv.shape[0] = rows;
+    }
+    buf->assign((size_t)(rows * H * R), 0);
+    RadTensor q{};
+    q.data = buf->data();
+    q.dtype = RAD_BF16;
+    q.rank = 3;
+    q.shape[0] = rows;
+    q.shape[1] = H;
+    q.shape[2] = R;
+    q.stride[0] = H * R;
+    q.stride[1] = R;
+    q.stride[2] = 1;
+    for (int64_t r = 0; r < rows; ++r)
+        for (int64_t h = 0; h < H; ++h)
+            for (int64_t c = 0; c < R; ++c)
+                stt(&q, (r * H + h) * R + c,
+                    ldt(&src, r * src.stride[0] + h * src.stride[1] + c * src.stride[2]));
+    /* The rope op's own geometry, [rows, heads * width]: its head pitch is the head's width, so a
+     * rank-3 view (heads one rank down) would only be read right where the two agree. */
+    RadTensor qe = q;
+    qe.rank = 2;
+    qe.shape[0] = rows;
+    qe.shape[1] = H * R;
+    qe.stride[0] = H * R;
+    qe.stride[1] = 1;
+    RadParam rp[8];
+    int np = 0;
+    rp[np++] = RAD_INT("head_dim", R);
+    rp[np++] = RAD_INT("n_head", H);
+    rp[np++] = RAD_INT("n_head_kv", 0);
+    rp[np++] = RAD_F64("theta", (double)p_f32(a, "rope_theta", 10000.0f));
+    rp[np++] = RAD_F64("scale", (double)p_f32(a, "rope_scale", 1.0f));
+    rp[np++] = RAD_STR("mode", mode);
+    const char* sec = p_str(a, "rope_sections", nullptr);
+    if (sec && *sec) rp[np++] = RAD_STR("sections", sec);
+    RadTensor rt[2] = { qe, pv };
+    RadArgs ra{};
+    ra.t = rt;
+    ra.n_t = 2;
+    ra.p = rp;
+    ra.n_p = np;
+    RAD_REF_TRY(ref_rope(&ra, RadStream{}));
+    *dst = q;
+    return RAD_OK;
+}
+
 }  // namespace
 
 /* mla_attn_paged with a window and a sink. Sequence s owns query rows [cu[s], cu[s+1]), its
@@ -349,6 +417,12 @@ int ref_mla_attn_paged_sink(const RadArgs* a, RadStream) {
         return RAD_E_SHAPE;
     const int64_t n_seq = numel(&su), rows = q.shape[0];
     if (cu_at(&cu, 0) != 0 || cu_at(&cu, n_seq) != rows || bt.shape[0] < n_seq) return RAD_E_SHAPE;
+    std::vector<uint16_t> qrbuf;
+    RadTensor qrr = qr;
+    /* Not folded into RAD_REF_TRY: a call the macro hides is one the linter cannot see. */
+    const int frst = sink_rope(a, 8, qr, rows, H, R, &qrbuf, &qrr);
+    RAD_REF_TRY(frst);
+    qr = qrr;
     REF_PAR_FOR_DYN(rows * H * 64)
     for (int64_t job = 0; job < rows * H; ++job) {
         const int64_t r = job / H, head = job % H;
@@ -386,6 +460,11 @@ int ref_mla_attn_sel_sink(const RadArgs* a, RadStream) {
         o.shape[0] != q.shape[0] || o.shape[1] != H || o.shape[2] != L || !sink_vector_ok(sinks, H))
         return RAD_E_SHAPE;
     const int64_t rows = q.shape[0];
+    std::vector<uint16_t> qrbuf;
+    RadTensor qrr = qr;
+    const int frst = sink_rope(a, 7, qr, rows, H, R, &qrbuf, &qrr);
+    RAD_REF_TRY(frst);
+    qr = qrr;
     REF_PAR_FOR_DYN(rows * H * 64)
     for (int64_t job = 0; job < rows * H; ++job) {
         const int64_t r = job / H, head = job % H;
