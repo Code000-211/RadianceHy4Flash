@@ -92,18 +92,28 @@ struct GlmTp {
     }
 };
 
+/* The prefill tile's domain: libr4d's `cGemmNtF32Wmma` row serves N 16..512 and K 64..16384 in
+ * whole 64-element stages, and it reads W stored bf16. A declare runs on the host and cannot read a
+ * row's limits, so the plugin states the same three bounds here; a band this refuses would be an
+ * op no row serves (`libr4d/r4d_rows.cpp`, `libavx/avx_glm.cpp`). */
+inline bool glm_projection_tile_serves(int64_t k, int64_t cols, bool weight_bf16) {
+    return weight_bf16 && k >= 64 && k <= 16384 && k % 64 == 0 && cols >= 16 && cols <= 512;
+}
+
 /* Keep existing f32 projections' declarations identical, including their graph hashes.
  *
- * `wmma` declares the prefill tile's row (gemm_nt_f32_wmma) instead: gemm_nt_f32's bf16 operands
+ * `wmma` declares the prefill band's row (gemm_nt_f32_wmma) instead: gemm_nt_f32's bf16 operands
  * and F32 output on the bf16 WMMA tile, which sums each 16-deep k step as one and so lands in a
  * different last bit from the F32 routing kernel (LOSSY, opt-in: notes/backlog/lossy/P-13.md).
- * The row serves M >= 128, so the range starts there and the band below it is not declared: a
- * caller that wants today's kernel there declares without `wmma`. */
+ * The band is the prefill one -- rows from GlmTp::kSplitRows, the step size from which this code
+ * calls a step prefill-sized, and above the row's own M >= 128 -- so the shorter steps (decode and
+ * verify) keep today's kernel in an op declared without `wmma`. A caller must not ask for it below
+ * that floor: the range would be empty, which the schema refuses. */
 inline rad_op declare_glm_projection(RadBuilder* b, int64_t rows, int64_t n, int64_t k,
                                      rad_weight weight, bool packed, rad_buf input, rad_buf output,
-                                     bool wmma = false, int64_t wmma_min_rows = 128) {
-    const RadParam params[] = { RAD_RANGE("M", wmma ? wmma_min_rows : 1, rows), RAD_INT("N", n),
-                                RAD_INT("K", k), RAD_STR("dtype", "bf16"),
+                                     bool wmma = false) {
+    const RadParam params[] = { RAD_RANGE("M", wmma ? GlmTp::kSplitRows : 1, rows),
+                                RAD_INT("N", n), RAD_INT("K", k), RAD_STR("dtype", "bf16"),
                                 RAD_INT("weight_bf16", 1) };
     return rw(b, rad_decl_op(b, wmma ? "gemm_nt_f32_wmma" : "gemm_nt_f32", params, packed ? 5 : 4,
                              &weight, 1),
@@ -125,24 +135,27 @@ struct SplitF32Proj {
     rad_op op_part = 0, op_gather = 0;
     int64_t cols = 0, k = 0, min_rows = 0, first_col = 0;
 
+    /* Whether a rank of `world` takes a slice of a projection `n` wide at all, and so whether the
+     * split below serves its prefill rows (`declare` applies this rule). */
+    static bool columns_split(int world, int64_t n) {
+        return world >= 2 && n % world == 0 && (n / world * 4) % 16 == 0;
+    }
+
     int declare(RadBuilder* b, Names& nm, const Geom& g, const char* name, int64_t rows, int64_t n,
                 int64_t width, rad_weight weight, rad_buf input, rad_buf output, bool weight_bf16,
                 bool wmma = false) {
-        min_rows = GlmTp::kSplitRows;
-        if (g.world < 2 || n % g.world || (n / g.world * 4) % 16) {
-            min_rows = 0;
-            return RAD_OK;
-        }
+        min_rows = columns_split(g.world, n) ? GlmTp::kSplitRows : 0;
+        if (!min_rows) return RAD_OK;
         cols = n / g.world;
         k = width;
         first_col = g.rank * cols;
-        /* The prefill tile reads W as bf16 in whole 64-element K stages, so only a stored-bf16
-         * projection of the width and expert count its row serves leaves this kernel. */
-        const bool tile = wmma && weight_bf16 && k >= 64 && k <= 16384 && k % 64 == 0 &&
-                          cols >= 16 && cols <= 512 && rows >= GlmTp::kSplitRows;
+        /* Only a stored-bf16 slice of a width and height the prefill tile serves leaves gemm_nt_f32.
+         * A step shorter than the split's floor never takes the split, so the tile's range would be
+         * empty there; the op is then declared on the F32 kernel it is never issued from. */
+        const bool tile = wmma && rows >= GlmTp::kSplitRows &&
+                          glm_projection_tile_serves(k, cols, weight_bf16);
         part = decl_b(b, nm.f("%s.part", name), RAD_F32, { rows, cols });
-        op_part = declare_glm_projection(b, rows, cols, k, weight, weight_bf16, input, part, tile,
-                                         GlmTp::kSplitRows);
+        op_part = declare_glm_projection(b, rows, cols, k, weight, weight_bf16, input, part, tile);
         op_gather = rw(
             b,
             RAD_OP(b, "all_gather",
