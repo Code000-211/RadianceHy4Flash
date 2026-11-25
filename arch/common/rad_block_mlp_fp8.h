@@ -136,7 +136,7 @@ inline int MlpFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l, co
                                        ? std::initializer_list<rad_buf>{ w.ffn.q, w.ffn.s, w.ffn.x }
                                        : std::initializer_list<rad_buf>{ w.ffn.q, w.ffn.s },
                                    &gated_rows, wide_fold);
-    else if (fold_ok && gate_up.iqr && w.h.q8_fed && w.h.q8_rot && w.ffn.q8_fed && w.ffn.q8_rot)
+    else if (fold_ok && gated_fold_iqr_ok(gate_up, w.h, w.ffn, true))
         op_gated = decl_gated_fold_iqr(b, g.max_tok, gate_up.N, gate_up.K, gate_up.w, gate_up.ws,
                                        { w.h.q8, w.h.s8 },
                                        gq_ffn.want_x

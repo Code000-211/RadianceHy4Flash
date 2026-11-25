@@ -35,7 +35,21 @@ constexpr uint32_t kWaves = kThreads / kWave;
 constexpr uint32_t kGroup = 128;
 
 // One block per row; a wave owns one 128-column group, a lane four consecutive columns (one dword
-// store, 128 contiguous bytes per wave, two v_cvt_pk_fp8_f32).
+// store, 128 contiguous bytes per wave, two v_cvt_pk_fp8_f32), and a block's waves run the groups
+// of its row kWaves at a time.
+//
+// A launch whose wavefront count lands on a multiple of the card's 2048 wavefronts is about five
+// times slower per byte (r4d_common.h), and a launch of M blocks has 8*M of them: at M 256 and its
+// multiples the whole grid is in that window. The launcher pads the row count with
+// r4d_cliff_rows, and the kernel returns at once in a row that is not there - still reaching
+// r4d_chain_done, which is what the chained form's target counts (r4d_chain.h). Measured on
+// gfx1201 (kbench, 5 rounds): K 3072 M 256 21.2 -> 6.4 us, M 512 25.4 -> 9.0, K 1536 M 256
+// 21.2 -> 3.8.
+//
+// Spreading a row's groups over several blocks (one group a wave, three blocks for the 24 groups of
+// a K 3072 row) was measured and not taken: it is faster under kbench alone (a K 16384 row at M 1
+// 7.7 -> 2.4 us) but costs 0.3 us a launch in the served chain, where 213 of them run a decode
+// pass against a 2.7-3.3 us launch, and the class went 635 -> 700 us (K-22).
 //
 // ROT applies r4d_fwht_wave<128> in registers between the load and the absmax; the mapping (four
 // values per lane) is the one it expects, so no LDS or barrier is needed, and the absmax sees the
@@ -45,8 +59,9 @@ constexpr uint32_t kGroup = 128;
 // I8 is the same quantiser at int8 codes (quant_act_i8g, had_quant_act_i8g): scale amax/127,
 // round-to-nearest-even into -127..127, same row-major layout and per-(row, 128) scales.
 //
-// CHAIN brackets the body with the chained launch's wait and add (r4d_chain.h); no block returns
-// early. quant_act_fp8_kernel and r4dchain_quant_act_fp8 below are the plain and chained forms.
+// CHAIN brackets the body with the chained launch's wait and add (r4d_chain.h); a block of a row
+// the launch padded in does nothing but reach r4d_chain_done. quant_act_fp8_kernel and
+// r4dchain_quant_act_fp8 below are the plain and chained forms.
 //
 // SUB is the 128-column blocks one scale covers: 1, or 2 for IQ8R's 256-wide group (int8 only),
 // where a wave owns both blocks of a group, rotates each on its own (the rotation stays 128 wide)
@@ -54,11 +69,17 @@ constexpr uint32_t kGroup = 128;
 template <bool ROT, bool I8 = false, bool CHAIN = false, uint32_t SUB = 1>
 __device__ __forceinline__ void quant_act_fp8_body(
     const uint16_t* __restrict__ x, uint8_t* __restrict__ q, float* __restrict__ s,
-    uint32_t K, uint32_t nkb, uint32_t x_ld, uint32_t q_ld, uint32_t s_ld) {
+    uint32_t K, uint32_t nkb, uint32_t x_ld, uint32_t q_ld, uint32_t s_ld, uint32_t m_rows) {
     static_assert(SUB == 1 || (SUB == 2 && I8), "a 256 group is the int8 quantiser's");
     if (CHAIN) r4d_chain_wait_vec();
     const uint32_t row = blockIdx.x;
     const uint32_t lane = threadIdx.x & (kWave - 1), wave = threadIdx.x / kWave;
+    // A row the launch added past the full-card cliff (r4d_cliff_rows): it reads, writes and scales
+    // nothing, but the block still reaches r4d_chain_done, which the chained form's target counts.
+    if (row >= m_rows) {
+        if (CHAIN) r4d_chain_done();
+        return;
+    }
     const size_t xrow = (size_t)row * x_ld;
     const size_t qrow = (size_t)row * q_ld;
 
@@ -113,14 +134,15 @@ __device__ __forceinline__ void quant_act_fp8_body(
 }
 
 #define R4D_QAF_PARAMS const uint16_t* __restrict__ x, uint8_t* __restrict__ q,                  \
-    float* __restrict__ s, uint32_t K, uint32_t nkb, uint32_t x_ld, uint32_t q_ld, uint32_t s_ld
+    float* __restrict__ s, uint32_t K, uint32_t nkb, uint32_t x_ld, uint32_t q_ld, uint32_t s_ld,  \
+    uint32_t m_rows
 template <bool ROT, bool I8 = false, uint32_t SUB = 1>
 __global__ __launch_bounds__(kThreads) void quant_act_fp8_kernel(R4D_QAF_PARAMS) {
-    quant_act_fp8_body<ROT, I8, false, SUB>(x, q, s, K, nkb, x_ld, q_ld, s_ld);
+    quant_act_fp8_body<ROT, I8, false, SUB>(x, q, s, K, nkb, x_ld, q_ld, s_ld, m_rows);
 }
 template <bool ROT, bool I8 = false, uint32_t SUB = 1>
 __global__ __launch_bounds__(kThreads) void r4dchain_quant_act_fp8(R4D_QAF_PARAMS) {
-    quant_act_fp8_body<ROT, I8, true, SUB>(x, q, s, K, nkb, x_ld, q_ld, s_ld);
+    quant_act_fp8_body<ROT, I8, true, SUB>(x, q, s, K, nkb, x_ld, q_ld, s_ld, m_rows);
 }
 #undef R4D_QAF_PARAMS
 
@@ -148,15 +170,19 @@ static int quant_act_fp8_launch(long a, long q, long s, int M, int K,
     const int grp = wide ? 2 * (int)kGroup : (int)kGroup;
     const int nkb = (K + grp - 1) / grp;
     if (!s_ld) s_ld = nkb;
+    /* One block a row has kWaves wavefronts, so a launch of M rows is in the full-card window
+     * (r4d_common.h) at M 256 and its multiples; r4d_cliff_rows steps past it with rows that return
+     * at once. */
+    const unsigned rows = r4d_cliff_rows((uint32_t)M, 1u, kWaves);
     /* The chained form at decode heights, where the row resolved with `chain`. */
     const bool ch = chain && M <= 64;
 #define R4D_QA(ROT_, I8_, SUB_)                                                               \
-    (ch ? R4D_EMIT(stream, (r4dchain_quant_act_fp8<ROT_, I8_, SUB_>), dim3((uint32_t)M),       \
-                   dim3(kThreads), 0, (const uint16_t*)a, (uint8_t*)q, (float*)s, (uint32_t)K, \
-                   (uint32_t)nkb, (uint32_t)x_ld, (uint32_t)q_ld, (uint32_t)s_ld)               \
-        : R4D_EMIT(stream, (quant_act_fp8_kernel<ROT_, I8_, SUB_>), dim3((uint32_t)M),         \
-                   dim3(kThreads), 0, (const uint16_t*)a, (uint8_t*)q, (float*)s, (uint32_t)K, \
-                   (uint32_t)nkb, (uint32_t)x_ld, (uint32_t)q_ld, (uint32_t)s_ld))
+    (ch ? R4D_EMIT(stream, (r4dchain_quant_act_fp8<ROT_, I8_, SUB_>), dim3(rows),             \
+                   dim3(kThreads), 0, (const uint16_t*)a, (uint8_t*)q, (float*)s, (uint32_t)K,  \
+                   (uint32_t)nkb, (uint32_t)x_ld, (uint32_t)q_ld, (uint32_t)s_ld, (uint32_t)M)  \
+        : R4D_EMIT(stream, (quant_act_fp8_kernel<ROT_, I8_, SUB_>), dim3(rows),                 \
+                   dim3(kThreads), 0, (const uint16_t*)a, (uint8_t*)q, (float*)s, (uint32_t)K,  \
+                   (uint32_t)nkb, (uint32_t)x_ld, (uint32_t)q_ld, (uint32_t)s_ld, (uint32_t)M))
     if (wide)    emit_rc = rot ? R4D_QA(true, true, 2u) : R4D_QA(false, true, 2u);
     else if (i8) emit_rc = rot ? R4D_QA(true, true, 1u) : R4D_QA(false, true, 1u);
     else         emit_rc = rot ? R4D_QA(true, false, 1u) : R4D_QA(false, false, 1u);

@@ -741,9 +741,29 @@ for it. `residual` present is the `fused_add_rms_norm` form.
 | `rmsnorm_quant_i8g` | `M` `n` `eps`:f64 `dtype` `wadd`:f64/opt | `x`, `residual`:inout?, `w`w → `q`, `scale`, `out_bf16`?; `w_post`w?, `scalar`w? |
 | `gelu_mul_quant_i8` | `M` `n` `dtype` | `gate_up` → `q`, `scale`, `out_bf16`? |
 | `gelu_mul_quant_i8g` | `M` `n` `dtype` | `gate_up` → `q`, `scale`, `out_bf16`? |
+| `gemm_nt_q_dual` | `M`(range) `N` `N2` `K` `group` `dtype` | `a`, `a_scale`, `b`w, `b_scale`w → `y`; `b2`w, `b2_scale`w → `y2` |
 
 `gelu_mul_quant_i8` is `gelu_mul` with `rmsnorm_quant_i8`'s quantiser on its pass, byte-identical
 to the pair.
+
+`gemm_nt_q_dual` is two GEMMs of one activation's codes over two weights of one encoding and one
+`K`, in one launch: `b` → `y` (`N` columns) and `b2` → `y2` (`N2`), both reading the one `a` and
+`a_scale`. The two launches' blocks are concatenated in one grid, each part decoding and folding
+exactly as it does alone, so both outputs are byte-identical to the pair of calls it replaces --
+which is what makes it a gain rather than a numerical path. One encoding is the pair's condition in
+full: a pair of two forms is not its subject, nor is a pair of two runs of a computed trellis, whose
+fold length differs -- the encoding carries the planes' runs and row-blocks, so the two differ there
+too. The two widths are the pair's own, which is why `N2` is a parameter of its own: each part's
+blocks are the blocks its own launch gives it, so each `N` is a multiple of that block -- 16
+columns, and 32 from 4096 columns up, where the block is two tiles. libr4d's row is `gemm_iqr_dual`:
+both weights IQR, one row (the GEMV, where the two launches are launch and ramp cost), a block of
+eight waves per part -- two of its 16-row tiles where that part's own launch takes four waves a
+tile, one where it takes eight. K-02: Hy4-flash's
+`q_nope` and `q_rope` read the one q residual's codes at 6144 and 2048 columns on a sparse layer
+(3.84 and 1.32 MiB of codes) or 12288 and 4096 on a sliding one (7.61 and 2.58 MiB), and a layer's
+two launches become one. A sparse layer is 32 heads unsharded and 16 a rank at TP2, a sliding one
+64 and 32, at 192 + 64 columns a head; the narrower pair is also what a sliding layer has at TP2
+and the wider one what it has at TP1.
 
 `gated_had_quant_i8g` and `rmsnorm_had_quant_i8g` are `gated_quant_fp8` and `rmsnorm_quant_fp8`
 with `had_quant_act_i8g`'s quantiser on their pass: the `group`-wide rotation of the bf16-rounded
@@ -2173,6 +2193,7 @@ The VAEs' convolutions are `conv3d_ndhwc` with `tpad` and the audio VAE's `conv2
 | `router_sigmoid_topk_scatter` | `M`(range) `n_expert` `n_local`/opt `top_k` `norm` `route_scale`:f64 `dtype` `expert_base`/opt `protect`:str/opt | `logits`, `bias`w → `ids`, `weights`, `sorted_tok`, `expert_offset`, `expert_count`, `gate`?, `inverse`? |
 | `moe_scatter_inv` | `M`(range) `n_expert` `top_k` `expert_base`/opt `protect`:str/opt | `expert_ids` → `sorted_tok`, `expert_offset`, `expert_count`, `inverse` |
 | `moe_gather_inv` | `M`(range) `n` `top_k` `dtype` `act`:str/opt | `y_expert`, `expert_w`, `inverse`, `shared`?, `shared_gate`? → `y` |
+| `moe_gather_inv_i8g` | `M`(range) `n` `top_k` `dtype` `group` | `y_expert`, `expert_w`, `inverse` → `q8`, `q8_scale`, `y` |
 | `moe_gather` | `M`(range) `n` `top_k` `dtype` `act`:str/opt | `y_expert`, `expert_w`, `sorted_tok`, `shared`?, `shared_gate`? → `y` |
 | `row_topk` | `M`(range) `N` `R` `vocab_off`/opt `dtype` | `x` → `idx`, `val`, `pairs`? |
 | `row_topk_merge` | `M` `R` `world_size` `dtype` | `gathered` → `idx`, `val` |
@@ -2372,6 +2393,18 @@ own because `moe_scatter`'s and `moe_gather`'s operand lists are the shared voca
 512), and `moe_gather_inv` runs the kernel `moe_gather` picks at the same size, bf16 or f32
 weights; both are byte-identical to the pair they replace, at GLM's shape with f32 routing weights
 and the shared arm folded in (`r4d_selftest`).
+
+**`moe_gather_inv_i8g`** is `moe_gather_inv` at `top_k = 16` with no shared arm, writing the sum's
+rotated int8 codes (`q8`, `[M, n]` i8) and their f32 scales (`q8_scale`, `[M, n / group]`) in the
+same launch, so a linear reading the sum declares no quantiser of its own -- one launch fewer a
+layer (K-19). The gather's 256-column wave is exactly the 128-wide FWHT and the group's amax that
+`quant_act_i8g` runs (`group` 128, or 256 for an IQ8R trunk), so `q8` and `q8_scale` are
+byte-identical to running `quant_act_i8g` over `y` afterwards; `y` is byte-identical to
+`moe_gather_inv`'s (`tests/r4d_emu/test_moefuse.cpp` drives its entry point over both of its wave
+forms and each pinned form, codes and scales against a host reference over six shapes;
+`--perfmoefuse` checks the same against the gather + `had_quant_act_i8g` pair on the card). `n` is
+a multiple of 256 and `group` is 128 or 256; operands are writes after the reads because the shared
+vocabulary's lists are fixed, hence an op of its own.
 
 At `dtype=mxfp4a8` (the host libraries; libr4d has no row), `w` and `w_odd` are OCP e2m1 codes and `w_scale` and `w_odd_scale` hold one
 E8M0 exponent per (row, 32 of K), typed `e8m0` or raw `u8`; either way a byte is an exponent, not
@@ -3771,8 +3804,8 @@ refuses the graph rather than resolving a similar op.
 | `mla_project_kv` | `M`(range) `heads` `k_dim` `v_dim` `latent_dim` `mode` `dtype` | `a`, `b`w → `y` |
 | `mla_expand_gate` | `M`(range) `heads` `k_dim` `v_dim` `latent_dim` `dtype` | `x`, `w`w, `g` → `y` |
 | `mla_expand_gate_had_quant_i8g` | `M`(range) `heads` `k_dim` `v_dim` `latent_dim` `group` `dtype` | `x`, `w`w, `g` → `q`, `scale`, `out_bf16`? |
-| `mla_attn_paged_sink` | `M`(range) `heads` `latent_dim` `rope_dim` `block_size` `window` `scale`:f64 `dtype` `stable`/opt `row0`/opt | `q`, `q_rope`, `kv`, `block_table`, `seqused`, `cu_seqlens`, `sinks`w → `out` |
-| `mla_attn_sel_sink` | `M`(range) `heads` `latent_dim` `rope_dim` `blocks` `block_size` `scale`:f64 `dtype` `stable`/opt | `q`, `q_rope`, `kv`, `bt`, `length`, `sinks`w → `out` |
+| `mla_attn_paged_sink` | `M`(range) `heads` `latent_dim` `rope_dim` `block_size` `window` `scale`:f64 `dtype` `stable`/opt `row0`/opt `rope_theta`:f64/opt `rope_scale`:f64/opt `rope_mode`/opt `rope_sections`/opt | `q`, `q_rope`, `kv`, `block_table`, `seqused`, `cu_seqlens`, `sinks`w → `out`, `rope_pos`/opt |
+| `mla_attn_sel_sink` | `M`(range) `heads` `latent_dim` `rope_dim` `blocks` `block_size` `scale`:f64 `dtype` `stable`/opt `rope_theta`:f64/opt `rope_scale`:f64/opt `rope_mode`/opt `rope_sections`/opt | `q`, `q_rope`, `kv`, `bt`, `length`, `sinks`w → `out`, `rope_pos`/opt |
 | `mla_row_norm_rope_store` | `M`(range) `latent` `rope_dim` `eps`:f64 `theta`:f64 `scale`:f64/opt `mode`/opt `sections`/opt `block_size` `dtype` | `row`:inout, `w`w, `positions`, `slot_mapping`, `kv_cache`:inout |
 | `mla_kv_split` | `M`(range) `heads` `k_dim` `v_dim` `rope_dim` `dtype` | `kvb`, `k_rope` → `k`, `v` |
 | `attn_kv_sink` | `M`(range) `N` `heads` `head_dim` `window` `scale`:f64 `dtype` | `q`, `k`, `v`, `cu_q`, `cu_k`, `sinks`w → `out` |
@@ -3886,10 +3919,16 @@ read `xn` issue no quantiser; the chain gains the quantiser as its last step.
 `imrope_gptj` with `sections` and `[3, M]` positions, `theta`, `scale`), then `kv_store` of the row as
 one KV head of `(latent + rope_dim) / 2`, its first half the key slot and the rest the value slot, into
 `kv_cache` `[blocks, 1, block_size, latent + rope_dim]` at `slot_mapping`. The row is left as the
-chain leaves it. Byte-identical to the three ops (the same bodies run in the same order, one workgroup
-of 256 threads a token; the norm's sum is the 256-lane partition at every width). It publishes no
+chain leaves it. Byte-identical to the three ops: one pass restates their arithmetic — the norm's
+per-column form over the same 256-lane partition at every width, `rope_turn`'s angle and its bf16
+rounding, `kv_store`'s slot rule and its dword store — and writes the row and the slot out of the
+registers that produced each value, where the chain wrote the row and copied it back. One workgroup
+of 256 threads a token; the rope phase strides over every pair of the rotary, so any even `rope_dim`
+is covered. It publishes no
 `replaces` hook: the chain's operands are column slices of one buffer, which a hook cannot wire.
-r4d_selftest runs it against the three rows on column-slice operands. `arch/hyv4flash` issues it in
+r4d_selftest runs it against the three rows on column-slice operands, and `tests/r4d_emu_row` holds
+it to them in the emulator, byte for byte, including a rotary wider than a workgroup.
+`arch/hyv4flash` issues it in
 front of the paged store (not the streamed one, nor with the debug taps on) when the op is declared.
 
 ### `mla_attn_paged_sink`, `mla_attn_sel_sink`, `attn_kv_sink`
@@ -3936,6 +3975,22 @@ maximum is taken (libref shifts by the maximum of the scores and the sink).
   workgroup takes a slot instead of walking the row, and its scratch is sized for those partials (25
   MiB at 48 rows of 32 heads and 8 slots). Hy4-flash declares its decode-class rows with `stable 1`
   and its prefill rows with `stable 0`.
+- **`rope_pos`** (both ops, optional) is the rotary's positions -- `[rows]` or `[3, rows]`, indexed
+  by the row of this launch (the operand is this launch's rows, a view of a whole step's array) --
+  and with it `q_rope` holds the projection's raw columns and the launch turns them itself, so
+  the rows need no separate `rope` launch. The angle and the rounding are `rope`'s own (`rope_turn`
+  in `libr4d/r4d_rope.h`: the same base ladder, yarn, the proportional cut, `sincosf`, and
+  `f32_to_bf16` on each of the pair's two results), so the fused form is `rope` followed by this op
+  byte for byte; `rope_theta` (default 10000), `rope_scale` (default 1), `rope_mode` and
+  `rope_sections` are `rope`'s parameters over `rope_dim`. Only gptj's adjacent pairing is
+  supported -- `gptj` with one position plane, `imrope_gptj` with three -- because a lane turns the
+  eight rotary columns of its own fragment; the other pairing (`neox`, `mrope`, `axial`) reaches
+  half a head away, where no lane holds both, and is refused with `RAD_E_UNSUPPORTED` rather than
+  half applied. Without `rope_pos` (or with a null operand) `q_rope` arrives rotated and the four
+  parameters are unused. `r4d_selftest` runs the folded launch against libref's own
+  rope-then-sink (a decode row, a verify's rows, the paged and the selected form, at a scale off 1)
+  and holds the launch's stable promise folded too: a verify's rows equal their single-row decode,
+  and the forms agree byte for byte.
 - **`attn_kv_sink`** is dense attention over separate keys and values (the non-absorbed prefill).
   `cu_q`, `cu_k` hold absolute offsets into `q` and into `k` / `v`; sequence `s` has `m_s` query
   rows and `n_s >= m_s` key rows (otherwise `RAD_E_SHAPE`), query `i` sits at key index
