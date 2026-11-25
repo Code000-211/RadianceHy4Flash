@@ -724,6 +724,10 @@ static uint32_t map_tiles_pin(const RadArgs* a) {
     const long long m = r4d_geti_or(a, "map", 0);
     return (uint32_t)(m == kMapTiles || m == kPackTiles ? m : 0);
 }
+/* A `map` value the two maps do not name is refused by the launcher (moe_iqr_launch), not read as
+ * the rule: a misspelt RADIANCE_TUNE= pin must not look like a successful one. */
+constexpr bool map_axis_names_map(long long m) { return !m || m == (long long)kMapTiles ||
+                                                      m == (long long)kPackTiles; }
 /* The routed rows between which a narrow-K wave takes two weight tiles. Flash-Next's down
  * projection (2560 x 384:256, 512 experts, top 10), us a launch at one tile -> two: 10 rows 11.1 ->
  * 11.9 (too few waves to fill the card), 20 rows level, 30 rows 21.1 -> 20.3, 80 rows 48.0 -> 44.1,
@@ -845,6 +849,7 @@ int moe_iqr_launch(const RadArgs* a, RadStream stream, int ncls) {
     const long long n_expert = r4d_geti_or(a, "n_expert", 0);
     const long long top_k = r4d_geti_or(a, "top_k", 0);
     if (parts <= 0 || parts > 255 || n_expert <= 0 || top_k <= 0) return R4D_NO(RAD_E_SHAPE);
+    if (!map_axis_names_map(r4d_geti_or(a, "map", 0))) return R4D_NO(RAD_E_INVAL);
     if (n_expert > (long long)kMaxExpert) return R4D_NO(RAD_E_UNSUPPORTED);
     if (r4d_geti_or(a, "group", kBlock) != (long long)kBlock) return R4D_NO(RAD_E_SHAPE);
     const long long a_group = r4d_geti_or(a, "a_group", kBlock);

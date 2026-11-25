@@ -3580,6 +3580,48 @@ static void moe_gather_at(const Plugin& pl, const RadKernelInfo* r, const MoeGat
                " differ from a column a thread" + first);
     }
 
+    /* K-59's `form` axis: the same choice the hook pins, read from the launch's parameters, and a
+     * value the forms do not name refused rather than read as the rule. */
+    {
+        auto run_axis = [&](long long form, std::vector<uint16_t>& out) -> int {
+            std::vector<uint16_t> junk((size_t)(M * n), 0x7f7fu);
+            st_memcpy(d_y, junk.data(), junk.size() * 2, hipMemcpyHostToDevice);
+            std::vector<RadParam> p2 = ps;
+            p2.push_back(PI("form", form));
+            RadArgs a2 = a;
+            a2.p = p2.data(); a2.n_p = (int)p2.size();
+            const int rc = r->launch(&a2, nullptr);
+            const hipError_t he = (hipError_t)st_stream_sync(nullptr);
+            if (rc == RAD_OK && he != hipSuccess) return RAD_E_DEVICE;
+            out.assign((size_t)(M * n), 0u);
+            st_memcpy(out.data(), d_y, out.size() * 2, hipMemcpyDeviceToHost);
+            return rc;
+        };
+        std::vector<uint16_t> ax;
+        if (const int rc = run_axis(1, ax); rc != RAD_OK) {
+            ok(("moe_gather, the form axis, a column a thread" + at).c_str(), false,
+               "rc=" + std::to_string(rc));
+        } else {
+            int64_t diff = 0;
+            for (size_t i = 0; i < ax.size(); ++i) diff += ax[i] != base[i];
+            ok(("moe_gather, the form axis, a column a thread, byte for byte" + at).c_str(),
+               diff == 0, std::to_string(diff) + " of " + std::to_string(M * n) +
+                              " differ from the pinned form");
+        }
+        if (const int rc = run_axis(2, ax); sh.wide && !f32 && rc == RAD_OK) {
+            int64_t diff = 0;
+            for (size_t i = 0; i < ax.size(); ++i) diff += ax[i] != base[i];
+            ok(("moe_gather, the form axis, a wave a token, byte for byte" + at).c_str(),
+               diff == 0, std::to_string(diff) + " of " + std::to_string(M * n) +
+                              " differ from the pinned form");
+        }
+        {
+            const int rc = run_axis(7, ax);
+            ok(("moe_gather, a form the forms do not name" + at + " is refused").c_str(),
+               rc == RAD_E_INVAL, "rc=" + std::to_string(rc));
+        }
+    }
+
     if (M >= 2048 && sh.wide && !f32) {
         hipEvent_t e0, e1;
         st_ev_create(&e0);
@@ -20053,6 +20095,27 @@ static void moe_down_mt_case(const Plugin& pl, int64_t Mtok) {
         ok((std::string(nm) + ": the dmt axis at eight tiles is refused").c_str(),
            rca == RAD_E_UNSUPPORTED, "rc " + std::to_string(rca) + " for a value that is neither 2 nor 4");
     }
+    /* K-59: what the axis is worth at this shape -- the two blocks, three rounds each, the order
+     * rotated so a clock ramp falls on both. */
+    {
+        auto us_of = [&](long long dm) {
+            std::vector<RadParam> p2 = ps;
+            p2.push_back(PI("dmt", dm));
+            RadArgs a2 = a;
+            a2.p = p2.data(); a2.n_p = (int)p2.size();
+            return st_time_us([&](int) { r->launch(&a2, (RadStream) nullptr); }, 8, nullptr);
+        };
+        std::vector<double> u2, u4;
+        for (int round = 0; round < 3; ++round) {
+            if (round & 1) { u4.push_back(us_of(4)); u2.push_back(us_of(2)); }
+            else           { u2.push_back(us_of(2)); u4.push_back(us_of(4)); }
+        }
+        auto med = [](std::vector<double> v) { std::sort(v.begin(), v.end()); return v[v.size() / 2]; };
+        const double m2 = med(u2), m4 = med(u4);
+        std::printf("  dmt timing\tdmt 2 %8.1f us  dmt 4 %8.1f us  (dmt 4 is %+.1f%%)\n", m2, m4,
+                    100.0 * (m4 - m2) / m2);
+        std::fflush(stdout);
+    }
     dfree_all();
 }
 
@@ -26281,6 +26344,18 @@ static void moe_w4_gemm(const Plugin& pl, int64_t Tr, const MoeW4Shape& sh, int 
      * the sorted operand). */
     const bool fk2 = !sh.sorted_a && g64 && sh.K0 % 256 == 0 && sh.K1 % 256 == 0;
     moe_dec_variants(pl, r, a, d_y, (size_t)(Tr * N), fk2, what);
+    /* K-59's `dmt` axis: only the w4nl64a8i8h dtype's launch builds both M tiles a block of the
+     * 256-column down tile, so every other dtype of these rows -- and a shape whose down tile is
+     * not wide -- refuses the pin rather than taking the rule as if it were the pin. */
+    if ((act8 && dt != std::string("w4nl64a8i8h")) || w8 || (act8 && !dn_wide)) {
+        std::vector<RadParam> pd = ps;
+        pd.push_back(PI("dmt", 4));
+        RadArgs ad = a;
+        ad.p = pd.data(); ad.n_p = (int)pd.size();
+        const int rc = r->launch(&ad, nullptr);
+        ok((what + ": the dmt axis is refused").c_str(), rc == RAD_E_UNSUPPORTED,
+           "rc=" + std::to_string(rc));
+    }
     if (!four) return;
 
     /* The same experts as four classes by number mod 4 (`moe_gemm_q_mod4`): each parity table read
@@ -26346,6 +26421,33 @@ static void moe_w4_gemm(const Plugin& pl, int64_t Tr, const MoeW4Shape& sh, int 
     moe_aligned_down_tile(pl, r4, a4, d_y, d_map, map_bytes, (size_t)(Tr * N), two_cls[1],
                           dn_wide, ne, what4);
     moe_dec_variants(pl, r4, a4, d_y, (size_t)(Tr * N), fk2, what4);
+    /* K-59's `dmt` axis on the four-class twin, the shape where both M tiles a block are built:
+     * the 64-row block's bytes against the rule's, through this row's own launcher. */
+    if (act8 == 1 && dn_wide && !two_cls[0].empty()) {
+        std::vector<RadParam> p4d = ps4;
+        p4d.push_back(PI("dmt", 4));
+        RadArgs a4d = a4;
+        a4d.p = p4d.data(); a4d.n_p = (int)p4d.size();
+        a4d.scratch = d_map; a4d.scratch_bytes = map_bytes;
+        {
+            std::vector<uint16_t> junk((size_t)(Tr * N), 0x7f7fu);
+            st_memcpy(d_y, junk.data(), junk.size() * 2, hipMemcpyHostToDevice);
+        }
+        const int rc = r4->launch(&a4d, nullptr);
+        st_stream_sync(nullptr);
+        if (rc != RAD_OK) {
+            ok((what4 + ": the dmt axis at four").c_str(), false, "launch rc=" + std::to_string(rc));
+        } else {
+            std::vector<uint16_t> got((size_t)(Tr * N));
+            st_memcpy(got.data(), d_y, got.size() * 2, hipMemcpyDeviceToHost);
+            int64_t diff = 0;
+            for (size_t i = 0; i < got.size(); ++i) diff += got[i] != two_cls[0][i];
+            ok((what4 + ": the dmt axis at four, the 64-row block, byte for byte" +
+                " with the rule").c_str(),
+               diff == 0, std::to_string(diff) + " of " + std::to_string(Tr * N) +
+                             " elements differ");
+        }
+    }
 }
 
 static void moe_w6_cases(const Plugin& pl) {
@@ -38779,6 +38881,7 @@ static void device_phase(const Plugin& pl) {
             moe_w4_gemm(pl, 8, { "small mixed down", 256, 256, 128, 128, 1, 3, true }, 0, false,
                         false, 8, 1);
             /* a large prefill pass: the down tile's 64-row block against the 32-row block */
+            moe_down_mt_case(pl, 2048);
             moe_down_mt_case(pl, 4096);
             moe_down_mt_case(pl, 8192);
         }

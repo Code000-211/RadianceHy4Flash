@@ -6439,11 +6439,12 @@ static const RadTunable tMlaSink[] = {
  * in the same ascending order.
  * `map` (moe_gemm_iqr, moe_gemm_iqr_mod4; r4d_moe_iqr.hip): 4 the run map, 8 the packed map, 0 the
  * rule (packed from kPackMinRowsPerExpert rows an expert). Both name the same blocks.
- * `dmt` (moe_gemm_i8a8, moe_gemm_i8a8_mod4; r4d_moe.hip): the M tiles a block of the 256-column
+ * `dmt` (moe_gemm_w4a8i8, moe_gemm_w4a8i8_mod4; r4d_moe.hip): the M tiles a block of the 256-column
  * down tile -- 4 is 64-row entries, 2 is 32-row entries with the 128-column tile -- 0 the rule
  * (4 from kMoeDownMtRowsPerExpert rows an expert). A row is computed with the same WMMAs either
- * way. Only the int8 down GEMMs take this axis; the trellis (IQR) and bf16 down forms choose
- * their tile by the narrow-K rule.
+ * way. Only the w4nl64a8i8h dtype of those two rows builds both blocks and so reads the axis; their
+ * other dtypes (w4a8i8, w4a8i8h, w4nl32a8i8h) and the int8-code rows refuse it rather than take it
+ * as the rule, and the trellis (IQR) and bf16 down forms choose their tile by the narrow-K rule.
  *
  * rad-tune walks them where the shapes reach them; the test hooks still win where a test sets
  * one, so the selftest's byte comparisons cover the same forms. */
@@ -6458,7 +6459,7 @@ static const RadTunable tMoeIqrMap[] = {
 };
 static const int64_t kMoeDownMt[] = { 0, 2, 4 };
 static const RadTunable tMoeDown[] = {
-  { "dmt", kMoeDownMt, NELEM(kMoeDownMt), 0, "M tiles a block of the 256-column down tile; 0 = by rows an expert" },
+  { "dmt", kMoeDownMt, NELEM(kMoeDownMt), 0, "M tiles a block of the 256-column down tile, w4nl64a8i8h only; 0 = by rows an expert" },
 };
 
 /* ------------------------------------------------------------------- all-reduce launch geometry
@@ -9891,7 +9892,7 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   "(row, 128 of K), bf16 out. dtype i8a8h: the weight rotated by a 128-wide Hadamard along K, the "
   "1/128 in its scale, against had_quant_act_i8g's activation",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
-  ROW(cMoeGemmI8), ROW(tMoeDown), nullptr,
+  ROW(cMoeGemmI8), NOTUNE,
   /* Both planes are the container's own bytes (r4d_rad_layout_i8_rowmajor), so an expert reaches
    * the kernel from any tier unchanged. */
   nullptr, nullptr, r4d_rad_moe_gemm_i8a8, r4d_rad_moe_gemm_q_scratch,
@@ -9904,7 +9905,7 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   "as moe_gemm_i8a8, every class",
   "as moe_gemm_i8a8",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
-  ROW(cMoeGemmI8), ROW(tMoeDown), nullptr,
+  ROW(cMoeGemmI8), NOTUNE,
   nullptr, nullptr, r4d_rad_moe_gemm_i8a8_mod4, r4d_rad_moe_gemm_q_scratch,
   r4d_rad_layout_moe_i8_mod4, nullptr,
   r4d_shape_moe_gemm_i8_mod4 },

@@ -2400,8 +2400,9 @@ extern "C" void r4d_moe_gather_pin_form(int form) { g_moe_gather_pin = form; }
  * column's slots in the same ascending order, so the choice moves no bits. */
 static inline int r4d_moe_gather_form(const RadArgs* a) {
     if (g_moe_gather_pin) return g_moe_gather_pin;
+    /* A value the forms do not name is left to the launcher's refusal, not read as the rule. */
     const long long f = r4d_geti_or(a, "form", 0);
-    return (int)(f < 0 || f > 3 ? 0 : f);
+    return f < 0 || f > 3 ? -1 : (int)f;
 }
 
 /* ============================================================== the plugin ABI entry points */
@@ -2878,7 +2879,9 @@ static int g_moe_down_mt_pin = -1;
  * hook wins where it is set. Four M tiles a block is 64-row entries with the 256-column tile; two
  * is 32-row entries with the 128-column one, and a block's map covers fewer rows, so both compute
  * every element of a row with the same WMMAs in the same order (r4d_selftest compares them byte for
- * byte). A value other than 2 or 4 is refused, not silently taken as the rule. */
+ * byte). A value other than 2 or 4 is refused, not silently taken as the rule. Only the w4nl64a8i8h
+ * dtype's launch builds both blocks and so reads this; every other dtype's launch refuses the axis
+ * (moe_gemm_launch), so rad-tune never walks it where it cannot choose. */
 static inline int r4d_moe_down_mt(const RadArgs* a, long long T, long long n_expert) {
     if (g_moe_down_mt_pin > 0) return g_moe_down_mt_pin;
     const long long dm = r4d_geti_or(a, "dmt", 0);
@@ -3076,6 +3079,9 @@ static int moe_gemm_launch(const RadArgs* a, RadStream stream, int ncls = 2) {
     /* The decode band's launch has a chained form (r4d_chain.h); the prefill forms have none. */
     const bool chain = r4d_geti_or(a, "chain", 0) != 0;
     if ((form == 0 && r4d_moe_decode_band(T, n_expert)) || form == 2) {
+        /* K-59's `dmt` chooses between the prefill form's two wide blocks; the decode band has no
+         * such block, so a pin here is refused rather than quietly taken as the rule. */
+        if (r4d_geti_or(a, "dmt", 0)) return R4D_NO(RAD_E_UNSUPPORTED);
         /* The decode grid is (tile, run) wide (the kernel's ES note); decode has one tile of rows,
          * which alone would give only N/64 workgroups. */
         const unsigned tiles = (unsigned)((T + 15) / 16);
@@ -3157,12 +3163,18 @@ static int moe_gemm_launch(const RadArgs* a, RadStream stream, int ncls = 2) {
         if (tpin == 2 && (!map || !dn_wide)) return R4D_NO(RAD_E_UNSUPPORTED);
         if (tpin == 1) dn_wide = false;
         /* The 256-column tile's M tiles a block (r4d_moe_down_mt); the 64-row block's map has fewer
-         * entries than the scratch holds. */
+         * entries than the scratch holds. Only this instantiation (the w4nl64a8i8h dtype's down)
+         * builds both blocks; the entry points refuse `dmt` on every dtype that does not. */
         int dmt = 2;
-        if constexpr (W4 == 2 && I8) { if (map && dn_wide) {
+        if constexpr (W4 == 2 && I8) {
+            if (map && dn_wide) {
                 dmt = r4d_moe_down_mt(a, T, n_expert);
                 if (dmt != 2 && dmt != 4) return R4D_NO(RAD_E_UNSUPPORTED);
-            } }
+            } else if (r4d_geti_or(a, "dmt", 0)) {
+                /* This shape has no wide block to choose between: refused, not read as the rule. */
+                return R4D_NO(RAD_E_UNSUPPORTED);
+            }
+        }
         const long long dfm = dmt * 16;
         const long long dcap = dmt == 2 ? cap : r4d_blockmap_cap(T, n_expert, dfm);
         if (map) {
@@ -3298,14 +3310,22 @@ extern "C" int r4d_rad_moe_gemm_w4a8(const RadArgs* a, RadStream stream) {
  * with an E4M3 scale per (row, 64 or 32 of K). */
 static int moe_gemm_w4a8i8(const RadArgs* a, RadStream stream, int ncls) {
     const char* wdt = r4d_gets(a, "dtype");
-    if (wdt && !std::strcmp(wdt, "w4nl64a8i8h")) return moe_gemm_launch<2, true>(a, stream, ncls);
+    const bool nl64 = wdt && !std::strcmp(wdt, "w4nl64a8i8h");
+    /* K-59's `dmt` axis: only this dtype's launch builds both M-tile blocks of the 256-column down
+     * tile (moe_gemm_launch, W4 == 2 && I8), so on the row's other dtypes the pin is refused before
+     * a tensor is read rather than taken as the rule. */
+    if (!nl64 && r4d_geti_or(a, "dmt", 0)) return RAD_E_UNSUPPORTED;
+    if (nl64) return moe_gemm_launch<2, true>(a, stream, ncls);
     if (wdt && !std::strcmp(wdt, "w4nl32a8i8h")) return moe_gemm_launch<3, true>(a, stream, ncls);
     return moe_gemm_launch<1, true>(a, stream, ncls);
 }
 extern "C" int r4d_rad_moe_gemm_i8a8(const RadArgs* a, RadStream s) {
+    /* No int8-code down builds the 64-row block, so the `dmt` pin is refused here (K-59). */
+    if (r4d_geti_or(a, "dmt", 0)) return RAD_E_UNSUPPORTED;
     return moe_gemm_launch<0, true>(a, s);
 }
 extern "C" int r4d_rad_moe_gemm_i8a8_mod4(const RadArgs* a, RadStream s) {
+    if (r4d_geti_or(a, "dmt", 0)) return RAD_E_UNSUPPORTED;
     return moe_gemm_launch<0, true>(a, s, 4);
 }
 extern "C" int r4d_rad_moe_gemm_w4a8i8(const RadArgs* a, RadStream s) {
