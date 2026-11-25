@@ -344,6 +344,98 @@ static void idx_score_tiles() {
     }
 }
 
+/* P-10 (arch/hyv4flash/hyv4flash_indexer.h, the RADIANCE_HY4_INDEXER=fp8 / int8 branch): the packed
+ * key cache's score, `dsa_score`, is issued a row tile at a time too, and the tile after the first
+ * reads its cu rebased by the tile's first row (the plugin's sub_i32) and the tile's own rows of the
+ * query codes [rows * heads, n], of their scales [rows * heads, 1] and of the gates [rows, heads].
+ * A tile at a wrong row of any of the three would score one row's codes against another row's gates,
+ * so the tiles must give what one whole-chunk launch gives, byte for byte: this runs a 600-row,
+ * two-sequence chunk whole and then in 256 + 256 + 88 tiles, the last tile part way through the
+ * second sequence. The fixture keeps the cases the split tests use: a missing page (-inf scores),
+ * pages that repeat a key (exact ties) and signed gates. */
+static void dsa_score_tiles() {
+    ++g_cases;
+    const int64_t H = 32, N = 128, BT = 156, SC = 156, R = 256, M = 600, S = 2, pages = 400,
+                  kPitch = 136;
+    const std::vector<int32_t> cu_all = { 0, 300, 600 };
+    const std::vector<int32_t> nc = { 75, 150 };
+    Rng rng(601);
+    auto code = [&] {
+        uint8_t v;
+        do v = (uint8_t)rng.r(256);
+        while ((v & 0x7f) == 0x7f);
+        return v;
+    };
+    std::vector<uint8_t> q((size_t)(M * H * N)), cache((size_t)(pages * kPitch), 0);
+    for (auto& v : q) v = code();
+    for (int64_t p = 0; p < pages; ++p) {
+        uint8_t* page = &cache[(size_t)(p * kPitch)];
+        if (p % 5 == 4) {
+            std::memcpy(page, page - kPitch, (size_t)kPitch);   /* the key of the page before it */
+            continue;
+        }
+        for (int64_t d = 0; d < N; ++d) page[d] = code();
+        const float scale = std::ldexp(1.0f, -6 - (int)(p % 3));
+        std::memcpy(page + N, &scale, 4);
+    }
+    std::vector<float> qs((size_t)(M * H)), gate((size_t)(M * H));
+    for (size_t i = 0; i < qs.size(); ++i) qs[i] = std::ldexp(1.0f, -5 - (int)(i % 3));
+    for (auto& v : gate) v = rng.r(10) == 0 ? 0.0f : rng.n();
+    std::vector<int32_t> bt((size_t)(S * BT), -1);
+    for (int64_t s = 0; s < S; ++s)
+        for (int64_t b = 0; b <= nc[(size_t)s] && b < BT; ++b)
+            bt[(size_t)(s * BT + b)] = (int32_t)((s * BT + b * 7) % pages);
+    bt[(size_t)(BT + 3)] = -1;                                   /* a missing page in the chunk's seq */
+    auto tens = [](void* p, uint32_t dt, std::vector<int64_t> sh) {
+        RadTensor t{};
+        t.data = p; t.dtype = dt; t.rank = (uint32_t)sh.size();
+        int64_t st = 1;
+        for (int i = (int)sh.size() - 1; i >= 0; --i) {
+            t.shape[i] = sh[(size_t)i]; t.stride[i] = st; st *= sh[(size_t)i];
+        }
+        return t;
+    };
+    auto launch = [&](int64_t m0, int64_t rows, const std::vector<int32_t>& cu, std::vector<float>& out) {
+        std::vector<RadTensor> t = {
+            tens(q.data() + m0 * H * N, RAD_F8E4M3, { rows * H, N }),
+            tens(qs.data() + m0 * H, RAD_F32, { rows * H, 1 }),
+            tens(gate.data() + m0 * H, RAD_F32, { rows, H }),
+            tens(cache.data(), RAD_U8, { pages, 1, 4, 34 }),
+            RadTensor{},
+            tens(bt.data(), RAD_I32, { S, BT }), tens((void*)cu.data(), RAD_I32, { S + 1 }),
+            tens((void*)nc.data(), RAD_I32, { S }), tens(out.data() + m0 * SC, RAD_F32, { rows, SC }) };
+        t[3].stride[0] = kPitch;
+        std::vector<RadParam> p = { pi("M", rows), pi("n", N), pi("heads", H), pi("blocks", BT),
+                                    pi("seqs", S), ps("dtype", "fp8_e4m3") };
+        RadArgs a{};
+        a.t = t.data(); a.n_t = (int)t.size(); a.p = p.data(); a.n_p = (int)p.size(); a.world_size = 1;
+        return r4d_rad_dsa_score(&a, nullptr);
+    };
+    std::vector<float> whole((size_t)(M * SC), 7.0f), tiles((size_t)(M * SC), 7.0f);
+    int rc = launch(0, M, cu_all, whole);
+    for (int64_t m0 = 0; m0 < M; m0 += R) {
+        const int64_t rows = std::min(R, M - m0);
+        std::vector<int32_t> cu(cu_all);
+        for (auto& v : cu) v -= (int32_t)m0;      /* what the indexer's sub_i32 writes */
+        rc |= launch(m0, rows, cu, tiles);
+    }
+    const bool same = std::memcmp(whole.data(), tiles.data(), whole.size() * 4) == 0;
+    int64_t fin = 0, inf = 0;
+    for (float v : whole) {
+        fin += std::isfinite(v);
+        inf += std::isinf(v);
+    }
+    char w[128];
+    std::snprintf(w, sizeof w, "dsa_score M %lld in 256-row tiles = one launch, %lld scores (%lld -inf)",
+                  (long long)M, (long long)fin, (long long)inf);
+    if (rc != RAD_OK || !same || !fin || !inf) {
+        std::printf("FAIL %s: rc=%d, %s\n", w, rc, same ? "equal" : "the tiles DIFFER");
+        ++g_fails;
+    } else {
+        std::printf("ok   %s\n", w);
+    }
+}
+
 static void ihc_pre() {
     struct G { int64_t hc, n, M, pad; bool post; };
     for (const G& g : { G{ 4, 96, 3, 0, true }, G{ 4, 40, 2, 5, true }, G{ 2, 17, 3, 0, true },
@@ -834,6 +926,7 @@ int main() {
     dfly_sel();
     idx_score_forms();
     idx_score_tiles();
+    dsa_score_tiles();
     std::printf("%d case(s), %d failure(s)\n", g_cases, g_fails);
     return g_fails ? 1 : 0;
 }
