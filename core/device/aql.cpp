@@ -789,6 +789,26 @@ uint64_t read_progress() {
 /* The DMA lanes' part of the dump, set once a lane opens. */
 void (*g_dump_lanes)() = nullptr;
 
+/* A queue's chain accounting for the stall report (issue #251, after krisf's dump in PR #252). A
+ * chained kernel behind another waits in its prologue for the queue's completion counter, so a
+ * queue that is idle while a wait stands is one whose counter is short of what a slot or a flush
+ * needs: a block that never counted. The line gives the blocks issued, the counter as the host
+ * reads it now and the largest value it has read (the read can lag the card, see chain_flush, so a
+ * short read alone proves nothing while the queue still runs), what the slot at the read index
+ * needs before it is rewritten, the flush outstanding if there is one, and what decides whether
+ * the next chained packet keeps its barrier bit. Read without the queue's lock, as the rest of
+ * the report is: the thread that holds it may be the one that is stuck. */
+std::string chain_line(Stream* s, uint64_t rd) {
+    const uint64_t ctr = s->chain_ctr ? *reinterpret_cast<volatile uint64_t*>(s->chain_ctr) : 0;
+    const uint64_t need = s->slot_need.empty() ? 0 : s->slot_need[rd & s->mask];
+    return fmt("chain: issued %" PRIu64 ", counter reads %" PRIu64 " (largest read %" PRIu64
+               "), the slot at the read index needs %" PRIu64 ", flush %s for %" PRIu64
+               "; gates %d, last packet %s, plain in flight %d, collective in flight %d",
+               s->chain_issued, ctr, s->chain_seen, need, s->flush_out ? "out" : "none",
+               s->flush_target, s->gates.load(std::memory_order_relaxed),
+               s->prev_chained ? "chained" : "plain", (int)s->plain_inflight, (int)s->peer_inflight);
+}
+
 void dump_queues(const char* where) {
     std::lock_guard<std::mutex> lk(G().streams_mu);
     RAD_ERR("device: %s has seen no queue advance for %u s; the queues:", where, kStallMs / 1000);
@@ -818,16 +838,7 @@ void dump_queues(const char* where) {
         }
         RAD_ERR("  device %d queue %p: written %" PRIu64 ", read %" PRIu64 " -> %s", s->ord,
                 (void*)s->q, wr, rd, what.c_str());
-        /* DIAG(hy4-tp2-hang): the chain accounting at the stall — distinguishes a counter that is
-         * genuinely short (a kernel's blocks never counted) from a host read that lags. */
-        RAD_ERR("    chain: issued=%llu seen=%llu ctr=%llu flush_target=%llu flush_out=%d "
-                "gates=%u peer=%u plain=%u prev_chain=%d slot_need[rd]=%llu",
-                (unsigned long long)s->chain_issued, (unsigned long long)s->chain_seen,
-                (unsigned long long)__atomic_load_n(s->chain_ctr, __ATOMIC_RELAXED),
-                (unsigned long long)s->flush_target, (int)s->flush_out,
-                (unsigned)s->gates.load(), (int)s->peer_inflight,
-                (int)s->plain_inflight, (int)s->prev_chained,
-                (unsigned long long)s->slot_need[rd & s->mask]);
+        RAD_ERR("    %s", chain_line(s, rd).c_str());
     }
     if (g_dump_lanes) g_dump_lanes();
 }
@@ -4971,6 +4982,17 @@ void chain_read_lag(void* stream, uint64_t lag) {
 
 uint64_t chain_flushes() { return g_chain_flushes.load(std::memory_order_relaxed); }
 
+int chain_state(void* stream, uint64_t* issued, uint64_t* counted, std::string* line) {
+    Stream* s = ours(stream);
+    if (!s || !issued || !counted) return RAD_E_INVAL;
+    s->lock();
+    *issued = s->chain_issued;
+    *counted = s->chain_ctr ? *reinterpret_cast<volatile uint64_t*>(s->chain_ctr) : 0;
+    if (line) *line = chain_line(s, hsa_queue_load_read_index_scacquire(s->q));
+    s->unlock();
+    return RAD_OK;
+}
+
 int chain_marks(void* stream, unsigned* seen, unsigned n) {
     if (!ours(stream) || !seen) return RAD_E_INVAL;
     for (unsigned i = 0; i < n; ++i)
@@ -5299,6 +5321,7 @@ int chain_marks(void*, unsigned*, unsigned) { return RAD_E_UNSUPPORTED; }
 int chain_asks(void*, const void*, void*, uint64_t, unsigned*, unsigned) { return RAD_E_UNSUPPORTED; }
 void chain_read_lag(void*, uint64_t) {}
 uint64_t chain_flushes() { return 0; }
+int chain_state(void*, uint64_t*, uint64_t*, std::string*) { return RAD_E_UNSUPPORTED; }
 }  // namespace aql
 }  // namespace rad
 
