@@ -1379,9 +1379,10 @@ void select_peek(const DraftDepthCfg& c, DraftDepthRow* r, int n, int rounds, in
 }
 
 /* `late`: 0 the rule alone; 1 the late choice behind it (cfg.late_lag rounds not waited for);
- * 2 the control that reads one round too far. */
+ * 2 the control that reads one round too far. `link`: 1 every step also tells the calibration what
+ * the link cost it, half its routed experts off the device at DraftDepthCfg::link_us a miss. */
 LoadRun run_depth_load(const DraftDepthCfg& cfg0, int n_seq, bool trav, int trials, double noise,
-                       int other_rows = 0, int late = 0, int online = 0) {
+                       int other_rows = 0, int late = 0, int online = 0, int link = 0) {
     /* `online`: 1 the tables follow the run (DraftDepthOnline, fed by every verified chain,
      * refreshed every 16 steps); 2 the control whose tables are made from the verify of the very
      * step they then decide. */
@@ -1459,6 +1460,7 @@ LoadRun run_depth_load(const DraftDepthCfg& cfg0, int n_seq, bool trav, int tria
                 }
             }
             R.rounds += ran; ++steps;
+            int rows_step = other_rows;                /* the rows this step routed experts for */
             for (int i = 0; i < n; ++i) {
                 const int q = act[i];
                 const int D = row[i].depth < 1 ? 1 : row[i].depth;
@@ -1473,6 +1475,7 @@ LoadRun run_depth_load(const DraftDepthCfg& cfg0, int n_seq, bool trav, int tria
                 for (int j = D; j < 64; ++j) tr.st[j] = RadMtpCoupleState{};
                 tr.n = D;
                 R.mean_depth += D; ++R.share[D < 8 ? D : 7]; ++rows;
+                rows_step += 1 + D;
                 int step_out[64], accepted = 0;
                 const int m = trav ? walk_trav(tr, seed[q], (uint64_t)len[q], noise, 0, step_out, &accepted, RadMtpTravOpt{})
                                    : walk(tr, seed[q], (uint64_t)len[q], noise, 0, step_out, &accepted);
@@ -1481,6 +1484,16 @@ LoadRun run_depth_load(const DraftDepthCfg& cfg0, int n_seq, bool trav, int tria
                 /* the chain is settled: the engine feeds it when its verify is committed */
                 if (online == 1)
                     draft_depth_online_chain(cfg, &on, D, cfg.load && n > 1 ? row[i].rule : 0, accepted, sv, ns);
+            }
+            if (online == 1 && link) {
+                /* the step's own price: its rows at the table's, its round per round, and the link
+                 * half its routed experts cost at the link's rate (what the engine feeds) */
+                const int routed = draft_depth_routed_rows(rows_step, n, ran);
+                const int64_t missed = routed / 2;
+                const double lk = cfg.link_us * 1e-3 * (double)missed;
+                const double ms = 14.0 + cfg.load_row_ms[n] * (double)rows_step +
+                                  cfg.load_round_ms[n] * (double)ran + lk;
+                draft_depth_online_step(cfg, &on, n, rows_step, ran, ms, 3 * rows_step, missed, routed);
             }
             if (online == 1 && (++fed & 15) == 0) draft_depth_online_refresh(&cfg, &on);
         }
@@ -1573,6 +1586,47 @@ TEST(load_aware_depth_rule_prices_rows_and_rounds_apart) {
     went = 0;
     for (int i = 0; i < 6; ++i) went += q[i].depth == 3;
     CHECK_EQ(went, 6);
+}
+
+TEST(load_aware_row_price_carries_the_link_the_steps_paid) {
+    DraftDepthCfg c = depth_cfg_load(5, 1, 0.85, 0.5, 0.1);
+    /* the rows a step routed experts for: its verify's R and its drafter's D passes of the n rows */
+    CHECK_EQ(draft_depth_routed_rows(34, 8, 3), 58);
+    CHECK_EQ(draft_depth_routed_rows(34, 8, 0), 34);
+    CHECK_EQ(draft_depth_routed_rows(34, 0, 3), 34);
+    CHECK_EQ(draft_depth_routed_rows(0, 8, 2), 16);
+    /* the link adds to a row's trunk price, once a row, and no tile moves with it (D-11) */
+    CHECK_NEAR(draft_depth_load_cost(c, 3, 8), 8 * 0.5, 1e-12);
+    c.load_link_ms[3] = 0.18;
+    CHECK_NEAR(draft_depth_load_cost(c, 3, 8), 8 * (0.5 + 0.18), 1e-12);
+    CHECK_NEAR(draft_depth_load_cost(c, 3, 8) - draft_depth_load_cost(c, 3, 6), 2 * (0.5 + 0.18), 1e-12);
+    /* the link is a row's, so a tile past 32 rows is added once and the link is not */
+    for (auto& jm : c.load_jump_ms) jm[1] = 1.5;
+    CHECK_NEAR(draft_depth_load_cost(c, 3, 33), 33 * (0.5 + 0.18) + 1.5, 1e-12);
+    for (auto& jm : c.load_jump_ms) jm[1] = 0.0;
+    c.load_link_ms[3] = 0.0;
+    CHECK_NEAR(draft_depth_load_cost(c, 3, 8), 8 * 0.5, 1e-12);
+    /* three rows at conf .8 deciding round 3, a row 0.5 and the round 0.1: every row's .3 clears its
+     * own .5 -- and with the link the step measured at 0.4 a row, a row costs .9 and none does */
+    DraftDepthRow r[3];
+    for (int i = 0; i < 3; ++i) { draft_depth_begin(c, &r[i], false); r[i].depth = 2; draft_depth_observe(&r[i], 1, 0.8); }
+    CHECK(draft_depth_go_load(c, r, 3, 3));
+    int went = 0;
+    for (int i = 0; i < 3; ++i) went += r[i].depth == 3;
+    CHECK_EQ(went, 3);
+    c.load_link_ms[3] = 0.4;
+    for (int i = 0; i < 3; ++i) { draft_depth_begin(c, &r[i], false); r[i].depth = 2; draft_depth_observe(&r[i], 1, 0.8); }
+    CHECK(!draft_depth_go_load(c, r, 3, 3));
+    CHECK_EQ(r[0].depth, 2); CHECK(r[0].done);
+    /* one row at conf .95 still clears a link of 0.3 (gain .45 > .3 + the round's .1) beside two at
+     * .4: the link prices a row, it does not ban drafting */
+    c.load_link_ms[3] = 0.3;
+    for (int i = 0; i < 3; ++i) { draft_depth_begin(c, &r[i], false); r[i].depth = 2; }
+    draft_depth_observe(&r[0], 1, 0.95);
+    draft_depth_observe(&r[1], 1, 0.40);
+    draft_depth_observe(&r[2], 1, 0.40);
+    CHECK(draft_depth_go_load(c, r, 3, 3));
+    CHECK_EQ(r[0].depth, 3); CHECK_EQ(r[1].depth, 2); CHECK_EQ(r[2].depth, 2);
 }
 
 TEST(load_aware_chain_depth_keeps_the_target_law) {
@@ -1833,15 +1887,79 @@ TEST(online_calibration_prices_rows_and_tiles_from_step_times) {
     CHECK_NEAR(d.load_row_ms[2], 0.824, 1e-12); CHECK_NEAR(d.load_lam[2], 0.3558, 1e-12);
 }
 
+TEST(online_calibration_prices_a_row_at_its_trunk_time_and_the_link_the_steps_paid) {
+    /* The same 8000 steps twice: once with every expert the step routed off the device (the link
+     * paid, 66 us a miss), once with the device holding them all. The steps' times differ by the
+     * link and by nothing else, so the two tables say what the link did to the price: the row is
+     * its own time either way (the verify's rows' link is taken out of the fit), and the round
+     * keeps the drafter's own passes' link -- a round routes n rows as well. */
+    DraftDepthCfg c = depth_cfg(5, 1, DRAFT_DEPTH_TOP, 0.85), cb = c;
+    draft_depth_load_defaults(&c);
+    draft_depth_load_defaults(&cb);
+    c.link_us = cb.link_us = 66.0;
+    const double row4 = c.load_row_ms[4];
+    DraftDepthOnline o, ob;
+    draft_depth_online_begin(c, &o);
+    draft_depth_online_begin(cb, &ob);
+    uint64_t x = 0x9e3779b97f4a7c15ull;
+    auto rnd = [&]() { x ^= x << 13; x ^= x >> 7; x ^= x << 17; return (double)(x >> 11) / 9007199254740992.0; };
+    double tok = 0, ms_sum = 0;
+    for (int i = 0; i < 8000; ++i) {
+        const int R = 9 + (int)(rnd() * 43.0);                           /* 9 .. 51 rows */
+        const int D = 2 + (int)(rnd() * 4.0);                            /* 2 .. 5, off the rows' count */
+        const double body = 14.0 + 0.5 * R + 0.9 * D + (R > 32 ? 2.0 : 0.0) + (rnd() - 0.5) * 0.6;
+        const int routed = draft_depth_routed_rows(R, 8, D);
+        const int tk = 8 + R / 3;
+        draft_depth_online_step(c, &o, 8, R, D, body + 66.0 * 1e-3 * (double)routed, tk, routed, routed);
+        draft_depth_online_step(cb, &ob, 8, R, D, body, tk, 0, routed);
+        tok += tk; ms_sum += body;
+    }
+    /* a price follows steps that are over: it is not in the table until the refresh */
+    CHECK_NEAR(c.load_link_ms[8], 0.0, 1e-12);
+    CHECK_EQ(o.steps, 8000L);
+    draft_depth_online_refresh(&c, &o);
+    draft_depth_online_refresh(&cb, &ob);
+    std::printf("  the link fed: row %.3f round %.3f link %.4f tile %.2f; held: row %.3f round %.3f "
+                "link %.4f (want .500/.900/.000, +8 x .066 on the round, .066 a row)\n",
+                c.load_row_ms[8], c.load_round_ms[8], c.load_link_ms[8], c.load_jump_ms[8][1],
+                cb.load_row_ms[8], cb.load_round_ms[8], cb.load_link_ms[8]);
+    /* a constant miss rate's average is that rate, 66 us a routed row; nothing missed is nothing */
+    CHECK_NEAR(c.load_link_ms[8], 0.066, 1e-9);
+    CHECK_NEAR(cb.load_link_ms[8], 0.0, 1e-9);
+    /* the row is its own time in both: the verify's link is out of the fit and added by the price */
+    CHECK(std::fabs(c.load_row_ms[8] - 0.5) < 0.04);
+    CHECK(std::fabs(c.load_row_ms[8] - cb.load_row_ms[8]) < 0.04);
+    CHECK_NEAR(draft_depth_load_cost(c, 8, 21) - draft_depth_load_cost(c, 8, 20), c.load_row_ms[8] + 0.066, 1e-9);
+    CHECK_NEAR(draft_depth_load_cost(cb, 8, 21) - draft_depth_load_cost(cb, 8, 20), cb.load_row_ms[8], 1e-9);
+    /* the round keeps the drafter's own passes' link: 8 rows a round, 8 x 66 us of it. The ridge
+     * that resolves a jump column no step has triggered spreads a little of it into the constant,
+     * and the fit weights the recent steps more, so the eight rows' link lands within a fifth. */
+    CHECK(c.load_round_ms[8] - cb.load_round_ms[8] > 0.40 && c.load_round_ms[8] - cb.load_round_ms[8] < 0.60);
+    CHECK(std::fabs(cb.load_round_ms[8] - 0.9) < 0.10);
+    CHECK(std::fabs(c.load_jump_ms[8][1] - 2.0) < 0.3);                  /* a tile is the same price */
+    CHECK(std::fabs(cb.load_lam[8] / (tok / ms_sum) - 1.0) < 0.06);       /* the rate is the wall's, as it is */
+    CHECK_NEAR(c.load_row_ms[4], row4, 1e-12);
+    CHECK_NEAR(c.load_link_ms[4], 0.0, 1e-12);                           /* a row count nobody ran keeps the table */
+    /* a step whose counters told nothing (routed 0) leaves the measured price where it is */
+    draft_depth_online_step(c, &o, 8, 30, 3, 60.0, 18, 0, 0);
+    draft_depth_online_refresh(&c, &o);
+    CHECK_NEAR(c.load_link_ms[8], 0.066, 1e-9);
+    /* every routed unit missed, but the count now over twice the routed rows' worth: 33 us a row */
+    for (int i = 0; i < 4000; ++i) draft_depth_online_step(c, &o, 8, 24, 3, 60.0, 16, 24, 48);
+    draft_depth_online_refresh(&c, &o);
+    CHECK_NEAR(c.load_link_ms[8], 0.033, 1e-3);
+}
+
 TEST(online_calibration_keeps_the_target_law_and_tables_made_from_the_steps_own_verify_do_not) {
     const int trials = 120000;
     g_sharp = 2.0;
     /* The rule and the late choice with tables that follow the run: every chain a verify settled
      * is counted, the tables are remade every 16 steps, and each later step is decided by them.
      * They are functions of steps that are over, so every sequence keeps the target's law. */
-    struct C { int n, late; double trow, tround, tile; int other; const char* name; };
-    const C cs[] = { { 2, 0, 0.30, 0.25, 0.0, 0, "2 rows, the rule" }, { 3, 1, 0.14, 0.10, 0.0, 0, "3 rows, rule + late" },
-                     { 3, 1, 0.08, 0.05, 0.30, 7, "3 rows, late, a tile" } };
+    struct C { int n, late; double trow, tround, tile; int other, link; const char* name; };
+    const C cs[] = { { 2, 0, 0.30, 0.25, 0.0, 0, 0, "2 rows, the rule" }, { 3, 1, 0.14, 0.10, 0.0, 0, 0, "3 rows, rule + late" },
+                     { 3, 1, 0.08, 0.05, 0.30, 7, 0, "3 rows, late, a tile" },
+                     { 3, 1, 0.30, 0.25, 0.0, 0, 1, "3 rows, the link fed" } };
     for (const C& c : cs) {
         DraftDepthCfg cfg = depth_cfg_load(4, 1, 0.40, c.trow, c.tround);
         for (auto& jm : cfg.load_jump_ms) jm[0] = c.tile;
@@ -1850,7 +1968,7 @@ TEST(online_calibration_keeps_the_target_law_and_tables_made_from_the_steps_own_
         for (int t = 0; t < 3; ++t)
             for (int j = 0; j <= DraftDepthCfg::kCalRounds; ++j) cfg.cal_p[t][j][1] = 0.5;
         for (int trav = 1; trav >= 0; --trav) {
-            const LoadRun r = run_depth_load(cfg, c.n, trav != 0, trials, 0.6, c.other, c.late, 1);
+            const LoadRun r = run_depth_load(cfg, c.n, trav != 0, trials, 0.6, c.other, c.late, 1, c.link);
             double z3 = 0, z1 = 0;
             for (int q = 0; q < c.n; ++q) { z3 = std::max(z3, r.z3[q]); z1 = std::max(z1, r.z1[q]); }
             std::printf("  online %-21s %s: worst z3=%.2f z1=%.2f acc=%.3f depth %.2f rounds %.2f shares %.2f %.2f %.2f %.2f\n",

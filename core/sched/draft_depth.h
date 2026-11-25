@@ -111,6 +111,16 @@ struct DraftDepthCfg {
     double load_round_ms[kLoadSeqs + 1] = {};
     int    load_jump_at[kJumps] = { 16, 32, 48, 64 };          /* a verify of more rows than this ... */
     double load_jump_ms[kLoadSeqs + 1][kJumps] = {};           /* ... costs this much more, once */
+    /* The link (D-11). A row's price above is its calibrated ms with the link's share in it only
+     * on average: a routed expert that is not resident is read across the link on the step's
+     * critical path (HeatStats::stream_bytes, 66 us a missed unit at the link's 27.6 GB/s), and
+     * how many of the experts a step routes are missed follows the hot set and the placement, not
+     * the row count. So the row price gains the link the last steps measured per routed row
+     * (load_link_ms, fed by draft_depth_online_step from `routed - routed_resident`), and the
+     * table is fitted on step times net of the verify rows' link, so that the link enters the cost
+     * once (here) and not again inside load_row_ms. */
+    double link_us = 66.0;                                     /* one missed unit's link time, us */
+    double load_link_ms[kLoadSeqs + 1] = {};                   /* by drafting rows n: the link a row pays */
     double cal_x[kCalKnots] = {};            /* ascending conf knots */
     /* cal_p[t][j][k]: draft j's acceptance at conf(j - 2 + t) = cal_x[k]: the confidence the rule
      * reads one round behind (t 0), the last one before the draft (t 1), and the one that
@@ -243,14 +253,23 @@ inline int draft_depth_seqs(int n) {
 }
 
 /* What a verify of R query rows costs under the load-aware rule's model, in milliseconds past a
- * constant. */
+ * constant: a row its trunk time and the link the last steps measured it paid (D-11), the tiles
+ * once. */
 inline double draft_depth_load_cost(const DraftDepthCfg& c, int n, int R) {
     const int nn = draft_depth_seqs(n);
     if (R < 0) R = 0;
-    double ms = c.load_row_ms[nn] * (double)R;
+    double ms = (c.load_row_ms[nn] + c.load_link_ms[nn]) * (double)R;
     for (int k = 0; k < DraftDepthCfg::kJumps; ++k)
         if (R > c.load_jump_at[k]) ms += c.load_jump_ms[nn][k];
     return ms;
+}
+
+/* The rows a step routed experts for: its verify's R rows and its drafter's D passes of the n
+ * drafting rows. The link a row pays is the step's missed experts over this count (D-11). */
+inline int draft_depth_routed_rows(int R, int n, int D) {
+    if (R < 0) R = 0;
+    if (n < 0 || D < 0) return R;
+    return R + n * D;
 }
 
 /* Round `j` (>= 2) for the `n` drafting rows of one step under the load-aware rule; every
@@ -435,6 +454,10 @@ inline int draft_depth_parse_list(const char* s, double* out, int cap, double lo
  *                rows are past), by drafting rows, with the static prices as a prior: a
  *                coefficient the steps do not tell apart (a round from the rows that come with
  *                it) stays near the measured table, one they do (a row, a tile) follows them.
+ *                The regression's dependent variable is the step net of the link its verify rows
+ *                paid (D-11), so that a row's price is its own time and the link is added to it
+ *                from the steps' own miss counts (`link`), not from a coefficient the misses'
+ *                variance would otherwise hide in.
  *
  * Table 0 (the rule's, read one round behind) counts a chain the rule sent on to round j and the
  * late choice then cut as "not accepted": what the round yielded is what the rule weighs.
@@ -450,6 +473,9 @@ struct DraftDepthOnline {
     double  cal0[3][kR + 1][kK] = {};        /* the static tables */
     double  cn[3][kR + 1][kK]   = {}, ca[3][kR + 1][kK] = {};
     struct Lam { double tok = 0, ms = 0; int64_t n = 0; } lam[kN + 1];
+    /* The link one routed row paid, by drafting rows: an average of the steps' own measurement
+     * (D-11), which the row price carries until the next refresh. */
+    struct Link { double ms = 0; int64_t n = 0; } link[kN + 1];
     struct Reg { double S[kF][kF] = {}; double b[kF] = {}; double ms_avg = 0; int64_t n = 0; } reg[kN + 1];
     double  theta0[kN + 1][kF] = {};         /* the static prices: (base, row, round, jumps) */
     double  theta[kN + 1][kF]  = {};         /* the last fit, for the log */
@@ -502,15 +528,33 @@ inline void draft_depth_online_chain(const DraftDepthCfg& c, DraftDepthOnline* o
 
 /* One pure decode step whose passes have ended, `ms` after the step before it (a pure decode
  * step of the same `n` drafting rows): its verify's rows R, the rounds D its drafter ran, the
- * tokens it made. */
+ * tokens it made, and the step's link -- `missed` routed experts it found off the device, over
+ * the `routed` rows it routed them for (draft_depth_routed_rows; 0: the engine's counters told
+ * nothing, the row price keeps the link it has). */
 inline void draft_depth_online_step(const DraftDepthCfg& c, DraftDepthOnline* o, int n, int R, int D,
-                                    double ms, int tokens) {
+                                    double ms, int tokens, int64_t missed = 0, int routed = 0) {
     if (!(ms > 0.0) || ms > 500.0 || n < 1 || R < 1 || tokens < 1) return;
     const int nn = draft_depth_seqs(n);
     DraftDepthOnline::Reg& G = o->reg[nn];
     /* a stall (a client arriving, a page fault) is no price of a row */
     if (G.n >= 32 && (ms > 2.5 * G.ms_avg || ms < 0.4 * G.ms_avg)) { ++o->outliers; return; }
     ++o->steps;
+    /* The link the step paid, per routed row: its missed experts at the link's rate a miss. The
+     * rate is an EMA like the step's own, because a row is priced by the steps before it. */
+    double link_row = 0.0;
+    if (missed >= 0 && routed > 0) {
+        DraftDepthOnline::Link& K = o->link[nn];
+        link_row = c.link_us * 1e-3 * (double)missed / (double)routed;
+        const double wk = 1.0 / (double)(K.n + 1);
+        const double w = wk > 0.010772 ? wk : 0.010772;
+        K.ms += w * (link_row - K.ms);
+        ++K.n;
+    }
+    /* The table is fitted on the step net of its verify rows' link: what a row's own time is,
+     * with the link added back by the row price. A miss measurement that leaves the step no time
+     * is a measurement gone wrong and no price. */
+    double fit_ms = ms - link_row * (double)R;
+    if (!(fit_ms > 0.25 * ms)) fit_ms = 0.25 * ms;
     const double wa = 1.0 / (double)(G.n + 1);
     G.ms_avg += (wa > 1.0 / 64.0 ? wa : 1.0 / 64.0) * (ms - G.ms_avg);
     ++G.n;
@@ -524,7 +568,7 @@ inline void draft_depth_online_step(const DraftDepthCfg& c, DraftDepthOnline* o,
     x[0] = 1.0; x[1] = (double)R; x[2] = (double)D;
     for (int k = 0; k < DraftDepthCfg::kJumps; ++k) x[3 + k] = R > c.load_jump_at[k] ? 1.0 : 0.0;
     for (int a = 0; a < DraftDepthOnline::kF; ++a) {
-        G.b[a] = G.b[a] * o->reg_keep + x[a] * ms;
+        G.b[a] = G.b[a] * o->reg_keep + x[a] * fit_ms;
         for (int b = 0; b < DraftDepthOnline::kF; ++b) G.S[a][b] = G.S[a][b] * o->reg_keep + x[a] * x[b];
     }
 }
@@ -533,6 +577,7 @@ inline void draft_depth_online_step(const DraftDepthCfg& c, DraftDepthOnline* o,
 inline void draft_depth_online_refresh(DraftDepthCfg* c, DraftDepthOnline* o) {
     enum { kF = DraftDepthOnline::kF, kK = DraftDepthOnline::kK };
     ++o->refreshes;
+    auto clamp = [](double v, double lo_, double hi_) { return v < lo_ ? lo_ : (v > hi_ ? hi_ : v); };
     const int K = draft_depth_knots(*c);
     for (int t = 0; t < 3; ++t)
         for (int j = 2; j <= DraftDepthOnline::kR; ++j) {
@@ -560,6 +605,10 @@ inline void draft_depth_online_refresh(DraftDepthCfg* c, DraftDepthOnline* o) {
     for (int n = 1; n <= DraftDepthOnline::kN; ++n) {
         const DraftDepthOnline::Lam& L = o->lam[n];
         if (L.n >= 32 && L.ms > 0.0 && L.tok > 0.0) c->load_lam[n] = L.tok / L.ms;
+        /* The link a row pays, from the steps that measured it (D-11). Set even before the table
+         * has the steps for a fit of its own: the price is a measurement, not a coefficient. */
+        const DraftDepthOnline::Link& K2 = o->link[n];
+        if (K2.n >= 32) c->load_link_ms[n] = clamp(K2.ms, 0.0, 5.0);
         const DraftDepthOnline::Reg& G = o->reg[n];
         if (G.n < 64) continue;
         /* (S + P) theta = b + P theta0, by Cholesky: S + P is positive definite */
@@ -591,7 +640,6 @@ inline void draft_depth_online_refresh(DraftDepthCfg* c, DraftDepthOnline* o) {
         bool finite = true;
         for (int a = 0; a < kF; ++a) finite = finite && y[a] == y[a] && y[a] > -1e6 && y[a] < 1e6;
         if (!finite) continue;
-        auto clamp = [](double v, double lo_, double hi_) { return v < lo_ ? lo_ : (v > hi_ ? hi_ : v); };
         for (int a = 0; a < kF; ++a) o->theta[n][a] = y[a];
         c->load_row_ms[n]   = clamp(y[1], 0.05, 5.0);
         c->load_round_ms[n] = clamp(y[2], 0.10, 5.0);
