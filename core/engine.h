@@ -776,9 +776,9 @@ private:
     std::chrono::steady_clock::time_point depth_note_t_{};
     int           depth_note_step_ = -2, depth_note_rows_ = 0;
     uint64_t      depth_note_n_ = 0;
-    /* Rank 0's heat counters at the last note: the routed experts since then that were not
-     * resident are the link the step paid, fed to the row price (D-11, sched/draft_depth.h). */
-    uint64_t      depth_heat_missed_ = 0;
+    /* Rank 0's stream_bytes at the last note: the expert bytes read across the link since then
+     * are the link the step paid, fed to the row price (D-11, sched/draft_depth.h). */
+    uint64_t      depth_heat_bytes_ = 0;
     uint64_t      depth_explore_n_ = 0;                  /* load-aware steps counted for DraftDepthCfg::force */
     int           depth_explore_force(bool load, int n);
     void          depth_step_note(const RadBatch* b, const StepOut& so);

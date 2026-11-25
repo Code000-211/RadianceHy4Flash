@@ -1380,7 +1380,7 @@ void select_peek(const DraftDepthCfg& c, DraftDepthRow* r, int n, int rounds, in
 
 /* `late`: 0 the rule alone; 1 the late choice behind it (cfg.late_lag rounds not waited for);
  * 2 the control that reads one round too far. `link`: 1 every step also tells the calibration what
- * the link cost it, half its routed experts off the device at DraftDepthCfg::link_us a miss. */
+ * the link cost it, half its routed rows' experts off the device at 66 us a routed row. */
 LoadRun run_depth_load(const DraftDepthCfg& cfg0, int n_seq, bool trav, int trials, double noise,
                        int other_rows = 0, int late = 0, int online = 0, int link = 0) {
     /* `online`: 1 the tables follow the run (DraftDepthOnline, fed by every verified chain,
@@ -1487,13 +1487,12 @@ LoadRun run_depth_load(const DraftDepthCfg& cfg0, int n_seq, bool trav, int tria
             }
             if (online == 1 && link) {
                 /* the step's own price: its rows at the table's, its round per round, and the link
-                 * half its routed experts cost at the link's rate (what the engine feeds) */
+                 * half its routed rows cost at 66 us a row (what the engine feeds, from bytes) */
                 const int routed = draft_depth_routed_rows(rows_step, n, ran);
-                const int64_t missed = routed / 2;
-                const double lk = cfg.link_us * 1e-3 * (double)missed;
+                const double lk_us = 66.0 * (double)routed / 2.0;
                 const double ms = 14.0 + cfg.load_row_ms[n] * (double)rows_step +
-                                  cfg.load_round_ms[n] * (double)ran + lk;
-                draft_depth_online_step(cfg, &on, n, rows_step, ran, ms, 3 * rows_step, missed, routed);
+                                  cfg.load_round_ms[n] * (double)ran + lk_us * 1e-3;
+                draft_depth_online_step(cfg, &on, n, rows_step, ran, ms, 3 * rows_step, lk_us, routed);
             }
             if (online == 1 && (++fed & 15) == 0) draft_depth_online_refresh(&cfg, &on);
         }
@@ -1896,7 +1895,7 @@ TEST(online_calibration_prices_a_row_at_its_trunk_time_and_the_link_the_steps_pa
     DraftDepthCfg c = depth_cfg(5, 1, DRAFT_DEPTH_TOP, 0.85), cb = c;
     draft_depth_load_defaults(&c);
     draft_depth_load_defaults(&cb);
-    c.link_us = cb.link_us = 66.0;
+    c.link_bw_gbs = cb.link_bw_gbs = 27.6;                    /* the feed below is explicit us */
     const double row4 = c.load_row_ms[4];
     DraftDepthOnline o, ob;
     draft_depth_online_begin(c, &o);
@@ -1910,8 +1909,9 @@ TEST(online_calibration_prices_a_row_at_its_trunk_time_and_the_link_the_steps_pa
         const double body = 14.0 + 0.5 * R + 0.9 * D + (R > 32 ? 2.0 : 0.0) + (rnd() - 0.5) * 0.6;
         const int routed = draft_depth_routed_rows(R, 8, D);
         const int tk = 8 + R / 3;
-        draft_depth_online_step(c, &o, 8, R, D, body + 66.0 * 1e-3 * (double)routed, tk, routed, routed);
-        draft_depth_online_step(cb, &ob, 8, R, D, body, tk, 0, routed);
+        draft_depth_online_step(c, &o, 8, R, D, body + 66.0 * 1e-3 * (double)routed, tk,
+                                66.0 * (double)routed, routed);
+        draft_depth_online_step(cb, &ob, 8, R, D, body, tk, 0.0, routed);
         tok += tk; ms_sum += body;
     }
     /* a price follows steps that are over: it is not in the table until the refresh */
@@ -1945,7 +1945,7 @@ TEST(online_calibration_prices_a_row_at_its_trunk_time_and_the_link_the_steps_pa
     draft_depth_online_refresh(&c, &o);
     CHECK_NEAR(c.load_link_ms[8], 0.066, 1e-9);
     /* every routed unit missed, but the count now over twice the routed rows' worth: 33 us a row */
-    for (int i = 0; i < 4000; ++i) draft_depth_online_step(c, &o, 8, 24, 3, 60.0, 16, 24, 48);
+    for (int i = 0; i < 4000; ++i) draft_depth_online_step(c, &o, 8, 24, 3, 60.0, 16, 66.0 * 24.0, 48);
     draft_depth_online_refresh(&c, &o);
     CHECK_NEAR(c.load_link_ms[8], 0.033, 1e-3);
 }

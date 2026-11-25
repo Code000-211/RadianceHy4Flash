@@ -113,13 +113,12 @@ struct DraftDepthCfg {
     double load_jump_ms[kLoadSeqs + 1][kJumps] = {};           /* ... costs this much more, once */
     /* The link (D-11). A row's price above is its calibrated ms with the link's share in it only
      * on average: a routed expert that is not resident is read across the link on the step's
-     * critical path (HeatStats::stream_bytes, 66 us a missed unit at the link's 27.6 GB/s), and
-     * how many of the experts a step routes are missed follows the hot set and the placement, not
-     * the row count. So the row price gains the link the last steps measured per routed row
-     * (load_link_ms, fed by draft_depth_online_step from `routed - routed_resident`), and the
-     * table is fitted on step times net of the verify rows' link, so that the link enters the cost
-     * once (here) and not again inside load_row_ms. */
-    double link_us = 66.0;                                     /* one missed unit's link time, us */
+     * critical path (HeatStats::stream_bytes), and how much a step routes of those follows the
+     * hot set and the placement, not the row count. So the row price gains the link the last
+     * steps measured per routed row (load_link_ms, fed by draft_depth_online_step as the step's
+     * stream_bytes over link_bw_gbs), and the table is fitted on step times net of the verify
+     * rows' link, so that the link enters the cost once (here) and not again inside load_row_ms. */
+    double link_bw_gbs = 27.6;                                 /* the link's read rate (experts-streaming) */
     double load_link_ms[kLoadSeqs + 1] = {};                   /* by drafting rows n: the link a row pays */
     double cal_x[kCalKnots] = {};            /* ascending conf knots */
     /* cal_p[t][j][k]: draft j's acceptance at conf(j - 2 + t) = cal_x[k]: the confidence the rule
@@ -265,7 +264,7 @@ inline double draft_depth_load_cost(const DraftDepthCfg& c, int n, int R) {
 }
 
 /* The rows a step routed experts for: its verify's R rows and its drafter's D passes of the n
- * drafting rows. The link a row pays is the step's missed experts over this count (D-11). */
+ * drafting rows. The link a row pays is the step's stream_bytes over this count (D-11). */
 inline int draft_depth_routed_rows(int R, int n, int D) {
     if (R < 0) R = 0;
     if (n < 0 || D < 0) return R;
@@ -528,23 +527,23 @@ inline void draft_depth_online_chain(const DraftDepthCfg& c, DraftDepthOnline* o
 
 /* One pure decode step whose passes have ended, `ms` after the step before it (a pure decode
  * step of the same `n` drafting rows): its verify's rows R, the rounds D its drafter ran, the
- * tokens it made, and the step's link -- `missed` routed experts it found off the device, over
- * the `routed` rows it routed them for (draft_depth_routed_rows; 0: the engine's counters told
- * nothing, the row price keeps the link it has). */
+ * tokens it made, and the step's link -- `link_us` microseconds the step's stream_bytes took
+ * across the link, over the `routed` rows it routed them for (draft_depth_routed_rows; 0 rows:
+ * the engine's counters told nothing, the row price keeps the link it has). */
 inline void draft_depth_online_step(const DraftDepthCfg& c, DraftDepthOnline* o, int n, int R, int D,
-                                    double ms, int tokens, int64_t missed = 0, int routed = 0) {
+                                    double ms, int tokens, double link_us = 0.0, int routed = 0) {
     if (!(ms > 0.0) || ms > 500.0 || n < 1 || R < 1 || tokens < 1) return;
     const int nn = draft_depth_seqs(n);
     DraftDepthOnline::Reg& G = o->reg[nn];
     /* a stall (a client arriving, a page fault) is no price of a row */
     if (G.n >= 32 && (ms > 2.5 * G.ms_avg || ms < 0.4 * G.ms_avg)) { ++o->outliers; return; }
     ++o->steps;
-    /* The link the step paid, per routed row: its missed experts at the link's rate a miss. The
-     * rate is an EMA like the step's own, because a row is priced by the steps before it. */
+    /* The link the step paid, per routed row: its traffic at the link's rate. The rate is an EMA
+     * like the step's own, because a row is priced by the steps before it. */
     double link_row = 0.0;
-    if (missed >= 0 && routed > 0) {
+    if (link_us >= 0.0 && routed > 0) {
         DraftDepthOnline::Link& K = o->link[nn];
-        link_row = c.link_us * 1e-3 * (double)missed / (double)routed;
+        link_row = link_us * 1e-3 / (double)routed;
         const double wk = 1.0 / (double)(K.n + 1);
         const double w = wk > 0.010772 ? wk : 0.010772;
         K.ms += w * (link_row - K.ms);

@@ -528,24 +528,25 @@ void Engine::depth_step_note(const RadBatch* b, const StepOut& so) {
     /* A block drafter's step runs one query pass whatever its rows verify: one "round". */
     const int n = depth_block_ ? block_rows_ : serial_rows_;
     const int rounds = depth_block_ ? (block_rows_ > 0 ? 1 : 0) : serial_done_;
-    /* The link this step paid (D-11): rank 0's routed experts since the last note, and how many of
-     * them were not resident -- read across the link on the step's critical path. A price, never a
-     * residency decision, so the counters' snapshot is the right read (place/heat.h); the counters
-     * move on every note, so the delta is this step's alone for a step that is fed. */
-    int64_t missed = 0;
+    /* The link this step paid (D-11): rank 0's expert bytes read across the link since the last
+     * note -- the routed experts that were not resident, which the GEMM reads from their tier on
+     * the step's critical path (HeatStats::stream_bytes, place/heat.h). A price, never a residency
+     * decision, so the counters' snapshot is the right read; the counters move on every note, so
+     * the delta is this step's alone for a step that is fed. */
+    double  link_us = 0.0;
     int     routed_rows = 0;
     if (depth_online_on_ && !ranks_.empty()) {
         const HeatStats hs = ranks_[0]->heat.stats();
-        const uint64_t mis = hs.routed >= hs.routed_resident ? hs.routed - hs.routed_resident : 0;
-        missed = (int64_t)(mis - depth_heat_missed_);
-        depth_heat_missed_ = mis;
+        const uint64_t add = hs.stream_bytes >= depth_heat_bytes_ ? hs.stream_bytes - depth_heat_bytes_ : 0;
+        depth_heat_bytes_ = hs.stream_bytes;
+        link_us = (double)add / (depth_cfg_.link_bw_gbs * 1e3);      /* bytes / (GB/s * 1000) = us */
         routed_rows = draft_depth_routed_rows((int)b->n_tok, n, rounds);
     }
     if (depth_online_on_ && pure && n >= 1 && rounds >= 1 && tokens > 0 &&
         depth_note_step_ == b->step - 1 && depth_note_rows_ == n) {
         const double ms = std::chrono::duration<double, std::milli>(now - depth_note_t_).count();
         draft_depth_online_step(depth_cfg_, &depth_online_, n, (int)b->n_tok, rounds, ms, tokens,
-                                missed, routed_rows);
+                                link_us, routed_rows);
     }
     depth_note_t_ = now;
     depth_note_step_ = pure ? b->step : -2;
