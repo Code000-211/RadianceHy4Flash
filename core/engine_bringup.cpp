@@ -5303,13 +5303,19 @@ int Engine::start() {
      * Here because it needs the cache's carve (the addresses) and the mover's compute stream
      * (which a recall drains). Every rank lends its own pool, same geometry on every card; only a
      * plan that moves units borrows. A strip is one layer's stripe of one lendable group, lent
-     * from the top, since a group's top blocks are the top of every layer's stripe. */
+     * from the top, since a group's top blocks are the top of every layer's stripe.
+     *
+     * A sliding-window group lends the slots no sequence occupies through its own loan (M-11,
+     * kv.h "the loan"), so it is its own set of strips. It is carved second, with the unit budget
+     * the KV cache's slots left: the two loans hold the same experts, and a slot no unit can fill
+     * would mark blocks lent that nothing then uses. */
     for (auto& r : ranks_) {
         if (!r->heat.enabled()) continue;
         RAD_TRY(rad_dev_set(r->device));
-        std::vector<LoanStrip> strips;
+        std::vector<LoanStrip> strips, win_strips;
         for (const KVGroupPlan& p : r->kv.plans()) {
-            if (!r->kv.lendable(p.index) || !p.base) continue;
+            const bool win = r->kv.win_lendable(p.index);
+            if ((!win && !r->kv.lendable(p.index)) || !p.base) continue;
             const int64_t lbpb = p.layer_bytes_per_block(), stripe = p.layer_stride();
             for (int64_t L = 0; L < p.n_layers; ++L) {
                 LoanStrip st;
@@ -5317,10 +5323,11 @@ int Engine::start() {
                 st.bytes = p.pool_blocks() * lbpb;
                 st.unit_bytes = lbpb;
                 st.unit_tokens = p.block_size;
-                strips.push_back(st);
+                (win ? win_strips : strips).push_back(st);
             }
         }
         RAD_TRY(r->mover.lend_from(Mover::kLendKV, strips));
+        RAD_TRY(r->mover.lend_from(Mover::kLendKvWindow, win_strips, /*share_unit_budget=*/true));
         if (r->mover.flex_capacity() > 0) lending_ = true;
     }
     /* The next-layer expert prefetch, where one rank's experts sit in a pinned pool for routed GEMMs
@@ -5502,17 +5509,25 @@ int Engine::start() {
      * drained to the affordable loan before the blocks are handed out, and the followers' marks
      * move at once (a tier restore on a follower uses the id rank 0 just chose). */
     if (lending_)
-        ranks_[0]->kv.set_reclaim([this](int64_t tokens) -> int {
+        ranks_[0]->kv.set_reclaim([this](int32_t group, int64_t tokens) -> int {
+            /* A window group has a loan of its own (kv.h "the loan"); every other paged group
+             * answers on the KV loan. */
+            const int lender = ranks_[0]->kv.win_lendable(group) ? Mover::kLendKvWindow
+                                                                 : Mover::kLendKV;
             int st = RAD_OK;
             for (auto& r : ranks_) {
                 if (rad_dev_set(r->device) < 0) { st = RAD_E_DEVICE; break; }
-                st = r->mover.reclaim(Mover::kLendKV, tokens, &r->heat);
+                st = r->mover.reclaim(lender, tokens, &r->heat);
                 if (st < 0) break;
             }
             if (st >= 0)
                 for (size_t i = 1; i < ranks_.size(); ++i) {
                     KVManager& f = ranks_[i]->kv;
-                    if (tokens < f.loan_tokens()) (void)f.set_loan(tokens);
+                    if (lender == Mover::kLendKvWindow) {
+                        if (tokens < f.window_loan_tokens()) (void)f.set_window_loan(tokens);
+                    } else if (tokens < f.loan_tokens()) {
+                        (void)f.set_loan(tokens);
+                    }
                 }
             (void)rad_dev_set(ranks_[0]->device);
             return st;
@@ -5522,7 +5537,8 @@ int Engine::start() {
      * model holds, backs the stripes on every rank, and the followers take the new mark. A
      * refusal is RAD_E_FULL, and the request waits as on a full cache. */
     if (!lending_ && broker_ && ranks_[0]->kv.flex())
-        ranks_[0]->kv.set_fleet_reclaim([this](int64_t tokens, bool* waiting_for_fleet) -> int {
+        ranks_[0]->kv.set_fleet_reclaim([this](int32_t, int64_t tokens,
+                                               bool* waiting_for_fleet) -> int {
             KVManager& k0 = ranks_[0]->kv;
             const int64_t cur = k0.loan_tokens();
             if (tokens >= cur) return RAD_OK;

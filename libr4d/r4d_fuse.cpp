@@ -736,6 +736,72 @@ extern "C" int r4d_fuse_mla_expand_gate(const RadParam* p, int n_p, uint64_t pre
 }
 
 /* ==========================================================================================
+ * qsa_work_pool_tail -- qsa_work, idx_pool_gated over its stage, then qsa_tail_store (K-24).
+ * (row: qsa_work_pool_tail_bf16; kernel: libr4d/r4d_qsa_work_pool_tail_bf16.hip)
+ *
+ * Operands: [0] k  [1] pos  [2] cu  [3] state  [4] sidx  [5] bt  [6] wv  [7] wg  [8] ape
+ *           [9] gain  [10] rope?  [11] page  [12] bpos  [13] nc  [14] cache?
+ *
+ * One temporary, `stage`: the kernel gathers the block's `ratio` raw keys, its destination page and
+ * its first-token position into shared memory instead of the global buffer `qsa_work` writes, and
+ * the pool reads them back from there with the same arithmetic (libr4d/r4d_idx_pool_body.h). The
+ * pool is the same op reading `qsa_work`'s `bpos` as its `pos` and writing `cache` with no `out`,
+ * which is how arch/hyv4flash/hyv4flash_indexer.h issues the unfused pair; a geometry without
+ * `cache` has no chain, because this op has no `out` to hand the pooled key to.
+ *
+ * The tail store is exact only while the kernel stores it: this kernel writes a sequence's rows
+ * when its chunk holds at most `ring - ratio + 1` tokens, and leaves a longer chunk to the caller's
+ * qsa_tail_store. A hook cannot see the per-sequence row counts (they are data, not parameters),
+ * so the chain is claimed only for the geometries where the bound holds whatever the split is:
+ * every chunk of `M` tokens split over `seqs` >= 1 sequences is at most `M` rows, so
+ * `M <= ring - ratio + 1` is sufficient and `M` alone decides it. A geometry past it has no chain
+ * at all, not a chain of two steps, so the hook declines from the first step and the caller's
+ * report says so, rather than memcmp'ing a chain the kernel did not do.
+ */
+extern "C" int r4d_fuse_qsa_work_pool_tail(const RadParam* p, int n_p, uint64_t present, int step,
+                                           RadFuseStep* out) {
+    if (!out) return RAD_E_INVAL;
+    const int64_t M = pi(p, n_p, "M"), r = pi(p, n_p, "ratio", 4),
+                  g = pi(p, n_p, "ring", r);
+    /* `work` is the pool's row count here as in qsa_work: the launch is as wide as `page`, and the
+     * operand description sizes `page` from the same default. */
+    const int64_t W = pi(p, n_p, "work", 1);
+    if (M <= 0 || r <= 0 || g < r || W <= 0) return RAD_E_UNSUPPORTED;
+    if (!RAD_FUSE_HAS(present, 14)) return RAD_E_UNSUPPORTED;   /* no cache, no pool output */
+    if (M > g - r + 1) return RAD_E_UNSUPPORTED;               /* see above: the kernel left it */
+    switch (step) {
+    case 0: {
+        Step s(out, "qsa_work");
+        s.mirror(p, n_p, "M").mirror(p, n_p, "n").mirror(p, n_p, "ratio")
+         .mirror(p, n_p, "ring").mirror(p, n_p, "seqs");
+        if (rad_param_find(p, n_p, "work")) s.mirror(p, n_p, "work");
+        else s.pint("work", W);
+        s.mirror(p, n_p, "dtype");
+        /* k, pos, cu, state, sidx, bt, rope, stage = the temporary, page, bpos, nc */
+        return s.wire({ 0, 1, 2, 3, 4, 5, opt_opd(present, 10), RAD_FUSE_TMP(0), 11, 12, 13 });
+    }
+    case 1: {
+        Step s(out, "idx_pool_gated");
+        /* One row a block, which is the page width, not the step's token count. */
+        s.pint("M", W).mirror(p, n_p, "n").mirror(p, n_p, "ratio")
+         .mirror(p, n_p, "rotary_dim").mirror(p, n_p, "eps").mirror(p, n_p, "theta")
+         .mirror(p, n_p, "mode").mirror_opt(p, n_p, "sections")
+         .mirror_opt(p, n_p, "block_size").mirror(p, n_p, "dtype");
+        /* k = the stage, wv, wg, ape, gain, pos = bpos, page, cache, out = none */
+        return s.wire({ RAD_FUSE_TMP(0), 6, 7, 8, 9, 12, 11, 14, RAD_FUSE_NONE });
+    }
+    case 2: {
+        Step s(out, "qsa_tail_store");
+        s.mirror(p, n_p, "M").mirror(p, n_p, "n").mirror(p, n_p, "ratio")
+         .mirror(p, n_p, "ring").mirror(p, n_p, "seqs").mirror(p, n_p, "dtype");
+        return s.wire({ 0, 1, 2, 3, 4 });              /* k, pos, cu, state, sidx */
+    }
+    default:
+        return RAD_E_NOTFOUND;
+    }
+}
+
+/* ==========================================================================================
  * mla_expand_gate_had_quant_i8g -- the expansion, gate_mul over it, then had_quant_act_i8g (G-3c).
  * (row: mla_expand_gate_had_quant_i8g; kernel: libr4d/r4d_mla_kv_bf16.hip, kv_expand_gate_quant)
  *
