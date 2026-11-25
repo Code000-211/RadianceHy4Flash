@@ -75,9 +75,9 @@ struct IndexWire {
     rad_buf sel_ids = 0;  /* [T, group_topk] i32 */
     /* P-10: one row tile's first rows (0, score_rows, 2 score_rows, ...) and a tile's cu rebased
      * by its first row, for the score and the select of a step taller than one tile. */
-    rad_buf tile_off = 0; /* [tiles] i32 */
+    rad_buf tile_off = 0; /* [max_tiles] i32 */
     rad_buf cu_tile = 0;  /* [seqs + 1] i32 */
-    int64_t work = 0, blocks = 0, ring = 0, score_rows = 0, tiles = 0;
+    int64_t work = 0, blocks = 0, ring = 0, score_rows = 0, max_tiles = 0;
     int declare(RadBuilder* b, Names& nm, const Shape& s, const Geom& g) {
         const int64_t T = g.max_tok, D = s.ix_dim, R = s.sparse.qk_rope, Hi = s.ix_heads;
         work = (T + s.ix_pool - 1) / s.ix_pool + g.max_seqs;
@@ -107,9 +107,9 @@ struct IndexWire {
          * idx_score's grid splits live blocks as well as rows (K-43), so a 256-row launch still
          * fills the card. */
         score_rows = taps_on() ? T : std::min<int64_t>(T, kScoreTile);
-        tiles = (T + score_rows - 1) / score_rows;
+        max_tiles = (T + score_rows - 1) / score_rows;
         score = decl_b(b, nm.f("ix.score"), RAD_F32, { score_rows, blocks });
-        tile_off = decl_b(b, nm.f("ix.tile_off"), RAD_I32, { tiles });
+        tile_off = decl_b(b, nm.f("ix.tile_off"), RAD_I32, { max_tiles });
         cu_tile = decl_b(b, nm.f("ix.cu_tile"), RAD_I32, { g.max_seqs + 1 });
         sel = decl_b(b, nm.f("ix.selected"), RAD_I32, { T, s.ix_group_topk });
         nsel = decl_b(b, nm.f("ix.nsel"), RAD_I32, { T });
@@ -312,7 +312,7 @@ struct Indexer {
         HY4_NEED(op_select, "qsa_select (own)");
         /* P-10: the row tiles' offsets and the rebased cu a tile after the first reads (step()). */
         op_tile_off = mk(b, "iota",
-                         { RAD_RANGE("M", 1, w.tiles), RAD_INT("start", 0),
+                         { RAD_RANGE("M", 1, w.max_tiles), RAD_INT("start", 0),
                            RAD_INT("step", w.score_rows) },
                          {}, {}, { w.tile_off });
         op_rebase = mk(b, "sub_i32", { RAD_RANGE("M", 1, g.max_seqs + 1) }, {}, { w.tile_off },
