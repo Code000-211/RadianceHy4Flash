@@ -41,6 +41,14 @@ struct SelOut {
     int64_t first = 0;           /* the plane row the window starts at (layer base + step row) */
 };
 
+/* P-10: how many rows one score + select issue covers. 256 is the low end of the item's
+ * 256..1024 and the larger saving, and it is the score kernel's own threshold for its row-tiled
+ * form (libr4d/r4d_idx_score_bf16.hip's kTileRows), so every full tile takes that form: its grid is
+ * (rows / 16, keys / 128) workgroups, which splits the live blocks as well as the rows, so a
+ * 256-row launch still fills the card -- and a row's scores do not depend on the row count
+ * (K-43). A shorter last tile takes the per-row form, as a decode step does today. */
+constexpr int64_t kScoreTile = 256;
+
 /* The planes every sparse layer's indexer shares. */
 struct IndexWire {
     rad_buf tk = 0;       /* [T, D] token keys */
@@ -52,7 +60,7 @@ struct IndexWire {
     rad_buf iqr = 0;      /* [T, Hi * R] */
     rad_buf iq = 0;       /* [T, Hi, D] the rotated query */
     rad_buf iw = 0;       /* [T, Hi] head weights */
-    rad_buf score = 0;    /* [T, blocks] f32 */
+    rad_buf score = 0;    /* [score_rows, blocks] f32: one row tile of scores */
     rad_buf sel = 0;      /* [T, group_topk] i32 page table a row */
     rad_buf nsel = 0;     /* [T] i32 */
     rad_buf len = 0;      /* [T] i32 */
@@ -65,7 +73,11 @@ struct IndexWire {
     rad_buf zero_pos = 0; /* [work] i32 zeros: the pooled key before its rotation */
     rad_buf ident = 0;    /* [seqs, blocks] i32 the identity table: selections as group indices */
     rad_buf sel_ids = 0;  /* [T, group_topk] i32 */
-    int64_t work = 0, blocks = 0, ring = 0;
+    /* P-10: one row tile's first rows (0, score_rows, 2 score_rows, ...) and a tile's cu rebased
+     * by its first row, for the score and the select of a step taller than one tile. */
+    rad_buf tile_off = 0; /* [tiles] i32 */
+    rad_buf cu_tile = 0;  /* [seqs + 1] i32 */
+    int64_t work = 0, blocks = 0, ring = 0, score_rows = 0, tiles = 0;
     int declare(RadBuilder* b, Names& nm, const Shape& s, const Geom& g) {
         const int64_t T = g.max_tok, D = s.ix_dim, R = s.sparse.qk_rope, Hi = s.ix_heads;
         work = (T + s.ix_pool - 1) / s.ix_pool + g.max_seqs;
@@ -87,12 +99,23 @@ struct IndexWire {
         iqr = decl_b(b, nm.f("ix.query_rope"), RAD_BF16, { T, Hi * R });
         iq = decl_b(b, nm.f("ix.query"), RAD_BF16, { T, Hi, D });
         iw = decl_b(b, nm.f("ix.head_weights"), RAD_BF16, { T, Hi });
-        score = decl_b(b, nm.f("ix.score"), RAD_F32, { T, blocks });
+        /* P-10: the score plane is one row tile tall, not the whole chunk's -- max_tok * blocks f32
+         * is 134 MB at 64K context and 268 MB at 128K, and 256 rows of it is 16.8 MB and 33.5 MB --
+         * and score and select then run a tile at a time (step()). A tap reads a whole chunk's
+         * scores (the WP4 check), so under taps the plane keeps max_tok rows and a step is one
+         * tile. kScoreTile 256 is the item's 256-1024 at the end that gives the arena back:
+         * idx_score's grid splits live blocks as well as rows (K-43), so a 256-row launch still
+         * fills the card. */
+        score_rows = taps_on() ? T : std::min<int64_t>(T, kScoreTile);
+        tiles = (T + score_rows - 1) / score_rows;
+        score = decl_b(b, nm.f("ix.score"), RAD_F32, { score_rows, blocks });
+        tile_off = decl_b(b, nm.f("ix.tile_off"), RAD_I32, { tiles });
+        cu_tile = decl_b(b, nm.f("ix.cu_tile"), RAD_I32, { g.max_seqs + 1 });
         sel = decl_b(b, nm.f("ix.selected"), RAD_I32, { T, s.ix_group_topk });
         nsel = decl_b(b, nm.f("ix.nsel"), RAD_I32, { T });
         len = decl_b(b, nm.f("ix.length"), RAD_I32, { T });
         if (!tk || !stage || !page || !bpos || !nc || !iqn || !iqr || !iq || !iw || !score ||
-            !sel || !nsel || !len)
+            !sel || !nsel || !len || !tile_off || !cu_tile)
             return RAD_E_INVAL;
         if (s.ix_fp8) {
             iqf = decl_b(b, nm.f("ix.query_rows"), RAD_BF16, { T * Hi, D });
@@ -124,6 +147,7 @@ struct Indexer {
     rad_weight key_gain = 0, wv = 0, wg = 0, ape = 0, pool_gain = 0;
     rad_op op_key_norm = 0, op_work = 0, op_pool = 0, op_tail = 0;
     rad_op op_q_rope = 0, op_qn_copy = 0, op_qr_copy = 0, op_score = 0, op_select = 0;
+    rad_op op_tile_off = 0, op_rebase = 0;                  /* P-10: the row tiles */
     rad_op op_q_rows = 0, op_q_quant = 0, op_gate_f32 = 0;   /* RADIANCE_HY4_INDEXER=int8 */
     rad_op op_tap_zero = 0, op_tap_pool = 0, op_tap_ident = 0, op_tap_select = 0, op_tap_nsel0 = 0;
     Tap t_token_keys{}, t_group_keys{}, t_sel{}, t_nsel{}, t_score{};
@@ -265,27 +289,35 @@ struct Indexer {
                                RAD_STR("to", "f32") },
                              {}, { w.iw }, { w.iwf });
             op_score = mk(b, "dsa_score",
-                          { RAD_RANGE("M", 1, T), RAD_INT("n", D), RAD_INT("heads", Hi),
+                          { RAD_RANGE("M", 1, w.score_rows), RAD_INT("n", D), RAD_INT("heads", Hi),
                             RAD_INT("blocks", w.blocks), RAD_INT("seqs", g.max_seqs),
                             RAD_STR("dtype", s.ix_i8 ? "int8" : "fp8_e4m3") },
-                          {}, { w.qcodes, w.qscale, w.iwf, w.nc }, { w.score });
+                          {}, { w.qcodes, w.qscale, w.iwf, w.nc, w.cu_tile }, { w.score });
             HY4_NEED(op_q_rows && op_gate_f32, "cast");
             HY4_NEED(op_q_quant, "dsa_query / dsa_query_i8 (RADIANCE_HY4_INDEXER=int8)");
             HY4_NEED(op_score, "dsa_score at 16 heads (RADIANCE_HY4_INDEXER=int8)");
         } else {
             op_score = mk(b, "idx_score",
-                          { RAD_RANGE("M", 1, T), RAD_INT("n", D), RAD_INT("heads", Hi),
+                          { RAD_RANGE("M", 1, w.score_rows), RAD_INT("n", D), RAD_INT("heads", Hi),
                             RAD_INT("blocks", w.blocks), RAD_INT("seqs", g.max_seqs),
                             RAD_STR("dtype", "bf16") },
-                          {}, { w.iq, w.iw, w.nc }, { w.score });
+                          {}, { w.iq, w.iw, w.nc, w.cu_tile }, { w.score });
             HY4_NEED(op_score, "idx_score");
         }
         op_select = mk(b, "qsa_select",
-                       { RAD_RANGE("M", 1, T), RAD_INT("blocks", w.blocks),
+                       { RAD_RANGE("M", 1, w.score_rows), RAD_INT("blocks", w.blocks),
                          RAD_INT("topk", s.ix_group_topk - 1), RAD_INT("ratio", r),
                          RAD_INT("seqs", g.max_seqs), RAD_INT("signed", 1), RAD_INT("own", 1) },
-                       {}, { w.score, w.nc }, { w.sel, w.nsel, w.len });
+                       {}, { w.score, w.nc, w.cu_tile }, { w.sel, w.nsel, w.len });
         HY4_NEED(op_select, "qsa_select (own)");
+        /* P-10: the row tiles' offsets and the rebased cu a tile after the first reads (step()). */
+        op_tile_off = mk(b, "iota",
+                         { RAD_RANGE("M", 1, w.tiles), RAD_INT("start", 0),
+                           RAD_INT("step", w.score_rows) },
+                         {}, {}, { w.tile_off });
+        op_rebase = mk(b, "sub_i32", { RAD_RANGE("M", 1, g.max_seqs + 1) }, {}, { w.tile_off },
+                       { w.cu_tile });
+        HY4_NEED(op_tile_off && op_rebase, "iota / sub_i32 (the indexer's row tiles)");
 
         /* Taps: the token keys; each closing group's pooled key before its rotation (the pool
          * again at position 0, which turns nothing); the selection as group indices (the select
@@ -406,38 +438,66 @@ struct Indexer {
         rows.spans([&](int64_t src, int64_t dst, int64_t count) {
             head.step(c, act(xa), w.iw, T, src, count, dst);
         });
-        const RadOperand score = bcol_at(w.score, 0, w.blocks, 0, p.live, M);
+        const int64_t score_rows = w.score_rows;
+        const int64_t tiles = (M + score_rows - 1) / score_rows;
+        const int64_t Hi = s.ix_heads;
         if (s.ix_fp8) {
-            const int64_t Hi = s.ix_heads;
             RAD_ISSUE_N(c, op_q_rows, M * Hi, brows(w.iq, M), brows(w.iqf, M * Hi));
             RAD_ISSUE_N(c, op_q_quant, M * Hi, brows(w.iqf, M * Hi), brows(w.qcodes, M * Hi),
                         brows(w.qscale, M * Hi));
             RAD_ISSUE_N(c, op_gate_f32, M, brows(w.iw, M), brows(w.iwf, M));
-            /* The packed cache in place of `k` and its scales (dsa_score's packed form). */
-            RAD_ISSUE_N(c, op_score, M, brows(w.qcodes, M * Hi), brows(w.qscale, M * Hi),
-                        brows(w.iwf, M), kv_cache(index, layer), RAD_NONE,
-                        praw2(ib->block_table, RAD_I32, S, ib->block_table_pitch), qcu,
-                        brows(w.nc, S), score, RAD_NONE);
-        } else {
-            RAD_ISSUE_N(c, op_score, M, brows(w.iq, M), brows(w.iw, M), kv_cache(index, layer),
-                        praw2(ib->block_table, RAD_I32, S, ib->block_table_pitch), qcu,
-                        brows(w.nc, S), score);
         }
-        /* P-09: on a snapshot layer of a single-span step of a group that does not stream the
-         * selection is written straight into the layer's snapshot window (the attention reads it
-         * from there); the wire keeps `len`, which both paths write the same way. */
-        const RadOperand o_sel = sel_out ? brow_slice(sel_out->sel, sel_out->first, M, s.ix_group_topk)
-                                         : brows(w.sel, M);
-        const RadOperand o_nsel = sel_out ? brow_slice(sel_out->nsel, sel_out->first, M, 1)
-                                          : brows(w.nsel, M);
-        RAD_ISSUE_N(c, op_select, M, score,
-                    praw2(ab->block_table, RAD_I32, S, ab->block_table_pitch), brows(w.nc, S), qpos,
-                    qcu, o_sel, o_nsel, brows(w.len, M));
+        /* P-10: score and select a tile of rows at a time, into the one [score_rows, blocks] plane.
+         * Both kernels take each row's sequence from `cu` in the step's row space, so a tile that
+         * starts at row t0 reads a cu rebased by t0 (sub_i32, an exact int32 subtraction) into
+         * w.cu_tile, its scalar the tile's own offset from w.tile_off; the first tile reads cu as
+         * it is, and a step of one tile (every decode step, every tap step) issues nothing extra. */
+        if (tiles > 1)
+            RAD_ISSUE_N(c, op_tile_off, tiles, brow_slice(w.tile_off, 0, tiles, 1));
+        for (int64_t t0 = 0, ti = 0; t0 < M; t0 += score_rows, ++ti) {
+            const int64_t n = std::min(score_rows, M - t0);
+            RadOperand cu_t = qcu;
+            if (t0 > 0) {
+                RAD_ISSUE_N(c, op_rebase, S + 1, qcu, brow_slice(w.tile_off, ti, 1, 1),
+                            brows(w.cu_tile, S + 1));
+                cu_t = brows(w.cu_tile, S + 1);
+            }
+            const RadOperand tscore = bcol_at(w.score, 0, w.blocks, 0, p.live, n);
+            if (s.ix_fp8) {
+                /* The packed cache in place of `k` and its scales (dsa_score's packed form). */
+                RAD_ISSUE_N(c, op_score, n, brow_slice(w.qcodes, t0 * Hi, n * Hi, D),
+                            brow_slice(w.qscale, t0 * Hi, n * Hi, 1),
+                            brow_slice(w.iwf, t0, n, Hi), kv_cache(index, layer), RAD_NONE,
+                            praw2(ib->block_table, RAD_I32, S, ib->block_table_pitch), cu_t,
+                            brows(w.nc, S), tscore, RAD_NONE);
+            } else {
+                RAD_ISSUE_N(c, op_score, n, brow_slice(w.iq, t0, n, Hi * D),
+                            brow_slice(w.iw, t0, n, Hi), kv_cache(index, layer),
+                            praw2(ib->block_table, RAD_I32, S, ib->block_table_pitch), cu_t,
+                            brows(w.nc, S), tscore);
+            }
+            /* P-09: on a snapshot layer of a single-span step of a group that does not stream the
+             * selection is written straight into the layer's snapshot window (the attention reads
+             * it from there); the wire keeps `len`, which both paths write the same way. */
+            const RadOperand o_sel =
+                sel_out ? brow_slice(sel_out->sel, sel_out->first + t0, n, s.ix_group_topk)
+                        : brow_slice(w.sel, t0, n, s.ix_group_topk);
+            const RadOperand o_nsel = sel_out
+                ? brow_slice(sel_out->nsel, sel_out->first + t0, n, 1)
+                : brow_slice(w.nsel, t0, n, 1);
+            RAD_ISSUE_N(c, op_select, n, tscore,
+                        praw2(ab->block_table, RAD_I32, S, ab->block_table_pitch), brows(w.nc, S),
+                        praw(queries->positions + t0, RAD_I32, n), cu_t, o_sel, o_nsel,
+                        brow_slice(w.len, t0, n, 1));
+        }
         if (op_tap_select) {
-            /* The identity table is refilled each step; the select over it writes `len` again
-             * with the same values (the lengths do not depend on the table). */
+            /* A tap reads the whole chunk's scores, so under taps the plane holds the chunk's own
+             * rows and a step is one tile: the identity table is refilled each step, and the select
+             * over it writes `len` again with the same values (the lengths do not depend on the
+             * table). */
+            const RadOperand tscore = bcol_at(w.score, 0, w.blocks, 0, p.live, M);
             RAD_ISSUE_N(c, op_tap_ident, S * w.blocks, bcol_at(w.ident, 0, w.blocks, 0, w.blocks, S));
-            RAD_ISSUE_N(c, op_tap_select, M, score, bcol_at(w.ident, 0, w.blocks, 0, w.blocks, S),
+            RAD_ISSUE_N(c, op_tap_select, M, tscore, bcol_at(w.ident, 0, w.blocks, 0, w.blocks, S),
                         brows(w.nc, S), qpos, qcu, brows(w.sel_ids, M), brows(w.nsel, M),
                         brows(w.len, M));
             t_sel.step(c, brows(w.sel_ids, M), M);
