@@ -1203,6 +1203,21 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         for (const Layer& l : m.layers)
             for (rad_buf v : { l.attn.w.o, l.ffn.junction_a(), l.ffn.junction_b() })
                 if (v) rad_buf_concurrent(b, v);
+        /* P-07: a junction that took the Engram form (EG) reads the Engram's key, value and mask on
+         * the second lane (junction_tail's gate), and those are written by the `pre` half -- two
+         * GEMMs and a norm -- which the step issues on lane 0 in front of the junction. So lane 0
+         * then runs the piece behind (the previous layer's FFN) while lane 1 reads them, and the
+         * three are transient: the declared order ends their use before the junction, so the arena
+         * may lay that FFN's scratch on their bytes. Name them, as rule 3 of the lane's contract
+         * asks (the connection's own buffers are PERSIST already). */
+        for (size_t i = 1; i < m.layers.size(); ++i) {
+            if (!m.layers[i - 1].j_end.eg) continue;
+            const int e = m.layers[i].engram;
+            if (e < 0) continue;
+            const EngramWire& w = m.engrams[(size_t)e].w;
+            for (rad_buf v : { w.key, w.val, w.mask })
+                if (v) rad_buf_concurrent(b, v);
+        }
     }
     RAD_ARCH_TRY(m.t_final.declare(b, nm, T, "final_hidden", -1, RAD_BF16, E, m.final_hidden));
     m.unpack_hidden = decl_copy(b, T, E, RAD_BF16, m.final_hidden, m.final_hidden);

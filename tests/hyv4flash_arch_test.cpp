@@ -3802,6 +3802,54 @@ TEST(p07_the_junction_in_front_of_an_engram_takes_its_gate) {
     steps_clean_at(off.b, 0, 1);
 }
 
+/* P-07 with the pipelined prefill, where the Engram form's gate runs on the second lane. Its three
+ * operands -- eg.key and eg.value of the two GEMMs and the norm, eg.mask of the gather -- are
+ * written by the `pre` half on lane 0 in front of the junction, while lane 0 then runs the piece
+ * behind (the layer before's FFN): a transient whose declared use ends before the junction, so the
+ * arena may lay that FFN's scratch on its bytes. Rule 3 of the lane's contract asks the declare to
+ * name every buffer the second lane touches to rad_buf_concurrent, which is what keeps them off
+ * other buffers. Without the pipeline nothing overlaps and they stay transient. */
+TEST(p07_the_pipelined_gate_names_its_operands_to_the_planner) {
+    auto eg_operands = [](const RadBuilder& b, bool named) {
+        for (const char* n : { "eg.key", "eg.value", "eg.mask" }) {
+            const rad_buf h = buf_named(b, n);
+            REQUIRE(h);
+            CHECK_EQ(has_buf(b.concurrent, h), named);
+        }
+    };
+    for (int pipe = 0; pipe < 2; ++pipe) {
+        if (pipe) setenv("RADIANCE_HY4_PIPE", "1", 1);
+        else unsetenv("RADIANCE_HY4_PIPE");
+        /* the step reads the model the last declare built, so each graph is stepped before the next */
+        Declared d(bf16_encs, 2, 0, true);
+        unsetenv("RADIANCE_HY4_PIPE");
+        REQUIRE_EQ(d.rc, RAD_OK);
+        const auto& m = *hyv4flash::models[0];
+        CHECK_EQ(m.pipe_on, pipe != 0);
+        /* this model's Engram sits in front of a layer whose junction carries its gate */
+        bool fused = false;
+        for (size_t i = 1; i < m.layers.size(); ++i) {
+            if (!m.layers[i - 1].j_end.eg) continue;
+            CHECK(m.layers[i].engram >= 0);
+            fused = true;
+        }
+        CHECK(fused);
+        eg_operands(d.b, pipe != 0);
+        every_weight_read(d.b);
+        steps_clean_at(d.b, 0, 1);
+    }
+    /* ... and with the junction off the gate is a launch of its own on lane 0: nothing of it is
+     * the second lane's, so its operands are not named there. */
+    setenv("RADIANCE_HY4_PIPE", "1", 1);
+    setenv("RADIANCE_HY4_JUNCTION", "0", 1);
+    Declared off(bf16_encs, 2, 0, true);
+    unsetenv("RADIANCE_HY4_JUNCTION");
+    unsetenv("RADIANCE_HY4_PIPE");
+    REQUIRE_EQ(off.rc, RAD_OK);
+    CHECK_EQ(count_op(off.b, "engram_gate"), 1);
+    eg_operands(off.b, false);
+}
+
 /* A model whose Engram opens the last layer: `engram_layer_ids` name one above the layer the memory
  * sits in front of, so id `n_layers` is the last one. */
 struct DeclaredLastEngram {
