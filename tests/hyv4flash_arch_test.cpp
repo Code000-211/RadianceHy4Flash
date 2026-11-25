@@ -1603,6 +1603,13 @@ TEST(quantised_routed_experts_are_served_clamped) {
  * own epilogue; the down GEMM reads exactly what the gate_up wrote, and neither a `swiglu_clamped`
  * nor a quantiser op stands between them. With that row undeclared, the pair is back with the plane
  * it stages. */
+/* trellis_i8 with the fused gate_up row refused, for the arm below. */
+static void trellis_i8_no_gated(RadBuilder* b) {
+    bf16_encs(b);
+    b->encs[0].second = b->encs[1].second = enc_trellis(RAD_U4, true);
+    b->refuse.insert("moe_gemm_q_gated");
+}
+
 TEST(k53_the_routed_gate_up_writes_the_down_codes_itself) {
     auto trellis_i8 = [](RadBuilder* b) {
         bf16_encs(b);
@@ -1678,6 +1685,31 @@ TEST(k53_the_routed_gate_up_writes_the_down_codes_itself) {
     CHECK_EQ(gu_w, 2);
     CHECK_EQ(cl_r, 2);
     CHECK_EQ(cl_w, 4);
+
+    /* A checkpoint whose gate_up row is not the fused one's family: the fused op is asked for and
+     * resolves nothing (`rad_op_resolved`), and the block stages the pair's plane again -- the
+     * quantiser declares and the plane has its writer and reader back. */
+    {
+        g3_fusions = true;
+        Declared unr(trellis_i8_no_gated);
+        g3_fusions = false;
+        REQUIRE_EQ(unr.rc, RAD_OK);
+        CHECK_EQ(count_op(unr.b, "moe_gemm_q_gated"), 2);   /* asked, refused */
+        CHECK_EQ(count_op(unr.b, "moe_gemm_q"), 4);        /* two down, two gate_up */
+        CHECK_EQ(count_op(unr.b, "swiglu_clamped_had_quant_i8g"), 2);
+        const rad_buf egu2 = buf_named(unr.b, "moe.expert_gate_up");
+        REQUIRE(egu2 != 0);
+        int pw = 0, pr = 0;
+        bool any_resolved = false;
+        for (const auto& o : unr.b.ops) {
+            pw += (int)in(o.writes, egu2);
+            pr += (int)in(o.reads, egu2);
+            if (o.op == "moe_gemm_q_gated" && o.resolved) any_resolved = true;
+        }
+        CHECK_EQ(pw, 2);
+        CHECK(pr >= 1);
+        CHECK(!any_resolved);
+    }
 
     every_weight_read(off.b);
 }

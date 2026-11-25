@@ -1376,11 +1376,20 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
         const RadParam* pb = ncls == 4 ? p4 : p2;
         const int np = (int)(ncls == 4 ? sizeof p4 / sizeof *p4 : sizeof p2 / sizeof *p2) - cut;
         std::vector<RadParam> pr(pb, pb + np);
-        /* the fused row's own parameter, the clamp its quantisation applies */
-        if (gu_q) pr.push_back(RAD_F64("limit", c.swiglu_limit));
-        rad_op h = rad_decl_op(b, ncls == 4 ? (gu_q ? "moe_gemm_q_gated_mod4" : "moe_gemm_q_mod4")
-                                            : (gu_q ? "moe_gemm_q_gated" : "moe_gemm_q"),
-                               pr.data(), (int)pr.size(), tab.data(), (int)tab.size());
+        const char* pair_name = ncls == 4 ? "moe_gemm_q_mod4" : "moe_gemm_q";
+        const char* fused_name = ncls == 4 ? "moe_gemm_q_gated_mod4" : "moe_gemm_q_gated";
+        rad_op h = 0;
+        if (gu_q) {
+            /* the fused row's own parameter, the clamp its quantisation applies */
+            std::vector<RadParam> pf(pr);
+            pf.push_back(RAD_F64("limit", c.swiglu_limit));
+            h = rad_decl_op(b, fused_name, pf.data(), (int)pf.size(), tab.data(), (int)tab.size());
+            /* A checkpoint whose gate_up row is not the fused one's family (a w4nl table, say)
+             * resolves nothing: the pair, with the plane it stages. */
+            if (!rad_op_resolved(b, h)) gu_q = gu_q8 = false;
+        }
+        if (!gu_q)
+            h = rad_decl_op(b, pair_name, pr.data(), (int)pr.size(), tab.data(), (int)tab.size());
         /* the fused form's outputs are the codes and scale the down GEMM reads, not the plane */
         op_gu = gu_q ? rw(b, h, {gin_q, gin_s, w.sorted, w.eoff}, {down_eff.cq(), down_eff.cs()})
                      : rw(b, h, {gin_q, gin_s, w.sorted, w.eoff}, {w.egu});
