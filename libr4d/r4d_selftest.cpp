@@ -9774,8 +9774,9 @@ static void rope_ladder_case(const Plugin& pl) {
 
 /* rope_bf16's chained form against the plain launch, byte for byte: the chained kernel reads the
  * step's position in front of its chain wait (K-29), so every byte of the row has to come out the
- * same. Both widths the body has: a plain neox one and the multi-component (imrope) one, whose
- * position is the three-component table rope_pos reads component by component. */
+ * same. Every width the body has: a plain neox one, the multi-component (imrope) one, whose position
+ * is the three-component table rope_pos reads component by component, and a two-section axial one,
+ * whose table has two rows and no third one to read. */
 static void rope_chain_case(const Plugin& pl) {
     const char* what = "rope's chained form against the plain launch, byte for byte";
     const RadKernelInfo* r = find(pl, "rope_bf16");
@@ -9784,12 +9785,15 @@ static void rope_chain_case(const Plugin& pl) {
     const int64_t hd = 64, rot = 64, n_head = 3, nkv = 1;
     const int64_t row = (n_head + 2 * nkv) * hd;
     const float theta = 10000.0f;
-    struct C { int64_t M; bool imrope; const char* mode; };
-    const C cs[] = { { 6, false, "neox" }, { 6, true, "imrope_gptj" }, { 1, false, "neox" } };
+    struct C { int64_t M; int comps; const char* mode; const char* sections; };
+    const C cs[] = { { 6, 1, "neox", nullptr },
+                     { 6, 3, "imrope_gptj", "11 11 10" },
+                     { 5, 2, "axial", "16 16" },
+                     { 1, 1, "neox", nullptr } };
 
     for (const C& c : cs) {
-        const std::string what_c = fmt("%s: M %lld%s", what, (long long)c.M,
-                                       c.imrope ? ", imrope" : "");
+        const std::string what_c = fmt("%s: M %lld, %s (%d component%s)", what, (long long)c.M,
+                                       c.mode, c.comps, c.comps == 1 ? "" : "s");
         std::vector<uint16_t> x((size_t)(c.M * row));
         for (size_t i = 0; i < x.size(); ++i) {
             float v = (float)(((i * 7) % 23) - 11) / 13.0f;
@@ -9797,13 +9801,11 @@ static void rope_chain_case(const Plugin& pl) {
             x[i] = h_to_bf16(v);
         }
         /* The position of row m is its own in every component, so a wrong component shows. */
-        std::vector<int32_t> pos((size_t)(c.M * (c.imrope ? 3 : 1)));
+        std::vector<int32_t> pos((size_t)(c.M * c.comps));
         for (int64_t m = 0; m < c.M; ++m) {
             pos[(size_t)m] = (int32_t)(3 + 5 * m);
-            if (c.imrope) {
-                pos[(size_t)(c.M + m)] = (int32_t)(100 + 7 * m);
-                pos[(size_t)(2 * c.M + m)] = (int32_t)(900 + 11 * m);
-            }
+            if (c.comps > 1) pos[(size_t)(c.M + m)] = (int32_t)(100 + 7 * m);
+            if (c.comps > 2) pos[(size_t)(2 * c.M + m)] = (int32_t)(900 + 11 * m);
         }
         void* d_x[2];
         for (int k = 0; k < 2; ++k) d_x[k] = dalloc(x.size() * 2);
@@ -9811,7 +9813,8 @@ static void rope_chain_case(const Plugin& pl) {
         if (!d_x[0] || !d_x[1] || !d_pos) { ok(what_c.c_str(), false, "hipMalloc failed"); continue; }
         st_memcpy(d_pos, pos.data(), pos.size() * 4, hipMemcpyHostToDevice);
 
-        const RadTensor pt = c.imrope ? T(d_pos, RAD_I32, { 3, c.M }) : T(d_pos, RAD_I32, { c.M });
+        const RadTensor pt = c.comps > 1 ? T(d_pos, RAD_I32, { c.comps, c.M })
+                                         : T(d_pos, RAD_I32, { c.M });
         int64_t diff = -1;
         for (int chain = 0; chain < 2; ++chain) {
             st_memcpy(d_x[chain], x.data(), x.size() * 2, hipMemcpyHostToDevice);
@@ -9820,7 +9823,7 @@ static void rope_chain_case(const Plugin& pl) {
                                          PI("n_head_kv", nkv), PF("theta", (double)theta),
                                          PF("scale", 1.0), PS("mode", c.mode),
                                          PI("rotary_dim", rot) };
-            if (c.imrope) ps.push_back(PS("sections", "11 11 10"));
+            if (c.sections) ps.push_back(PS("sections", c.sections));
             if (chain) ps.push_back(PI("chain", 1));
             const int rc = [&] {
                 RadArgs a;
