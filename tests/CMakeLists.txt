@@ -173,6 +173,9 @@ string(APPEND RAD_PERF_SCRIPT "include([==[${CMAKE_CURRENT_SOURCE_DIR}/perf_entr
 # back to the host at dlopen, so like the engine it carries all of rad_core and exports it.
 set(RAD_TESTS_WHOLE_CORE shipped_plugins_test)
 
+# issue_link_hold_test: which collectives take the link hold (--wrap=rad_link_hold, below).
+set(RAD_TESTS_WRAP_LINK_HOLD issue_link_hold_test)
+
 file(GLOB RAD_TESTS CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/*_test.cpp)
 if(NOT RAD_HIP_FOUND)
   list(FILTER RAD_TESTS EXCLUDE REGEX "/dspark_device_test\\.cpp$")
@@ -270,6 +273,11 @@ foreach(t ${RAD_TESTS})
   endif()
   if(n IN_LIST RAD_TESTS_WITH_LEGACY)
     target_link_libraries(${n} PRIVATE rad_legacy_toolparse)
+  endif()
+  # The test records rad_link_hold calls through the linker's wrap, so it needs no strong symbol
+  # beside dispatch.cpp.o.
+  if(n IN_LIST RAD_TESTS_WRAP_LINK_HOLD)
+    target_link_options(${n} PRIVATE -Wl,--wrap=rad_link_hold)
   endif()
   target_compile_definitions(${n} PRIVATE RAD_CHAT_FIXTURES="${RAD_CHAT_FIXTURES}"
                                           RAD_MEDIA_FIXTURES="${RAD_MEDIA_FIXTURES}"
