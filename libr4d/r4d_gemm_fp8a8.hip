@@ -744,7 +744,7 @@ void r4dchain_gemm_fp8a8(
     const uint8_t* __restrict__ Ap, const uint16_t* __restrict__ Sa,                           \
     const int8_t* __restrict__ Bp, const float* __restrict__ Sb, uint16_t* __restrict__ C,     \
     uint32_t rows, uint32_t cols, uint32_t M, uint32_t b_ld, uint32_t sb_ld
-template <uint32_t KW, uint32_t SB, uint32_t NT>
+template <uint32_t KW, uint32_t SB, uint32_t NT, class CH>
 __device__ __forceinline__ void gemm_i8_kpar_body(R4D_I8KPAR_PARAMS) {
     constexpr uint32_t kUG = SB / kBlock;   /* 128-K units a scale group */
     __shared__ float s_red[KW][NT][8 * kWave];
@@ -786,8 +786,22 @@ __device__ __forceinline__ void gemm_i8_kpar_body(R4D_I8KPAR_PARAMS) {
      * further tile's fragments a tile ahead. */
     Stage8 ac[2], an[2];
     i2v bc[8], bn[8], bq[2][8];
+    /* Chained, the block waits in the poll while its predecessor runs (aql.cpp's chain plan), so
+     * the first unit of the weight and its group's scale are issued before the acquire: a static
+     * weight's bytes are not written by any op of a pass (operand role RAD_OPD_WEIGHT,
+     * core/runtime/issue.cpp's haz_note orders no read of one), so neither load can see a partial
+     * write, and both return into registers that survive the acquire. The token rows and the
+     * first tile's fragments stay behind the wait. */
+    uint4 q4p = make_uint4(0u, 0u, 0u, 0u);
+    if (CH::on) {
+        if (wave < ngrp) {
+            aload(wave * kUG, ac);
+            q4p = *(const uint4*)(Sa + ((size_t)rt * ngrp + wave) * 16u + acc_row(lane, 0));
+        }
+        r4d_chain_wait_vec();
+    }
     if (wave < ngrp) {
-        aload(wave * kUG, ac);
+        if (!CH::on) aload(wave * kUG, ac);
         bload(0u, wave * kUG, bc);
     }
     for (uint32_t g = wave; g < ngrp; g += KW) {
@@ -818,7 +832,8 @@ __device__ __forceinline__ void gemm_i8_kpar_body(R4D_I8KPAR_PARAMS) {
         }
         /* The lane's eight rows' bf16 scales of this group are consecutive in the tile-major
          * plane: one 16-byte load. */
-        const uint4 q4 = *(const uint4*)(Sa + ((size_t)rt * ngrp + g) * 16u + acc_row(lane, 0));
+        const uint4 q4 = (CH::on && g == wave) ? q4p
+                        : *(const uint4*)(Sa + ((size_t)rt * ngrp + g) * 16u + acc_row(lane, 0));
         const uint32_t qd[4] = { q4.x, q4.y, q4.z, q4.w };
 #pragma unroll
         for (uint32_t j = 0; j < NT; ++j) {
@@ -865,8 +880,7 @@ __device__ __forceinline__ void gemm_i8_kpar_body(R4D_I8KPAR_PARAMS) {
 template <uint32_t KW, uint32_t SB, uint32_t NT, class CH>
 __global__ __launch_bounds__(KW * kWave) R4D_WAVES(6)
 void gemm_i8_kpar_kernel(R4D_I8KPAR_PARAMS) {
-    if (CH::on) r4d_chain_wait_vec();
-    gemm_i8_kpar_body<KW, SB, NT>(Ap, Sa, Bp, Sb, C, rows, cols, M, b_ld, sb_ld);
+    gemm_i8_kpar_body<KW, SB, NT, CH>(Ap, Sa, Bp, Sb, C, rows, cols, M, b_ld, sb_ld);
     if (CH::on) r4d_chain_done();
 }
 #undef R4D_I8KPAR_PARAMS

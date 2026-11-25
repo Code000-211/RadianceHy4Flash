@@ -1150,8 +1150,20 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
 
     /* In a staged pass a collective holds the card's link; the stager's copy lists yield meanwhile
      * (see rad_link_hold). Taken after every wait this op's operands put on the stream, so nothing
-     * between hold and release can wait on a weight stuck behind a yielding list. */
-    const bool hold = staging_ && p.collective && dom == RAD_DOMAIN_DEVICE;
+     * between hold and release can wait on a weight stuck behind a yielding list.
+     *
+     * Lane 0 only. The gate is one word a card whose parity is the hold (rad_link_hold), so a
+     * card's holds must not overlap in time, and issue order guarantees that on one stream only.
+     * A pipelined prefill runs lane 1's junction reduce beside lane 0's arm, which has a
+     * collective of its own (Hy4-flash's router projection, an all_gather), and both rows end
+     * their hold in the kernel (RAD_LINK_ENDED). When lane 0's hold barrier ran while lane 1's
+     * reduce was still in flight, the word went even, the gather read it even and left it alone,
+     * the reduce then decremented it, and the gate stayed odd with nothing holding: every
+     * yielding list on the card stopped and the step with it (issue #2: four ranks, the first
+     * 8192-row step, whose 4096-row pieces' reduce is still running when the gather starts).
+     * Lane 1's collectives therefore take no hold and get no gate; the lists share the link with
+     * them. */
+    const bool hold = staging_ && p.collective && dom == RAD_DOMAIN_DEVICE && lane_ == 0;
     const RadArgs* la = &ip.args;
     RadArgs gate_args;
     if (hold) {
@@ -1517,6 +1529,12 @@ int             rad_ctx_wgp_count(RadCtx* c) {
     return c ? static_cast<rad::Ctx*>(c)->wgp_count() : 32;
 }
 RadStream       rad_stream(RadCtx* c)     { return c ? static_cast<rad::Ctx*>(c)->stream() : nullptr; }
+
+/* The domain this deployment's issue dispatches `op` to: RAD_DOMAIN_DEVICE or RAD_DOMAIN_HOST.
+ * See abi/rad_runtime.h. */
+int rad_op_domain(RadCtx* c, rad_op op) {
+    return c ? static_cast<rad::Ctx*>(c)->op_domain(op) : RAD_E_INVAL;
+}
 
 /* The second lane. `rad_lane` selects the lane subsequent issues launch on; `rad_lane_join`
  * orders one behind the other with an event, blocking neither the host nor a stream. The runtime

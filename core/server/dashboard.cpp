@@ -410,6 +410,8 @@ HttpResponse Server::handle_stats(const HttpRequest&) {
         o["prefill_chunks_capped"] = m.prefill_chunks_capped;
         o["steps_decode"]    = m.steps_decode;
         o["steps_held"]      = m.steps_held;
+        o["steps_sliced"]    = m.steps_sliced;
+        o["substeps"]        = m.substeps;
         o["steps_ahead"]     = m.steps_ahead;
         /* Why a step was not issued ahead (S-07): one count per reason, and the first check that
          * refused names it. steps_ahead plus these is every step_next the engine made once a step

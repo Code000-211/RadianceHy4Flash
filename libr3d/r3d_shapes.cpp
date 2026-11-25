@@ -529,7 +529,7 @@ int r3d_shape_gemm_nt(const RadParam* p, int n_p, int operand, RadOpdDesc* out) 
  * gates, the row's own dtype. */
 int r3d_shape_gemm_nt_f32(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const int64_t M = gi(p, n_p, "M", 0), N = gi(p, n_p, "N", 0), K = gi(p, n_p, "K", 0);
-    const RadOpdDesc list[] = { opd((uint32_t)RAD_BF16, M, K), opd((uint32_t)RAD_F32, N, K),
+    const RadOpdDesc list[] = { opd((uint32_t)RAD_BF16, M, K), opd(gi(p, n_p, "weight_bf16", 0) ? RAD_BF16 : RAD_F32, N, K),
                                 opd((uint32_t)RAD_F32, M, N) };   /* a, b, y */
     R3D_PICK(list);
 }

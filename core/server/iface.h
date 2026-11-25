@@ -177,6 +177,10 @@ struct SchedMetrics {
     int64_t steps_ahead = 0;          /* issued behind the step before, ahead of its commit */
     int64_t prefill_chunks_capped = 0; /* held back for other work in the step (--busy-prefill-chunk) */
     int64_t steps_held = 0;           /* decode-only steps --prefill-interleave inserted */
+    /* --chunk-slices (S-02): prefill chunks planned as layer-sliced sub-steps, and the sub-steps
+     * those groups planned. */
+    int64_t steps_sliced = 0;
+    int64_t substeps = 0;
     int64_t mixed_step_target_steps = 0; /* mixed steps observed by --mixed-step-target-ms */
     int64_t mixed_step_target_misses = 0;      /* those whose completed wall time exceeded the target */
     int64_t mixed_step_target_prefill_cap = 0; /* current learned mixed-prefill row cap */

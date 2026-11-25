@@ -119,6 +119,13 @@ The options:
   which the limit does not count. The compose files set it.
 - `--network host`: the server binds the host's addresses directly, IPv4 and IPv6, with no NAT in
   front of it.
+- `-v /srv/radiance-ngram:/srv/radiance-ngram:ro` where `ngram-placement` is `ram=DIR`: the tmpfs
+  holding the shared Engram copy is mounted on the host, sized for the table and with
+  `huge=always`, and passed in. The container cannot set it up for itself: Docker's `/dev/shm` is
+  64 MiB, `--shm-size` raises that size but takes no page size, `--tmpfs` refuses `huge=` outright,
+  and `shmem_enabled` is a host sysfs. A directory on an ordinary filesystem is not refused, it only
+  warns (the table is then written to disk and read back through the page cache), so the mount is
+  what makes the reuse a memory operation instead of a 60 GiB read.
 
 The image sets `GPU_MAX_ALLOC_PERCENT=100` and `GPU_MAX_HEAP_SIZE=100`, because the HIP runtime's
 defaults cap one allocation, and the heap, below what the placement plan hands out.
