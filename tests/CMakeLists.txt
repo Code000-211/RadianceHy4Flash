@@ -173,6 +173,9 @@ string(APPEND RAD_PERF_SCRIPT "include([==[${CMAKE_CURRENT_SOURCE_DIR}/perf_entr
 # back to the host at dlopen, so like the engine it carries all of rad_core and exports it.
 set(RAD_TESTS_WHOLE_CORE shipped_plugins_test)
 
+# issue_link_hold_test: which collectives take the link hold (--wrap=rad_link_hold, below).
+set(RAD_TESTS_WRAP_LINK_HOLD issue_link_hold_test)
+
 file(GLOB RAD_TESTS CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/*_test.cpp)
 if(NOT RAD_HIP_FOUND)
   list(FILTER RAD_TESTS EXCLUDE REGEX "/dspark_device_test\\.cpp$")
@@ -270,6 +273,11 @@ foreach(t ${RAD_TESTS})
   endif()
   if(n IN_LIST RAD_TESTS_WITH_LEGACY)
     target_link_libraries(${n} PRIVATE rad_legacy_toolparse)
+  endif()
+  # The test records rad_link_hold calls through the linker's wrap, so it needs no strong symbol
+  # beside dispatch.cpp.o.
+  if(n IN_LIST RAD_TESTS_WRAP_LINK_HOLD)
+    target_link_options(${n} PRIVATE -Wl,--wrap=rad_link_hold)
   endif()
   target_compile_definitions(${n} PRIVATE RAD_CHAT_FIXTURES="${RAD_CHAT_FIXTURES}"
                                           RAD_MEDIA_FIXTURES="${RAD_MEDIA_FIXTURES}"
@@ -597,8 +605,9 @@ set_tests_properties(isa_tools PROPERTIES TIMEOUT ${RAD_TEST_TIMEOUT})
 # recurrence, the MXFP4 expert GEMM's forms, the MLA matrix row's pairings and its sink, the KV
 # resolve, the buffer-keyed device blocks, LiLiCorr's candidate correlator, Muse Glimmer's
 # vision-tower taps, GLM's MoE decode fusions and its gather's quantising forms (r4d_moe.hip: the
-# publish entry points themselves, so the launcher's choice of wave form and its refusals run too)
-# and GLM's DSA scoring split by query rows, whose kernels a card-less build otherwise never runs.
+# publish entry points themselves, so the launcher's choice of wave form and its refusals run too),
+# GLM's DSA scoring split by query rows and the row top-k (row_topk, cast_row_topk: both launch
+# forms and the arrival counters), whose kernels a card-less build otherwise never runs.
 # emu/hip/hip_runtime.h supplies the HIP names, each GPU thread is a fiber, and
 # __syncthreads and cross-lane ops are barriers (one not reached uniformly is reported as a
 # deadlock). Checked against ports of libref's ref_attn_paged and ref_qsa_select, the host
@@ -627,10 +636,11 @@ set(R4D_EMU_HIP ${R4D_DIR}/r4d_attn_paged_window.hip ${R4D_DIR}/r4d_pair_argmax_
 list(APPEND R4D_EMU_HIP ${R4D_DIR}/r4d_attn_kv_sink_h256.hip)
 list(APPEND R4D_EMU_HIP ${R4D_DIR}/r4d_ihc_bf16.hip ${R4D_DIR}/r4d_engram_bf16.hip
                         ${R4D_DIR}/r4d_mla_kv_bf16.hip ${R4D_DIR}/r4d_dfly.hip
-                        ${R4D_DIR}/r4d_model_bf16.hip)
+                        ${R4D_DIR}/r4d_model_bf16.hip ${R4D_DIR}/r4d_rowtopk_bf16.hip
+                        ${R4D_DIR}/r4d_idx_score_bf16.hip)
 set(R4D_EMU_TESTS attn pick norm escale qsa lora f32 mhc kda mla moefuse kvres
                   dsa lili vit)
-list(APPEND R4D_EMU_TESTS attn_kv_sink hy4 mla_sink mla_kv row)
+list(APPEND R4D_EMU_TESTS attn_kv_sink hy4 mla_sink mla_kv row topk)
 set(R4D_EMU_BUILT OFF)
 if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$")
   # No fiber switch for this ISA.
@@ -676,7 +686,7 @@ else()
                 ${R4D_EMU}/test_dsa.cpp ${R4D_EMU}/test_lili.cpp
                 ${R4D_EMU}/test_vit.cpp ${R4D_EMU}/test_attn_kv_sink.cpp
                 ${R4D_EMU}/test_hy4.cpp ${R4D_EMU}/test_mla_sink.cpp
-                ${R4D_EMU}/test_mla_kv.cpp ${R4D_EMU}/test_row.cpp)
+                ${R4D_EMU}/test_mla_kv.cpp ${R4D_EMU}/test_row.cpp ${R4D_EMU}/test_topk.cpp)
       get_filename_component(stem ${src} NAME_WE)
       set(lang "")
       if(src MATCHES "\\.hip$")
@@ -713,7 +723,8 @@ else()
   endif()
 endif()
 if(R4D_EMU_BUILT)
-  foreach(t pick norm escale qsa lora f32 mhc kda mla moefuse kvres dsa lili vit hy4 mla_sink mla_kv row)
+  foreach(t pick norm escale qsa lora f32 mhc kda mla moefuse kvres dsa lili vit hy4 mla_sink mla_kv
+            row topk)
     add_test(NAME r4d_emu_${t} COMMAND ${CMAKE_BINARY_DIR}/tests/r4d_emu_${t})
   endforeach()
   # Hy4-flash's non-absorbed prefill (attn_kv_sink_h256): about 4 s.
@@ -738,6 +749,9 @@ if(R4D_EMU_BUILT)
   # ops make, byte for byte, over plain and imrope rotary, both gain dtypes, padding slots, a
   # chained call and a rotary wider than a block.
   set_tests_properties(r4d_emu_row PROPERTIES LABELS "r4d_emu" TIMEOUT ${RAD_TEST_TIMEOUT})
+  # r4d_emu_topk: row_topk's one- and two-launch forms and cast_row_topk against the cast then
+  # row_topk, byte for byte, and the cast's rounding over every f32 pattern.
+  set_tests_properties(r4d_emu_topk PROPERTIES LABELS "r4d_emu" TIMEOUT ${RAD_TEST_TIMEOUT})
   set_tests_properties(r4d_emu_lora r4d_emu_kda r4d_emu_hy4 r4d_emu_mla_kv PROPERTIES
                        ENVIRONMENT "RADIANCE_HOME=${CMAKE_BINARY_DIR}/radiance_home")
   # A seeded random sweep, mostly prefill shapes on the WMMA kernel, which the emulator runs at
@@ -945,6 +959,11 @@ if(RAD_PYTHON3)
   add_test(NAME dspark_qos_regression_test
            COMMAND ${RAD_PYTHON3} ${CMAKE_CURRENT_SOURCE_DIR}/dspark_qos_regression_test.py)
   set_tests_properties(dspark_qos_regression_test PROPERTIES LABELS "unit;fast" TIMEOUT ${RAD_TEST_TIMEOUT})
+  # scripts/backlog/{probe,agg,attr,layer}.py over a made-up run: a stamped long-context run holds phases
+  # with no window of their own, and the readers must read the waves rather than die on them (T-03).
+  add_test(NAME backlog_stamps_test COMMAND ${RAD_PYTHON3} ${CMAKE_CURRENT_SOURCE_DIR}/backlog_stamps_test.py)
+  set_tests_properties(backlog_stamps_test PROPERTIES LABELS "unit;fast" SKIP_RETURN_CODE 77
+                       TIMEOUT ${RAD_TEST_TIMEOUT})
 endif()
 
 # ================================================================== the shipped plugins, out of tree

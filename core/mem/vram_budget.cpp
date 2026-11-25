@@ -141,6 +141,22 @@ static int resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudg
     for (const VramFacts& f : per_rank) held_out = std::max(held_out, f.held_out);
     b.already_held = std::max<int64_t>(b.capacity - freeb - held_out, 0);
 
+    /* Of that measured term, the part a build could give back: the code objects resident on the
+     * card, each loaded whole from its module at its kernel's first launch
+     * (DeviceBackend::code_resident). M-14 asks for it beside `already held` because it is the one
+     * piece of the held memory the deployment chooses -- libr4d carries the integer-expert forms a
+     * given quantization never launches. The worst rank's, and left out of the receipt where the
+     * backend loads no device code at all. */
+    for (const VramFacts& f : per_rank) {
+        if (f.code_bytes <= b.code_bytes) continue;
+        b.code_bytes   = f.code_bytes;
+        b.code_modules = f.code_modules;
+    }
+    const std::string code_note = b.code_bytes > 0
+        ? fmt("  of which code      %10s   %d code module(s) resident when the plan read it; the exit line has the served figure\n",
+              humanb(b.code_bytes).c_str(), b.code_modules)
+        : std::string();
+
     /* What is left after the fixed terms. */
     b.drift = kDriverDrift;
     b.claimable = b.capacity - (b.already_held + b.drift + b.headroom + b.arena + b.staging +
@@ -164,6 +180,7 @@ static int resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudg
             "VRAM does not cover the fixed costs before a single pool is sized:\n"
             "  card total         %10s\n"
             "  already held       %10s   (driver context, code objects, anything else on the card)\n"
+            "%s"
             "  driver drift       %10s   (what that moves by after it is read)\n"
             "  --gpu-headroom-mib %10s\n"
             "  activation arena   %10s   (buffer plan + kernel scratch)\n"
@@ -173,7 +190,8 @@ static int resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudg
             "  ------------------------------\n"
             "  short by           %10s\n"
             "%s",
-            humanb(b.capacity).c_str(), humanb(b.already_held).c_str(), humanb(b.drift).c_str(),
+            humanb(b.capacity).c_str(), humanb(b.already_held).c_str(), code_note.c_str(),
+            humanb(b.drift).c_str(),
             humanb(b.headroom).c_str(), humanb(b.arena).c_str(), humanb(b.staging).c_str(),
             humanb(b.queues).c_str(), b.n_queues, humanb(b.queue_bytes).c_str(),
             humanb(b.prefetch).c_str(), humanb(-b.claimable).c_str(), how);
@@ -325,6 +343,7 @@ static int resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudg
         "VRAM budget, per card:\n"
         "  card total         %10s\n"
         "  already held       %10s   measured: driver context, code objects, anything else resident\n"
+        "%s"
         "  driver drift       %10s   what that moves by after it is read: kept free\n"
         "  activation arena   %10s   computed from the buffer plan\n"
         "  step staging       %10s   the step batch's block tables and media staging, and the\n"
@@ -346,7 +365,8 @@ static int resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudg
         "  vram_kv            %10s   %s\n"
         "  unclaimed          %10s   the headroom, the unusable above, and what MiB rounding\n"
         "                                  could not place\n",
-        humanb(b.capacity).c_str(), humanb(b.already_held).c_str(), humanb(b.drift).c_str(),
+        humanb(b.capacity).c_str(), humanb(b.already_held).c_str(), code_note.c_str(),
+        humanb(b.drift).c_str(),
         humanb(b.arena).c_str(), humanb(b.staging).c_str(),
         humanb(b.queues).c_str(), b.n_queues, humanb(b.queue_bytes).c_str(), humanb(b.prefetch).c_str(),
         shared ? "left to the host" : "--gpu-headroom-mib", humanb(b.headroom).c_str(),

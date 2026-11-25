@@ -15,7 +15,8 @@
  *   z     = final_norm(x)
  *   chain k = 0..depth-1:  zc = z[k+1] + down(silu(gate(c)) * up(c)),  c = [hnorm(z[k+1]) |
  *     enorm(embed(prev))], prev the bonus then each proposal; proposal k = argmax(lm_head(zc))
- *     (the trunk's head, row_topk over the bf16-rounded logits, ties to the lower id)
+ *     (the trunk's head, row_topk over the bf16-rounded logits, ties to the lower id; one
+ *     cast_row_topk where a library serves it, else cast then row_topk)
  *
  * Under load the core may stage the short block instead (D-06: kShortBlock = 4 rows, so 3
  * proposals and 3 chain rounds; --draft-short-from). The draft is causal, so that pass is the
@@ -335,7 +336,7 @@ struct Dfly {
     struct Step {
         rad_buf rowk = 0;
         rad_op op_rowk = 0, op_zk = 0, op_pe = 0, op_hn = 0, op_en = 0,
-               op_silu = 0, op_add = 0, op_head = 0, op_lcast = 0, op_topk = 0,
+               op_silu = 0, op_add = 0, op_head = 0, op_lcast = 0, op_topk = 0, op_ctopk = 0,
                op_tok = 0, op_prev = 0, op_gcp = 0, op_ucp = 0;
         rad_op op_rowk_lo = 0;   /* rowk at the short block's stride (rounds < block_lo - 1) */
         /* --draft-coupling: the sampled proposal (and, sabotaged, the shortlist's ids replaced
@@ -828,23 +829,43 @@ struct Dfly {
                               RAD_STR("dtype", "bf16") },
                             { head }, { zc }, { logits });
             RAD_ARCH_TRY(st.t_logits.declare(b, nm, S, "dfly.logits", ki, RAD_F32, Vr, logits));
-            st.op_lcast = mk(b, "cast",
-                             { RAD_RANGE("M", 1, S), RAD_INT("n", Vr), RAD_STR("from", "f32"),
-                               RAD_STR("to", "bf16") },
-                             {}, { logits }, { lbf });
             /* Sharded, row_topk ranks this rank's columns, reports global ids and writes the pair
              * plane; the merge below overwrites cidx / cval with the global top-R. Whole, no
-             * `vocab_off` (an optional parameter present at 0 is another declaration). */
-            if (s.world > 1)
-                st.op_topk = mk(b, "row_topk",
-                                { RAD_RANGE("M", 1, S), RAD_INT("N", Vr), RAD_INT("R", R),
-                                  RAD_INT("vocab_off", g.vocab_off), RAD_STR("dtype", "bf16") },
-                                {}, { lbf }, { cidx, cval, pairs });
-            else
-                st.op_topk = mk(b, "row_topk",
-                                { RAD_RANGE("M", 1, S), RAD_INT("N", Vr), RAD_INT("R", R),
-                                  RAD_STR("dtype", "bf16") },
-                                {}, { lbf }, { cidx, cval });
+             * `vocab_off` (an optional parameter present at 0 is another declaration).
+             *
+             * cast_row_topk is that cast and row_topk in one op: it reads the f32 logits and
+             * rounds each as the cast does, so its outputs are the pair's bytes without the
+             * cast's launch or the bf16 plane. Taken where a library serves it; the pair
+             * otherwise. */
+            if (rad_op_declared(b, "cast_row_topk")) {
+                if (s.world > 1)
+                    st.op_ctopk = mk(b, "cast_row_topk",
+                                     { RAD_RANGE("M", 1, S), RAD_INT("N", Vr), RAD_INT("R", R),
+                                       RAD_INT("vocab_off", g.vocab_off), RAD_STR("dtype", "f32") },
+                                     {}, { logits }, { cidx, cval, pairs });
+                else
+                    st.op_ctopk = mk(b, "cast_row_topk",
+                                     { RAD_RANGE("M", 1, S), RAD_INT("N", Vr), RAD_INT("R", R),
+                                       RAD_STR("dtype", "f32") },
+                                     {}, { logits }, { cidx, cval });
+                if (st.op_ctopk && !rad_op_resolved(b, st.op_ctopk)) st.op_ctopk = 0;
+            }
+            if (!st.op_ctopk) {
+                st.op_lcast = mk(b, "cast",
+                                 { RAD_RANGE("M", 1, S), RAD_INT("n", Vr), RAD_STR("from", "f32"),
+                                   RAD_STR("to", "bf16") },
+                                 {}, { logits }, { lbf });
+                if (s.world > 1)
+                    st.op_topk = mk(b, "row_topk",
+                                    { RAD_RANGE("M", 1, S), RAD_INT("N", Vr), RAD_INT("R", R),
+                                      RAD_INT("vocab_off", g.vocab_off), RAD_STR("dtype", "bf16") },
+                                    {}, { lbf }, { cidx, cval, pairs });
+                else
+                    st.op_topk = mk(b, "row_topk",
+                                    { RAD_RANGE("M", 1, S), RAD_INT("N", Vr), RAD_INT("R", R),
+                                      RAD_STR("dtype", "bf16") },
+                                    {}, { lbf }, { cidx, cval });
+            }
             if (s.world > 1) {
                 /* Row-interleaved, so a row's pairs from every rank are adjacent, as
                  * row_topk_merge reads them. A pair of ops a step (each step's buffers live
@@ -895,8 +916,8 @@ struct Dfly {
             HY4_NEED(c_g.ok() && c_u.ok() && c_d.ok() && st.op_add && st.op_silu,
                      "gemm_nt / silu_mul / add");
             HY4_NEED(st.op_head, "logits_gemm");
-            HY4_NEED(st.op_lcast && st.op_tok && st.op_prev && st.op_gcp && st.op_ucp, "cast");
-            HY4_NEED(st.op_topk, "row_topk (bf16)");
+            HY4_NEED(st.op_tok && st.op_prev && st.op_gcp && st.op_ucp, "cast");
+            HY4_NEED(st.op_ctopk || (st.op_lcast && st.op_topk), "cast and row_topk (bf16)");
         }
         if (sabotage && !coupled) {
             op_sabotage = mk(b, "fill",
@@ -1112,15 +1133,17 @@ struct Dfly {
             st.t_corr.step(c, brows(zc, n), n);
             RAD_ISSUE_N(c, st.op_head, n, brows(zc, n), RAD_W(head), brows(logits, n));
             st.t_logits.step(c, brows(logits, n), n);
-            RAD_ISSUE_N(c, st.op_lcast, n, brows(logits, n), brows(lbf, n));
+            if (!st.op_ctopk) RAD_ISSUE_N(c, st.op_lcast, n, brows(logits, n), brows(lbf, n));
+            /* cast_row_topk reads the f32 logits where row_topk reads their bf16 copy */
+            const rad_op topk = st.op_ctopk ? st.op_ctopk : st.op_topk;
+            const rad_buf tin = st.op_ctopk ? logits : lbf;
             if (st.op_merge) {
-                RAD_ISSUE_N(c, st.op_topk, n, brows(lbf, n), brows(cidx, n), brows(cval, n),
+                RAD_ISSUE_N(c, topk, n, brows(tin, n), brows(cidx, n), brows(cval, n),
                             brows(pairs, n));
                 RAD_ISSUE(c, st.op_gather, RAD_B(pairs), RAD_B(gath));
                 RAD_ISSUE_N(c, st.op_merge, n, brows(gath, n), brows(cidx, n), brows(cval, n));
             } else {
-                RAD_ISSUE_N(c, st.op_topk, n, brows(lbf, n), brows(cidx, n), brows(cval, n),
-                            RAD_NONE);
+                RAD_ISSUE_N(c, topk, n, brows(tin, n), brows(cidx, n), brows(cval, n), RAD_NONE);
             }
             st.t_idx.step(c, brows(cidx, n), n);
             st.t_val.step(c, brows(cval, n), n);

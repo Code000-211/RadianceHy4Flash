@@ -126,8 +126,8 @@ static const RadParamSpec pHcWrite[] = { P_INT("M"), P_INT("n"), P_INT("hc"), P_
 /* The control vector's projection (libref/ref_hc.cpp, core/cvec.h): one unit direction per layer and a
  * per-row switch. `v` is f32 whatever the stream's dtype is, because the engine uploads the table
  * in f32; `on` is an int32 row mask (core derive.cpp's `projection_on_rows`). */
-static const RadParamSpec pHcProject[] = { P_INT("M"), P_INT("n"), P_INT("hc"), P_F64("scale"),
-                                           P_STR("dtype") };
+static const RadParamSpec pHcProject[] = { P_INT("M"), P_INT("n"), P_INT("hc"), P_INTO("vsep"),
+                                           P_F64("scale"), P_STR("dtype") };
 static const RadOperandSpec oHcProject[] = { INOUT("h"), OPD("v"), OPD("on") };
 static const RadOperandSpec oHcEnter[] = { OPD("x"), OUT("h") };
 static const RadOperandSpec oHcWrite[] = { OPD("y"), OPD("inj"), INOUT("h") };
@@ -1948,6 +1948,10 @@ static const RadOpSchema kSchemas[] = {
   "Exact per-row top-R, descending, ties to the lower column. `vocab_off` shifts every column it "
   "reports, so a rank's slice reports GLOBAL ids; `pairs` is the [M, R, 2] (int32 id, float value) "
   "plane an all_gather moves, with id -1 for a slot the row could not fill." },
+{ "cast_row_topk", ARR(pRowTopk), ARR(oRowTopk),
+  "row_topk over an f32 plane rounded to bf16, as `cast` f32 -> bf16 rounds it (to nearest even, "
+  "the cast's NaN rule included): the bytes of `cast` then row_topk at dtype bf16, without the "
+  "cast's launch or its bf16 plane. `dtype` is the plane's, f32; `val` reports the rounded values." },
 { "row_topk_merge", ARR(pRowTopkMerge), ARR(oRowTopkMerge),
   "The R largest of world_size all-gathered per-rank candidate sets, in the same descending "
   "(idx, val) form the single-rank top-R produces. `gathered` is [M, world_size * R, 2] pairs, "
@@ -2918,6 +2922,7 @@ SIMPLE("ref_kv_resolve", "kv_resolve", "attn",
 SIMPLE("ref_dflash_conv", "dflash_conv", "draft",
        "DFlash2 grouped dynamic depthwise convolution", DT_FLOAT, ref_dflash_conv),
 SIMPLE("ref_row_topk", "row_topk", "moe", "exact per-row top-R", DT_FLOAT, ref_row_topk),
+SIMPLE("ref_cast_row_topk", "cast_row_topk", "moe", "row_topk over an f32 plane rounded to bf16 (cast then row_topk)", "f32 in, f32 values + i32 columns out", ref_cast_row_topk),
 SIMPLE("ref_row_topk_merge", "row_topk_merge", "moe", "the global top-R of the gathered per-rank candidate sets", DT_FLOAT, ref_row_topk_merge),
 SIMPLE("ref_pair_argmax", "pair_argmax", "moe", "the global top-1 of a row of gathered (id, value) pairs, one id a row", DT_FLOAT, ref_pair_argmax),
 ROWL("ref_logit_rerank", "logit_rerank", "moe",
