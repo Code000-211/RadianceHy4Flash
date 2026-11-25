@@ -664,6 +664,10 @@ list(APPEND R4D_EMU_HIP ${R4D_DIR}/r4d_ihc_bf16.hip ${R4D_DIR}/r4d_engram_bf16.h
 set(R4D_EMU_TESTS attn pick norm escale qsa lora f32 mhc kda mla moefuse kvres
                   dsa lili vit)
 list(APPEND R4D_EMU_TESTS attn_kv_sink hy4 mla_sink mla_kv idxpool qsafront row topk)
+# The sampler (test_sample.cpp): each case in both thread orders (emu_reverse_order) against a
+# serial host oracle, so a result that depends on the order threads reach an LDS atomic in fails.
+list(APPEND R4D_EMU_HIP ${R4D_DIR}/r4d_sample_chain_f32.hip ${R4D_DIR}/r4d_sample_stages_f32.hip)
+list(APPEND R4D_EMU_TESTS sample)
 set(R4D_EMU_BUILT OFF)
 if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$")
   # No fiber switch for this ISA.
@@ -710,7 +714,8 @@ else()
                 ${R4D_EMU}/test_vit.cpp ${R4D_EMU}/test_attn_kv_sink.cpp
                 ${R4D_EMU}/test_hy4.cpp ${R4D_EMU}/test_mla_sink.cpp
                 ${R4D_EMU}/test_mla_kv.cpp ${R4D_EMU}/test_idxpool.cpp
-                ${R4D_EMU}/test_qsafront.cpp ${R4D_EMU}/test_row.cpp ${R4D_EMU}/test_topk.cpp)
+                ${R4D_EMU}/test_qsafront.cpp ${R4D_EMU}/test_row.cpp ${R4D_EMU}/test_topk.cpp
+                ${R4D_EMU}/test_sample.cpp)
       get_filename_component(stem ${src} NAME_WE)
       set(lang "")
       if(src MATCHES "\\.hip$")
@@ -771,6 +776,8 @@ if(R4D_EMU_BUILT)
   # r4d_emu_idxpool: the compressed indexer's gated pool against libref, byte for byte, with the
   # dead-page early-out's fixtures.
   set_tests_properties(r4d_emu_mla_kv PROPERTIES LABELS "r4d_emu" TIMEOUT ${RAD_TEST_TIMEOUT})
+  add_test(NAME r4d_emu_sample COMMAND ${CMAKE_BINARY_DIR}/tests/r4d_emu_sample)
+  set_tests_properties(r4d_emu_sample PROPERTIES LABELS "r4d_emu" TIMEOUT ${RAD_TEST_TIMEOUT})
   set_tests_properties(r4d_emu_idxpool PROPERTIES LABELS "r4d_emu" TIMEOUT ${RAD_TEST_TIMEOUT})
   # r4d_emu_qsafront: the fused key side against the three ops it replaces (qsa_work ->
   # idx_pool_gated -> qsa_tail_store), byte for byte, with the tail's alias bound on both sides of
@@ -836,6 +843,9 @@ set(HALO_EMU_HIP ${HALO_DIR}/halo_gemm_fp8a8.hip ${HALO_DIR}/halo_gemm_mxfp4a8_t
 # the units that own each geometry) against test_attn's reference.
 set(HALO_EMU_TESTS gemm norm escale pick attn qsa lora f32 mhc fp8f32 kda moemx mla moefuse kvres
                    dsa ref paged)
+# sample: r4d_emu's test_sample.cpp over libhalo's sample_chain (the stage kernels are not built here).
+list(APPEND HALO_EMU_HIP ${HALO_DIR}/halo_sample_chain_f32.hip)
+list(APPEND HALO_EMU_TESTS sample)
 set(HALO_EMU_BUILT OFF)
 if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$")
   # No fiber switch for this ISA.
@@ -899,7 +909,7 @@ elseif(R4D_EMU_CXX)
   set(HALO_EMU_BUILT ON)
 endif()
 if(HALO_EMU_BUILT)
-  foreach(t gemm norm escale pick qsa lora f32 mhc fp8f32 kda mla moefuse kvres dsa ref paged)
+  foreach(t gemm norm escale pick qsa lora f32 mhc fp8f32 kda mla moefuse kvres dsa ref paged sample)
     add_test(NAME halo_emu_${t} COMMAND ${CMAKE_BINARY_DIR}/tests/halo_emu_${t})
     set_tests_properties(halo_emu_${t} PROPERTIES LABELS "halo_emu;fast" TIMEOUT ${RAD_TEST_TIMEOUT})
   endforeach()

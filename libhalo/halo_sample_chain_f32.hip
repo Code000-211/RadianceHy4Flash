@@ -25,6 +25,10 @@
 // four radix passes each over 256 buckets of a monotone key, giving the k-th largest probability
 // and the nucleus threshold exactly without sorting.
 //
+// The nucleus mass is summed in fixed point (q62), not in f32: a float sum through an LDS atomic
+// takes the order the threads happen to arrive in, so the same logits could cut the nucleus at a
+// neighbouring key from one run to the next. An integer sum has no order.
+//
 // The kernel reads the logits through explicit row and column strides, so nothing is
 // model-specific. The entry point takes flat scalars and returns a negative code instead of
 // throwing, for the reason given in halo_gemm_fp8a8.hip. `f32` in the name is the logits dtype.
@@ -53,9 +57,10 @@ __device__ __forceinline__ uint32_t mono(float v) {
 struct Shared {
   float    red[kThr];       // the general-purpose reduction buffer
   uint32_t red_i[kThr];     // ...and the ids that ride along with it
-  float    mass[256];       // radix buckets by probability mass (top_p)
+  unsigned long long mass[256];  // radix buckets by probability mass in q62 (top_p)
   uint32_t cnt[256];        // ...and by count (top_k)
-  uint32_t prefix;          // the threshold key being narrowed, high byte first
+  uint32_t prefix;          // the top_k threshold key being narrowed, high byte first
+  uint32_t prefix_p;        // ...and the nucleus's, a word of its own: see the top_p passes
   uint32_t slice;           // which thread's slice an inverse-CDF draw landed in
   float    slice_base;      // the cumulative mass before that slice
   uint32_t pick;
@@ -63,6 +68,13 @@ struct Shared {
   float    excl_total;
   float    p_query;
 };
+
+// A probability as a q62 integer. The scaling is a power of two, so the product is exact, and every
+// probability from 2^-39 up converts exactly; smaller ones lose bits below 2^-62 of the mass. A
+// whole row sums to about 2^62, a factor of four under the word. NaN and negatives are 0.
+__device__ __forceinline__ unsigned long long q62(float p) {
+  return p > 0.0f ? (unsigned long long)(fminf(p, 2.0f) * 4611686018427387904.0f) : 0ull;
+}
 
 __device__ __forceinline__ float reduce_max(Shared& sh, float v) {
   sh.red[threadIdx.x] = v;
@@ -186,35 +198,42 @@ __global__ __launch_bounds__(kThr) void sample_kernel(
   // bucket holds the threshold and the next pass narrows inside it. Ties at the threshold are all
   // kept, which can overshoot top_p by the tie's mass, rather than inventing an order among equal
   // probabilities.
+  //
+  // The mass is an integer (q62, see the file header): the buckets, the walk and the target all
+  // are, so the threshold is a function of the row alone, whatever order the adds land in.
+  //
+  // The passes narrow `prefix_p`, not `prefix`: no barrier stands between the other threads' read
+  // of the top_k threshold above and thread 0's reset here, so with one word a thread could take
+  // the reset for its k_key and count the whole vocabulary into the nucleus.
   uint32_t p_key = 0u;
   if (top_p < 1.0f) {
-    if (tid == 0) sh.prefix = 0u;
+    if (tid == 0) sh.prefix_p = 0u;
     __syncthreads();
-    float target = top_p;
+    unsigned long long target = q62(top_p);
     for (int shift = 24; shift >= 0; shift -= 8) {
-      if (tid < 256) sh.mass[tid] = 0.0f;
+      if (tid < 256) sh.mass[tid] = 0ull;
       __syncthreads();
       const uint32_t mask = (shift == 24) ? 0u : (0xFFFFFFFFu << (shift + 8));
       for (uint32_t v = tid; v < vocab; v += kThr) {
         const float p = prob(v);
         const uint32_t key = mono(p);
-        if ((key & mask) == (sh.prefix & mask) && (k_key == 0u || key >= k_key))
-          atomicAdd(&sh.mass[(key >> shift) & 0xFFu], p);
+        if ((key & mask) == (sh.prefix_p & mask) && (k_key == 0u || key >= k_key))
+          atomicAdd(&sh.mass[(key >> shift) & 0xFFu], q62(p));
       }
       __syncthreads();
       if (tid == 0) {
-        float acc = 0.0f;
+        unsigned long long acc = 0ull;
         uint32_t b = 0u;
         for (int i = 255; i >= 0; --i) {
           if (acc + sh.mass[i] >= target) { b = (uint32_t)i; break; }
           acc += sh.mass[i];
         }
         target -= acc;
-        sh.prefix |= b << shift;
+        sh.prefix_p |= b << shift;
       }
       __syncthreads();
     }
-    p_key = sh.prefix;
+    p_key = sh.prefix_p;
   }
 
   // min_p is a floor relative to the mode, and the mode's probability is exp(0)/Z.
