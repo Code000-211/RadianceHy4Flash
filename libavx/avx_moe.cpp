@@ -1456,6 +1456,45 @@ AVX_KERNEL(row_topk) {
     return RAD_OK;
 }
 
+/* ------------------------------------------------------------------ cast_row_topk */
+/* row_topk over an f32 plane rounded to bf16 first, as `cast` f32 -> bf16 rounds it
+ * (rad_f32_to_bf16, libref's rounding): the fused form of that pair, the same bytes. */
+AVX_KERNEL(cast_row_topk) {
+    if (!rad_args_have(a, 3)) return RAD_E_INVAL;
+    const RadTensor *x = &a->t[0], *idx = &a->t[1], *val = &a->t[2];
+    if (x->dtype != RAD_F32) return RAD_E_DTYPE;
+    const RadTensor* pairs = rad_arg_in(a, 3);
+    const int64_t off = p_int(a, "vocab_off", 0);
+    const int64_t N = p_int(a, "N", x->rank >= 2 ? x->shape[x->rank - 1] : 0);
+    const int64_t R = p_int(a, "R", 1);
+    if (N <= 0 || R <= 0) return RAD_E_SHAPE;
+    const int64_t M = numel(x) / N;
+    if (M <= 0 || numel(idx) < M * R || numel(val) < M * R) return RAD_E_SHAPE;
+    if (pairs && (pairs->dtype != RAD_F32 || numel(pairs) < M * R * 2)) return RAD_E_SHAPE;
+
+    AVX_PARALLEL_FOR_IF(M * N >= AVX_PAR_MIN)
+    for (int64_t m = 0; m < M; ++m) {
+        float* buf = scratch_f32((size_t)N);
+        const float* v = in_row(x, rowoff(x, m, N), N, buf);
+        for (int64_t j = 0; j < N; ++j) buf[j] = rad_bf16_to_f32(rad_f32_to_bf16(v[j]));
+        float pv = INFINITY;
+        int64_t pi = -1;
+        for (int64_t r = 0; r < R; ++r) {
+            const bool ok = topk_next_f32(buf, N, &pv, &pi);
+            const int64_t id = ok ? pi + off : -1;
+            st_int_dt(idx->dtype, idx->data, rowoff(idx, m, R) + r * laststride(idx), id);
+            stt(val, rowoff(val, m, R) + r * laststride(val), ok ? pv : -INFINITY);
+            if (pairs) {
+                float* const q = (float*)pairs->data + (m * R + r) * 2;
+                const int32_t i32 = (int32_t)id;
+                std::memcpy(q, &i32, sizeof i32);
+                q[1] = ok ? pv : -INFINITY;
+            }
+        }
+    }
+    return RAD_OK;
+}
+
 /* ------------------------------------------------------------------ row_topk_merge */
 /* The R largest of world_size all-gathered per-rank candidate sets, in the single-rank path's
  * descending (idx, val) form.

@@ -65,9 +65,12 @@
  *   sample_logprobs    M(range) n_vocab k vocab_off?   logits, params     -> stats
  *
  * `M` counts sampled positions, not tokens: one per sequence at decode, n_spec+1 per sequence at
- * a verify. `params` is [M] DeviceSampleParams rows. `history` is [M, max_hist] int32 global
- * token ids, row m addressed by its hist_off/hist_len. `breakers` is [M, max_hist] uint8 beside
- * it, nonzero where that token is a whole DRY sequence breaker. `bitmask` is [M, mask_words]
+ * a verify. `params` is [M] DeviceSampleParams rows. `history` is a rank-1 operand of M * w
+ * int32 global token ids: row m occupies cells [m * w, (m + 1) * w) and is addressed by its
+ * hist_off/hist_len. The pitch w is the width the step's rows use -- at most max_hist, read as
+ * numel / M, since the core uploads the rows at that width, not at max_hist (C-06). `breakers`
+ * is the same M * w cells of uint8 beside it, nonzero where that token is a whole DRY sequence
+ * breaker. `bitmask` is [M, mask_words]
  * uint32, addressed by the row's mask_row. The ban's `whitelist` is a [M, mask_words] uint32
  * bitmask (a SET bit exempts that column from the ban) addressed by the row itself, absent when
  * no staged row carries one. `vocab_off` is this rank's first vocabulary row,
@@ -354,6 +357,16 @@ private:
     const DeviceSampleParams* cur_stage_ = nullptr;   /* what the last build staged */
     int32_t*            hist_stage_   = nullptr;
     uint8_t*            brk_stage_    = nullptr;
+    /* C-06: the history planes can ride to the card at the width the step's rows use, not at
+     * max_hist: the kernels and the references read the row pitch as numel/M, so the upload
+     * width is the pitch they see. Compacting pays a host copy of the narrower plane to save
+     * the same plane's host-to-device upload, so run() does it only when the step's widest
+     * staged row is at most half of max_hist -- where the copy is no larger than the upload it
+     * replaces -- and otherwise uploads the staging directly at the full width. The widest row
+     * the last build staged: */
+    int32_t*            hist_pack_    = nullptr;
+    uint8_t*            brk_pack_     = nullptr;
+    int64_t             hist_w_       = 0;
     int32_t*            ngram_stage_  = nullptr;   /* [rows][2]: n-gram length, window */
     uint32_t*           ngram_wl_stage_ = nullptr; /* [rows][mask_words] exemption bitmask */
     uint32_t*           mask_stage_   = nullptr;

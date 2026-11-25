@@ -91,6 +91,12 @@ int chain_marks(void* stream, unsigned* seen, unsigned n);
 void chain_read_lag(void* stream, uint64_t lag);
 uint64_t chain_flushes();
 
+/* `stream`'s chain accounting as the stall report prints it (aql.cpp, dump_queues): the blocks of
+ * chained kernels issued on it so far, the completion counter as the host reads it now, and the
+ * report's line. Tests only (tests/device_test.cpp). RAD_E_UNSUPPORTED in a build without the
+ * backend. */
+int chain_state(void* stream, uint64_t* issued, uint64_t* counted, std::string* line);
+
 /* `n` chained launches onto `stream`, each a card-side copy of `bytes` (a multiple of 16) from
  * `src` to `dst` that also stores at seen[i] whether it found a chain record in its argument
  * slot: i + 1 if every block did, that with the top bit set if one did not. A block that found

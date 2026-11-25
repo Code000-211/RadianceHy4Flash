@@ -126,8 +126,8 @@ static const RadParamSpec pHcWrite[]   = { P_INT("M"), P_INT("n"), P_INT("hc"), 
 static const RadOperandSpec oHcEnter[] = { OPD("x"), OUT("h") };
 static const RadOperandSpec oHcWrite[] = { OPD("y"), OPD("inj"), INOUT("h") };
 /* The control vector's projection: one unit direction per layer (f32) and an int32 per-row switch. */
-static const RadParamSpec pHcProject[] = { P_INT("M"), P_INT("n"), P_INT("hc"), P_F64("scale"),
-                                           P_STR("dtype") };
+static const RadParamSpec pHcProject[] = { P_INT("M"), P_INT("n"), P_INT("hc"), P_INTO("vsep"),
+                                           P_F64("scale"), P_STR("dtype") };
 static const RadOperandSpec oHcProject[] = { INOUT("h"), OPD("v"), OPD("on") };
 
 static const RadParamSpec pMtpEnter[]   = { P_INT("M"), P_INT("n"), P_INT("hc"), P_F64("eps"),
@@ -205,14 +205,17 @@ static const RadParamSpec pMlaProjectKv[] = { P_INT("M"), P_INT("heads"), P_INT(
     P_INT("v_dim"), P_INT("latent_dim"), P_STR("mode"), P_STR("dtype") };
 static const RadParamSpec pMlaAttnPagedSink[] = { P_INT("M"), P_INT("heads"), P_INT("latent_dim"),
     P_INT("rope_dim"), P_INT("block_size"), P_INT("window"), P_F64("scale"), P_STR("dtype"),
-    P_INTO("stable") };
+    P_INTO("stable"), P_F64O("rope_theta"), P_F64O("rope_scale"), P_STRO("rope_mode"),
+    P_STRO("rope_sections") };
 static const RadOperandSpec oMlaAttnPagedSink[] = { OPD("q"), OPD("q_rope"), OPD("kv"),
-    OPD("block_table"), OPD("seqused"), OPD("cu_seqlens"), WGT("sinks"), OUT("out") };
+    OPD("block_table"), OPD("seqused"), OPD("cu_seqlens"), WGT("sinks"), OUT("out"),
+    OPD_O("rope_pos") };
 static const RadParamSpec pMlaAttnSelSink[] = { P_INT("M"), P_INT("heads"), P_INT("latent_dim"),
     P_INT("rope_dim"), P_INT("blocks"), P_INT("block_size"), P_F64("scale"), P_STR("dtype"),
-    P_INTO("stable") };
+    P_INTO("stable"), P_F64O("rope_theta"), P_F64O("rope_scale"), P_STRO("rope_mode"),
+    P_STRO("rope_sections") };
 static const RadOperandSpec oMlaAttnSelSink[] = { OPD("q"), OPD("q_rope"), OPD("kv"), OPD("bt"),
-    OPD("length"), WGT("sinks"), OUT("out") };
+    OPD("length"), WGT("sinks"), OUT("out"), OPD_O("rope_pos") };
 static const RadParamSpec pMlaKvSplit[] = { P_INT("M"), P_INT("heads"), P_INT("k_dim"),
     P_INT("v_dim"), P_INT("rope_dim"), P_STR("dtype") };
 static const RadOperandSpec oMlaKvSplit[] = { OPD("kvb"), OPD("k_rope"), OUT("k"), OUT("v") };
@@ -374,6 +377,8 @@ static const RadParamSpec pDequantW4[] = { P_INT("N"), P_INT("K"), P_INT("group"
 static const RadOperandSpec oDequantW4[] = { WGT("wq"), WGT("ws"), OUT("y") };
 
 /* ---- gemm --------------------------------------------------------------------------------- */
+static const RadParamSpec pGemmF32[] = { P_INT("M"), P_INT("N"), P_INT("K"), P_STR("dtype"),
+                                         P_INTO("weight_bf16") };
 static const RadParamSpec pGemm[]       = { P_INT("M"), P_INT("N"), P_INT("K"), P_STR("dtype") };
 static const RadOperandSpec oGemm[]     = { OPD("a"), WGT("b"), OUT("y") };
 static const RadParamSpec pGemmBias[]   = { P_INT("M"), P_INT("N"), P_INT("K"), P_STR("dtype"),
@@ -1196,7 +1201,11 @@ static const RadOpSchema kSchemas[] = {
   "q_rope.rope_j); out = sum exp(s_j) latent_j / (sum exp(s_j) + exp(sink[h])): the sink joins the "
   "softmax once and carries no value. No visible key gives zero. `stable` 1 (optional, default 0) "
   "asks that a row's bytes not depend on the launch (M, its other rows); a row-independent "
-  "kernel ignores it." },
+  "kernel ignores it. `rope_pos` (optional) is the rotary's positions, indexed by the row of "
+  "this launch (the operand is this launch's rows, a view of a whole step's array): with it "
+  "the fragment is turned here from q_rope's raw columns (`rope_theta`, `rope_scale`, "
+  "`rope_mode` gptj or imrope_gptj, `rope_sections`), so the rows need no `rope` launch; "
+  "without it q_rope arrives rotated." },
 { "mla_attn_sel_sink", ARR(pMlaAttnSelSink), ARR(oMlaAttnSelSink),
   "mla_attn's per-query page table and visible length with a rotary part and a sink: tokens "
   "[0, length[r]) of table row bt[r]. The score, the sink and `stable` are "
@@ -1255,8 +1264,8 @@ static const RadOpSchema kSchemas[] = {
   "Per-head query absorption or value expansion through the shared [head,(K|V),latent] BF16 matrix." },
 { "dsa_score", ARR(pDsaScore), ARR(oDsaScore),
   "Per-head ReLU of FP8 dot products, then signed head gates and scales; invalid history is -inf." },
-{ "gemm_nt_f32", ARR(pGemm), ARR(oGemm),
-  "BF16 activations times F32 weights, F32 accumulation and output; preserves routing and index gate precision." },
+{ "gemm_nt_f32", ARR(pGemmF32), ARR(oGemm),
+  "BF16 activations times F32 or stored BF16 weights, F32 accumulation and output; preserves routing and index gate precision." },
 { "dsa_query", ARR(pMnD), ARR(oQuantFp8),
   "Normalized Hadamard, BF16 boundary and power-of-two E4M3 quantization per query head." },
 { "dsa_query_i8", ARR(pMnD), ARR(oQuantFp8),
@@ -1455,6 +1464,8 @@ static const RadOpSchema kSchemas[] = {
   "grouped GEMM over the expert-sorted rows, quantised operands, four classes by number mod 4." },
 { "moe_gather", ARR(pMoeGather), ARR(oMoeGather), "weighted scatter back to token order." },
 { "row_topk", ARR(pRowTopk), ARR(oRowTopk), "exact per-row top-R." },
+{ "cast_row_topk", ARR(pRowTopk), ARR(oRowTopk),
+  "row_topk over an f32 plane rounded to bf16 as `cast` rounds it: the cast then row_topk, fused." },
 { "row_topk_merge", ARR(pRowTopkMerge), ARR(oRowTopkMerge),
   "the global top-R of the gathered per-rank candidate sets." },
 { "pair_argmax", ARR(pPairArgmax), ARR(oPairArgmax),
@@ -1868,8 +1879,8 @@ ROWL("avx_hc_read", "hc_read", "norm",
 SIMPLE("avx_hc_write", "hc_write", "norm", "gated residual write: h[s] += inj[s] * y", DT_FLOAT,
        L(hc_write)),
 SIMPLE("avx_hc_project", "hc_project", "norm",
-       "control vector: h[s] -= scale * (h[s] . v) * v where the row's flag is on", DT_FLOAT,
-       L(hc_project)),
+       "control vector: h[s] -= scale * (h[s] . v_s) * v_s where the row's flag is on; vsep 0 is "
+       "one shared v, vsep n is a per-stream table", DT_FLOAT, L(hc_project)),
 ROWL("avx_mtp_enter", "mtp_enter", "norm",
      "MTP head entry: two norms, a per-sub-stream fc and a broadcast fc",
      DT_FLOAT ", or fc matrices of E4M3 / int8 codes with a scale plane, joined", L(mtp_enter),
@@ -2182,6 +2193,7 @@ ROW_CB("avx_moe_gemm_q_mod4", "moe_gemm_q_mod4", "moe",
 SIMPLE("avx_moe_gather", "moe_gather", "moe", "weighted scatter back to token order", DT_FLOAT,
        L(moe_gather)),
 SIMPLE("avx_row_topk", "row_topk", "moe", "exact per-row top-R", DT_FLOAT, L(row_topk)),
+SIMPLE("avx_cast_row_topk", "cast_row_topk", "moe", "row_topk over an f32 plane rounded to bf16 (cast then row_topk)", "f32 in, f32 values + i32 columns out", L(cast_row_topk)),
 SIMPLE("avx_row_topk_merge", "row_topk_merge", "moe",
        "the global top-R of the gathered per-rank candidate sets", DT_FLOAT, L(row_topk_merge)),
 SIMPLE("avx_pair_argmax", "pair_argmax", "moe",

@@ -45,9 +45,13 @@ enum {
 /* One row per sampled position. Laid out so the 8-byte fields are aligned and the struct has no
  * padding anywhere, including at the tail.
  *
- * History window: `hist_off` and `hist_len` address the row's own row of the history plane,
- * [M, max_hist] int32 with row m belonging to sampled position m; the window is
- * history[m][hist_off .. hist_off + hist_len), clamped to the row. Token ids in it are global
+ * History window: `hist_off` and `hist_len` address the row's own row of the history plane:
+ * a rank-1 operand of M * w int32 cells, row m belonging to sampled position m and occupying
+ * cells [m * w, (m + 1) * w). The pitch w is the width the step's rows use -- at most
+ * max_hist, and never larger than the widest row the step staged -- so a stage reads it as
+ * numel / M of the operand it is handed, never as an assumed max_hist. The window is
+ * history[m][hist_off .. hist_off + hist_len), clamped to the row; the core stages each row's
+ * whole span within w, so the clamp does not cut a staged row short. Token ids in it are global
  * vocabulary ids; a stage over a vocabulary shard subtracts its `vocab_off` parameter.
  *
  * `penalty_last_n` and `dry_penalty_last_n` window the tail of that span: 0 turns the stage off
