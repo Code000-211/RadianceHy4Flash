@@ -1822,6 +1822,18 @@ static constexpr int64_t kArenaGuard = 1ll << 20;
  * A refused level is simply dropped. */
 void Engine::probe_arena_levels() {
     for (auto& r : ranks_) r->arena_levels.clear();
+    /* The full plan's peak live (BufPlanReport::peak_live): the most transient bytes one op index
+     * sees, which is what the packer aims at. The gap between it and the packed transients is the
+     * waste greedy colouring leaves -- the number a change to liveness (rad_buf_full_write) moves.
+     * Logged before the levels, so it is there on a plugin that declares no smaller step. */
+    if (!ranks_.empty()) {
+        const int64_t arena = ranks_[0]->program.arena_bytes;
+        const int64_t trans = std::max<int64_t>(arena - ranks_[0]->program.arena_fixed_bytes, 0);
+        const int64_t peak  = ranks_[0]->program.arena_peak_live;
+        RAD_INFO("activation arena: %s planned (%s of transients, peak live %s, %s of waste)",
+                 humanb(arena).c_str(), humanb(trans).c_str(), humanb(peak).c_str(),
+                 humanb(std::max<int64_t>(trans - peak, 0)).c_str());
+    }
     RadArchProbe pb{};
     (void)rad_tools_probe(plugins_, meta_, &pb, cfg_.image_gen_max_pixels, cfg_.image_gen_max_refs);
     if (!pb.shape_probe_ok) {

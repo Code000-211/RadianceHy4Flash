@@ -878,6 +878,18 @@ int Builder::buf_concurrent(rad_buf b) {
     return RAD_OK;
 }
 
+/* See rad_buf_full_write. Recorded here and applied by liveness at finish(). */
+int Builder::buf_full_write(rad_buf b) {
+    if (finished_) {
+        err(RAD_E_STATE, "buf_full_write after declare finished");
+        return RAD_E_STATE;
+    }
+    if (b == 0 || b >= prog_.buffers.size()) return RAD_E_INVAL;
+    full_write_bufs_.insert(b);
+    prog_.buffers[b].full_write = true;
+    return RAD_OK;
+}
+
 /* See rad_lane1_window_begin. The window is the ops declared between the two calls. */
 int Builder::lane1_window(bool end) {
     if (finished_) { err(RAD_E_STATE, "rad_lane1_window after declare finished"); return RAD_E_STATE; }
@@ -2602,6 +2614,45 @@ void Builder::finish_kv_groups() {
     }
 }
 
+void Builder::build_runs(rad_buf h) {
+    BufferInfo& b = prog_.buffers[h];
+    b.runs.clear();
+    if (!b.full_write) {
+        b.runs.push_back(BufRun{ b.first_def, b.last_use });
+        return;
+    }
+    /* One run per stretch of uses, and the stretch ends where the value is written again: at an op
+     * that writes the buffer after an op of the same run read it. Two things do not end it. An op
+     * that reads and writes both (an in-place update: the norm that reads q_a's output and writes
+     * it back leaves what it did not touch alive). And a write that no read in the run precedes,
+     * because the ops of one stretch may write the plane in pieces -- a GEMM writes a latent, a
+     * rotary writes its rope columns, one op handle each -- and the bytes are only free once every
+     * stretch has read what it needs. Both directions are the safe one: a run kept too long costs
+     * arena bytes, a run ended too early would take data the next op still reads, and Ctx::issue
+     * refuses that read by name. */
+    int32_t lo = -1, hi = -1;
+    bool read_since = false;
+    for (size_t o = 1; o < op_bufs_.size(); ++o) {
+        const OpBufUse& u = op_bufs_[o];
+        const bool wr = std::find(u.writes.begin(), u.writes.end(), h) != u.writes.end();
+        const bool rd = std::find(u.reads.begin(),  u.reads.end(),  h) != u.reads.end();
+        if (!wr && !rd) continue;
+        const int32_t t = (int32_t)o;
+        if (wr && !rd && read_since && lo >= 0) {
+            b.runs.push_back(BufRun{ lo, hi });
+            lo = -1;
+            read_since = false;
+        }
+        if (lo < 0) lo = t;
+        hi = t;
+        if (rd) read_since = true;
+    }
+    if (lo >= 0) b.runs.push_back(BufRun{ lo, hi });
+    /* The life the engine reads past the op list (the logits and pooled buffers, set above as
+     * last_use) keeps its bytes to the last op. */
+    if (!b.runs.empty() && b.runs.back().hi < b.last_use) b.runs.back().hi = b.last_use;
+}
+
 void Builder::finish_buffer_liveness() {
     const int32_t last_op = std::max<int32_t>((int32_t)prog_.ops.size() - 1, 0);
     /* A second lane, signalled by any concurrent buffer, gets a second scratch region
@@ -2632,6 +2683,7 @@ void Builder::finish_buffer_liveness() {
             (concurrent_bufs_.count((rad_buf)i) && lane1_w1_ < 0)) {
             b.first_def = 0;
             b.last_use  = last_op;
+            b.runs.assign(1, BufRun{ 0, last_op });
             continue;
         }
         /* A concurrent buffer under a declared window (rad_lane1_window_begin): live across the
@@ -2639,6 +2691,7 @@ void Builder::finish_buffer_liveness() {
         if (concurrent_bufs_.count((rad_buf)i)) {
             b.first_def = std::min(first[i], lane1_w0_);
             b.last_use  = std::max(last[i], lane1_w1_);
+            b.runs.assign(1, BufRun{ b.first_def, b.last_use });
             continue;
         }
         b.first_def = first[i];
@@ -2650,6 +2703,13 @@ void Builder::finish_buffer_liveness() {
          * sharing; the undeclared-use guard in core/runtime/issue.cpp enforces it. The pooled
          * output likewise: the engine reads it after the last op. */
         if ((rad_buf)i == prog_.logits_buf || (rad_buf)i == prog_.pooled_buf) b.last_use = last_op;
+
+        /* The runs of its liveness. A buffer its plugin declared rad_buf_full_write is dead
+         * between its use-runs: every op that writes it writes all of it, so the values before a
+         * gap are gone the moment the next run's first op lands. One run per such start, which is
+         * what lets an attention scratch and a MoE scratch that never coexist in a layer share
+         * one region instead of each holding bytes for the whole step. */
+        build_runs(i);
     }
 
     /* Region 1 holds what an op the second lane may issue asks for (Program::scratch_bytes_lane1):
@@ -2816,6 +2876,11 @@ int rad_op_writes(RadBuilder* b, rad_op h, const rad_buf* bufs, int n) {
 int rad_buf_concurrent(RadBuilder* b, rad_buf buf) {
     if (!b) return RAD_E_INVAL;
     return B(b)->buf_concurrent(buf);
+}
+
+int rad_buf_full_write(RadBuilder* b, rad_buf buf) {
+    if (!b) return RAD_E_INVAL;
+    return B(b)->buf_full_write(buf);
 }
 
 int rad_lane1_window_begin(RadBuilder* b) {

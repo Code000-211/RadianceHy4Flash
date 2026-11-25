@@ -204,12 +204,17 @@ std::string dump_graph_str(const Program& p, const std::vector<std::string>* err
             persist += b.bytes;
         }
     }
+    /* peak live over the runs, not the envelope: a buffer declared rad_buf_full_write is dead
+     * between its runs (see plan_buffers), which is what the packer exploits. */
     for (int32_t t = 1; t <= std::max<int32_t>(last_op, 1); ++t) {
         int64_t live = 0;
         for (size_t i = 1; i < p.buffers.size(); ++i) {
             const BufferInfo& b = p.buffers[i];
             if (b.decl.kind != RAD_BUF_TRANSIENT || b.decl.domain == RAD_DOMAIN_HOST) continue;
-            if (b.first_def <= t && t <= b.last_use) live += b.bytes;
+            bool on = b.runs.empty();
+            for (const BufRun& r : b.runs)
+                if (r.covers(t)) { on = true; break; }
+            if (on) live += b.bytes;
         }
         peak = std::max(peak, live);
     }
@@ -233,10 +238,15 @@ std::string dump_graph_str(const Program& p, const std::vector<std::string>* err
     for (size_t i = 1; i < p.buffers.size(); ++i) big.push_back(&p.buffers[i]);
     std::sort(big.begin(), big.end(),
               [](const BufferInfo* a, const BufferInfo* b) { return a->bytes > b->bytes; });
-    for (size_t i = 0; i < big.size() && i < 5; ++i)
-        s += fmt("    %-32s %12s  %-9s live [%d,%d] @ %lld\n", big[i]->name.c_str(),
+    for (size_t i = 0; i < big.size() && i < 5; ++i) {
+        std::string life_suffix;
+        if (big[i]->runs.size() > 1) life_suffix = fmt(" in %zu runs", big[i]->runs.size());
+        else if (big[i]->full_write) life_suffix = " (rewritten whole)";
+        s += fmt("    %-32s %12s  %-9s live [%d,%d]%s @ %lld\n", big[i]->name.c_str(),
                  humanb(big[i]->bytes).c_str(), bld_buf_kind_name(big[i]->decl.kind),
-                 big[i]->first_def, big[i]->last_use, (long long)big[i]->arena_offset);
+                 big[i]->first_def, big[i]->last_use, life_suffix.c_str(),
+                 (long long)big[i]->arena_offset);
+    }
     s += "\n";
 
     /* ---------------------------------------------------------------- KV groups */

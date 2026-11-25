@@ -213,6 +213,10 @@ int Ctx::bind_buffers() {
     buf_host_.assign(P.buffers.size(), 0);
     buf_live0_.assign(P.buffers.size(), -1);
     buf_live1_.assign(P.buffers.size(), -1);
+    buf_runs_.clear();
+    buf_run_at_.assign(P.buffers.size() + 1, 0);
+    buf_written_.assign(P.buffers.size(), Ctx::BufWritten{});
+    buf_written_handles_.clear();
 
     for (size_t i = 1; i < P.buffers.size(); ++i) {
         BufferInfo& bi = P.buffers[i];
@@ -244,7 +248,23 @@ int Ctx::bind_buffers() {
         buf_host_[i] = bi.decl.domain == RAD_DOMAIN_HOST ? 1 : 0;
         buf_live0_[i] = bi.first_def;
         buf_live1_[i] = bi.last_use;
+        /* The life as runs, in one flat list: buf_runs_ holds each run as (lo, hi) at
+         * 2 * buf_run_at_[i] .. 2 * buf_run_at_[i + 1], the index in core/runtime/issue.cpp's
+         * guard. A buffer with no run is live everywhere (see finish_buffer_liveness). */
+        buf_run_at_[i] = (int32_t)(buf_runs_.size() / 2);
+        const std::vector<BufRun>& runs = bi.runs;
+        if (runs.empty()) {
+            buf_runs_.push_back(0);
+            buf_runs_.push_back(std::max<int32_t>((int32_t)P.ops.size() - 1, 0));
+        } else {
+            if (P.buffers[i].full_write) buf_written_handles_.push_back((int32_t)i);
+            for (const BufRun& r : runs) {
+                buf_runs_.push_back(r.lo);
+                buf_runs_.push_back(r.hi);
+            }
+        }
     }
+    buf_run_at_[P.buffers.size()] = (int32_t)(buf_runs_.size() / 2);
     level_tmpl_.assign(1, buf_tmpl_);
     level_ = 0;
     refresh_buf_numel();
@@ -1525,6 +1545,8 @@ int Ctx::run_step(const RadBatch* b) {
     step_status_ = RAD_OK;
     step_fail_.clear();
     prof_n_      = 0;
+    /* The rad_buf_full_write coverage is per run and a step begins every run again. */
+    for (int32_t h : buf_written_handles_) buf_written_[h].run = -1;
     kvstream_enter(this, b);
     {
         const int rc = run_pass(b);
