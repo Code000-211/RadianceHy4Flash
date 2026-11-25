@@ -1,0 +1,22 @@
+name: Moebius issue
+description: An issue Moebius and its helpers read by its sections.
+body:
+  - type: input
+    id: item
+    attributes:
+      label: "Item"
+      description: "The backlog item this is for, such as K-47. Issues the backlog sync makes keep the backlog's own format."
+  - type: textarea
+    id: what_is_wanted
+    attributes:
+      label: "What is wanted"
+      description: "What is slow or wrong, on which GPUs, lane and shapes, and what should be true instead."
+    validations:
+      required: true
+  - type: textarea
+    id: how_we_will_know_it_is_done
+    attributes:
+      label: "How we will know it is done"
+      description: "The test, or the measurement and the bar it must meet (notes/backlog/CARDS.md §2: output byte-identical or inside the item's bound, the targeted kernel, op or step faster in ms, end-to-end tok/s or TTFT not worse beyond noise). The numbers go in notes/backlog/measurements/<item>.md."
+    validations:
+      required: true
