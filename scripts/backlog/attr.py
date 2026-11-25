@@ -21,7 +21,9 @@ def short(k):
 def coll(n): return n.startswith("ar_") or "all_reduce" in n or "all_gather" in n or "oneshot" in n
 out = {}
 for ph in R["phases"]:
-    a, b = ph["mono_ns"]
+    w = ph.get("mono_ns")
+    if not w or not w[1]: continue   # a composite (longctx, idle, long8) or gap (stallN) phase: no window
+    a, b = w
     ps = [v for v in P.values() if a <= min(x["s"] for x in v) and max(x["e"] for x in v) <= b]
     kinds = collections.defaultdict(list)
     for v in ps: kinds[int(v[0]["records"])].append(v)
