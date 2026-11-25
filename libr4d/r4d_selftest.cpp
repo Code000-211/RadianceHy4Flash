@@ -20725,10 +20725,13 @@ static SinkOps sink_ops(bool sel, int64_t heads, const std::vector<int64_t>& qle
     }
     return o;
 }
-/* The output bytes (margins included) of one device launch of `row` at pin form `form`. */
+/* The output bytes (margins included) of one device launch of `row` at pin form `form`, chained
+ * when `chain` (K-29 reads the sink's prologue in front of the chain wait). */
 static bool sink_device(const Plugin& pl, const RadKernelInfo* row, SinkOps& o, int form,
-                        std::vector<uint8_t>& got) {
+                        std::vector<uint8_t>& got, bool chain = false) {
     auto* pin = (void (*)(int))dlsym(pl.h, "r4d_mla_sink_pin_form");
+    std::vector<RadParam> ps(o.ps);
+    if (chain) ps.push_back(PI("chain", 1));
     std::vector<void*> mem(o.host.size(), nullptr);
     std::vector<RadTensor> dev(o.host.size());
     for (size_t i = 0; i < o.host.size(); ++i) {
@@ -20741,8 +20744,8 @@ static bool sink_device(const Plugin& pl, const RadKernelInfo* row, SinkOps& o, 
     RadArgs a{};
     a.t = dev.data();
     a.n_t = (int)dev.size();
-    a.p = o.ps.data();
-    a.n_p = (int)o.ps.size();
+    a.p = ps.data();
+    a.n_p = (int)ps.size();
     a.world_size = 1;
     const int64_t need = row->scratch ? row->scratch(&a) : 0;
     if (need < 0) return false;
@@ -20906,6 +20909,21 @@ static void mla_sink_bytes(const Plugin& pl, int64_t heads, std::vector<int64_t>
         for (int64_t rr = 0; eq && rr < ot.shape[0]; ++rr)
             eq = row_bytes(g, s.host[(size_t)s.out], rr) == row_bytes(base, ot, rr);
         ok(fmt("%s paged == sel", label.c_str()).c_str(), eq);
+    }
+    /* K-29: the chained form reads the step's metadata in front of its chain wait, and no engine
+     * record reaches r4d_selftest, so the wait returns at once and only the bracket differs. Every
+     * byte -- the guards too -- has to be the plain launch's, in both forms. */
+    {
+        std::vector<uint8_t> g;
+        const bool ran = sink_device(pl, paged, all, 0, g, true);
+        ok(fmt("%s chained form == plain bytes", label.c_str()).c_str(), ran && g == base);
+    }
+    if (!window) {
+        SinkOps s = sink_ops(true, heads, qlen, ctx, 0, bs, 0, 1, stable);
+        std::vector<uint8_t> plain, g;
+        const bool ran = sink_device(pl, selr, s, 0, plain) && sink_device(pl, selr, s, 0, g, true);
+        ok(fmt("%s chained selection form == plain bytes", label.c_str()).c_str(),
+           ran && g == plain);
     }
 }
 
