@@ -3764,167 +3764,363 @@ TEST(g3_junctions_write_the_codes_their_readers_take) {
     CHECK(had_on < count_op(off.b, "had_quant_act_i8g"));
 }
 
+/* ============================================================ P-10: the indexer's row tiles */
+namespace {
+
+/* P-10: the model a tiling test stands on -- mini, or the DFly's manifest -- declared with room for
+ * a prefill chunk taller than one score tile. `spec` is the draft depth the manifest asks for,
+ * `taps` the tap reads, `indexer` the score the indexer runs: null the bf16 `idx_score`, "fp8" /
+ * "int8" the packed `dsa_score` of the wide indexer head. */
+struct TiledDecl {
+    MetaKV mk;
+    RadBuilder b;
+    RadBuildCtx ctx;
+    int rc = 0;
+    std::string err;
+    explicit TiledDecl(MetaKV m = mini_meta(), int spec = 0, bool taps = false,
+                       const char* indexer = nullptr)
+        : mk(std::move(m)) {
+        if (indexer) mk.set("index_head_dim", "128");   /* the packed score's own head width */
+        bf16_encs(&b);
+        ctx = spec ? spec_ctx(0, 1, spec) : build_ctx();
+        ctx.max_tok = 1024;                             /* four tiles, and a chunk of 600 rows */
+        if (indexer) setenv("RADIANCE_HY4_INDEXER", indexer, 1);
+        if (taps) setenv("RADIANCE_HY4_TAPS", "1", 1);
+        {
+            G3Env g3env;
+            err = stderr_of([&] { rc = hyv4flash::declare(&b, mk.meta(), &ctx); });
+        }
+        if (indexer) unsetenv("RADIANCE_HY4_INDEXER");
+        if (taps) unsetenv("RADIANCE_HY4_TAPS");
+        if (rc != RAD_OK) fprintf(stderr, "%s", err.c_str());
+    }
+    const hyv4flash::Model& m() const { return *hyv4flash::models[0]; }
+};
+
+/* One prefill chunk of `rows` rows over one sequence, stepped, and the issues the step recorded. */
+struct TiledChunk {
+    std::unique_ptr<Kit> k;
+    RadCtx c{};
+    TiledChunk(RadBuilder& b, int rows) : k(kit(b, {}, { rows }, 0)) {
+        k->b.positions_h = k->pos.data();
+        c.b = &b;
+        c.batch = &k->b;
+        hyv4flash::step(&c, &k->b);
+    }
+};
+
+/* A row tile of a chunk: the chunk row it starts at, and the rows it carries. */
+struct Tile {
+    int64_t first = 0, rows = 0;
+};
+std::vector<Tile> tiles_of(int64_t rows, int64_t tile) {
+    std::vector<Tile> v;
+    for (int64_t t0 = 0; t0 < rows; t0 += tile)
+        v.push_back({ t0, rows - t0 < tile ? rows - t0 : tile });
+    return v;
+}
+
+/* The issues of `op` in the order the step made them, those `keep` accepts. An op runs once a tile
+ * and a layer, in tile order, so its issue k belongs to tile k % tiles. */
+std::vector<const RecIssue*> issues_of(const RadBuilder& b, const RadCtx& c, const char* op) {
+    std::vector<const RecIssue*> v;
+    for (const RecIssue& i : c.issues) {
+        const RecOp* o = b.op_of(i.op);
+        if (o && o->op == op) v.push_back(&i);
+    }
+    return v;
+}
+template <class Keep>
+std::vector<const RecIssue*> issues_of(const RadBuilder& b, const RadCtx& c, const char* op,
+                                      Keep keep) {
+    std::vector<const RecIssue*> v;
+    for (const RecIssue& i : c.issues) {
+        const RecOp* o = b.op_of(i.op);
+        if (o && o->op == op && keep(i)) v.push_back(&i);
+    }
+    return v;
+}
+
+/* How many times a step issued `op`. */
+int times_issued(const RadCtx& c, rad_op op) {
+    int n = 0;
+    for (const RecIssue& i : c.issues) n += i.op == op;
+    return n;
+}
+
+/* How many times the step issued the tile offsets: once a sparse layer, and only a step taller
+ * than one tile. */
+int tile_offset_issues(const RadCtx& c, const hyv4flash::Model& m) {
+    int n = 0;
+    for (const RecIssue& i : c.issues)
+        for (const auto& l : m.layers)
+            if (l.ix.op_tile_off && i.op == l.ix.op_tile_off) {
+                ++n;
+                break;
+            }
+    return n;
+}
+
+/* The sparse layers: those that score and select. */
+int sparse_layers(const hyv4flash::Model& m) {
+    int n = 0;
+    for (const auto& l : m.layers) n += l.ix.op_score != 0;
+    return n;
+}
+
+/* The cu a tile's score or select carries: the step's own on the first tile, the rebased table on
+ * every later one. */
+void check_tile_cu(const RecIssue& i, int opd, const Tile& t, const hyv4flash::Model& m,
+                   const Kit& k) {
+    if (t.first == 0) {
+        CHECK_EQ(i.opd[opd].kind, (uint8_t)RAD_OPK_RAW);
+        CHECK(i.opd[opd].raw == k.cu.data());
+    } else {
+        CHECK_EQ(i.opd[opd].kind, (uint8_t)RAD_OPK_BUF);
+        CHECK_EQ(i.opd[opd].handle, m.iw.cu_tile);
+    }
+}
+
+/* The later tiles of a layer's selection write the rows of the per-row planes that follow the
+ * first tile's: `sel` is topk a row, `nsel` and `len` a row (opd[5], opd[6], opd[7]). */
+void check_tile_selection(const std::vector<const RecIssue*>& select, const std::vector<Tile>& tl,
+                          int64_t topk) {
+    REQUIRE_EQ(select.size(), tl.size());
+    for (size_t t = 1; t < tl.size(); ++t) {
+        const RecIssue& si = *select[t];
+        CHECK_EQ(si.n, tl[t].rows);
+        CHECK_EQ(si.opd[5].offset, select[0]->opd[5].offset + tl[t].first * topk);
+        CHECK_EQ(si.opd[6].offset, select[0]->opd[6].offset + tl[t].first);
+        CHECK_EQ(si.opd[7].offset, select[0]->opd[7].offset + tl[t].first);
+    }
+}
+
+/* What a chunk taller than a tile issues around the tiles: the offsets once a model, and a layer's
+ * cu rebased once a tile after the first. */
+void check_tiles_issued(const RadBuilder& b, const RadCtx& c, const hyv4flash::Model& m,
+                        int sparse, int64_t tiles) {
+    const std::vector<const RecIssue*> rebase = issues_of(b, c, "sub_i32", [&](const RecIssue& i) {
+        return i.opd[2].handle == m.iw.cu_tile;      /* not the model's own P-04 rebase */
+    });
+    CHECK_EQ(tile_offset_issues(c, m), sparse);   /* the tile offsets, once a layer */
+    REQUIRE_EQ((int64_t)rebase.size(), (tiles - 1) * sparse);
+    for (size_t r = 0; r < rebase.size(); ++r) {
+        const RecIssue& i = *rebase[r];
+        CHECK_EQ(i.n, (int64_t)2);                   /* one sequence: the step's cu[0] and its end */
+        CHECK_EQ(i.opd[0].kind, (uint8_t)RAD_OPK_RAW);
+        CHECK_EQ(i.opd[1].handle, m.iw.tile_off);
+        CHECK_EQ(i.opd[1].offset, 1 + (int64_t)r % (tiles - 1));   /* the tile it rebases by */
+        CHECK_EQ(i.opd[2].handle, m.iw.cu_tile);
+    }
+}
+
+}  /* namespace */
+
 /* P-10: the indexer's score plane is one row tile tall (kScoreTile rows, not max_tok), and a prefill
  * chunk taller than a tile is scored and selected a tile at a time. Each issue then carries the
  * tile's own rows and its own slots of the per-row planes, and its cu: the step's cu rebased by the
  * tile's first row (sub_i32 off the tile offsets, an exact int32 shift), which the kernels read as
  * the row's place in its sequence. */
 TEST(the_indexer_scores_and_selects_a_row_tile_at_a_time) {
-    MetaKV mk = mini_meta();
-    RadBuilder b;
-    bf16_encs(&b);
-    RadBuildCtx ctx = build_ctx();
-    ctx.max_tok = 1024;
-    int rc = 0;
-    {
-        G3Env g3env;
-        std::string err = stderr_of([&] { rc = hyv4flash::declare(&b, mk.meta(), &ctx); });
-        if (rc != RAD_OK) fprintf(stderr, "%s", err.c_str());
-    }
-    REQUIRE_EQ(rc, RAD_OK);
-    const auto& m = *hyv4flash::models[0];
+    TiledDecl d;
+    REQUIRE_EQ(d.rc, RAD_OK);
+    const auto& m = d.m();
     const int64_t D = m.s.ix_dim, Hi = m.s.ix_heads, topk = m.s.ix_group_topk;
 
     /* The plane holds one tile and not the chunk: 256 * blocks f32 instead of 1024 * blocks. */
-    const RecBuf* sc = find_b(b, "ix.score");
+    const RecBuf* sc = find_b(d.b, "ix.score");
     REQUIRE(sc != nullptr);
     CHECK_EQ(sc->d.rank, (uint32_t)2);
     CHECK_EQ(sc->d.shape[0], (int64_t)256);
     CHECK_EQ(sc->d.shape[1], m.iw.blocks);
-    const RecBuf* off = find_b(b, "ix.tile_off");
+    const RecBuf* off = find_b(d.b, "ix.tile_off");
     REQUIRE(off != nullptr);
     CHECK_EQ(off->d.dtype, (uint32_t)RAD_I32);
-    CHECK_EQ(off->d.shape[0], (int64_t)4);              /* 1024 rows in 256-row tiles */
-    const RecBuf* cu_t = find_b(b, "ix.cu_tile");
+    CHECK_EQ(off->d.shape[0], (int64_t)4);           /* 1024 rows in 256-row tiles */
+    const RecBuf* cu_t = find_b(d.b, "ix.cu_tile");
     REQUIRE(cu_t != nullptr);
     CHECK_EQ(cu_t->d.shape[0], m.g.max_seqs + 1);
 
     /* One chunk of 600 rows over one sequence: 256 + 256 + 88 rows a tile, on both sparse layers. */
-    auto k = kit(b, {}, { 600 }, 0);
-    k->b.positions_h = k->pos.data();
-    RadCtx c{ .b = &b, .batch = &k->b };
-    hyv4flash::step(&c, &k->b);
-    CHECK_LINT(b, &c);
-    int sparse = 0;
-    for (const auto& l : m.layers) sparse += l.ix.op_score != 0;
+    TiledChunk c(d.b, 600);
+    CHECK_LINT(d.b, &c.c);
+    const int sparse = sparse_layers(m);
     REQUIRE_EQ(sparse, 2);
-    CHECK_EQ(count_issued(b, c, "idx_score"), 3 * sparse);
-    CHECK_EQ(count_issued(b, c, "qsa_select"), 3 * sparse);
-    /* A tile after the first, a layer, and once the model's own P-04 rebase of the chunk's cu. */
-    CHECK_EQ(count_issued(b, c, "sub_i32"), 2 * sparse + 1);
-    CHECK_EQ(count_issued(b, c, "iota"), sparse);          /* the tiles' offsets, once a layer */
+    const std::vector<Tile> tl = tiles_of(600, 256);
+    REQUIRE_EQ(tl.size(), (size_t)3);
 
-    const int64_t rows[3] = { 256, 256, 88 }, first[3] = { 0, 256, 512 };
-    struct Sel { int64_t sel[3]{}, nsel[3]{}, len[3]{}; };
-    std::vector<Sel> sels;
-    int n = 0;                                             /* the score/select issue pair */
-    for (const RecIssue& i : c.issues) {
-        const RecOp* o = b.op_of(i.op);
-        if (!o) continue;
-        const bool score = o->op == "idx_score", select = o->op == "qsa_select";
-        if (!score && !select) continue;
-        const int t = (int)((n % 6) / 2);                   /* the tile in the layer */
-        const int64_t t0 = first[t];
-        CHECK_EQ(i.n, rows[t]);
-        if (score) {
-            /* The tile's rows of the step's q and gate planes, and its slot of the plane. */
-            CHECK_EQ(i.opd[0].offset, t0 * Hi * D);
-            CHECK_EQ(i.opd[1].offset, t0 * Hi);
-            CHECK_EQ(i.opd[6].kind, (uint8_t)RAD_OPK_BUF);
-            CHECK_EQ(i.opd[6].offset, 0);
-            CHECK_EQ(i.opd[6].rows, rows[t]);
-            if (t == 0) {
-                /* The first tile reads the step's cu as it is. */
-                CHECK_EQ(i.opd[4].kind, (uint8_t)RAD_OPK_RAW);
-                CHECK(i.opd[4].raw == k->cu.data());
-            } else {
-                CHECK_EQ(i.opd[4].kind, (uint8_t)RAD_OPK_BUF);
-                CHECK_EQ(i.opd[4].handle, m.iw.cu_tile);
-            }
-        } else {
-            CHECK_EQ(i.opd[0].offset, 0);
-            CHECK_EQ(i.opd[0].rows, rows[t]);
-            CHECK(i.opd[3].raw == (const void*)(k->pos.data() + t0));   /* the tile's positions */
-            if ((int)sels.size() <= (n / 6)) sels.resize((size_t)(n / 6) + 1);
-            Sel& s = sels[(size_t)(n / 6)];
-            s.sel[t] = i.opd[5].offset;                     /* the selection, topk a row */
-            s.nsel[t] = i.opd[6].offset;                    /* its counts */
-            s.len[t] = i.opd[7].offset;                     /* and the lengths */
-        }
-        ++n;
+    const std::vector<const RecIssue*> score = issues_of(d.b, c.c, "idx_score");
+    REQUIRE_EQ(score.size(), tl.size() * (size_t)sparse);
+    for (size_t i = 0; i < score.size(); ++i) {
+        const Tile& t = tl[i % tl.size()];
+        const RecIssue& si = *score[i];
+        /* The tile's rows of the step's q and gate planes, and its slot of the plane. */
+        CHECK_EQ(si.n, t.rows);
+        CHECK_EQ(si.opd[0].offset, t.first * Hi * D);
+        CHECK_EQ(si.opd[0].rows, t.rows);
+        CHECK_EQ(si.opd[1].offset, t.first * Hi);
+        CHECK_EQ(si.opd[1].rows, t.rows);
+        CHECK_EQ(si.opd[6].kind, (uint8_t)RAD_OPK_BUF);
+        CHECK_EQ(si.opd[6].offset, 0);
+        CHECK_EQ(si.opd[6].rows, t.rows);
+        check_tile_cu(si, 4, t, m, *c.k);
     }
-    CHECK_EQ(n, 6 * sparse);
-    REQUIRE_EQ(sels.size(), (size_t)sparse);
-    for (const Sel& s : sels)
-        for (int t = 1; t < 3; ++t) {
-            CHECK_EQ(s.sel[t], s.sel[0] + first[t] * topk);
-            CHECK_EQ(s.nsel[t], s.nsel[0] + first[t]);
-            CHECK_EQ(s.len[t], s.len[0] + first[t]);
+    const std::vector<const RecIssue*> select = issues_of(d.b, c.c, "qsa_select");
+    REQUIRE_EQ(select.size(), tl.size() * (size_t)sparse);
+    for (int l = 0; l < sparse; ++l) {
+        const std::vector<const RecIssue*> layer(
+            select.begin() + (ptrdiff_t)(l * tl.size()),
+            select.begin() + (ptrdiff_t)((l + 1) * tl.size()));
+        for (size_t t = 0; t < tl.size(); ++t) {
+            const RecIssue& si = *layer[t];
+            CHECK_EQ(si.opd[0].offset, 0);
+            CHECK_EQ(si.opd[0].rows, tl[t].rows);
+            CHECK(si.opd[3].raw == (const void*)(c.k->pos.data() + tl[t].first));
+            check_tile_cu(si, 4, tl[t], m, *c.k);
         }
-
-    /* The rebase: the step's cu less each tile's own offset, in the tile's slot of the table. */
-    int r = 0;
-    for (const RecIssue& i : c.issues) {
-        const RecOp* o = b.op_of(i.op);
-        if (!o || o->op != "sub_i32" || i.opd[2].handle != m.iw.cu_tile) continue;   /* not P-04's */
-        const int t = 1 + (r % 2);
-        CHECK_EQ(i.n, (int64_t)2);                          /* one sequence: cu[0] and cu[1] */
-        CHECK_EQ(i.opd[0].kind, (uint8_t)RAD_OPK_RAW);
-        CHECK_EQ(i.opd[1].handle, m.iw.tile_off);
-        CHECK_EQ(i.opd[1].offset, (int64_t)t);
-        CHECK_EQ(i.opd[2].handle, m.iw.cu_tile);
-        ++r;
+        check_tile_selection(layer, tl, topk);
     }
-    CHECK_EQ(r, 2 * sparse);
+    check_tiles_issued(d.b, c.c, m, sparse, (int64_t)tl.size());
 
     /* A decode step is one tile: no offsets, no rebase, and the score once a layer with its rows. */
-    auto kd = kit(b, { 1, 1, 1 }, {}, 0);
+    auto kd = kit(d.b, { 1, 1, 1 }, {}, 0);
     kd->b.positions_h = kd->pos.data();
-    RadCtx cd{ .b = &b, .batch = &kd->b };
+    RadCtx cd{ .b = &d.b, .batch = &kd->b };
     hyv4flash::step(&cd, &kd->b);
-    CHECK_LINT(b, &cd);
-    CHECK_EQ(count_issued(b, cd, "idx_score"), sparse);
-    CHECK_EQ(count_issued(b, cd, "sub_i32"), 0);
-    CHECK_EQ(count_issued(b, cd, "iota"), 0);
+    CHECK_LINT(d.b, &cd);
+    CHECK_EQ(count_issued(d.b, cd, "idx_score"), sparse);
+    CHECK_EQ(count_issued(d.b, cd, "sub_i32"), 0);
+    CHECK_EQ(tile_offset_issues(cd, m), 0);
 }
 
-/* P-10: a tap reads a whole chunk's scores, so under the taps the plane keeps the chunk's rows and a
- * step is one tile: the select over the tap's identity table and the score of the chunk still run
- * once a layer, with nothing rebased. */
-TEST(the_score_plane_under_the_taps_keeps_the_chunks_rows) {
-    MetaKV mk = mini_meta();
-    RadBuilder b;
-    bf16_encs(&b);
-    RadBuildCtx ctx = build_ctx();
-    ctx.max_tok = 1024;
-    setenv("RADIANCE_HY4_TAPS", "1", 1);
-    int rc = 0;
-    {
-        G3Env g3env;
-        std::string err = stderr_of([&] { rc = hyv4flash::declare(&b, mk.meta(), &ctx); });
-        if (rc != RAD_OK) fprintf(stderr, "%s", err.c_str());
+/* P-10: RADIANCE_HY4_INDEXER=fp8 / int8 -- the packed key cache's score is issued a row tile at a
+ * time too, and it carries more per-row planes than the bf16 one: the tile's rows of the query
+ * codes [rows * heads, D] and of their scales [rows * heads, 1], and its rows of the gate plane
+ * [rows, heads]. A tile at a wrong row of any of the three would score one row's codes against
+ * another row's gates, so each tile's three offsets are checked, and its cu. */
+TEST(the_packed_indexer_scores_and_selects_a_row_tile_at_a_time) {
+    for (const char* mode : { "fp8", "int8" }) {
+        TiledDecl d(mini_meta(), 0, false, mode);
+        REQUIRE_EQ(d.rc, RAD_OK);
+        const auto& m = d.m();
+        const int64_t D = m.s.ix_dim, Hi = m.s.ix_heads, topk = m.s.ix_group_topk;
+        REQUIRE_EQ(D, (int64_t)128);                 /* the packed score's own head width */
+        const int sparse = sparse_layers(m);
+        REQUIRE_EQ(sparse, 2);
+
+        TiledChunk c(d.b, 600);
+        CHECK_LINT(d.b, &c.c);
+        const std::vector<Tile> tl = tiles_of(600, 256);
+        REQUIRE_EQ(tl.size(), (size_t)3);
+
+        const std::vector<const RecIssue*> score = issues_of(d.b, c.c, "dsa_score");
+        REQUIRE_EQ(score.size(), tl.size() * (size_t)sparse);
+        for (size_t i = 0; i < score.size(); ++i) {
+            const Tile& t = tl[i % tl.size()];
+            const RecIssue& si = *score[i];
+            CHECK_EQ(si.n, t.rows);
+            /* the tile's rows of the packed codes [rows * heads, D] and of their scales */
+            CHECK_EQ(si.opd[0].handle, m.iw.qcodes);
+            CHECK_EQ(si.opd[0].offset, t.first * Hi * D);
+            CHECK_EQ(si.opd[0].rows, t.rows * Hi);
+            CHECK_EQ(si.opd[1].handle, m.iw.qscale);
+            CHECK_EQ(si.opd[1].offset, t.first * Hi);
+            CHECK_EQ(si.opd[1].rows, t.rows * Hi);
+            /* and its rows of the gate plane, a row a head */
+            CHECK_EQ(si.opd[2].handle, m.iw.iwf);
+            CHECK_EQ(si.opd[2].offset, t.first * Hi);
+            CHECK_EQ(si.opd[2].rows, t.rows);
+            /* the same slot of the plane, and the same cu, as the bf16 score */
+            CHECK_EQ(si.opd[8].offset, 0);
+            CHECK_EQ(si.opd[8].rows, t.rows);
+            check_tile_cu(si, 6, t, m, *c.k);
+        }
+        /* The select after it is the bf16 one: the tile's rows and its cu. */
+        const std::vector<const RecIssue*> select = issues_of(d.b, c.c, "qsa_select");
+        REQUIRE_EQ(select.size(), tl.size() * (size_t)sparse);
+        for (int l = 0; l < sparse; ++l) {
+            const std::vector<const RecIssue*> layer(
+                select.begin() + (ptrdiff_t)(l * tl.size()),
+                select.begin() + (ptrdiff_t)((l + 1) * tl.size()));
+            for (size_t t = 0; t < tl.size(); ++t) {
+                CHECK(select[(size_t)(l * tl.size()) + t]->opd[3].raw ==
+                      (const void*)(c.k->pos.data() + tl[t].first));
+                check_tile_cu(*layer[t], 4, tl[t], m, *c.k);
+            }
+            check_tile_selection(layer, tl, topk);
+        }
+        check_tiles_issued(d.b, c.c, m, sparse, (int64_t)tl.size());
     }
-    REQUIRE_EQ(rc, RAD_OK);
-    unsetenv("RADIANCE_HY4_TAPS");
-    const auto& m = *hyv4flash::models[0];
-    const RecBuf* sc = find_b(b, "ix.score");
+}
+
+/* P-10: under the taps the score plane keeps the chunk's rows, because a tap reads a whole chunk's
+ * scores, so a step is one tile: the score of the chunk and the select over the tap's identity
+ * table still run once a layer, with nothing rebased. */
+TEST(the_score_plane_under_the_taps_keeps_the_chunks_rows) {
+    TiledDecl d(mini_meta(), 0, true);
+    REQUIRE_EQ(d.rc, RAD_OK);
+    const auto& m = d.m();
+    const RecBuf* sc = find_b(d.b, "ix.score");
     REQUIRE(sc != nullptr);
     CHECK_EQ(sc->d.shape[0], (int64_t)1024);
 
-    auto k = kit(b, {}, { 600 }, 0);
-    k->b.positions_h = k->pos.data();
-    RadCtx c{ .b = &b, .batch = &k->b };
-    hyv4flash::step(&c, &k->b);
-    CHECK_LINT(b, &c);
-    int sparse = 0;
-    for (const auto& l : m.layers) sparse += l.ix.op_score != 0;
+    TiledChunk c(d.b, 600);
+    CHECK_LINT(d.b, &c.c);
+    const int sparse = sparse_layers(m);
     REQUIRE_EQ(sparse, 2);
-    CHECK_EQ(count_issued(b, c, "idx_score"), sparse);
-    CHECK_EQ(count_issued(b, c, "qsa_select"), 2 * sparse);   /* the score's and the tap's */
-    int rebased = 0;
-    for (const RecIssue& i : c.issues) {
-        const RecOp* o = b.op_of(i.op);
-        if (o && o->op == "sub_i32" && i.opd[2].handle == m.iw.cu_tile) ++rebased;
+    CHECK_EQ(count_issued(d.b, c.c, "idx_score"), sparse);
+    CHECK_EQ(count_issued(d.b, c.c, "qsa_select"), 2 * sparse);   /* the score's and the tap's */
+    CHECK(issues_of(d.b, c.c, "sub_i32", [&](const RecIssue& i) {
+              return i.opd[2].handle == m.iw.cu_tile;
+          }).empty());
+    CHECK_EQ(tile_offset_issues(c.c, m), 0);   /* one tile a step: no offsets */
+}
+
+/* P-10 with P-09: a snapshot layer's selection is written straight into the layer's window of the
+ * snapshot planes, so a chunk taller than a tile fills the window row by row -- each tile's rows at
+ * the window's first row plus the tile's own -- and the attention still reads the selection from the
+ * window's first row. */
+TEST(a_snapshot_layer_fills_its_window_a_row_tile_at_a_time) {
+    TiledDecl d(dfly_meta(), 5);
+    REQUIRE_EQ(d.rc, RAD_OK);
+    const auto& m = d.m();
+    const auto& sn = m.df.snap[0];
+    const auto& lay = m.layers[(size_t)sn.layer];
+    const int64_t topk = m.s.ix_group_topk;
+    REQUIRE_EQ(lay.ix.op_score != 0, true);          /* the draft layer sits over a sparse one */
+
+    TiledChunk c(d.b, 600);
+    REQUIRE(c.c.step_fail.empty());
+    CHECK_LINT(d.b, &c.c);
+    const std::vector<Tile> tl = tiles_of(600, 256);
+    REQUIRE_EQ(tl.size(), (size_t)3);
+    REQUIRE(sn.base + 600 <= m.df.snap_t);           /* the chunk fits the layer's window */
+
+    const std::vector<const RecIssue*> sel = issues_of(d.b, c.c, "qsa_select", [&](const RecIssue& i) {
+        return i.op == lay.ix.op_select;
+    });
+    REQUIRE_EQ(sel.size(), tl.size());
+    for (size_t t = 0; t < tl.size(); ++t) {
+        const RecIssue& si = *sel[t];
+        CHECK_EQ(si.n, tl[t].rows);
+        CHECK_EQ((rad_buf)si.opd[5].handle, m.df.snap_sel);
+        CHECK_EQ((rad_buf)si.opd[6].handle, m.df.snap_nsel);
+        /* the tile's own rows of the window, past the layer's base */
+        CHECK_EQ(si.opd[5].offset, (sn.base + tl[t].first) * topk);
+        CHECK_EQ(si.opd[5].rows, tl[t].rows);
+        CHECK_EQ(si.opd[6].offset, sn.base + tl[t].first);
+        CHECK_EQ(si.opd[6].rows, tl[t].rows);
     }
-    CHECK_EQ(rebased, 0);
+    /* Nothing copied the planes afterwards: the attention reads the window from its first row. */
+    CHECK_EQ(times_issued(c.c, m.df.op_sel), 0);
+    size_t attn = SIZE_MAX;
+    for (size_t i = 0; i < c.c.issues.size() && attn == SIZE_MAX; ++i) {
+        const rad_op op = c.c.issues[i].op;
+        if (op == lay.attn.op_sel || op == lay.attn.op_paged || op == lay.attn.op_sel_pf ||
+            op == lay.attn.op_paged_pf)
+            attn = i;
+    }
+    REQUIRE(attn != SIZE_MAX);
+    CHECK_EQ((rad_buf)c.c.issues[attn].opd[3].handle, m.df.snap_sel);
+    CHECK_EQ(c.c.issues[attn].opd[3].offset, sn.base * topk);
 }
