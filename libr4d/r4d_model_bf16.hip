@@ -854,11 +854,12 @@ static_assert(sizeof(MlaRowFront) == 104, "MlaRowFront has padding");
 template <bool WF32, class CH>
 __global__ __launch_bounds__(kThreads) void mla_row_front_kernel(MlaRowFront p) {
     /* K-29: the step's position and slot mapping in front of the wait, which then covers their
-     * loads; the row's own columns behind it are the launch in front's. Nothing behind the wait is a
-     * scalar load (tests/chain_scalar_audit.py), so the vector-cache wait does. */
-    const RopePos rp = rope_pos(p.pos, blockIdx.x, p.plane, p.rscale);
+     * loads; the row's own columns behind it are the launch in front's. The wait stays the scalar
+     * one: the audit counts the struct's kernarg reloads behind it as scalar loads ("scalar loads
+     * behind the acquire: 4"), so the flush it does goes too. */
+    const RopePos rp = rope_pos(p.pos, blockIdx.x, p.plane, p.rscale, p.n_sec);
     const int32_t slot = p.slot[blockIdx.x];
-    if (CH::on) r4d_chain_wait_vec();
+    if (CH::on) r4d_chain_wait();
     rmsnorm_body<WF32, kThreads>(p.row, p.gain, p.row, p.L, p.eps, 0.0f, 1.0f, p.pitch, p.pitch,
                                  gridDim.x);
     __syncthreads();
