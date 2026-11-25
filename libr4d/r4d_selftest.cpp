@@ -10212,9 +10212,12 @@ static void rope_chain_case(const Plugin& pl) {
 
         const RadTensor pt = c.comps > 1 ? T(d_pos, RAD_I32, { c.comps, c.M })
                                          : T(d_pos, RAD_I32, { c.M });
+        /* The input, kept aside: the loop below replaces `x` with the plain launch's output, and the
+         * chained launch must start from the same rows, not from rows already turned once. */
+        const std::vector<uint16_t> in = x;
         int64_t diff = -1;
         for (int chain = 0; chain < 2; ++chain) {
-            st_memcpy(d_x[chain], x.data(), x.size() * 2, hipMemcpyHostToDevice);
+            st_memcpy(d_x[chain], in.data(), in.size() * 2, hipMemcpyHostToDevice);
             std::vector<RadTensor> ts = { T(d_x[chain], RAD_BF16, { c.M, row }), pt };
             std::vector<RadParam> ps = { PI("M", c.M), PI("head_dim", hd), PI("n_head", n_head),
                                          PI("n_head_kv", nkv), PF("theta", (double)theta),
@@ -10231,7 +10234,7 @@ static void rope_chain_case(const Plugin& pl) {
                 return st_stream_sync(nullptr) == hipSuccess ? RAD_OK : RAD_E_STATE;
             }();
             if (rc != RAD_OK) { diff = -1; break; }
-            std::vector<uint16_t> got(x.size());
+            std::vector<uint16_t> got(in.size());
             st_memcpy(got.data(), d_x[chain], got.size() * 2, hipMemcpyDeviceToHost);
             if (!chain) { x = got; continue; }
             diff = 0;
@@ -10240,8 +10243,6 @@ static void rope_chain_case(const Plugin& pl) {
         if (diff < 0) { ok(what_c.c_str(), false, "launch failed"); continue; }
         /* `x` now holds the plain launch's bytes; the chained run had to reproduce them. */
         ok(what_c.c_str(), diff == 0, "bytes differing: " + std::to_string(diff));
-        for (int k = 0; k < 2; ++k) if (d_x[k]) st_free(d_x[k]);
-        if (d_pos) st_free(d_pos);
     }
 }
 
