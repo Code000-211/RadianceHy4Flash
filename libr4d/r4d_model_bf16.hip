@@ -650,6 +650,22 @@ __device__ __forceinline__ int rope_comp(int mode, uint32_t i, const int* sec, i
     return c;
 }
 
+/* The step's rotary position for one token, read once (K-29): p[0] is pos[m] and, with a component
+ * pitch, p[c] is pos[c * plane + m] for the multi-component modes. rope_body takes it instead of
+ * reading `pos` itself, so that a chained block can read it in front of its wait (r4d_chain.h) and
+ * the wait covers the round trip. Both values are rope_body's own expression, so the bytes are the
+ * same whichever side of the wait the read happens. */
+struct RopePos { float p[3]; };
+__device__ __forceinline__ RopePos rope_pos(const int32_t* __restrict__ pos, uint32_t m,
+                                            uint32_t plane, float rscale) {
+    const float div = rscale != 0.0f ? rscale : 1.0f;
+    RopePos r;
+    r.p[0] = (float)pos[m] / div;
+    r.p[1] = plane ? (float)pos[(size_t)plane + m] / div : r.p[0];
+    r.p[2] = plane ? (float)pos[(size_t)2 * (size_t)plane + m] / div : r.p[0];
+    return r;
+}
+
 // r4dchain_rope is the chained form (r4d_chain.h), taken at decode heights.
 #define R4D_ROPE_PARAMS                                                                          \
     uint16_t* __restrict__ qkv, const int32_t* __restrict__ pos, uint32_t head_dim,              \
@@ -659,11 +675,9 @@ __device__ __forceinline__ int rope_comp(int mode, uint32_t i, const int* sec, i
 #define R4D_ROPE_ARGS                                                                            \
     qkv, pos, head_dim, n_rope_heads, rot, nfreq, den, gptj, theta, rscale, row_pitch, mode, s0, \
     s1, s2, n_sec, plane, yarn, l3
-__device__ __forceinline__ void rope_body(R4D_ROPE_PARAMS) {
+__device__ __forceinline__ void rope_body_at(R4D_ROPE_PARAMS, const RopePos& rp) {
     const uint32_t m = blockIdx.x;
     const uint32_t half = rot / 2;
-    const float div = rscale != 0.0f ? rscale : 1.0f;
-    const float p0 = (float)pos[m] / div;
     const int sec[3] = { s0, s1, s2 };
 
     for (uint32_t t = threadIdx.x + blockIdx.y * kThreads; t < n_rope_heads * half;
@@ -671,11 +685,11 @@ __device__ __forceinline__ void rope_body(R4D_ROPE_PARAMS) {
         const uint32_t h = t / half, i = t % half;
         uint16_t* __restrict__ hd = qkv + (size_t)m * row_pitch + (size_t)h * head_dim;
         float inv = 1.0f / powf(theta, (float)(2 * i) / (float)den);
-        float p = p0;
+        float p = rp.p[0];
         if (plane) {
             uint32_t j = i;
             const int c = rope_comp(mode, i, sec, n_sec, &j);
-            p = (float)pos[(size_t)c * plane + m] / div;
+            p = rp.p[c];
             if (mode == 4)
                 inv = 1.0f / powf(theta, (float)(2 * j) / (float)(2 * sec[c]));
         }
@@ -696,12 +710,19 @@ __device__ __forceinline__ void rope_body(R4D_ROPE_PARAMS) {
         hd[i1] = f32_to_bf16(x0 * s + x1 * c);
     }
 }
+__device__ __forceinline__ void rope_body(R4D_ROPE_PARAMS) {
+    rope_body_at(R4D_ROPE_ARGS, rope_pos(pos, blockIdx.x, plane, rscale));
+}
 __global__ __launch_bounds__(kThreads) void rope_kernel(R4D_ROPE_PARAMS) {
     rope_body(R4D_ROPE_ARGS);
 }
 __global__ __launch_bounds__(kThreads) void r4dchain_rope(R4D_ROPE_PARAMS) {
-    r4d_chain_wait();
-    rope_body(R4D_ROPE_ARGS);
+    /* K-29: the token's position in front of the wait, which then covers its load; only the qkv row
+     * behind it is the launch in front's. Nothing behind the wait is a scalar load
+     * (tests/chain_scalar_audit.py), so the vector-cache wait does. */
+    const RopePos rp = rope_pos(pos, blockIdx.x, plane, rscale);
+    r4d_chain_wait_vec();
+    rope_body_at(R4D_ROPE_ARGS, rp);
     r4d_chain_done();
 }
 #undef R4D_ROPE_ARGS

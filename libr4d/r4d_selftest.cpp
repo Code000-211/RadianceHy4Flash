@@ -9772,6 +9772,79 @@ static void rope_ladder_case(const Plugin& pl) {
     }
 }
 
+/* rope_bf16's chained form against the plain launch, byte for byte: the chained kernel reads the
+ * step's position in front of its chain wait (K-29), so every byte of the row has to come out the
+ * same. Both widths the body has: a plain neox one and the multi-component (imrope) one, whose
+ * position is the three-component table rope_pos reads component by component. */
+static void rope_chain_case(const Plugin& pl) {
+    const char* what = "rope's chained form against the plain launch, byte for byte";
+    const RadKernelInfo* r = find(pl, "rope_bf16");
+    if (!r) { ok(what, false, "row absent"); return; }
+
+    const int64_t hd = 64, rot = 64, n_head = 3, nkv = 1;
+    const int64_t row = (n_head + 2 * nkv) * hd;
+    const float theta = 10000.0f;
+    struct C { int64_t M; bool imrope; const char* mode; };
+    const C cs[] = { { 6, false, "neox" }, { 6, true, "imrope_gptj" }, { 1, false, "neox" } };
+
+    for (const C& c : cs) {
+        const std::string what_c = fmt("%s: M %lld%s", what, (long long)c.M,
+                                       c.imrope ? ", imrope" : "");
+        std::vector<uint16_t> x((size_t)(c.M * row));
+        for (size_t i = 0; i < x.size(); ++i) {
+            float v = (float)(((i * 7) % 23) - 11) / 13.0f;
+            if (i % 11 == 0) v *= 3.0f;
+            x[i] = h_to_bf16(v);
+        }
+        /* The position of row m is its own in every component, so a wrong component shows. */
+        std::vector<int32_t> pos((size_t)(c.M * (c.imrope ? 3 : 1)));
+        for (int64_t m = 0; m < c.M; ++m) {
+            pos[(size_t)m] = (int32_t)(3 + 5 * m);
+            if (c.imrope) {
+                pos[(size_t)(c.M + m)] = (int32_t)(100 + 7 * m);
+                pos[(size_t)(2 * c.M + m)] = (int32_t)(900 + 11 * m);
+            }
+        }
+        void* d_x[2];
+        for (int k = 0; k < 2; ++k) d_x[k] = dalloc(x.size() * 2);
+        void* d_pos = dalloc(pos.size() * 4);
+        if (!d_x[0] || !d_x[1] || !d_pos) { ok(what_c.c_str(), false, "hipMalloc failed"); continue; }
+        st_memcpy(d_pos, pos.data(), pos.size() * 4, hipMemcpyHostToDevice);
+
+        const RadTensor pt = c.imrope ? T(d_pos, RAD_I32, { 3, c.M }) : T(d_pos, RAD_I32, { c.M });
+        int64_t diff = -1;
+        for (int chain = 0; chain < 2; ++chain) {
+            st_memcpy(d_x[chain], x.data(), x.size() * 2, hipMemcpyHostToDevice);
+            std::vector<RadTensor> ts = { T(d_x[chain], RAD_BF16, { c.M, row }), pt };
+            std::vector<RadParam> ps = { PI("M", c.M), PI("head_dim", hd), PI("n_head", n_head),
+                                         PI("n_head_kv", nkv), PF("theta", (double)theta),
+                                         PF("scale", 1.0), PS("mode", c.mode),
+                                         PI("rotary_dim", rot) };
+            if (c.imrope) ps.push_back(PS("sections", "11 11 10"));
+            if (chain) ps.push_back(PI("chain", 1));
+            const int rc = [&] {
+                RadArgs a;
+                std::memset(&a, 0, sizeof a);
+                a.t = ts.data(); a.n_t = (int)ts.size();
+                a.p = ps.data(); a.n_p = (int)ps.size();
+                if (r->launch(&a, (RadStream)nullptr) != RAD_OK) return RAD_E_STATE;
+                return st_stream_sync(nullptr) == hipSuccess ? RAD_OK : RAD_E_STATE;
+            }();
+            if (rc != RAD_OK) { diff = -1; break; }
+            std::vector<uint16_t> got(x.size());
+            st_memcpy(got.data(), d_x[chain], got.size() * 2, hipMemcpyDeviceToHost);
+            if (!chain) { x = got; continue; }
+            diff = 0;
+            for (size_t i = 0; i < got.size(); ++i) diff += got[i] != x[i];
+        }
+        if (diff < 0) { ok(what_c.c_str(), false, "launch failed"); continue; }
+        /* `x` now holds the plain launch's bytes; the chained run had to reproduce them. */
+        ok(what_c.c_str(), diff == 0, "bytes differing: " + std::to_string(diff));
+        for (int k = 0; k < 2; ++k) if (d_x[k]) st_free(d_x[k]);
+        if (d_pos) st_free(d_pos);
+    }
+}
+
 /* ---- the two fp8 fusions, against the pair each one replaces -------------------------------- */
 //
 // Byte-identical, so the comparison is against the unfused kernels, not a host mirror: generated
@@ -37945,6 +38018,11 @@ static void device_phase(const Plugin& pl) {
     if (sel("rope_bf16")) {
         if (!g_case) std::printf("\nthe rotary ladder, against an f32 mirror of the kernel at each width\n");
         rope_ladder_case(pl);
+    }
+
+    if (sel("rope_bf16")) {
+        if (!g_case) std::printf("\nthe rotary's chained form, against the plain launch\n");
+        rope_chain_case(pl);
     }
 
     if (sel("grid_embed_sf_bf16")) {
