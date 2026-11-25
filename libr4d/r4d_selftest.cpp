@@ -3672,6 +3672,10 @@ static void moe_gather_case(const Plugin& pl) {
     // the wave-per-token form now takes it, timed against a column a thread.
     for (bool shared : { false, true })
         moe_gather_at(pl, r, { 2048, 1536, 8, shared ? "none" : nullptr, true }, true);
+    // the same chunk as the served block routes it -- 1984 rows of sixteen slots -- where sixteen
+    // slots is outside f32's window: the wave form must refuse the pin and the rule keep the
+    // sixteen-slot form (the timing of both at that geometry is in the i8g case below).
+    moe_gather_at(pl, r, { 1984, 1536, 16, nullptr, false }, true);
 }
 
 /* ------------------------------------------------------- the vocab-parallel top-R, end to end
@@ -23823,18 +23827,19 @@ static void moefuse_gather(const Plugin& pl, int64_t rows, bool slice, int iters
  * gathered rows byte for byte, and the int8 codes and f32 scales those two write over them (the
  * row's contract: "the codes are the ones had_quant_act_i8g would write from `y`"). The op picks
  * its wave form from the shape -- the sixteen-slot one at a decode height, the wide
- * 256-column-wave one at 40 rows with bf16 routing weights -- and `pin` forces one where a lane
+ * 256-column-wave one at 40 rows with either weight dtype -- and `pin` forces one where a lane
  * wants a form the shape would not pick. No shared arm: this form has none, so the pair runs
  * `moe_gather_inv`'s shared arm with a zero gate (its rows are still read, its sum adds nothing).
  * Timed, the pair and the one launch alone. */
 static void moefuse_gather_q8(const Plugin& pl, int64_t rows, int64_t g8, bool f32w, int pin,
-                             int iters) {
+                             int iters, int64_t n = 4096) {
     const bool check = iters < 0;
     if (iters == 0) iters = 200;
     const char* what = "moe_gather_inv_i8g";
-    const std::string lbl = fmt("%s, group %lld%s", what, (long long)g8,
+    const std::string shape = n == 4096 ? "" : fmt(", n %lld", (long long)n);
+    const std::string lbl = fmt("%s, group %lld%s%s", what, (long long)g8, shape.c_str(),
                                 pin ? fmt(", form %d", pin).c_str() : "");
-    const int64_t ne = 288, k = 16, n = 4096, nkb = n / g8, slots = rows * k;
+    const int64_t ne = 288, k = 16, nkb = n / g8, slots = rows * k;
     const RadKernelInfo* gi = find(pl, "moe_gather_inv_bf16");
     const RadKernelInfo* gq = find(pl, "moe_gather_inv_i8g");
     const RadKernelInfo* qz = find(pl, "had_quant_act_i8g");
@@ -23920,8 +23925,10 @@ static void moefuse_gather_q8(const Plugin& pl, int64_t rows, int64_t g8, bool f
     for (int f = 0; f < 2; ++f) for (int j = 0; j < 3; ++j) st_memset(o[f][j], 0xa5, sz3[j]);
     pin_form(pin);
     const int orc = pair_new(), nrc = fused_new();
-    pin_form(0);
     const bool ran = orc == RAD_OK && nrc == RAD_OK && st_stream_sync(nullptr) == hipSuccess;
+    const double us_po = st_time_us([&](int) { pair_new(); }, iters, nullptr);
+    const double us_pn = st_time_us([&](int) { fused_new(); }, iters, nullptr);
+    pin_form(0);
     bool same = ran;
     int first = -1;
     for (int j = 0; j < 3 && ran; ++j)
@@ -23937,8 +23944,6 @@ static void moefuse_gather_q8(const Plugin& pl, int64_t rows, int64_t g8, bool f
         return;
     }
     if (!ran) { std::printf("--perfmoefuse: %s launch failed (rc %d / %d)\n", lbl.c_str(), orc, nrc); return; }
-    const double us_po = st_time_us([&](int) { pair_new(); }, iters, nullptr);
-    const double us_pn = st_time_us([&](int) { fused_new(); }, iters, nullptr);
     fuse_line(fmt("gather + had_quant_act_i8g g%lld", (long long)g8).c_str(), us_po, us_pn, same);
 }
 
@@ -23951,8 +23956,8 @@ static void moefuse_perf(const Plugin& pl, int64_t rows, int iters) {
     moefuse_router(pl, rows, 0, iters);
     moefuse_router(pl, rows, 0, iters, true);
     moefuse_gather(pl, rows, false, iters);
-    /* the quantising gather: the sixteen-slot form at `rows`, the wide one at 40 (M > 32 with bf16
-     * weights), each form pinned at 40, and f32 routing weights (which offer only the sixteen) */
+    /* the quantising gather: the sixteen-slot form at `rows`, the wide one at 40 (M > 32, either
+     * weight dtype), each form pinned at 40, and f32 routing weights */
     moefuse_gather_q8(pl, rows, 128, false, 0, iters);
     if (rows <= 32) {
         moefuse_gather_q8(pl, 40, 128, false, 0, iters);
@@ -38774,7 +38779,8 @@ static void device_phase(const Plugin& pl) {
     }
     if (sel("moe_gather_inv_i8g")) {
         /* both groups an IQ8R trunk or an ordinary one takes, both weight dtypes (bf16 offers the
-         * wide form above the self-scan height, f32 only the sixteen-slot one), and each pin. */
+         * wide form above the self-scan height; f32 only up to eight slots a row, K-45), and each
+         * pin. */
         for (int64_t rows : { 1, 6, 48, 65, 256 })
             for (int64_t g8 : { (int64_t)128, (int64_t)256 })
                 for (bool f32w : { false, true }) moefuse_gather_q8(pl, rows, g8, f32w, 0, -1);
@@ -38782,6 +38788,16 @@ static void device_phase(const Plugin& pl) {
             moefuse_gather_q8(pl, 40, 128, false, pin, -1);
             moefuse_gather_q8(pl, 40, 256, true, 3, -1);
         }
+        /* Hy4-flash's own gather at a prefill chunk (K-45): 1984 rows of sixteen slots, its latent
+         * width 1536, group 128 and f32 routing weights -- above the self-scan height, but sixteen
+         * slots is outside f32's window, so the rule keeps the sixteen-slot column form. Checked
+         * byte for byte, then timed against both forms pinned: 182 us the rule, 290 us the wave
+         * form, which is why f32's window ends at eight slots. */
+        moefuse_gather_q8(pl, 1984, 128, true, 0, -1, 1536);
+        moefuse_gather_q8(pl, 1984, 128, true, 0, 0, 1536);
+        /* and each of the two forms pinned there, so the served shape's own choice can be seen */
+        moefuse_gather_q8(pl, 1984, 128, true, 2, 0, 1536);
+        moefuse_gather_q8(pl, 1984, 128, true, 3, 0, 1536);
     }
     if (sel("moe_scatter_inv_i32") || sel("moe_gather_inv_bf16")) {
         /* 512 slots is moe_gather's self-scan bound, 1024 the sort's one workgroup. */

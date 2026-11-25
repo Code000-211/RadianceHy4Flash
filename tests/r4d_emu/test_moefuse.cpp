@@ -769,7 +769,7 @@ void gather_quant_launcher_cases(std::mt19937& rng, int& cases, int& fails) {
         { 48, 512, 256, 0, false, true },
         { 48, 2560, 128, 3, false, false },   /* the sixteen-slot form, pinned at prefill */
         { 48, 512, 128, 2, false, true },     /* the wide form, pinned */
-        { 48, 512, 128, 2, true, true },      /* ... with f32 routing weights (K-45) */
+        { 48, 512, 128, 0, true, false },     /* f32 weights: outside their window, the column form */
     };
     const int k = 16, ne = 288;
     const float s_poison = -1234.5f;
@@ -965,17 +965,20 @@ void gather_wide_cases(std::mt19937& rng, int& cases, int& fails) {
         int M, n, nl, base, shared, pin; /* pin: 0 the launcher's rule, 2 the wide form */
         bool f32w;                       /* the router's scales, as Hy4-flash has them */
         bool wide;                       /* the form the launcher must run */
+        int k = 8;                       /* slots a row */
     };
     const WideShape shapes[] = {
         { 65, 1536, 288, 0, 1, 0, true, true },     /* Hy4's chunk, the rule's own choice */
         { 65, 1536, 288, 0, 2, 2, true, true },     /* pinned, a sigmoid-gated shared arm */
         { 65, 1536, 288, 0, 0, 2, true, true },     /* pinned, no shared expert */
         { 65, 1536, 288, 0, 1, 2, false, true },    /* pinned, bf16 scales (unchanged) */
+        { 65, 1536, 288, 0, 1, 0, true, false, 16 }, /* sixteen slots: f32's window ends at 8 */
+        { 65, 1536, 288, 0, 1, 0, false, true, 16 }, /* ... which bf16's does not (K-45) */
         { 65, 2048, 256, 64, 2, 2, true, true },    /* a slice: the slots outside it are dropped */
         { 65, 512, 288, 0, 1, 0, true, true },      /* a narrow chunk */
         { 8, 1536, 288, 0, 1, 0, true, false },     /* a decode height: the scalar form */
     };
-    const int k = 8, ne = 288;
+    const int ne = 288;
     std::normal_distribution<float> nd(0.f, 1.f);
     auto mat = [](void* d, uint32_t dt, int64_t r, int64_t c, int64_t ld) {
         RadTensor t{};
@@ -998,7 +1001,7 @@ void gather_wide_cases(std::mt19937& rng, int& cases, int& fails) {
         return t;
     };
     for (const WideShape& sh : shapes) {
-        const int M = sh.M, n = sh.n, T = M * k;
+        const int M = sh.M, n = sh.n, k = sh.k, T = M * k;
         std::vector<int32_t> ids((size_t)T);
         for (int r = 0; r < M; ++r) {
             std::vector<int32_t> pool(ne);
@@ -1097,14 +1100,18 @@ void gather_wide_cases(std::mt19937& rng, int& cases, int& fails) {
     struct Refuse {
         const char* what;
         int M, n, want;
+        int k = 8;
     };
     const Refuse refusals[] = {
         { "the wave-per-token form at a decode height", 8, 1536, RAD_E_UNSUPPORTED },
         { "the wave-per-token form at a width eight-column pieces do not tile", 65, 1532,
           RAD_E_UNSUPPORTED },
+        /* K-45: sixteen slots a row is outside f32's window, so pinning the wave form there is a
+         * refusal and the rule keeps the sixteen-slot column form (case above) */
+        { "f32 weights at sixteen slots a row", 65, 1536, RAD_E_UNSUPPORTED, 16 },
     };
     for (const Refuse& rf : refusals) {
-        const int M = rf.M, n = rf.n, T = M * k;
+        const int M = rf.M, n = rf.n, k = rf.k, T = M * k;
         std::vector<int32_t> ids((size_t)T, 0);
         Scatter plain = scatter_kernel(ids, ne, 0, nullptr, true);
         std::vector<int32_t> table = inverse_of(plain.sorted);

@@ -2259,6 +2259,13 @@ __global__ void gather_scatter_kernel(const int32_t* __restrict__ sorted,
  */
 constexpr uint32_t kGatherWideSlots = 16;      /* top_k at most this: the slots live in registers */
 constexpr uint32_t kGatherWideCols  = 8;       /* columns a lane, one sixteen-byte load */
+/* f32 scales take the wave form only up to this many slots a row (K-45, measured): at Hy4-flash's
+ * width the wave form is the faster one at eight slots (2048 rows x 1536 columns, 16384 routed
+ * rows: 57.3 us against the column form's 141.7 us) and the slower one at sixteen, where the
+ * served lane's i8g gather costs 289.7 us a layer in it against 182.4 us in the sixteen-slot form
+ * (1984 rows, 31744 routed rows). bf16 keeps the whole sixteen-slot window it had. */
+constexpr uint32_t kGatherWideF32Slots = 8;
+static_assert(kGatherWideF32Slots <= kGatherWideSlots, "a window inside the other");
 static_assert(kGatherWideSlots <= kWave, "slot j is read off lane j");
 
 template <uint32_t NW, bool F32 = false, bool Q = false>
@@ -3533,14 +3540,16 @@ static int moe_gather_body(const RadArgs* a, RadStream s, bool given, bool quant
     }
 
     /* The prefill form (gather_wide_kernel, a wave per token, sixteen bytes per lane) past the
-     * self-scan bound, where top_k fits kGatherWideSlots and every row is 16-byte aligned, at bf16
-     * and f32 scales alike (Hy4-flash's router writes f32, K-45). Same sums as gather_kernel,
-     * which serves everything else. */
+     * self-scan bound, where top_k fits the form's window and every row is 16-byte aligned, at bf16
+     * scales and -- up to kGatherWideF32Slots, the window it wins in -- f32 ones too (Hy4-flash's
+     * router writes f32, K-45). Same sums as gather_kernel, which serves everything else. */
     auto al16 = [](const void* p, long long ld) {
         return ((uintptr_t)p % 16) == 0 && ld % (long long)kGatherWideCols == 0;
     };
+    const long long wide_slots = ew->dtype == RAD_F32 ? (long long)kGatherWideF32Slots
+                                                     : (long long)kGatherWideSlots;
     const bool wide_ok = (ew->dtype == RAD_BF16 || ew->dtype == RAD_F32) && !small &&
-                         top_k <= (long long)kGatherWideSlots &&
+                         top_k <= wide_slots &&
                          n % (long long)kGatherWideCols == 0 && al16(ye->data, ye_ld) &&
                          al16(Y->data, y_ld) && (!sh || al16(sh->data, sh_ld));
     /* The sixteen-slot form (gather_kernel16, eight columns a lane, one sixteen-byte load a slot):
@@ -3570,11 +3579,12 @@ static int moe_gather_body(const RadArgs* a, RadStream s, bool given, bool quant
                            sh ? (const uint16_t*)sg->data : nullptr,                             \
                            (uint32_t)sh_ld, (uint32_t)sg_ld, sig, qp, sp,                        \
                            (uint32_t)q_ld, (uint32_t)s_ld, (uint32_t)g8)
-        if (ew->dtype == RAD_F32) {
-            if (quant) { R4D_MGW(gather_wide_kernel<NW, true, true>); }
-            else       { R4D_MGW(gather_wide_kernel<NW, true>); }
-        } else if (quant) {
+        /* The quantising form has no scalar and no shared arm; it is sixteen slots a row by its
+         * band's own constraint, which is outside f32's window, so it is bf16's alone. */
+        if (quant) {
             R4D_MGW(gather_wide_kernel<NW, false, true>);
+        } else if (ew->dtype == RAD_F32) {
+            R4D_MGW(gather_wide_kernel<NW, true>);
         } else {
             R4D_MGW(gather_wide_kernel<NW>);
         }
