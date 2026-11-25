@@ -395,6 +395,9 @@ extern "C" int r4d_rad_engram_ids(const RadArgs* a, RadStream s) {
                                          : R4D_EGI_K(false, R4dUnchained));
 #undef R4D_EGI_K
     if (rc != RAD_OK) return rc;
+    /* `advance` 0: the window was read, not moved on -- an Engram layer that shares another's
+     * history and is not the last of the step's. */
+    if (r4d_geti_or(a, "advance", 1) == 0) return RAD_OK;
     const dim3 sg((uint32_t)((p.n_seq + 63) / 64));
     return ch ? R4D_EMIT(s, (engram_state_kernel<r4dchain>), sg, dim3(64), 0, p)
               : R4D_EMIT(s, (engram_state_kernel<R4dUnchained>), sg, dim3(64), 0, p);

@@ -396,9 +396,12 @@ static void mla_kv() {
 static void engram_ids() {
     const int64_t heads = 4, ngram = 3, pad = 90, msize = 100, image = 95, video = 96;
     /* Form 4: a prefill whose last sequence hashes three tokens of its following prompt into
-     * `ahead_ids` (the read-ahead), `tok` running on past the step's rows. */
-    for (int form = 0; form < 5; ++form) {
-        const bool decode = form & 1, wide = form & 2, ahd = form == 4;
+     * `ahead_ids` (the read-ahead), `tok` running on past the step's rows. Forms 5 and 6 are the
+     * same two forms with `advance` 0: the four Engram layers of Hy4-flash share one window, and
+     * every layer but the last of a step hashes it without committing to it -- so the window is an
+     * input here, and a byte of it written fails the case. */
+    for (int form = 0; form < 7; ++form) {
+        const bool decode = form & 1, wide = form & 2, ahd = form == 4, adv = form >= 5;
         const int64_t A = ahd ? 3 : 0;
         const int64_t S = 3, W = decode ? 4 : 2;
         const std::vector<int64_t> Ts = decode ? std::vector<int64_t>{ 3, 1, 2 } : std::vector<int64_t>{ 4, 1, 3 };
@@ -413,7 +416,7 @@ static void engram_ids() {
         });
         ops.push_back(opd(RAD_I32, { 4, W }));
         fill(ops[1], [&](int64_t) { return (double)rng.r(90); });
-        ops[1].out = true;
+        ops[1].out = !adv;
         std::vector<int> cu = { 0 };
         for (int64_t t : Ts) cu.push_back(cu.back() + (int)t);
         ops.push_back(opd(RAD_I32, { S + 1 }));
@@ -452,9 +455,11 @@ static void engram_ids() {
         }
         std::vector<RadParam> p = { pi("M", M), pi("heads", heads), pi("ngram", ngram), pi("pad", pad),
                                     pi("map_size", msize), pi("image", image), pi("video", video) };
-        char w[100];
-        std::snprintf(w, sizeof w, "engram_ids %s%s, ids i%d, bit for bit", decode ? "decode" : "prefill",
-                      ahd ? " with ahead_ids" : "", wide ? 64 : 32);
+        if (adv) p.push_back(pi("advance", 0));
+        char w[120];
+        std::snprintf(w, sizeof w, "engram_ids %s%s, ids i%d%s, bit for bit", decode ? "decode" : "prefill",
+                      ahd ? " with ahead_ids" : "", wide ? 64 : 32,
+                      adv ? ", advance 0 (the window left as it was)" : "");
         check("engram_ids", r4d_rad_engram_ids, w, p, ops);
     }
 }
