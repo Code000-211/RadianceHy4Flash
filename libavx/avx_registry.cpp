@@ -126,8 +126,8 @@ static const RadParamSpec pHcWrite[]   = { P_INT("M"), P_INT("n"), P_INT("hc"), 
 static const RadOperandSpec oHcEnter[] = { OPD("x"), OUT("h") };
 static const RadOperandSpec oHcWrite[] = { OPD("y"), OPD("inj"), INOUT("h") };
 /* The control vector's projection: one unit direction per layer (f32) and an int32 per-row switch. */
-static const RadParamSpec pHcProject[] = { P_INT("M"), P_INT("n"), P_INT("hc"), P_F64("scale"),
-                                           P_STR("dtype") };
+static const RadParamSpec pHcProject[] = { P_INT("M"), P_INT("n"), P_INT("hc"), P_INTO("vsep"),
+                                           P_F64("scale"), P_STR("dtype") };
 static const RadOperandSpec oHcProject[] = { INOUT("h"), OPD("v"), OPD("on") };
 
 static const RadParamSpec pMtpEnter[]   = { P_INT("M"), P_INT("n"), P_INT("hc"), P_F64("eps"),
@@ -1464,6 +1464,8 @@ static const RadOpSchema kSchemas[] = {
   "grouped GEMM over the expert-sorted rows, quantised operands, four classes by number mod 4." },
 { "moe_gather", ARR(pMoeGather), ARR(oMoeGather), "weighted scatter back to token order." },
 { "row_topk", ARR(pRowTopk), ARR(oRowTopk), "exact per-row top-R." },
+{ "cast_row_topk", ARR(pRowTopk), ARR(oRowTopk),
+  "row_topk over an f32 plane rounded to bf16 as `cast` rounds it: the cast then row_topk, fused." },
 { "row_topk_merge", ARR(pRowTopkMerge), ARR(oRowTopkMerge),
   "the global top-R of the gathered per-rank candidate sets." },
 { "pair_argmax", ARR(pPairArgmax), ARR(oPairArgmax),
@@ -1877,8 +1879,8 @@ ROWL("avx_hc_read", "hc_read", "norm",
 SIMPLE("avx_hc_write", "hc_write", "norm", "gated residual write: h[s] += inj[s] * y", DT_FLOAT,
        L(hc_write)),
 SIMPLE("avx_hc_project", "hc_project", "norm",
-       "control vector: h[s] -= scale * (h[s] . v) * v where the row's flag is on", DT_FLOAT,
-       L(hc_project)),
+       "control vector: h[s] -= scale * (h[s] . v_s) * v_s where the row's flag is on; vsep 0 is "
+       "one shared v, vsep n is a per-stream table", DT_FLOAT, L(hc_project)),
 ROWL("avx_mtp_enter", "mtp_enter", "norm",
      "MTP head entry: two norms, a per-sub-stream fc and a broadcast fc",
      DT_FLOAT ", or fc matrices of E4M3 / int8 codes with a scale plane, joined", L(mtp_enter),
@@ -2191,6 +2193,7 @@ ROW_CB("avx_moe_gemm_q_mod4", "moe_gemm_q_mod4", "moe",
 SIMPLE("avx_moe_gather", "moe_gather", "moe", "weighted scatter back to token order", DT_FLOAT,
        L(moe_gather)),
 SIMPLE("avx_row_topk", "row_topk", "moe", "exact per-row top-R", DT_FLOAT, L(row_topk)),
+SIMPLE("avx_cast_row_topk", "cast_row_topk", "moe", "row_topk over an f32 plane rounded to bf16 (cast then row_topk)", "f32 in, f32 values + i32 columns out", L(cast_row_topk)),
 SIMPLE("avx_row_topk_merge", "row_topk_merge", "moe",
        "the global top-R of the gathered per-rank candidate sets", DT_FLOAT, L(row_topk_merge)),
 SIMPLE("avx_pair_argmax", "pair_argmax", "moe",

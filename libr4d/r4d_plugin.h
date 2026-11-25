@@ -579,6 +579,7 @@ int r4d_rad_gemm_mxfp4a8_gemv(const RadArgs*, RadStream);
  * plane more (r4d_layout.cpp, m2xfp4). */
 int r4d_rad_dequant_w4      (const RadArgs*, RadStream);
 int r4d_rad_rowtopk         (const RadArgs*, RadStream);
+int r4d_rad_cast_rowtopk    (const RadArgs*, RadStream);
 int64_t r4d_rad_rowtopk_scratch(const RadArgs*);
 int r4d_rad_rowtopk_merge   (const RadArgs*, RadStream);
 int r4d_rad_logit_rerank_i8 (const RadArgs*, RadStream);

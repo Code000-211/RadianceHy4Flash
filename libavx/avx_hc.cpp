@@ -348,14 +348,21 @@ AVX_KERNEL(hc_project) {
     const int64_t n  = p_int(a, "n", 0);
     const int64_t hc = p_int(a, "hc", 0);
     const float   sc = p_f32(a, "scale", 1.0f);
-    if (n <= 0 || hc <= 1 || numel(v) < n) return RAD_E_SHAPE;
+    /* vsep selects the direction layout: 0 is one direction shared by every stream, n is a
+     * per-stream table [hc, n]. The row count must match, so neither can be read as the other. */
+    const int64_t vsep = p_int(a, "vsep", 0);
+    if (vsep != 0 && vsep != n) return RAD_E_INVAL;
+    const int64_t vrows = vsep != 0 ? hc : 1;
+    if (n <= 0 || hc <= 1 || numel(v) < vrows * n) return RAD_E_SHAPE;
     const int64_t hn = hc * n;
     const int64_t rows = numel(h) / hn;
     if (rows <= 0 || numel(on) < rows) return RAD_E_SHAPE;
 
+    /* One copy of the whole table (one row, or hc rows for a per-stream package) up front: the
+     * loop below is parallel over rows * streams and must not touch shared scratch. */
     const int64_t vb = rowoff(v, 0, n);
-    float* vbuf = scratch_f32_c((size_t) n);
-    const float* vec = in_row(v, vb, n, vbuf);
+    float* vbuf = scratch_f32_c((size_t) (vrows * n));
+    const float* vtab = in_row(v, vb, vrows * n, vbuf);
 
     AVX_PARALLEL_FOR_IF(rows * hn >= AVX_PAR_MIN)
     for (int64_t k = 0; k < rows * hc; ++k) {
@@ -363,6 +370,7 @@ AVX_KERNEL(hc_project) {
         if (ldi(on, offlin(on, r)) == 0) continue;
         const int64_t hb = rowoff(h, r, hn), hs = laststride(h);
         const int64_t base = hb + c * n;
+        const float* vec = vtab + (vsep != 0 ? c * n : 0);
         float* hv = scratch_f32((size_t) n);
         const float* row = in_row(h, base, n, hv);
         if (hs != 1) {

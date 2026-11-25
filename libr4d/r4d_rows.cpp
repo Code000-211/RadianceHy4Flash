@@ -589,8 +589,8 @@ static const RadOperandSpec oGdnConvRecurrentUpdateHad[] = {
 
 /* The control vector's projection (r4d_hc_bf16.hip, with the other gated-residual kernels): a bf16
  * stream, one unit f32 direction for every stream, an int32 switch per row. */
-static const RadParamSpec pHcProject[] = { P_INT("M"), P_INT("n"), P_INT("hc"), P_F64("scale"),
-                                           P_STR("dtype") };
+static const RadParamSpec pHcProject[] = { P_INT("M"), P_INT("n"), P_INT("hc"), P_INTO("vsep"),
+                                           P_F64("scale"), P_STR("dtype") };
 static const RadOperandSpec oHcProject[] = {
     { "h", RAD_OPD_INOUT, 0 }, { "v", RAD_OPD_IN, 0 }, { "on", RAD_OPD_IN, 0 },
 };
@@ -4013,10 +4013,11 @@ static const RadOpSchema kSchemas[] = {
            "the block-scaled fp8 form of the block input and its Hadamard-rotated twin."),
     SCHEMA("hc_project", pHcProject, oHcProject,
            "the control vector's projection (llama.cpp's `--cvec-mode project`): for each of the "
-           "hc streams of a row whose `on` flag is 1, h[s] -= scale * (h[s] . v) * v, v that "
-           "layer's unit direction -- the same v for every stream -- and scale its stored norm. A "
-           "row whose flag is 0 is neither read nor written, so an unprojected request's stream is "
-           "the stock model's."),
+           "hc streams of a row whose `on` flag is 1, h[s] -= scale * (h[s] . v_s) * v_s, v_s that "
+           "layer's unit direction for stream s -- one direction for every stream when `vsep` is "
+           "0, or a per-stream table [hc, n] when `vsep` is n -- and scale its stored norm. A row "
+           "whose flag is 0 is neither read nor written, so an unprojected request's stream is the "
+           "stock model's."),
     SCHEMA("hc_write", pHcPlain, oHcWrite,
            "the write half: h[s] += inj[s] * y, into the UNNORMED stream."),
     SCHEMA("mtp_enter", pMtpEnter, oMtpEnter,
@@ -4161,6 +4162,11 @@ static const RadOpSchema kSchemas[] = {
            "column reported so a rank's slice reports global ids, and `pairs` is the [M, R, 2] "
            "(int32 id, float value) plane an all_gather moves; a slot the row could not fill "
            "reports id -1 there and column 0 in `idx`, which is the unsharded contract unchanged."),
+    SCHEMA("cast_row_topk", pRowTopk, oRowTopk,
+           "row_topk over an f32 plane rounded to bf16, as `cast` f32 -> bf16 rounds it (to "
+           "nearest even, the cast's NaN rule included): the bytes of `cast` then row_topk at "
+           "dtype bf16, without the cast's launch or its bf16 plane. `dtype` is the plane's, f32; "
+           "`val` reports the rounded values."),
     SCHEMA("row_topk_merge", pRowTopkMerge, oRowTopkMerge,
            "the R largest of world_size all-gathered per-rank candidate sets, in the same "
            "descending (idx, val) form the single-rank top-R produces. `gathered` is "
@@ -5759,6 +5765,10 @@ static const RadConstraint cMoeGatherQ8[] = {
  * candidates over lanes can lose one. The merge and the rerank share the limit. */
 static const RadConstraint cRowTopK[] = {
     C_DIV("N", 8), C_GE("M", 1), C_GE("R", 1), C_LE("R", 32), C_IN("dtype", "bf16"),
+};
+/* cast_row_topk: row_topk's over the f32 plane `cast` would narrow. */
+static const RadConstraint cCastRowTopK[] = {
+    C_DIV("N", 8), C_GE("M", 1), C_GE("R", 1), C_LE("R", 32), C_IN("dtype", "f32"),
 };
 static const RadConstraint cRowTopKMerge[] = {
     C_GE("M", 1), C_GE("R", 1), C_LE("R", 32), C_GE("world_size", 1), C_IN("dtype", "bf16"),
@@ -10000,11 +10010,22 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
 
 { "rowtopk_bf16", "row_topk", "select",
   "exact per-row top-R of a bf16 matrix, descending, ties to the lower column",
-  "any M, N a multiple of 8, R <= 32; two launches, caller-sized partial buffer",
+  "any M, N a multiple of 8, R <= 32; one launch at R <= 16 (stage 2 in the last wave), two "
+  "above; caller-sized partial buffer",
   "bf16 in, f32 values + i32 columns out",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cRowTopK), ROW(tTopk), nullptr,
   nullptr, nullptr, r4d_rad_rowtopk, r4d_rad_rowtopk_scratch, nullptr, nullptr,
+  r4d_shape_row_topk },
+
+{ "cast_rowtopk_f32", "cast_row_topk", "select",
+  "rowtopk_bf16 over an f32 matrix rounded to bf16 as it is read: cast f32 -> bf16 then row_topk, "
+  "in one or two launches and no bf16 plane",
+  "rowtopk_bf16's: any M, N a multiple of 8, R <= 32; one launch at R <= 16, two above",
+  "f32 in, f32 values (bf16-rounded) + i32 columns out",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cCastRowTopK), ROW(tTopk), nullptr,
+  nullptr, nullptr, r4d_rad_cast_rowtopk, r4d_rad_rowtopk_scratch, nullptr, nullptr,
   r4d_shape_row_topk },
 
 { "logit_rerank_i8", "logit_rerank", "select",
@@ -12181,7 +12202,7 @@ extern "C" int rad_kernel_chain(int i) {
          * selector */
         "sample_temp_f32", "sample_topk_f32", "sample_merge_topk_f32", "sample_pick_f32",
         "ar_gather_4rank", "gemm_w8a8_nt_m64", "rowtopk_bf16", "rowtopk_merge",
-        "dflash_select_bf16", "dflash_tree_bf16",
+        "cast_rowtopk_f32", "dflash_select_bf16", "dflash_tree_bf16",
         /* the weight read beside a collective (its blocks add before reading, r4d_prefetch.hip) */
         "prefetch",
         /* Flash-Next's decode pass: the connection's fused read, the fused router and the

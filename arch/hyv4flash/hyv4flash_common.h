@@ -576,16 +576,28 @@ inline bool taps_on() {
     return e && *e && std::strcmp(e, "0") != 0;
 }
 
+/* RADIANCE_HY4_CVEC_TAPS=1: only the control-vector derivation tap (dbg.cvec.<l>), without the
+ * rest of the harness tap set. That set is a PERSIST buffer a feature, and at 2048 rows it costs
+ * a ~12.4 GiB activation arena -- more than the cards have left after the weights. The cvec tap
+ * is shallow (one scroll of 192 rows) and costs ~4.7 MiB a layer. */
+inline bool cvec_taps_on() {
+    const char* e = std::getenv("RADIANCE_HY4_CVEC_TAPS");
+    return e && *e && std::strcmp(e, "0") != 0;
+}
+
 struct Tap {
     rad_buf buf = 0;
     rad_op op = 0;
     int64_t width = 0;
+    int64_t rows = 0;      /* rows the buffer holds; a step may copy fewer */
     explicit operator bool() const { return op != 0; }
-    /* `src` read [rows, width]; `width` 0 takes the tap's. */
+    /* `src` read [rows, width]; `width` 0 takes the tap's. `force` declares the tap even with
+     * RADIANCE_HY4_TAPS off (the cvec tap uses RADIANCE_HY4_CVEC_TAPS instead). */
     int declare(RadBuilder* b, Names& nm, int64_t max_rows, const char* key, int layer,
-                uint32_t dt, int64_t w, rad_buf src) {
-        if (!taps_on()) return RAD_OK;
+                uint32_t dt, int64_t w, rad_buf src, bool force = false) {
+        if (!taps_on() && !force) return RAD_OK;
         width = w;
+        rows = max_rows;
         const char* name = layer < 0 ? nm.f("dbg.%s", key) : nm.f("dbg.%s.%d", key, layer);
         buf = decl_b(b, name, dt, { max_rows, w }, RAD_BUF_PERSIST);
         if (!buf) return RAD_E_INVAL;
@@ -593,8 +605,9 @@ struct Tap {
         HY4_NEED(op, "the debug taps' copy (cast)");
         return RAD_OK;
     }
-    void step(RadCtx* c, RadOperand src, int64_t rows) const {
-        if (op && rows > 0) RAD_ISSUE_N(c, op, rows, src, brows(buf, rows));
+    void step(RadCtx* c, RadOperand src, int64_t nrows) const {
+        if (op && nrows > 0) RAD_ISSUE_N(c, op, rows > 0 && nrows > rows ? rows : nrows, src,
+                                        brows(buf, rows > 0 && nrows > rows ? rows : nrows));
     }
 };
 

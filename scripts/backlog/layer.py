@@ -7,7 +7,11 @@ if not FILT: sys.exit("layer.py: no c++filt or llvm-cxxfilt, neither on PATH nor
 rows = list(csv.DictReader(open(sys.argv[1]))); R = json.load(open(sys.argv[2])); PH = sys.argv[3]; REC = int(sys.argv[4]); LI = int(sys.argv[5]) if len(sys.argv) > 5 else 6
 for r in rows:
     for k in ("pass", "seq", "start_ns", "end_ns", "records", "queue"): r[k] = int(r[k] or 0)
-p = [p for p in R["phases"] if p["name"] == PH][0]; a, b = p["mono_ns"]
+w = [p for p in R["phases"] if p.get("name") == PH and p.get("mono_ns") and p["mono_ns"][1]]
+if not w:  # a composite phase (longctx, idle, long8) has no window of its own: name what does
+    sys.exit(f"layer.py: no stamped window for phase '{PH}'; {sys.argv[2]} has "
+             f"{', '.join(p.get('name', '(composite)') for p in R['phases'])}")
+p = w[0]; a, b = p["mono_ns"]
 rows = [r for r in rows if r["records"] == REC and a <= r["start_ns"] <= b and r["end_ns"]]
 names = sorted({r["kernel"] for r in rows})
 dem = dict(zip(names, subprocess.run([FILT] + names, capture_output=True, text=True).stdout.split("\n")))
