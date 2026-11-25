@@ -37,9 +37,6 @@
 namespace {
 
 enum { kEgThreads = 256, kEgWaves = kEgThreads / 32 };
-/* The gate's rows a workgroup at prefill: its four weight vectors are the same for every
- * row of a chunk, so the block holds them over its rows (decode keeps a row a block). */
-enum { kEgRows = 4 };
 
 __device__ __forceinline__ float eg_sigmoid(float x) { return 1.0f / (1.0f + expf(-x)); }
 
@@ -177,9 +174,6 @@ __global__ __launch_bounds__(64) void engram_state_kernel(EngramIds p) {
 __device__ __forceinline__ float eg_w(const uint16_t* p, uint32_t i) { return bf16_to_f32(p[i]); }
 __device__ __forceinline__ float eg_w(const float* p, uint32_t i) { return p[i]; }
 
-/* Elements a lane of the norm's wave keeps in registers: a head up to 256 wide, one read. */
-enum { kEgNormKeep = 8 };
-
 // One wave a (row, head), eight to a workgroup.
 template <typename WT>
 __device__ __forceinline__ void engram_norm_body(
@@ -190,43 +184,17 @@ __device__ __forceinline__ void engram_norm_body(
     if (job >= (uint64_t)M * heads) return;
     const uint64_t m = job / heads, hd = job % heads;
     const uint16_t* __restrict__ er = e + m * ep + hd * n;
-    /* The head is 96 wide in this model, three elements a lane, so the row stays in registers
-     * between the sum and the scale instead of being read off the card twice (and, when the rows
-     * are in the host arena, over the link twice). A head wider than kEgNormKeep lanes' worth reads
-     * its row again, as before. */
-    const bool keep_row = n <= (uint32_t)(32 * kEgNormKeep);
-    float keep[kEgNormKeep];
     float sq = 0.0f;
-    if (keep_row) {
-#pragma unroll
-        for (int k = 0; k < kEgNormKeep; ++k) {
-            keep[k] = 0.0f;
-            const uint32_t i = lane + 32u * (uint32_t)k;
-            if (i < n) {
-                keep[k] = bf16_to_f32(er[i]);
-                sq += keep[k] * keep[k];
-            }
-        }
-    } else {
-        for (uint32_t i = lane; i < n; i += 32) {
-            const float v = bf16_to_f32(er[i]);
-            sq += v * v;
-        }
+    for (uint32_t i = lane; i < n; i += 32) {
+        const float v = bf16_to_f32(er[i]);
+        sq += v * v;
     }
     sq = r4d_xor_sum<32>(sq);
     const float inv = 1.0f / sqrtf(sq / (float)n + eps);
     uint16_t* __restrict__ yr = y + m * yp + hd * n;
     const WT* __restrict__ gr = gain + hd * n;
-    if (keep_row) {
-#pragma unroll
-        for (int k = 0; k < kEgNormKeep; ++k) {
-            const uint32_t i = lane + 32u * (uint32_t)k;
-            if (i < n) yr[i] = f32_to_bf16(eg_w(gr, i) * keep[k] * inv);
-        }
-    } else {
-        for (uint32_t i = lane; i < n; i += 32)
-            yr[i] = f32_to_bf16(eg_w(gr, i) * bf16_to_f32(er[i]) * inv);
-    }
+    for (uint32_t i = lane; i < n; i += 32)
+        yr[i] = f32_to_bf16(eg_w(gr, i) * bf16_to_f32(er[i]) * inv);
 }
 
 template <typename WT, class CH>
@@ -258,139 +226,91 @@ __device__ __forceinline__ void eg_block_sum(float (&v)[K], float (*part)[K]) {
     __syncthreads();
 }
 
-// One workgroup R rows: one at a decode height, where a row a block is what keeps every block busy,
-// and kEgRows at a prefill chunk's, where the four weight vectors are the same for every row of the
-// block, so holding them in registers over its rows reads them once instead of once a row (half of
-// the op's traffic). R is a constant so the rows' sums stay in registers; the per-row sums keep
-// their order (i ascending a thread, then the lanes' tree, then the waves), so the results are the
-// one-row kernel's, bit for bit.
-template <int HC, typename WT, int R>
+template <int HC, typename WT>
 __device__ __forceinline__ void engram_gate_body(
     const uint16_t* __restrict__ key, const uint16_t* __restrict__ val,
     const int32_t* __restrict__ mask, const WT* __restrict__ wk,
     const WT* __restrict__ wq, const WT* __restrict__ wv,
     const WT* __restrict__ wb, uint16_t* __restrict__ h, uint32_t n, float eps,
-    float inv_sqrt_n, uint64_t kp, uint64_t vp, uint64_t hp, uint32_t M) {
+    float inv_sqrt_n, uint64_t kp, uint64_t vp, uint64_t hp) {
     constexpr int K1 = 1 + 2 * HC;
-    constexpr int KD = HC * R;
     __shared__ float part1[kEgWaves][K1];
-    __shared__ float part2[kEgWaves][KD];
-    __shared__ float invs[R][K1];   /* a row's inverses: val, then key and h a stream */
-    const uint64_t row0 = (uint64_t)blockIdx.x * (uint64_t)R;
+    __shared__ float part2[kEgWaves][HC];
+    const uint64_t row = blockIdx.x;
+    if (!mask[row]) return;
     const uint32_t t = threadIdx.x;
-    /* The block's rows, and the mask's verdict on each: a row past M is not one of the batch's.
-     * `ri` keeps the mask read on a row that exists, whichever way the check falls. */
-    bool act[R], live = false;
-#pragma unroll
-    for (int r = 0; r < R; ++r) {
-        const uint64_t rw = row0 + (uint64_t)r, ri = rw < (uint64_t)M ? rw : 0;
-        act[r] = rw < (uint64_t)M && mask[ri] != 0;
-        live = live || act[r];
-    }
-    if (!live) return;
+    const uint16_t* __restrict__ kr = key + row * kp;
+    const uint16_t* __restrict__ vr = val + row * vp;
+    uint16_t* __restrict__ hr = h + row * hp;
 
-    // The squares: val, then key and h of each stream, a row at a time.
+    // The squares: val, then key and h of each stream.
+    float s1[K1];
 #pragma unroll
-    for (int r = 0; r < R; ++r) {
-        float s1[K1];
+    for (int k = 0; k < K1; ++k) s1[k] = 0.0f;
+    for (uint32_t i = t; i < n; i += kEgThreads) {
+        const float v = bf16_to_f32(vr[i]);
+        s1[0] += v * v;
 #pragma unroll
-        for (int k = 0; k < K1; ++k) s1[k] = 0.0f;
-        if (act[r]) {
-            const uint16_t* __restrict__ kr = key + (row0 + (uint64_t)r) * kp;
-            const uint16_t* __restrict__ vr = val + (row0 + (uint64_t)r) * vp;
-            const uint16_t* __restrict__ hr = h + (row0 + (uint64_t)r) * hp;
-            for (uint32_t i = t; i < n; i += kEgThreads) {
-                const float v = bf16_to_f32(vr[i]);
-                s1[0] += v * v;
-#pragma unroll
-                for (int c = 0; c < HC; ++c) {
-                    const float kv = bf16_to_f32(kr[(uint32_t)c * n + i]);
-                    const float hv = bf16_to_f32(hr[(uint32_t)c * n + i]);
-                    s1[1 + 2 * c] += kv * kv;
-                    s1[2 + 2 * c] += hv * hv;
-                }
-            }
-        }
-        eg_block_sum<K1>(s1, part1);
-        if (t == 0) {
-#pragma unroll
-            for (int k = 0; k < K1; ++k) invs[r][k] = 1.0f / sqrtf(s1[k] / (float)n + eps);
+        for (int c = 0; c < HC; ++c) {
+            const float kv = bf16_to_f32(kr[(uint32_t)c * n + i]);
+            const float hv = bf16_to_f32(hr[(uint32_t)c * n + i]);
+            s1[1 + 2 * c] += kv * kv;
+            s1[2 + 2 * c] += hv * hv;
         }
     }
-    __syncthreads();   /* the sums are a wave's lane 0's; every thread reads invs below */
-
-    // The dots of the normed key and query: a stream's two weight vectors are read once for the
-    // block's rows.
-    float dot[KD];
-#pragma unroll
-    for (int k = 0; k < KD; ++k) dot[k] = 0.0f;
+    eg_block_sum<K1>(s1, part1);
+    const float inv_val = 1.0f / sqrtf(s1[0] / (float)n + eps);
+    float ik[HC], iq[HC];
 #pragma unroll
     for (int c = 0; c < HC; ++c) {
-        float ik[R], iq[R];
-#pragma unroll
-        for (int r = 0; r < R; ++r) {
-            ik[r] = invs[r][1 + 2 * c];
-            iq[r] = invs[r][2 + 2 * c];
-        }
-        for (uint32_t i = t; i < n; i += kEgThreads) {
-            const uint32_t j = (uint32_t)c * n + i;
-            const float wkk = eg_w(wk, j), wqq = eg_w(wq, j);
-#pragma unroll
-            for (int r = 0; r < R; ++r) {
-                if (!act[r]) continue;
-                const float kn = wkk * bf16_to_f32(key[(row0 + (uint64_t)r) * kp + j]) * ik[r];
-                const float qn = wqq * bf16_to_f32(h[(row0 + (uint64_t)r) * hp + j]) * iq[r];
-                dot[r * HC + c] += kn * qn;
-            }
-        }
-    }
-    eg_block_sum<KD>(dot, part2);
-    float gate[KD];
-#pragma unroll
-    for (int r = 0; r < R; ++r) {
-#pragma unroll
-        for (int c = 0; c < HC; ++c) {
-            const float d = dot[r * HC + c] * inv_sqrt_n;
-            const float sgn = d > 0.0f ? 1.0f : (d < 0.0f ? -1.0f : 0.0f);
-            gate[r * HC + c] = eg_sigmoid(sgn * sqrtf(fmaxf(fabsf(d), 1e-6f)));
-        }
+        ik[c] = 1.0f / sqrtf(s1[1 + 2 * c] / (float)n + eps);
+        iq[c] = 1.0f / sqrtf(s1[2 + 2 * c] / (float)n + eps);
     }
 
-    // The update, rounded once to bf16 and added to the stream, which rounds again. val's weight
-    // and the branch weights are read once for the block's rows, as above.
-    for (uint32_t i = t; i < n; i += kEgThreads) {
-        const float wvi = eg_w(wv, i);
-        float mn[R];
+    // The dots of the normed key and query.
+    float dot[HC];
 #pragma unroll
-        for (int r = 0; r < R; ++r)
-            mn[r] = act[r] ? wvi * bf16_to_f32(val[(row0 + (uint64_t)r) * vp + i]) * invs[r][0]
-                           : 0.0f;
+    for (int c = 0; c < HC; ++c) dot[c] = 0.0f;
+    for (uint32_t i = t; i < n; i += kEgThreads) {
 #pragma unroll
         for (int c = 0; c < HC; ++c) {
             const uint32_t j = (uint32_t)c * n + i;
-            const float wbj = eg_w(wb, j);
+            const float kn = eg_w(wk, j) * bf16_to_f32(kr[j]) * ik[c];
+            const float qn = eg_w(wq, j) * bf16_to_f32(hr[j]) * iq[c];
+            dot[c] += kn * qn;
+        }
+    }
+    eg_block_sum<HC>(dot, part2);
+    float gate[HC];
 #pragma unroll
-            for (int r = 0; r < R; ++r) {
-                if (!act[r]) continue;
-                const float upd = bf16_to_f32(f32_to_bf16(
-                    __fadd_rn(__fmul_rn(gate[r * HC + c], mn[r]), __fmul_rn(wbj, mn[r]))));
-                uint16_t* __restrict__ hr = h + (row0 + (uint64_t)r) * hp;
-                hr[j] = f32_to_bf16(__fadd_rn(bf16_to_f32(hr[j]), upd));
-            }
+    for (int c = 0; c < HC; ++c) {
+        const float d = dot[c] * inv_sqrt_n;
+        const float sgn = d > 0.0f ? 1.0f : (d < 0.0f ? -1.0f : 0.0f);
+        gate[c] = eg_sigmoid(sgn * sqrtf(fmaxf(fabsf(d), 1e-6f)));
+    }
+
+    // The update, rounded once to bf16 and added to the stream, which rounds again.
+    for (uint32_t i = t; i < n; i += kEgThreads) {
+        const float mn = eg_w(wv, i) * bf16_to_f32(vr[i]) * inv_val;
+#pragma unroll
+        for (int c = 0; c < HC; ++c) {
+            const uint32_t j = (uint32_t)c * n + i;
+            const float upd = bf16_to_f32(f32_to_bf16(
+                __fadd_rn(__fmul_rn(gate[c], mn), __fmul_rn(eg_w(wb, j), mn))));
+            hr[j] = f32_to_bf16(__fadd_rn(bf16_to_f32(hr[j]), upd));
         }
     }
 }
 
-template <int HC, typename WT, class CH, int R>
+template <int HC, typename WT, class CH>
 __global__ __launch_bounds__(kEgThreads) void engram_gate_kernel(
     const uint16_t* __restrict__ key, const uint16_t* __restrict__ val,
     const int32_t* __restrict__ mask, const WT* __restrict__ wk,
     const WT* __restrict__ wq, const WT* __restrict__ wv,
     const WT* __restrict__ wb, uint16_t* __restrict__ h, uint32_t n, float eps,
-    float inv_sqrt_n, uint64_t kp, uint64_t vp, uint64_t hp, uint32_t M) {
+    float inv_sqrt_n, uint64_t kp, uint64_t vp, uint64_t hp) {
     if (CH::on) r4d_chain_wait();
-    engram_gate_body<HC, WT, R>(key, val, mask, wk, wq, wv, wb, h, n, eps, inv_sqrt_n, kp, vp, hp,
-                                M);
+    engram_gate_body<HC, WT>(key, val, mask, wk, wq, wv, wb, h, n, eps, inv_sqrt_n, kp, vp, hp);
     if (CH::on) r4d_chain_done();
 }
 
@@ -531,24 +451,15 @@ extern "C" int r4d_rad_engram_gate(const RadArgs* a, RadStream s) {
         return R4D_NO(RAD_E_STRIDE);
     const float inv_sqrt_n = (float)std::pow((double)n, -0.5);
     const bool ch = r4d_geti_or(a, "chain", 0) != 0 && M <= 64;
-    /* A prefill chunk's rows share the four weight vectors, so a block holds them over kEgRows
-     * rows: a quarter of the weight traffic, at the cost of the rows a block running in series.
-     * With kEgRows rows a block a chunk of M rows fills M/kEgRows blocks, so the split starts at
-     * 256 rows, where that fills a R9700's 64 CUs; a decode step's handful of rows keeps a row a
-     * block, where every block is busy and a quarter of the vectors is all there is to read. */
-    const bool rpg = M >= 256;   /* the block's rows: kEgRows at a prefill height, else one */
-#define R4D_EGT_K(HC_, WT_, C_, R_)                                                              \
-    R4D_EMIT(s, (engram_gate_kernel<HC_, WT_, C_, R_>),                                          \
-                    dim3((uint32_t)((M + (R_) - 1) / (R_))), dim3(kEgThreads), 0,                \
+#define R4D_EGT_K(HC_, WT_, C_)                                                                  \
+    R4D_EMIT(s, (engram_gate_kernel<HC_, WT_, C_>), dim3((uint32_t)M), dim3(kEgThreads), 0,      \
                     (const uint16_t*)key->data, (const uint16_t*)val->data,                      \
                     (const int32_t*)mask->data, (const WT_*)wk->data,                            \
                     (const WT_*)wq->data, (const WT_*)wv->data,                                  \
                     (const WT_*)wb->data, (uint16_t*)h->data, (uint32_t)n, eps, inv_sqrt_n,      \
-                    (uint64_t)kp, (uint64_t)vp, (uint64_t)hp, (uint32_t)M)
-#define R4D_EG_ROWS(HC_, WT_, C_)                                                                \
-    (rpg ? R4D_EGT_K(HC_, WT_, C_, kEgRows) : R4D_EGT_K(HC_, WT_, C_, 1))
+                    (uint64_t)kp, (uint64_t)vp, (uint64_t)hp)
 #define R4D_EGT(HC_, WT_)                                                                        \
-    return ch ? R4D_EG_ROWS(HC_, WT_, r4dchain) : R4D_EG_ROWS(HC_, WT_, R4dUnchained)
+    return ch ? R4D_EGT_K(HC_, WT_, r4dchain) : R4D_EGT_K(HC_, WT_, R4dUnchained)
 #define R4D_EG(HC_) do { if (wf32) R4D_EGT(HC_, float); R4D_EGT(HC_, uint16_t); } while (0)
     switch (hc) {
         case 1: R4D_EG(1);

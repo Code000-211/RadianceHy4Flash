@@ -307,17 +307,10 @@ TEST(the_mini_graph_declares_every_layer_kind) {
     CHECK(find_w(b, "blk.1.engram_mult") != nullptr);
     /* The Engram table is model-level, so --ngram-placement keeps it off the cards. */
     CHECK_EQ(find_w(b, "blk.1.engram_table.weight")->d.group.layer, -1);
-    /* ...and the gather's planes in both domains: the card's, which a device gather (the table on
-     * the cards, or a RAM copy the card reads zero-copy) reads and writes in place, and the host
-     * arena's, which libavx's host gather writes with the table on a drive. step() picks one by
-     * rad_op_domain (K-58: a device gather on the host pair put the rows over the link twice).
-     * Device buffers were the only pair once, and a host gather there crashed the first prefill. */
+    /* ...and with it on disk libavx's host gather reads the ids and writes the rows in the host
+     * arena (a device gather reads them over the link): host-domain planes, as rad_block_ple.h's.
+     * Device buffers there crashed the first prefill. The read-ahead ids are host planes too. */
     for (const char* n : { "eg.ids", "eg.rows", "eg.ids_ahead" }) {
-        const RecBuf* eb = find_b(b, n);
-        REQUIRE(eb != nullptr);
-        CHECK_EQ(eb->d.domain, (int)RAD_DOMAIN_DEVICE);
-    }
-    for (const char* n : { "eg.ids_host", "eg.rows_host", "eg.ids_ahead_host" }) {
         const RecBuf* eb = find_b(b, n);
         REQUIRE(eb != nullptr);
         CHECK_EQ(eb->d.domain, (int)RAD_DOMAIN_HOST);
@@ -328,7 +321,7 @@ TEST(the_mini_graph_declares_every_layer_kind) {
     REQUIRE(gat != nullptr);
     rad_buf ahead_h = 0;
     for (size_t k = 0; k < b.bufs.size(); ++k)
-        if (b.bufs[k].name == "eg.ids_ahead_host") ahead_h = (rad_buf)(k + 1);
+        if (b.bufs[k].name == "eg.ids_ahead") ahead_h = (rad_buf)(k + 1);
     CHECK(in(gat->reads, ahead_h));
     /* q_b's rows per head: nope then rope, a piece a head. */
     const RecMap* qn = find_map(b, "blk.1.attn_q_nope.weight");
@@ -399,61 +392,6 @@ TEST(every_step_kind_is_lint_clean) {
     CHECK_LINT(a.b, &c);
     CHECK_EQ(count_issued(a.b, c, "attn_kv_sink"), 0);
     CHECK_EQ(count_issued(a.b, c, "sub_i32"), 1);   /* P-04: absorbed on every layer, rebased once */
-}
-
-/* K-58: the gather's planes follow the gather's domain. A device gather (the table on the cards,
- * or a RAM copy the card reads zero-copy) hashes into the card's eg.ids and gathers into the card's
- * eg.rows; a host gather (the table on a drive, read by libavx) hashes into and gathers into the
- * eg.*_host pair. Every issue of the step names the same pair the gather does, so nothing crosses
- * the link in the middle. */
-TEST(the_gather_planes_follow_the_gather_s_domain) {
-    Declared d;
-    REQUIRE_EQ(d.rc, RAD_OK);
-    rad_op gather_h = 0;
-    for (size_t i = 0; i < d.b.ops.size() && !gather_h; ++i)
-        if (d.b.ops[i].op == "embed_lookup_q") gather_h = (rad_op)(i + 1);
-    REQUIRE(gather_h != 0);
-    auto buf = [&](const char* n) {
-        for (size_t k = 0; k < d.b.bufs.size(); ++k)
-            if (d.b.bufs[k].name == n) return (rad_buf)(k + 1);
-        return (rad_buf)0;
-    };
-    const rad_buf ids[2] = { buf("eg.ids"), buf("eg.ids_host") };
-    const rad_buf ahead[2] = { buf("eg.ids_ahead"), buf("eg.ids_ahead_host") };
-    const rad_buf rows[2] = { buf("eg.rows"), buf("eg.rows_host") };
-    for (rad_buf x : { ids[0], ids[1], ahead[0], ahead[1], rows[0], rows[1] }) REQUIRE(x != 0);
-    auto uses = [](const RecIssue* is, rad_buf h) {
-        for (const RadOperand& o : is->opd)
-            if (o.kind == (uint8_t)RAD_OPK_BUF && o.handle == h) return true;
-        return false;
-    };
-    auto k = kit(d.b, {}, { 12 }, 0);
-    k->b.positions_h = k->pos.data();
-    k->b.n_ahead = 7;
-    const int64_t T = k->b.n_tok;
-    for (int host = 0; host <= 1; ++host) {
-        RadCtx c{ .b = &d.b, .batch = &k->b };
-        if (host) c.host_ops.push_back(gather_h);
-        hyv4flash::step(&c, &k->b);
-        CHECK(c.step_fail.empty());
-        CHECK_LINT(d.b, &c);
-        const RecIssue* hsh = issue_of(d.b, c, "engram_ids");
-        const RecIssue* gat = issue_of(d.b, c, "embed_lookup_q");
-        REQUIRE(hsh != nullptr);
-        REQUIRE(gat != nullptr);
-        CHECK(uses(hsh, ids[host]));        /* the hash writes the domain's ids */
-        CHECK(!uses(hsh, ids[!host]));
-        CHECK(uses(gat, ids[host]));        /* the gather reads them there */
-        CHECK(uses(gat, rows[host]));       /* and writes the rows there */
-        CHECK(!uses(gat, rows[!host]));
-        if (host) {
-            CHECK_EQ(hsh->opd[0].rows, T + 7);
-            CHECK(uses(gat, ahead[1]));     /* the host reader thread takes the ahead ids */
-        } else {
-            CHECK_EQ(hsh->opd[0].rows, T);
-            CHECK(!uses(gat, ahead[1]));
-        }
-    }
 }
 
 /* P-05 (audit F15): the ahead ids are hashed only where a gather reads them. A prefill step with

@@ -588,15 +588,13 @@ inline bool cvec_taps_on() {
 struct Tap {
     rad_buf buf = 0;
     rad_op op = 0;
-    rad_op op2 = 0;   /* the same copy from a second source: a producer with two domains */
     int64_t width = 0;
     int64_t rows = 0;      /* rows the buffer holds; a step may copy fewer */
     explicit operator bool() const { return op != 0; }
     /* `src` read [rows, width]; `width` 0 takes the tap's. `force` declares the tap even with
-     * RADIANCE_HY4_TAPS off (the cvec tap uses RADIANCE_HY4_CVEC_TAPS instead). `src2` declares the
-     * same tap over a second buffer of the producer's, one per domain (K-58's Engram ids). */
+     * RADIANCE_HY4_TAPS off (the cvec tap uses RADIANCE_HY4_CVEC_TAPS instead). */
     int declare(RadBuilder* b, Names& nm, int64_t max_rows, const char* key, int layer,
-                uint32_t dt, int64_t w, rad_buf src, bool force = false, rad_buf src2 = 0) {
+                uint32_t dt, int64_t w, rad_buf src, bool force = false) {
         if (!taps_on() && !force) return RAD_OK;
         width = w;
         rows = max_rows;
@@ -605,16 +603,10 @@ struct Tap {
         if (!buf) return RAD_E_INVAL;
         op = decl_copy(b, max_rows, w, dt, src, buf);
         HY4_NEED(op, "the debug taps' copy (cast)");
-        if (src2) {
-            op2 = decl_copy(b, max_rows, w, dt, src2, buf);
-            HY4_NEED(op2, "the debug taps' copy (cast)");
-        }
         return RAD_OK;
     }
-    /* `alt` copies from `src2`, the domain's buffer the step issued. */
-    void step(RadCtx* c, RadOperand src, int64_t nrows, bool alt = false) const {
-        const rad_op o = alt ? op2 : op;
-        if (o && nrows > 0) RAD_ISSUE_N(c, o, rows > 0 && nrows > rows ? rows : nrows, src,
+    void step(RadCtx* c, RadOperand src, int64_t nrows) const {
+        if (op && nrows > 0) RAD_ISSUE_N(c, op, rows > 0 && nrows > rows ? rows : nrows, src,
                                         brows(buf, rows > 0 && nrows > rows ? rows : nrows));
     }
 };
