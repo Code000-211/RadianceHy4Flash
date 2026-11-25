@@ -658,6 +658,17 @@ TEST(k24_a_declared_but_unserved_fused_key_side_still_declares) {
     CHECK(issue_of(b, c, "qsa_work") != nullptr);
     CHECK(issue_of(b, c, "idx_pool_gated") != nullptr);
     CHECK(issue_of(b, c, "qsa_tail_store") != nullptr);
+    /* and every unserved declaration of it is marked dropped (rad_op_dropped), so rad-convert's
+     * dead-op count and the engine's holes leave it out: the three ops run in its place */
+    int declared = 0;
+    for (const RecOp& o : b.ops)
+        if (o.op == "qsa_work_pool_tail") {
+            ++declared;
+            CHECK(o.dropped);
+        }
+    CHECK(declared > 0);
+    for (const RecOp& o : b.ops)
+        if (o.op != "qsa_work_pool_tail") CHECK(!o.dropped);
 }
 
 TEST(compact_dense_prefill_keeps_full_keys_and_restores_gather_indices) {

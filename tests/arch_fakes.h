@@ -64,6 +64,7 @@ struct RecOp {
     std::vector<rad_buf>    reads, writes;
     bool                    resolved = true;
     bool                    uses_declared = false;   /* rad_op_reads/writes were called */
+    bool                    dropped = false;         /* rad_op_dropped: its fallback runs */
 };
 struct RecMap {
     std::string              declared;
@@ -106,6 +107,7 @@ struct RadBuilder {
      * vocabulary); every other op is undeclared. */
     const std::set<std::string>* vocab = nullptr;
     std::vector<std::string> asked_undeclared;   /* what a real engine would refuse */
+    size_t                   last_decl = 0;      /* 1-based op the last rad_decl_op recorded */
     bool declared(const std::string& op) const {
         return vocab ? vocab->count(op) != 0 : undeclared.count(op) == 0;
     }
@@ -234,6 +236,7 @@ extern "C" rad_buf rad_decl_buffer(RadBuilder* b, const char* name, const RadBuf
 
 extern "C" rad_op rad_decl_op(RadBuilder* b, const char* op, const RadParam* params, int n_params,
                               const rad_weight* weights, int n_weights) {
+    b->last_decl = 0;
     if (!b->declared(op)) {
         b->asked_undeclared.push_back(op);
         return RAD_NULL_HANDLE;
@@ -256,6 +259,7 @@ extern "C" rad_op rad_decl_op(RadBuilder* b, const char* op, const RadParam* par
         if (p.key == "dtype" && b->refuse_dtype.count({r.op, p.sval})) dtype_refused = true;
     r.resolved = b->refuse.count(r.op) == 0 && !dtype_refused;
     b->ops.push_back(r);
+    b->last_decl = b->ops.size();
     /* Declare always completes. An unresolved op is RAD_NULL_HANDLE, an error only if the plugin
      * issues it (rad_builder.h). */
     return r.resolved ? (rad_op)b->ops.size() : RAD_NULL_HANDLE;
@@ -283,6 +287,13 @@ extern "C" int rad_op_resolved(RadBuilder* b, rad_op h) {
 
 extern "C" int rad_op_declared(RadBuilder* b, const char* op) {
     return op && b->declared(op);
+}
+
+/* As the builder's: only the op the last rad_decl_op recorded, and only an unresolved one. */
+extern "C" int rad_op_dropped(RadBuilder* b) {
+    if (b->last_decl == 0 || b->ops[b->last_decl - 1].resolved) return RAD_E_STATE;
+    b->ops[b->last_decl - 1].dropped = true;
+    return RAD_OK;
 }
 
 extern "C" rad_kvgroup rad_decl_kv_group(RadBuilder* b, const char* name,
