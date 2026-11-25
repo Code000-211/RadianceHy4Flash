@@ -534,22 +534,25 @@ __device__ __forceinline__ void merge_sink_body(const float* scratch, const floa
 
 /* CH `r4dchain`: the chained forms (r4d_chain.h) of both kernels of the launch. The bodies keep
  * their early returns (!mine lanes, empty slots); the wrappers bracket them so every block counts
- * once. The sink's own reads -- the keys, the scratch, the rotary'd query -- stay behind the
- * acquire; the block table and cu_seqlens are scalar loads there, which the scalar wait's acquire
- * covers, while the paged form's range and table slice are read in front of it (K-29). */
+ * once. The sink's own reads -- the keys, the scratch, the rotary'd query, and the selection form's
+ * tables -- stay behind the acquire, and every load it does behind it is a vector load
+ * (tests/chain_scalar_audit.py: "scalar loads behind the acquire: 0" for every form), so the wait
+ * is the vector-cache one; the paged form's range and table slice are read in front of it (K-29). */
 template <int HG, bool WIDE, bool SEL, bool FUSED, class CH>
 __global__ __launch_bounds__(HG * 128) void mla_sink_rows(
     const uint16_t* q, const uint16_t* qrot, const uint16_t* kv, const int* bt, const int* used,
     const int* cu, const int* len, const float* sinks, uint16_t* out, float* scratch, SinkMeta m) {
     __shared__ int span_pages[kSpanPages];
     /* K-29: the paged form's prologue (the visible range, the table row, the slice's pages) in front
-     * of the wait, which then covers its round trips; the selection form's is behind it (sink_pro). */
-    SinkPro pro = sink_pro<SEL>(bt, used, cu, len, m, blockIdx.x);
+     * of the wait, which then covers its round trips; the selection form's stays behind it, because
+     * its `len` is qsa_select's, a kernel of this pass. */
+    SinkPro pro{};
     if constexpr (!SEL) {
+        pro = sink_pro<SEL>(bt, used, cu, len, m, blockIdx.x);
         sink_spans(pro, m, threadIdx.x, HG * 128, span_pages);
         __syncthreads();
     }
-    if (CH::on) r4d_chain_wait();
+    if (CH::on) r4d_chain_wait_vec();
     mla_sink_rows_body<HG, WIDE, SEL, FUSED>(q, qrot, kv, bt, used, cu, len, sinks, out, scratch, m,
                                              pro, span_pages);
     if (CH::on) r4d_chain_done();
