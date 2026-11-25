@@ -3390,7 +3390,9 @@ per layer
   ihc_pre (hc_attn), rmsnorm (attn_norm)
   q_a, rmsnorm, q_nope / q_rope; kv_a, rmsnorm on the latent, rope (gptj) on q_rope -- under
   `rope_rows`, its row-form name -- and on the key,
-  kv_store of the row [latent | key] as one KV head of (512 + 64) / 2; attn_gate
+  kv_store of the row [latent | key] as one KV head of (512 + 64) / 2; attn_gate (a decode step's
+  query rotary is folded into the sink instead: its stable instance's optional `rope_pos`, one
+  launch a layer less; `RADIANCE_HY4_FOLD_QROPE=0` issues the `rope_rows` launch as well)
   [sparse] index_key, rmsnorm, qsa_work, idx_pool_gated into the indexer cache, qsa_tail_store;
            selecting: index_query_nope / _rope, rope_rows, index_head, idx_score,
            qsa_select(own 1)
@@ -3471,15 +3473,21 @@ ihc_pre (hc_head), rmsnorm (output_norm), gather_rows, logits_gemm
   (`RADIANCE_HY4_FUSE_QPROJ`, `r4d_selftest`'s `gemm_iqr_dual` case comparing them at 6144/2048,
   3072/1024 and 12288/4096, the last the one pair where both parts take four waves a tile; a pass
   wider than one row stays two launches, as does a pair on an engine whose library carries no such
-  row). The 128-group rotated quantisers
+  row). The same row carries q_a and the gate at a decode step (K-03): they read the attention
+  input's one set of codes (the gate is fed from q_a), and the gate's product is not read until
+  `mla_expand_gate`, so the pair is one launch fewer a layer -- q_a's 1024 columns the eight-wave
+  part, the gate's 4096 / 8192 (its kind's heads * v) the four-wave one -- under
+  `RADIANCE_HY4_FUSE_QA_GATE` (`r4d_selftest`'s dual case at 1024/4096 and 1024/8192, K 3072, the
+  attention input's), and two launches again where the two encodings are a form or a trellis run
+  apart. The 128-group rotated quantisers
   (`had_quant_act_i8g`, `rmsnorm_had_quant_i8g`, the experts' `had_quant_act_fp8`) run their
   chained forms (`chained` 1, `Geom::chain_q8`), since every GEMM around them chains. Launches of a
   recorded gpu-mini decode pass: bf16 132 -> 129, int8 170 -> 148, three fewer again with the q
   pair in one launch (a layer's, 3 layers). Switches (default on):
   `RADIANCE_HY4_SHARE_CODES`, `RADIANCE_HY4_FUSED_QUANT`, `RADIANCE_HY4_ROUTER_FUSE`,
-  `RADIANCE_HY4_CHAIN_Q8`, `RADIANCE_HY4_FUSE_QPROJ`. Not fused: the attention norm and the
-  feed-forward norm are the junction's (`rmsnorm_ihc_junction`), and o_proj's input comes out of
-  `mla_expand_gate`.
+  `RADIANCE_HY4_CHAIN_Q8`, `RADIANCE_HY4_FUSE_QPROJ`, `RADIANCE_HY4_FUSE_QA_GATE`. Not fused: the
+  attention norm and the feed-forward norm are the junction's (`rmsnorm_ihc_junction`), and o_proj's
+  input comes out of `mla_expand_gate`.
   `ffn_latent_out`'s is the one fused producer that is not a norm or a gate: the routed MoE gather
   (`moe_gather_inv_i8g`, K-19) writes the sum's rotated int8 codes and scales in the launch that
   sums it, so that linear declares no `had_quant_act_i8g`. It needs the slot table, no shared arm

@@ -56,6 +56,7 @@
 #include "r4d_common.h"
 #include "r4d_emit.h"
 #include "r4d_gdn_wmma.h"
+#include "r4d_rope.h"
 #include <algorithm>
 #include <climits>
 #include <cmath>
@@ -86,6 +87,13 @@ constexpr int kSpanPages = 160;
 
 struct SinkMeta {
     long qr, qh, rr, rh, kp, kt, bp, bc, lp, orr, oh, ss;
+    /* pos: the rotary's positions (`rope_pos`, [plane, rows] or [rows]) when the fragment is turned
+     * here, null when q_rope arrives rotated. rope: 1 when it is -- the caller passes the raw
+     * projection and the sink applies rope's own rotation, which is why no `rope` launch is needed
+     * for these rows. theta / rscale / mode / n_sec / s0..s2 are rope's, and plane its component
+     * pitch (0 for one-component positions). */
+    const int* pos;
+    double theta;
     /* splits: the launch's slots (grid z, the partial pitch; 1 = unsplit), law: the law's slot
      * count, sc_shift: log2 of the super-chunk, fused: an unsplit launch that still runs the law
      * (one workgroup walks the row's slots in order and folds each into an accumulator in the
@@ -94,11 +102,11 @@ struct SinkMeta {
      * piece at rows [row0, row0 + rows) of a one-sequence step is asked for its queries' absolute
      * positions, which `used - qlen + i` cannot give: that is the last qlen rows' formula). */
     int rows, heads, seqs, blocks, bs, bs_shift, pages, splits, law, sc_shift, fused, window, row0;
-    float scale;
-    int pad[2] = { 0, 0 }; /* no tail padding: a recorded pass's audit compares the argument's bytes */
+    int rope, plane, mode, n_sec, s0, s1, s2;
+    float scale, rscale;
 };
-static_assert(sizeof(SinkMeta) == 12 * 8 + 13 * 4 + 4 + 8, "SinkMeta is a kernel argument by value "
-              "and carries no padding");
+static_assert(sizeof(SinkMeta) == 12 * 8 + 8 + 8 + 20 * 4 + 2 * 4, "SinkMeta is a kernel argument "
+              "by value and carries no padding");
 
 /* r4d_mla_sink_pin_form: 0 the launcher's rule, 1 sixteen heads a workgroup, 2 thirty-two, 3 the
  * element-wise key load, 4 unsplit (not the law), 5 sixty-four heads a workgroup, 6 the fused
@@ -213,6 +221,35 @@ __device__ __forceinline__ void mla_sink_rows_body(
             }
             query[s] = u.f;
         }
+    }
+    /* The rotary, on the fragment the lane already holds: rope_turn's angle and rope_body's two
+     * expressions (r4d_rope.h), each rounded to bf16 exactly as the `rope` launch writes it to
+     * q_rope, then packed. gptj's pair is adjacent, so a lane's eight rotary columns are four
+     * pairs it owns; the launcher refuses the pairings whose partner is half a head away (no lane
+     * holds both). With this the rows need no `rope` launch: the projection's raw columns are what
+     * the operand holds, and the score sees the rotated ones. */
+    if (m.rope) {
+        const int sec[3] = { m.s0, m.s1, m.s2 };
+        const uint32_t i0 = (uint32_t)(quarter * 16 + 4 * (lane >> 4)) >> 1;
+        const uint32_t at = (uint32_t)r; /* this launch's row, as the operand gives them */
+        union {
+            uint16_t h[8];
+            v8bf f;
+        } u;
+        u.f = query[8];
+#pragma unroll
+        for (int e = 0; e < 4; ++e) {
+            float cc, sn;
+            /* The lane's columns are base + {0, 1, 2, 3} and base + {8, 9, 10, 11}: pairs
+             * i0 + {0, 1, 4, 5}. */
+            rope_turn(m.pos, at, i0 + (uint32_t)(e < 2 ? e : e + 2), RD, RD / 2, m.theta,
+                      m.rscale, m.mode, sec, m.n_sec, (uint32_t)m.plane, RadYarn{}, RadLlama3{},
+                      &cc, &sn);
+            const float x0 = bf16_to_f32(u.h[2 * e]), x1 = bf16_to_f32(u.h[2 * e + 1]);
+            u.h[2 * e] = f32_to_bf16(x0 * cc - x1 * sn);
+            u.h[2 * e + 1] = f32_to_bf16(x0 * sn + x1 * cc);
+        }
+        query[8] = u.f;
     }
     const int* const table = bt + (long)trow * m.bp;
     /* The cache offset of each token of a chunk, or -1 where nothing is visible, read from the
@@ -592,6 +629,49 @@ int sink_body(const RadArgs* a, RadStream stream) {
     if (!SEL && (su->rank != 1 || su->shape[0] < 1 || bt.shape[0] < su->shape[0] ||
                  !r4d_contig(su) || !r4d_contig(cu) || r4d_numel(cu) != su->shape[0] + 1))
         return RAD_E_SHAPE;
+    /* The rotary folded into this launch (optional `rope_pos`): the caller passes the projection's
+     * raw columns and this turns the fragment, so those rows need no `rope` launch. `rope_theta` /
+     * `rope_scale` / `rope_mode` / `rope_sections` are rope's own parameters, so the rotation is the
+     * launch's; with no `rope_pos` the operand must hold the rotated columns already and the four
+     * are unused. gptj's adjacent pairs only: the pairing that reaches half a head away is refused
+     * here rather than half applied in the body. */
+    int rmode = 0, plane = 0, n_sec = 0, r_s0 = 0, r_s1 = 0, r_s2 = 0;
+    const int* rpos = nullptr;
+    double rtheta = 10000.0;
+    float rscale = 1.0f;
+    if (const RadTensor* p = r4d_opt(a, nt)) {
+        if (p->dtype != RAD_I32) return RAD_E_DTYPE;
+        if (p->rank == 2 ? p->stride[1] != 1 : p->stride[0] != 1) return RAD_E_STRIDE;
+        const char* rl = r4d_gets(a, "rope_mode");
+        if (!rl) rl = "gptj";
+        if (!std::strcmp(rl, "gptj")) rmode = 0;
+        else if (!std::strcmp(rl, "imrope_gptj")) rmode = 3;
+        else return RAD_E_UNSUPPORTED;
+        int sec[3] = { 0, 0, 0 };
+        for (const char* v = r4d_gets(a, "rope_sections"); v && *v;) {
+            char* e = nullptr;
+            const long x = std::strtol(v, &e, 10);
+            if (e == v) break;
+            if (x <= 0 || n_sec >= 3) return RAD_E_SHAPE;
+            sec[n_sec++] = (int)x;
+            v = e;
+        }
+        if (p->rank >= 2) {
+            if (rmode != 3 || n_sec != 3 || p->shape[0] < 3 || p->shape[1] < rows)
+                return RAD_E_SHAPE;
+            plane = (int)(p->stride[0] >= p->shape[1] ? p->stride[0] : p->shape[1]);
+        } else if (r4d_numel(p) < rows) {
+            return RAD_E_SHAPE;
+        }
+        rpos = (const int*)p->data;
+        r_s0 = sec[0];
+        r_s1 = sec[1];
+        r_s2 = sec[2];
+        rtheta = r4d_getf(a, "rope_theta", 10000.0);
+        rscale = (float)r4d_getf(a, "rope_scale", 1.0);
+        if (!std::isfinite(rtheta) || rtheta <= 0 || !std::isfinite(rscale) || rscale <= 0)
+            return RAD_E_SHAPE;
+    }
     const int form = g_sink_form;
     const int law = sink_law(SEL, window);
     /* The split form up to the row cap (a workgroup a slot, merge_sink); past it, or where the
@@ -645,6 +725,8 @@ int sink_body(const RadArgs* a, RadStream stream) {
                       o.stride[0],
                       o.stride[1],
                       sk.stride[0],
+                      rpos,
+                      rtheta,
                       (int)rows,
                       (int)heads,
                       su ? (int)su->shape[0] : 0,
@@ -658,7 +740,15 @@ int sink_body(const RadArgs* a, RadStream stream) {
                       fused,
                       (int)window,
                       SEL ? 0 : (int)r4d_geti_or(a, "row0", 0),
-                      scale };
+                      rpos ? 1 : 0,
+                      plane,
+                      rmode,
+                      n_sec,
+                      r_s0,
+                      r_s1,
+                      r_s2,
+                      scale,
+                      rscale };
     const auto* qp = (const uint16_t*)q.data;
     const auto* rp = (const uint16_t*)qr.data;
     const auto* kp = (const uint16_t*)kv.data;

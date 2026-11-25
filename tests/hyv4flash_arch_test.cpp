@@ -129,7 +129,8 @@ struct G3Env {
     G3Env() {
         if (g3_fusions) return;
         for (const char* k : { "RADIANCE_HY4_FUSE_SWIGLU", "RADIANCE_HY4_FUSE_EXPAND_QUANT",
-                               "RADIANCE_HY4_FUSE_JUNCTION_Q", "RADIANCE_HY4_FUSE_QPROJ" })
+                               "RADIANCE_HY4_FUSE_JUNCTION_Q", "RADIANCE_HY4_FUSE_QPROJ",
+                               "RADIANCE_HY4_FUSE_QA_GATE" })
             if (!std::getenv(k)) { setenv(k, "0", 1); set.push_back(k); }
     }
     ~G3Env() { for (const char* k : set) unsetenv(k); }
@@ -601,6 +602,99 @@ TEST(a_tail_without_every_decode_row_in_place_runs_the_full_pass) {
         CHECK_EQ(q_rows, whole ? 3 : 8);
         CHECK_EQ(unpacked, whole ? 1 : 0);
     }
+}
+
+/* K-26: the decode query's rotary is applied inside the sinks' stable instances (`rope_pos`), so
+ * a step with no prefill rows needs no `rope` over its query rows. Where the rotation happens is
+ * the whole of it: a decode row rotated in the sink and again by a launch is a different
+ * attention, and so is one rotated nowhere, while the rest of the step is identical. So the
+ * choice is held here. Decode only: no `rope` launch a layer, and both sinks carry the step's own
+ * rotary positions, one a row -- the two sparse layers attend through the selection at this
+ * context, the sliding layer through the paged instance. Mixed, or RADIANCE_HY4_FOLD_QROPE=0: the
+ * launch runs over every query row the layer keeps (the fast instances and the non-absorbed path
+ * read the rotated buffer) and the sinks carry no positions. */
+TEST(a_decode_only_step_folds_the_query_rotary_into_the_sinks) {
+    Declared d;
+    REQUIRE_EQ(d.rc, RAD_OK);
+    const auto& m = *hyv4flash::models[0];
+    /* The per-layer ops the choice sits between: the query's rotary launch, and the two stable
+     * sinks it can fold into. */
+    auto rope_op = [&](rad_op op) {
+        for (const auto& l : m.layers)
+            if (l.attn.op_q_rope == op) return true;
+        return false;
+    };
+    auto sink_op = [&](rad_op op, bool& through_sel) {
+        for (const auto& l : m.layers)
+            if (l.attn.op_sel == op || l.attn.op_paged == op) {
+                through_sel = l.attn.op_sel == op;
+                return true;
+            }
+        return false;
+    };
+    struct Got {
+        int launches = 0, sinks = 0, positioned = 0, bare = 0, through_sel = 0, through_paged = 0;
+        int64_t rows = 0, pos_rows = 0;
+    };
+    /* fold: "1", "0", or nullptr for the shipped default. */
+    auto run = [&](const char* fold, const std::vector<int>& dq, const std::vector<int>& pq) {
+        if (fold) setenv("RADIANCE_HY4_FOLD_QROPE", fold, 1);
+        auto k = kit(d.b, dq, pq);
+        RadCtx c{ .b = &d.b, .batch = &k->b };
+        hyv4flash::step(&c, &k->b);
+        unsetenv("RADIANCE_HY4_FOLD_QROPE");
+        CHECK_LINT(d.b, &c);
+        CHECK(c.step_fail.empty());
+        CHECK(k->b.phase == (pq.empty() ? RAD_PHASE_DECODE : RAD_PHASE_MIXED));
+        Got g;
+        for (const auto& issue : c.issues) {
+            if (rope_op(issue.op)) {
+                ++g.launches;
+                g.rows += issue.n;
+                continue;
+            }
+            bool sel_op = false;
+            if (!sink_op(issue.op, sel_op)) continue;
+            ++g.sinks;
+            (sel_op ? g.through_sel : g.through_paged) += 1;
+            const RadOperand& rp = issue.opd.back();
+            if (rp.kind == RAD_OPK_NONE) {
+                ++g.bare;
+                CHECK(rp.raw == nullptr);
+            } else {
+                ++g.positioned;
+                g.pos_rows += rp.rows;
+                /* the step's own rotary positions, one a row it folds */
+                CHECK(rp.raw == (const void*)k->b.positions);
+                CHECK_EQ(rp.rows, issue.n);
+            }
+        }
+        return g;
+    };
+
+    const Got fold = run(nullptr, { 1, 1 }, {});
+    CHECK_EQ(fold.launches, 0);
+    CHECK_EQ(fold.sinks, 3);
+    CHECK_EQ(fold.through_sel, 2);
+    CHECK_EQ(fold.through_paged, 1);
+    CHECK_EQ(fold.positioned, 3);
+    CHECK_EQ(fold.bare, 0);
+    CHECK_EQ(fold.pos_rows, 6);
+
+    const Got off = run("0", { 1, 1 }, {});
+    CHECK_EQ(off.launches, 3);
+    CHECK_EQ(off.rows, 6);
+    CHECK_EQ(off.sinks, 3);
+    CHECK_EQ(off.positioned, 0);
+    CHECK_EQ(off.bare, 3);
+
+    /* One decode row and four prompt rows: the launch carries all five of them, a layer. */
+    const Got mixed = run(nullptr, { 1 }, { 4 });
+    CHECK_EQ(mixed.launches, 3);
+    CHECK_EQ(mixed.rows, 15);
+    CHECK_EQ(mixed.sinks, 3);
+    CHECK_EQ(mixed.positioned, 0);
+    CHECK_EQ(mixed.bare, 3);
 }
 
 /* #74 review, point 1: the tail's capacity counts the three rotary planes exactly when the
@@ -1876,6 +1970,150 @@ TEST(the_q_projections_go_out_as_one_launch) {
             CHECK_EQ(issued(true), r.duals);
             /* Two parts a layer, three layers (sparse, sliding, sparse). */
             CHECK_EQ(issued(false), 2 * (3 - r.duals));
+        }
+    }
+}
+
+/* K-03: q_a and the gate read one set of codes -- the attention input's, which q_a owns and the
+ * gate is fed -- and both are GEMVs at a decode step, which is what a pair's launch needs. The
+ * gate is off the critical path until `mla_expand_gate` reads it, so where their encodings agree
+ * the pair goes out in one `gemm_nt_q_dual` a layer and each Lin keeps its own launch for the wider
+ * passes. Off with RADIANCE_HY4_FUSE_QA_GATE=0; a library with no such row keeps the two launches,
+ * as the off arm does. Never for two forms (`tcq_code=mad` and `tcq=16` are the fold's), nor for
+ * two runs of the trellis (K-01's latent_in / gate_up_shexp pair differs exactly there: the run is
+ * the fold's length and the pair folds once). The pair's widths are the model's: q_a is the q_lora
+ * rank (replicated, 1024) and the gate its layer kind's heads * v (4096 on a sparse layer at TP2,
+ * 8192 on a sliding one), so the pair is an eight-wave part and a four-wave one -- the mix the
+ * row's block rule covers (sixteen rows below 4096 columns, thirty-two from there up). */
+TEST(the_gate_and_q_a_go_out_as_one_launch) {
+    struct Run { const char* what; bool same, off, host, swa_i8; uint32_t qa_run, gate_run;
+                 int64_t q_lora, v; int duals; };
+    const Run runs[] = {
+        /* q_a 1024 (eight waves), the gate 4096 / 8192 (four): one form, one run. */
+        { "one form, one run", true, false, false, false, 256, 256, 1024, 1024, 3 },
+        { "one form, no dual row", true, false, true, false, 256, 256, 1024, 1024, 0 },
+        { "one form, fused off", true, true, false, false, 256, 256, 1024, 1024, 0 },
+        { "two forms", false, false, false, false, 256, 256, 1024, 1024, 0 },
+        { "two runs", true, false, false, false, 128, 256, 1024, 1024, 0 },
+        { "the sliding layer's gate of another form", true, false, false, true, 256, 256, 1024, 1024,
+          2 },
+        { "a gate below the wide launch", true, false, false, false, 256, 256, 1024, 512, 3 },
+        /* The sparse kind's gate 16-aligned but not 32 (4112): the row's wide block cannot take it,
+         * so that kind keeps its two launches and the sliding layer's pair goes out. */
+        { "a gate part the wide block leaves a strip of", true, false, false, false, 256, 256, 1024,
+          1028, 1 },
+    };
+    for (const Run& r : runs) {
+        fprintf(stderr, "run %s\n", r.what);
+        /* G3Env leaves a switch alone when the test has already set it: the on arm asks for the pair
+         * itself, the off arm for the two launches. */
+        setenv("RADIANCE_HY4_FUSE_QA_GATE", r.off ? "0" : "1", 1);
+        RadBuilder b;
+        bf16_encs(&b);
+        b.encs.insert(b.encs.begin(),
+                      { { "attn_q_a.weight", enc_trellis(RAD_U5, true, r.qa_run) },
+                        { "attn_gate.weight", r.same ? enc_trellis(RAD_U5, true, r.gate_run)
+                                                     : enc_i8(true) } });
+        /* One layer's gate of another form, in front of the whole-model entry. */
+        if (r.swa_i8)
+            b.encs.insert(b.encs.begin(), { { "blk.1.attn_gate.weight", enc_i8(true) } });
+        /* A CPU engine: no device-only fused row, this file's idiom for one. */
+        if (r.host) b.undeclared.insert("gemm_nt_q_dual");
+        /* K is the embedding width for both parts: a trellis weight takes K in whole 128-column
+         * runs of the table, and the gate's K is the attention input's. */
+        MetaKV mk = mini_meta(/* wide */ true);
+        mk.set("q_lora_rank", std::to_string(r.q_lora).c_str());
+        mk.set("v_head_dim", std::to_string(r.v).c_str());
+        mk.set("swa_v_head_dim", std::to_string(r.v).c_str());
+        /* q_a is one width on every layer kind (replicated); the gate is its kind's heads * v:
+         * four sparse heads, eight sliding. */
+        const int64_t gate_n[2] = { 4 * r.v, 8 * r.v };
+        auto is_pair_op = [&](const RecOp* o) {
+            if (o->op != "gemm_nt_q" || pint(o, "K") != 128) return false;
+            if (pint(o, "N") == r.q_lora) return true;
+            for (int i = 0; i < 2; ++i)
+                if (pint(o, "N") == gate_n[i]) return true;
+            return false;
+        };
+        RadBuildCtx ctx = build_ctx();
+        G3Env g3env;
+        int rc = 0;
+        const std::string err = stderr_of([&] { rc = hyv4flash::declare(&b, mk.meta(), &ctx); });
+        unsetenv("RADIANCE_HY4_FUSE_QA_GATE");
+        if (rc != RAD_OK) fputs(err.c_str(), stderr);
+        REQUIRE_EQ(rc, RAD_OK);
+        /* One dual a layer where the pair is one form and one run, and none otherwise. */
+        CHECK_EQ(count_op(b, "gemm_nt_q_dual"), r.duals);
+        /* No op reaches rad_decl_op that the library does not carry: the pair without the row
+         * declares its two Lins and nothing else, where asking would fail the declare. */
+        CHECK_EQ(join(b.asked_undeclared), std::string());
+        /* Both own GEMMs stay declared: the pair serves the GEMV's band and every wider pass keeps
+         * the Lins' launches, so neither weight loses its launch. */
+        int own = 0;
+        for (const auto& o : b.ops)
+            if (is_pair_op(&o)) {
+                ++own;
+                const RecParam* m = param(&o, "M");
+                REQUIRE(m != nullptr);
+                CHECK(m->ihi > 1);
+            }
+        CHECK_EQ(own, 6);
+        /* The dual carries q_a's width first (it owns the codes and its launch is the earlier one)
+         * and one of the two layer kinds' gates second, at the GEMV's height; each declared pair is
+         * one whose parts are whole in the blocks the row takes. */
+        for (const auto& o : b.ops)
+            if (o.op == "gemm_nt_q_dual") {
+                const int64_t N = pint(&o, "N"), N2 = pint(&o, "N2");
+                CHECK_EQ(N, r.q_lora);
+                CHECK(N2 == gate_n[0] || N2 == gate_n[1]);
+                const int64_t rows = N >= 4096 ? 32 : 16, rows2 = N2 >= 4096 ? 32 : 16;
+                CHECK_EQ(N % rows, 0);
+                CHECK_EQ(N2 % rows2, 0);
+                CHECK_EQ(pint(&o, "K"), 128);
+                const RecParam* m = param(&o, "M");
+                REQUIRE(m != nullptr);
+                CHECK_EQ(m->ihi, 1);
+            }
+        every_weight_read(b);
+        steps_clean_at(b, 0, 1);
+        /* A one-token decode step: the pair's launch where it is declared, and the two Lins' own
+         * launches (both parts, three layers) everywhere else -- the switch off, a form or a run
+         * apart, a library with no such row, a part whose N the row's blocks do not cover. */
+        {
+            auto k = kit(b, { 1 }, {}, 0);
+            k->b.positions_h = k->pos.data();
+            auto v = run_passes(b, hyv4flash::step, { k.get() }, 0, 1);
+            CHECK_PASSES(b, v);
+            auto issued = [&](bool dual) {
+                int n = 0;
+                for (const auto& i : v[0]->issues) {
+                    const RecOp* o = b.op_of(i.op);
+                    if (!o) continue;
+                    if (dual) n += o->op == "gemm_nt_q_dual";
+                    else n += is_pair_op(o);
+                }
+                return n;
+            };
+            CHECK_EQ(issued(true), r.duals);
+            /* Two parts a layer, three layers (sparse, sliding, sparse). */
+            CHECK_EQ(issued(false), 2 * (3 - r.duals));
+        }
+        /* A two-token pass: the pair's height is the single row, so both Lins keep their launches
+         * whatever the switch says, and the fused arms step exactly as the off arm does. */
+        {
+            auto k = kit(b, { 2 }, {}, 0);
+            k->b.positions_h = k->pos.data();
+            auto v = run_passes(b, hyv4flash::step, { k.get() }, 0, 1);
+            CHECK_PASSES(b, v);
+            int dual = 0, own2 = 0;
+            for (const auto& i : v[0]->issues) {
+                const RecOp* o = b.op_of(i.op);
+                if (!o) continue;
+                if (o->op == "gemm_nt_q_dual") ++dual;
+                else if (is_pair_op(o)) ++own2;
+            }
+            CHECK_EQ(dual, 0);
+            CHECK_EQ(own2, 6);
         }
     }
 }
