@@ -2298,18 +2298,12 @@ the sum; only the gathered result narrows to bf16, as with bf16 weights.
 
 libr4d's `moe_gather_bf16` takes f32 weights in its column-per-thread kernel, with the self-scan
 up to 512 slots (and `top_k` up to 64) and the two prepass launches above. The wave-per-token
-form past 512 slots reads bf16 weights, and f32 ones up to eight slots a row, with the
-column-per-thread kernel's law (`fmaf` a slot in), so a layer whose router writes f32 --
-Hy4-flash's does (K-45) -- takes that form at its chunk's eight slots. Sixteen slots a row is
-outside f32's window, where the served lane's own gather costs 289.7 us a layer in the wave form
-against 182.4 us in the sixteen-slot column form (1984 rows x 1536 columns, 31744 routed rows), so
-f32 keeps the column form there and the change is additive (bf16's window is the whole sixteen
-slots it had). At `top_k = 16`, whose rows every launch in the trunk has, the column-per-thread
-kernel takes its sixteen-slot form: eight columns a lane and one sixteen-byte load a slot, the
-slots of a column summed in the same ascending order, so the bytes are the column-per-thread
-kernel's; it needs every row sixteen-byte aligned. A block that declares its sort's inverse table
-(K-18) also hands the gather `moe_gather_inv`, which reads the table instead of scanning the sort
-or building it.
+form past 512 slots reads bf16 weights only, so f32 weights stay on the column-per-thread kernel
+at every size. At `top_k = 16`, whose rows every launch in the trunk has, that kernel takes its
+sixteen-slot form: eight columns a lane and one sixteen-byte load a slot, the slots of a column
+summed in the same ascending order, so the bytes are the column-per-thread kernel's; it needs
+every row sixteen-byte aligned. A block that declares its sort's inverse table (K-18) also hands
+the gather `moe_gather_inv`, which reads the table instead of scanning the sort or building it.
 
 ### Quantised experts and the row gate
 
@@ -2415,11 +2409,8 @@ layer (K-19). The gather's 256-column wave is exactly the 128-wide FWHT and the 
 `quant_act_i8g` runs (`group` 128, or 256 for an IQ8R trunk), so `q8` and `q8_scale` are
 byte-identical to running `quant_act_i8g` over `y` afterwards; `y` is byte-identical to
 `moe_gather_inv`'s (`tests/r4d_emu/test_moefuse.cpp` drives its entry point over both of its wave
-forms and each pinned form, codes and scales against a host reference over seven shapes, sixteen
-slots a row included -- outside f32's wave window, so the quantising form, which is sixteen slots
-by its band's constraint, stays the column form with f32 weights and bf16's wave window is
-untouched; `--perfmoefuse` checks the same against the gather + `had_quant_act_i8g` pair on the
-card). `n` is
+forms and each pinned form, codes and scales against a host reference over six shapes;
+`--perfmoefuse` checks the same against the gather + `had_quant_act_i8g` pair on the card). `n` is
 a multiple of 256 and `group` is 128 or 256; operands are writes after the reads because the shared
 vocabulary's lists are fixed, hence an op of its own.
 
