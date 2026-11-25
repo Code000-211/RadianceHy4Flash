@@ -461,7 +461,10 @@ static void engram_ids() {
 
 static void engram_norm_gate() {
     struct N { int64_t M, heads, n, pad; double eps; };
-    for (const N& g : { N{ 3, 4, 24, 0, 0.0078125 }, N{ 2, 3, 37, 5, 1.19e-7 } }) {
+    /* n = the model's head width, n past a lane's register budget (the row is read twice again),
+     * a head narrower than the wave, and one that is not a lane multiple. */
+    for (const N& g : { N{ 3, 4, 24, 0, 0.0078125 }, N{ 2, 3, 37, 5, 1.19e-7 },
+                        N{ 2, 2, 96, 0, 0.0078125 }, N{ 2, 2, 264, 3, 1.19e-7 } }) {
         Rng rng((uint32_t)(g.n));
         const int64_t W = g.heads * g.n;
         std::vector<Opd> ops;
@@ -478,7 +481,10 @@ static void engram_norm_gate() {
         check("engram_norm", r4d_rad_engram_norm, w, p, ops);
     }
     struct G { int64_t M, hc, n, pad; double eps; };
-    for (const G& g : { G{ 4, 2, 48, 0, 0.0078125 }, G{ 3, 4, 20, 6, 1.19e-7 }, G{ 3, 1, 33, 0, 1e-6 } }) {
+    /* A workgroup a row (a decode-shaped batch) and four rows a workgroup (a prefill chunk, whose
+     * last block has rows past M beside the batch's), both with masked rows inside a block. */
+    for (const G& g : { G{ 4, 2, 48, 0, 0.0078125 }, G{ 3, 4, 20, 6, 1.19e-7 }, G{ 3, 1, 33, 0, 1e-6 },
+                        G{ 262, 2, 48, 0, 0.0078125 }, G{ 256, 4, 8, 0, 1.19e-7 } }) {
         Rng rng((uint32_t)(g.n * 5));
         const int64_t W = g.hc * g.n;
         std::vector<Opd> ops;
@@ -497,8 +503,8 @@ static void engram_norm_gate() {
         ops[7].out = true; ops[7].rtol = 2 * kUlp; ops[7].atol = 0.016;
         std::vector<RadParam> p = { pi("M", g.M), pi("n", g.n), pi("hc", g.hc), pf("eps", g.eps), ps("dtype", "bf16") };
         char w[100];
-        std::snprintf(w, sizeof w, "engram_gate hc %lld n %lld eps %g%s", (long long)g.hc, (long long)g.n, g.eps,
-                      g.pad ? " pitched" : "");
+        std::snprintf(w, sizeof w, "engram_gate M %lld hc %lld n %lld eps %g%s", (long long)g.M,
+                      (long long)g.hc, (long long)g.n, g.eps, g.pad ? " pitched" : "");
         check("engram_gate", r4d_rad_engram_gate, w, p, ops);
     }
 }
