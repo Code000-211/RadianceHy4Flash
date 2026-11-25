@@ -580,6 +580,18 @@ struct GateQuantFP8 {
     void step(RadCtx* c, rad_buf gate_up, int64_t T, int64_t r0 = 0, int64_t rows = 0) const;
 };
 
+/* Whether the clamped path over the bf16 plane `gate_up` resolves to ONE
+ * `swiglu_clamped_had_quant_i8g` -- declare's fused int8 branch, its condition and no other. A
+ * producer that can write those bytes itself asks this before it declares the GEMM that would
+ * otherwise stage the plane, so that neither it nor the quantiser touches the plane (K-53,
+ * moe_gemm_q_gated). With `silu_only` the product is the consumer's, so nothing fuses. */
+inline bool clamped_i8_fused_ok(RadBuilder* b, const Geom& g, const ActFP8& act,
+                                bool fuse_clamped_i8, bool rot, bool step, bool silu_only = false) {
+    return fuse_clamped_i8 && act.q8_fed && act.q8_rot && !rot && !step &&
+           !(g.w_bf16 || silu_only) && act.cq() && act.cs() && act.cg() == RAD_FP8_BLOCK &&
+           rad_op_declared(b, "swiglu_clamped_had_quant_i8g");
+}
+
 /* `rot` selects a different op (`gated_had_quant_fp8`), whose rotated codes only a weight stored
  * with the matching rotation can read; used for the routed MoE down projection at four bits. The
  * bf16 output is unrotated either way. */

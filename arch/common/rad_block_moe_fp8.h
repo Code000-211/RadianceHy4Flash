@@ -549,6 +549,10 @@ struct MoeFP8 {
      * 2 behind the routed down (in front of it on an `sh_dn_first` step). A step of more than one
      * pass asks nothing; the caller issues whatever is left once the block returns. */
     void step(RadCtx* c, const RadBatch* batch, const SideOps* side = nullptr) const;
+    /* The fused gate_up epilogue (K-53): the gate_up GEMM writes the down GEMM's codes and scale
+     * itself (moe_gemm_q_gated), so no quantiser op is declared and no bf16 plane is staged. Set
+     * in declare, read by pass(). */
+    bool gu_q8 = false;
     /* A checkpoint inside the step (RadBatch::ckpt_cut): its token on the card, for the routed
      * GEMMs' `split` operand, while step() issues a step that is one pass; null otherwise. Each
      * expert's rows before the checkpoint are then a run of their own, as a step ending there
@@ -1325,6 +1329,28 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
         }
         return tab;
     };
+    /* The gated quantiser's own shape, before the gate_up GEMM that may absorb it: `w.eff` is read
+     * only by the down GEMM, which takes the codes alone (no bf16 product is written), so the
+     * clamped int8 chain can resolve to one launch over the gate_up plane. */
+    gq_exp.fuse_clamped = c.swiglu_quant != 0;
+    gq_exp.fuse_clamped_i8 = c.swiglu_quant_i8 != 0 && !c.calib;
+    /* Gate_up and down are separate GEMMs. A trellis gate uses int8 input while a codebook (W5NL,
+     * W6NL) down reads rotated E4M3: select the latter pair only for the gated intermediate. */
+    ActFP8 down_eff = w.eff;
+    if (down_codebook_fp8) down_eff.q8_fed = down_eff.q8_rot = false;
+    const bool down_rot = rot && (!a8 || down_codebook_fp8);
+    /* K-53: that one launch is `swiglu_clamped_had_quant_i8g` over the plane the gate_up GEMM
+     * stages, and the GEMM can write its codes itself (moe_gemm_q_gated): then the [rows * top_k,
+     * 2F] plane is written and read by nobody, and the quantiser's launch is the GEMM's own. A
+     * block of that row owns one 128-column group of both parts after the rotation, so the parts
+     * are two of a width a block group divides, and its grid is the run map's (its `split`, which
+     * only cuts the pair's runs, has no place there). */
+    bool gu_q = gu == 2 && c.n_ff_exp > 0;
+    for (int q = 0; q < ncls && gu_q; ++q) gu_q = wq[q] % 128 == 0 && wq[q] == wq[0];
+    gu_q = gu_q && clamped_i8_fused_ok(b, g, down_eff, gq_exp.fuse_clamped_i8, down_rot,
+                                       c.swiglu_step != 0) &&
+           rad_op_declared(b, ncls == 4 ? "moe_gemm_q_gated_mod4" : "moe_gemm_q_gated");
+    gu_q8 = gu_q;
     /* The gate_up output is two parts (gate, up) of the widest class's width. A narrower class
      * fills each part's leading columns and zeros the rest, so the gated quantiser reads one layout
      * and the zeros past the width are never read by that class's down projection. */
@@ -1347,25 +1373,26 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
                                 RAD_INT("N_odd", gu * wq[1]), RAD_INT("K_odd", g.n_embd),
                                 RAD_INT("parts", gu), RAD_INT("a_group", gin_g) };
         const int cut = a8 ? 0 : 1;
-        rad_op h = ncls == 4
-            ? rad_decl_op(b, "moe_gemm_q_mod4", p4, (int)(sizeof p4 / sizeof *p4) - cut,
-                          tab.data(), (int)tab.size())
-            : rad_decl_op(b, "moe_gemm_q", p2, (int)(sizeof p2 / sizeof *p2) - cut,
-                          tab.data(), (int)tab.size());
-        op_gu = rw(b, h, {gin_q, gin_s, w.sorted, w.eoff}, {w.egu});
+        const RadParam* pb = ncls == 4 ? p4 : p2;
+        const int np = (int)(ncls == 4 ? sizeof p4 / sizeof *p4 : sizeof p2 / sizeof *p2) - cut;
+        std::vector<RadParam> pr(pb, pb + np);
+        /* the fused row's own parameter, the clamp its quantisation applies */
+        if (gu_q) pr.push_back(RAD_F64("limit", c.swiglu_limit));
+        rad_op h = rad_decl_op(b, ncls == 4 ? (gu_q ? "moe_gemm_q_gated_mod4" : "moe_gemm_q_mod4")
+                                            : (gu_q ? "moe_gemm_q_gated" : "moe_gemm_q"),
+                               pr.data(), (int)pr.size(), tab.data(), (int)tab.size());
+        /* the fused form's outputs are the codes and scale the down GEMM reads, not the plane */
+        op_gu = gu_q ? rw(b, h, {gin_q, gin_s, w.sorted, w.eoff}, {down_eff.cq(), down_eff.cs()})
+                     : rw(b, h, {gin_q, gin_s, w.sorted, w.eoff}, {w.egu});
     }
     /* The down projection's input can be rotated in place: `w.eff` is read only by the down GEMM,
      * which takes the codes alone (no bf16 product is written), so the gated quantiser resolves to
      * the rotated op at no extra launch. */
-    gq_exp.fuse_clamped = c.swiglu_quant != 0;
-    gq_exp.fuse_clamped_i8 = c.swiglu_quant_i8 != 0 && !c.calib;
-    /* Gate_up and down are separate GEMMs. A trellis gate uses int8 input while a codebook (W5NL,
-     * W6NL) down reads rotated E4M3: select the latter pair only for the gated intermediate. */
-    ActFP8 down_eff = w.eff;
-    if (down_codebook_fp8) down_eff.q8_fed = down_eff.q8_rot = false;
-    RAD_ARCH_TRY(gq_exp.declare(b, g, w.egu, down_eff, c.n_ff_exp, gact, c.rows * c.top_k,
-                                false, rot && (!a8 || down_codebook_fp8), c.swiglu_limit,
-                                c.swiglu_step != 0));
+    if (!gu_q)
+        RAD_ARCH_TRY(gq_exp.declare(b, g, w.egu, down_eff, c.n_ff_exp, gact, c.rows * c.top_k,
+                                    false, down_rot, c.swiglu_limit, c.swiglu_step != 0));
+    else
+        gq_exp.a = down_eff;  /* the epilogue writes these codes: the down GEMM reads them */
     {
         const std::vector<rad_weight> tab = tables(w_dn, w_dns);
         const RadParam p4[] = { RAD_RANGE("M", 1, c.rows), RAD_INT("N", g.n_embd),
@@ -2002,8 +2029,12 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
             RAD_WTAB(w_gu[1], n4[1]), RAD_WTAB(w_gus[1], n4[1]),
             RAD_WTAB(w_gu[2], n4[2]), RAD_WTAB(w_gus[2], n4[2]),
             RAD_WTAB(w_gu[3], n4[3]), RAD_WTAB(w_gus[3], n4[3]),
-            brows(w.egu, rows * k), sp };
-        rad_issue(c_, op_gu, o_, (int)(sizeof o_ / sizeof *o_) - (split_on ? 0 : 1), rows);
+            gu_q8 ? brows(gq_exp.a.cq(), rows * k) : brows(w.egu, rows * k),
+            gu_q8 ? brows(gq_exp.a.cs(), rows * k) : RAD_NONE,
+            sp };
+        /* The pair's plane sits where the fused form's `s` would, and `split` after both. */
+        rad_issue(c_, op_gu, o_,
+                  (int)(sizeof o_ / sizeof *o_) - (gu_q8 ? 0 : 1) - (split_on ? 0 : 1), rows);
     } else {
         /* `split` only where set, so every other step's operand list carries none. */
         const RadOperand o_[] = {
@@ -2012,14 +2043,19 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
             RAD_WTAB(w_gu[0], n_reg / 2), RAD_WTAB(w_gus[0], n_reg / 2),
             brows(w.sorted, rows * k), brows(w.eoff, n_reg + 1),
             RAD_WTAB(w_gu[1], n_reg / 2), RAD_WTAB(w_gus[1], n_reg / 2),
-            brows(w.egu, rows * k), sp };
-        rad_issue(c_, op_gu, o_, (int)(sizeof o_ / sizeof *o_) - (split_on ? 0 : 1), rows);
+            gu_q8 ? brows(gq_exp.a.cq(), rows * k) : brows(w.egu, rows * k),
+            gu_q8 ? brows(gq_exp.a.cs(), rows * k) : RAD_NONE,
+            sp };
+        /* The pair's plane sits where the fused form's `s` would, and `split` after both. */
+        rad_issue(c_, op_gu, o_,
+                  (int)(sizeof o_ / sizeof *o_) - (gu_q8 ? 0 : 1) - (split_on ? 0 : 1), rows);
     }
     if (shared && !sh_first)
         shared_up(c_, T, r0, rows,
                   (rfused && router_fused_gate) || (sfused && sigmoid_scatter_gate));
     if (side && !side_first) side->at(0);
-    gq_exp.step(c_, w.egu, rows * k, 0, rows * k);
+    /* The fused epilogue is that launch: no quantiser reads the plane, and none stages it. */
+    if (!gu_q8) gq_exp.step(c_, w.egu, rows * k, 0, rows * k);
     if (shared && !(op_sh_gated && rows <= sh_gated_rows)) gq_sh.step(c_, w.sgu, T, r0, rows);
     if (side) side->at(1);
     /* The shared arm's down projection in front of the routed down GEMM on a step of

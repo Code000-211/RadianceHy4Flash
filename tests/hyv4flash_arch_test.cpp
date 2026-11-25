@@ -1597,6 +1597,91 @@ TEST(quantised_routed_experts_are_served_clamped) {
     }
 }
 
+/* K-53: with the clamped int8 swiglu fusion on, the routed gate_up GEMM of a prefill step writes the
+ * down projection's codes and scale itself (`moe_gemm_q_gated`), so the [rows * top_k, 2F] bf16
+ * plane it used to stage is written and read by nobody and the pair's two launches become the GEMM's
+ * own epilogue; the down GEMM reads exactly what the gate_up wrote, and neither a `swiglu_clamped`
+ * nor a quantiser op stands between them. With that row undeclared, the pair is back with the plane
+ * it stages. */
+TEST(k53_the_routed_gate_up_writes_the_down_codes_itself) {
+    auto trellis_i8 = [](RadBuilder* b) {
+        bf16_encs(b);
+        b->encs[0].second = b->encs[1].second = enc_trellis(RAD_U4, true);
+    };
+    g3_fusions = true;
+    Declared on(trellis_i8);
+    g3_fusions = false;
+    REQUIRE_EQ(on.rc, RAD_OK);
+    /* both MoE layers' gate_up GEMMs are the fused row, at the model's clamp, over the pair's own
+     * operands (activation, its scale, the sort and its offsets, and each class's codes and scale as
+     * weights) and the down GEMM's two outputs */
+    CHECK_EQ(count_op(on.b, "moe_gemm_q_gated"), 2);
+    CHECK_EQ(count_op(on.b, "moe_gemm_q"), 2);   /* the down projections, and only them */
+    const rad_buf egu = buf_named(on.b, "moe.expert_gate_up");
+    REQUIRE(egu != 0);
+    int plane_r = 0, plane_w = 0;
+    for (const auto& o : on.b.ops) {
+        plane_r += (int)in(o.reads, egu);
+        plane_w += (int)in(o.writes, egu);
+    }
+    CHECK_EQ(plane_r, 0);
+    CHECK_EQ(plane_w, 0);
+    for (int i = 0; i < 2; ++i) {
+        const RecOp* f = find_op(on.b, "moe_gemm_q_gated", i);
+        REQUIRE(f != nullptr);
+        CHECK_EQ(pstr(f, "dtype"), std::string("i8a8h"));
+        CHECK_EQ(pint(f, "parts"), 2);
+        CHECK_EQ(pint(f, "group"), 128);
+        CHECK(std::fabs(pflt(f, "limit") - 10.0) < 1e-12);
+        REQUIRE_EQ(f->reads.size(), (size_t)4);
+        REQUIRE_EQ(f->writes.size(), (size_t)2);
+        /* the only readers of its outputs are the two down GEMMs -- the buffers are slot views, so
+         * both layers' rows are the one handle -- and each of them reads both */
+        int readers = 0;
+        for (const auto& o : on.b.ops) {
+            if (!in(o.reads, f->writes[0]) && !in(o.reads, f->writes[1])) continue;
+            CHECK_EQ(o.op, std::string("moe_gemm_q"));
+            CHECK(in(o.reads, f->writes[0]));
+            CHECK(in(o.reads, f->writes[1]));
+            ++readers;
+        }
+        CHECK_EQ(readers, 2);
+    }
+    every_weight_read(on.b);
+    steps_clean_at(on.b, 0, 1);
+
+    /* the row undeclared: the GEMM stages the plane and the clamped int8 quantiser reads it into the
+     * down GEMM's codes, two launches a layer */
+    g3_fusions = true;
+    Declared off([](RadBuilder* b) {
+        bf16_encs(b);
+        b->encs[0].second = b->encs[1].second = enc_trellis(RAD_U4, true);
+        b->undeclared.insert("moe_gemm_q_gated");
+    });
+    g3_fusions = false;
+    REQUIRE_EQ(off.rc, RAD_OK);
+    CHECK_EQ(count_op(off.b, "moe_gemm_q_gated"), 0);
+    CHECK_EQ(count_op(off.b, "moe_gemm_q"), 4);
+    const rad_buf egu_off = buf_named(off.b, "moe.expert_gate_up");
+    REQUIRE(egu_off != 0);
+    int gu_w = 0, cl_r = 0, cl_w = 0;
+    for (const auto& o : off.b.ops) {
+        if (in(o.writes, egu_off)) {
+            CHECK_EQ(o.op, std::string("moe_gemm_q"));
+            ++gu_w;
+        }
+        if (o.op == "swiglu_clamped_had_quant_i8g" && in(o.reads, egu_off)) {
+            ++cl_r;
+            cl_w += (int)o.writes.size();
+        }
+    }
+    CHECK_EQ(gu_w, 2);
+    CHECK_EQ(cl_r, 2);
+    CHECK_EQ(cl_w, 4);
+
+    every_weight_read(off.b);
+}
+
 /* K-18: the block declares the sort's inverse table, so the fused selection or the separate
  * `moe_scatter_inv` writes `moe.expert_slot` and `moe_gather_inv` reads it instead of rebuilding
  * it; without the device rows the pair falls back to `moe_scatter` / `moe_gather`, which scan the
