@@ -1,9 +1,11 @@
 /* issue_link_hold_test -- which collectives take the stager's link hold (Ctx::issue_body).
  *
  * In a staged pass a collective holds the card's link (rad_link_hold on, then off), so the
- * stager's copy lists yield meanwhile. Not on lane 1: a pipelined prefill's lane-1 collectives
- * under expert-tiered copies left the gate odd on every card and stalled a yielding list (issue
- * #2; the sequence that skips the kernel-side release is not identified). This runs the pass on
+ * stager's copy lists yield meanwhile. Not on lane 1: the gate is one word a card and its parity
+ * is the hold, so two holds that overlap in time lose it. A pipelined prefill's lane-1 reduce ran
+ * beside a lane-0 collective (the router's all_gather), both ending their hold in the kernel, and
+ * the gate was left odd on every card with nothing holding: a yielding list stopped for good
+ * (issue #2, Ctx::issue_body). This runs the pass on
  * the linked backend with a Program built by hand around a recording kernel, as issue_div_test
  * does, and counts the calls to rad_link_hold, which the link wraps (tests/CMakeLists.txt). It
  * checks the issue path only, not the hang, which needs four cards.
