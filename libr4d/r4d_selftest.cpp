@@ -8334,12 +8334,13 @@ static void moe_iqr_case(const Plugin& pl, const MoeIqrShape& sh) {
  * maps' bounds planted: 64 and 128 rows and their remainders of one and two (the dot path's rows at
  * 64, which the packed map must leave to it). Some slots inside runs are dropped ones and the last
  * rows are the dropped tail. moe_iqr_case holds the run map's grid against the dense row; here the
- * packed map and the rule must give its bytes. */
-static void moe_iqr_pack_case(const Plugin& pl, int64_t Mtok, bool down) {
+ * packed map and the rule must give its bytes, at four bits and at three (Hy4-flash's gate_up, which
+ * took the run map until K-44). */
+static void moe_iqr_pack_case(const Plugin& pl, int64_t Mtok, bool down, int B = 4) {
     if (!sel("moe_gemm_iqr")) return;
     const int64_t E = 512, top_k = 10, Tr = Mtok * top_k, drop = 23;
     char nm[200];
-    std::snprintf(nm, sizeof nm, "moe_gemm_iqr prefill maps, %s, %lld tokens (%lld rows)",
+    std::snprintf(nm, sizeof nm, "moe_gemm_iqr prefill maps B=%d, %s, %lld tokens (%lld rows)", B,
                   down ? "down 2560 x 384:256" : "gate_up 768:512 x 2560", (long long)Mtok, (long long)Tr);
     const RadKernelInfo* r = find(pl, "moe_gemm_iqr");
     typedef void (*PinFn)(int);
@@ -8417,7 +8418,7 @@ static void moe_iqr_pack_case(const Plugin& pl, int64_t Mtok, bool down) {
             Planes pp;
             rad_enc_clear(&pp.enc);
             rad_enc_copy_str(pp.enc.scheme, "trellis");
-            rad_enc_add_plane(&pp.enc, "codes", RAD_U4, 1, 1);
+            rad_enc_add_plane(&pp.enc, "codes", B == 3 ? RAD_U3 : RAD_U4, 1, 1);
             rad_enc_add_plane(&pp.enc, "scale", RAD_F32, 1, 0);
             const int t = rad_enc_add_table(&pp.enc, "trellis", RAD_I8, (int64_t)1 << 16, 1);
             pp.enc.plane[t].block[0] = run;
@@ -8512,6 +8513,24 @@ static void moe_iqr_pack_case(const Plugin& pl, int64_t Mtok, bool down) {
         if (fine) st_memcpy(out.data(), d_y, out.size() * 2, hipMemcpyDeviceToHost);
         return fine;
     };
+    /* The map the last launch built, read back: [0] the entry count, then an entry's
+     * (expert | rows << 16) and its first row. moe_iqr_packmap_kernel fills the rows field from the
+     * runs' lengths and r4d_moe_blockmap_emit leaves it zero (its dropped tail, 0xffffffff, is not a
+     * live expert's entry), so `with_rows` says which map ran. */
+    auto map_rows = [&](int64_t& entries, int64_t& with_rows) {
+        entries = with_rows = 0;
+        if (!a.scratch) return;
+        uint32_t n = 0;
+        st_memcpy(&n, a.scratch, 4, hipMemcpyDeviceToHost);
+        entries = (int64_t)n;
+        if (!n) return;
+        std::vector<uint32_t> m((size_t)(1 + 2 * (int64_t)n));
+        st_memcpy(m.data(), a.scratch, m.size() * 4, hipMemcpyDeviceToHost);
+        for (int64_t o = 0; o < (int64_t)n; ++o) {
+            const uint32_t w = m[(size_t)(1 + 2 * o)];
+            if (w != 0xffffffffu && (w >> 16)) ++with_rows;
+        }
+    };
     if (!run_pin(4, y0)) { ok(nm, false, "the run map's grid did not launch"); dfree_all(); return; }
     {
         /* the run map's grid wrote every row: no poison left, zeros in the dropped rows */
@@ -8537,6 +8556,16 @@ static void moe_iqr_pack_case(const Plugin& pl, int64_t Mtok, bool down) {
            diff ? std::to_string(diff) + " of " + std::to_string(y.size()) + " elements differ from the run map's, first row " +
                       std::to_string(first / N) + " column " + std::to_string(first % N)
                 : "the run map's bytes");
+        if (v == 8) {
+            /* the eight-tile map is built for this form: its entries carry their row counts */
+            int64_t entries = 0, with_rows = 0;
+            map_rows(entries, with_rows);
+            ok((std::string(nm) + ": the packed map at eight tiles is the one built").c_str(),
+               entries > 0 && with_rows > 0,
+               !entries ? "no map in the scratch"
+                        : std::to_string(with_rows) + " of " + std::to_string(entries) +
+                              " entries carry a row count (the run map was built)");
+        }
     }
     /* `split` (a checkpoint inside the step): with each expert's slots ascending, as the router's
      * stable sort leaves them, the rows of tokens before the split are a run of their own, so they
@@ -8608,8 +8637,9 @@ static void moe_iqr_pack_case(const Plugin& pl, int64_t Mtok, bool down) {
 
 /* --perfmoe's IQR rows: moe_gemm_iqr at Qwen3.8-Flash-Next's per-rank shapes (gate_up 768:512 rows
  * by 2560 in two parts, gathered by token; down 2560 rows by 384:256, sorted rows), every expert
- * its own buffer of random codes, at three, four and five bits. `iters` launches queued behind
- * one another and synced once: the time a launch adds to a step. */
+ * its own buffer of random codes, at three, four and five bits. R4D_PERF_IQR_SHAPE=hy4 swaps in
+ * Hy4-flash's routed gate_up at TP2 (see kProjHy4). `iters` launches queued behind one another and
+ * synced once: the time a launch adds to a step. */
 static void moe_iqr_perf(const Plugin& pl, int64_t Mtok, int iters, int64_t E, int64_t top_k,
                          int64_t draw = 0, int64_t rot = 1) {
     const RadKernelInfo* r = find(pl, "moe_gemm_iqr");
@@ -8700,6 +8730,7 @@ static void moe_iqr_perf(const Plugin& pl, int64_t Mtok, int iters, int64_t E, i
                 "tiles %lld (%.0f %% filled)\n", (long long)rmax, (long long)(ent_c[0] + ent_c[1]),
                 (long long)(til_c[0] + til_c[1]), 100.0 * (double)Tr / (16.0 * (double)(til_c[0] + til_c[1])));
     /* R4D_PERF_IQR_B: one code width instead of three; R4D_PERF_IQR_PROJ: 0 gate_up, 1 down alone;
+     * R4D_PERF_IQR_SHAPE: hy4 for Hy4-flash's gate_up at TP2, K 1536 as its container has it;
      * R4D_PERF_IQR_PINS: the prefill maps timed in turn (r4d_moe_iqr_pin_map_tiles's values, comma
      * separated; default "4,0": the run map at four token tiles, then the rule), each compared
      * byte for byte with the first. */
@@ -8722,11 +8753,20 @@ static void moe_iqr_perf(const Plugin& pl, int64_t Mtok, int iters, int64_t E, i
     struct Proj { const char* what; int64_t n0, n1, k0, k1, parts, run; bool srt; };
     static const Proj kProj[] = { { "gate_up 768:512 x 2560", 768, 512, 2560, 2560, 2, 128, false },
                                   { "down 2560 x 384:256", 2560, 2560, 384, 256, 1, 256, true } };
+    /* R4D_PERF_IQR_SHAPE=hy4: Hy4-flash's routed gate_up at TP2 instead -- 1536 rows by K 1536, the
+     * gate and up column parts of 768 each, codes u3 tcq=16 tcq_rows=128 (the u3 container's
+     * recipe). Hy4's down is w4nl64, which is not this row. */
+    static const Proj kProjHy4[] = { { "gate_up 1536 x 1536 (hy4 tp2)", 1536, 1536, 1536, 1536, 2, 128, false } };
+    const char* shp = std::getenv("R4D_PERF_IQR_SHAPE");
+    const bool hy4 = shp && !std::strcmp(shp, "hy4");
+    const Proj* const projs = hy4 ? kProjHy4 : kProj;
+    const int nprojs = hy4 ? 1 : 2;
     static const uint32_t kU[] = { 0, RAD_U1, RAD_U2, RAD_U3, RAD_U4, RAD_U5, RAD_U6, RAD_U7 };
     for (const int B : { 3, 4, 5 })
-        for (const Proj& P : kProj) {
+        for (int pj = 0; pj < nprojs; ++pj) {
+            const Proj& P = projs[pj];
             if (onlyB && B != onlyB) continue;
-            if (onlyP >= 0 && (int)(&P - kProj) != onlyP) continue;
+            if (onlyP >= 0 && pj != onlyP) continue;
             const int64_t Nc[2] = { P.n0, P.n1 }, Kc[2] = { P.k0, P.k1 };
             const int64_t N = std::max(P.n0, P.n1), K = std::max(P.k0, P.k1), nkb = K / 128;
             std::vector<RadParam> lp = { PI("N", Nc[0]), PI("K", Kc[0]), PI("N_odd", Nc[1]),
@@ -38617,6 +38657,9 @@ static void device_phase(const Plugin& pl) {
                 { "prefill gate/up", 4, 16, 128, 32, 4, 64, 768, 512, 2560, 2560, 2, false, 0 },
                 { "prefill gate/up, dropped slots", 3, 16, 128, 32, 4, 64, 768, 512, 2560, 2560, 2, false, 37 },
                 { "prefill down", 4, 16, 256, 32, 4, 64, 2560, 2560, 512, 256, 1, true, 5 },
+                /* the packed map: a prefill chunk's rows, three bits as Hy4-flash's gate_up is */
+                { "prefill gate/up, packed map", 3, 16, 128, 8, 4, 128, 768, 512, 2560, 2560, 2, false, 0 },
+                { "prefill down, packed map", 3, 16, 256, 8, 4, 128, 2560, 2560, 512, 256, 1, true, 0 },
                 /* runs past one token tile, and past one block's four */
                 { "prefill gate/up, long runs", 4, 16, 128, 8, 2, 200, 768, 512, 2560, 2560, 2, false, 3 },
                 { "prefill down, long runs", 4, 16, 256, 8, 2, 200, 2560, 2560, 512, 256, 1, true, 3 },
@@ -38630,11 +38673,14 @@ static void device_phase(const Plugin& pl) {
                 { "prefill down", 2, 15, 256, 8, 2, 96, 512, 512, 256, 256, 1, true, 0 },
             };
             for (const MoeIqrShape& sh : kIqr) moe_iqr_case(pl, sh);
-            /* a large prefill pass: the packed map's bytes against the run map's */
+            /* a large prefill pass: the packed map's bytes against the run map's, at four bits and
+             * at three (Hy4-flash's routed gate_up) */
             moe_iqr_pack_case(pl, 2048, false);
             moe_iqr_pack_case(pl, 4096, false);
             moe_iqr_pack_case(pl, 8192, false);
             moe_iqr_pack_case(pl, 3277, true);
+            for (const int64_t m : { 2048, 8192 }) moe_iqr_pack_case(pl, m, false, 3);
+            moe_iqr_pack_case(pl, 3277, true, 3);
         }
         const bool w4 = sel("moe_gemm_w4a8i8"), w4m = sel("moe_gemm_w4a8i8_mod4");
         const bool w8 = sel("moe_gemm_i8a8"), w8m = sel("moe_gemm_i8a8_mod4");
@@ -39789,7 +39835,8 @@ static void usage(void) {
                 "  --perfw6nl M [iters] [experts] [top_k]: W5NL and W6NL down at that TP2\n"
                 "             geometry and routing, synthetic resident weights; auto and pinned forms.\n"
                 "  --perfmoeiqr M [iters] [experts] [top_k] [draw] [routings]:  --perfmoe's IQR\n"
-                "             rows alone (moe_gemm_iqr at Qwen3.8-Flash-Next's per-rank shapes); the\n"
+                "             rows alone (moe_gemm_iqr at Qwen3.8-Flash-Next's per-rank shapes;\n"
+                "             R4D_PERF_IQR_SHAPE=hy4 for Hy4-flash's gate_up at TP2, K 1536); the\n"
                 "             routing draws from `draw` of the experts (0 or default: all), fewer\n"
                 "             giving longer runs of rows an expert, and the launches take\n"
                 "             `routings` different routings in turn (default 1; several read the\n"
