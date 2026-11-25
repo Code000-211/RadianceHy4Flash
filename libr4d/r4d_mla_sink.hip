@@ -160,6 +160,55 @@ __device__ __forceinline__ float sink_inv(float m, float d, float sink) {
     return c / fmaf(d, c, expf(sink - top));
 }
 
+/* The prologue's reads that no op of a pass writes: the row's visible range, its table row, and the
+ * block's slice of that table. In the paged form `used`, `cu` and `bt` are the host's (input
+ * operands), so a chained block runs this in front of its wait, which then covers the dependent
+ * reads -- the sequence, the used count, then the table (K-29). In the selection form `len` and the
+ * table are qsa_select's, a kernel of the pass, so there the prologue stays behind the acquire. */
+struct SinkPro {
+    int lo, hi, trow;             /* the row's visible tokens, and the table row it reads */
+    int begin, end;               /* that range as this slot cuts it */
+    int first;                    /* the slot's first token */
+    int first_block, span;        /* the table blocks the range touches, from `first_block` */
+    bool spanned;                 /* they fit kSpanPages, so the prologue staged them in LDS */
+    const int* table;             /* the row's table */
+};
+
+template <bool SEL>
+__device__ __forceinline__ SinkPro sink_pro(const int* bt, const int* used, const int* cu,
+                                            const int* len, const SinkMeta& m, int r) {
+    SinkPro p;
+    sink_range<SEL>(used, cu, len, m, r, p.lo, p.hi, p.trow);
+    p.begin = p.lo;
+    p.end = p.hi;
+    const int split = blockIdx.z;
+    if (m.splits > 1) {
+        /* Slot `split` is the super-chunk [lo + SC split, lo + SC (split + 1)); the law's last
+         * slot takes the rest of the range. */
+        const long sc = (long)p.lo + ((long)split << m.sc_shift),
+                   sc_end = sc + (1L << m.sc_shift);
+        p.begin = sc < p.lo ? p.lo : sc < p.hi ? (int)sc : p.hi;
+        if (split + 1 < m.law)
+            p.end = sc_end < p.begin ? p.begin : sc_end < p.hi ? (int)sc_end : p.hi;
+    }
+    p.first = p.begin;
+    p.table = bt + (long)p.trow * m.bp;
+    p.first_block = p.begin >> m.bs_shift;
+    p.span = p.begin < p.end ? ((p.end - 1) >> m.bs_shift) - p.first_block + 1 : 0;
+    p.spanned = p.span <= kSpanPages;
+    return p;
+}
+
+/* A split's whole table slice, where it fits, is read into LDS at once in the prologue: one table
+ * round trip a workgroup instead of one every few chunks (a table read cold from memory otherwise
+ * stalls the chunk that crosses into its next cache line). */
+__device__ __forceinline__ void sink_spans(const SinkPro& p, const SinkMeta& m, int tid, int nt,
+                                           int* span_pages) {
+    if (p.begin < p.end && p.spanned)
+        for (int i = tid; i < p.span; i += nt)
+            span_pages[i] = p.table[(long)(p.first_block + i) * m.bc];
+}
+
 /* FUSED: the fused form (m.fused), its own instance so its accumulator's registers do not touch
  * the other forms' schedule. KB: key buffers in LDS (K-41's `kb` axis). 2 double-buffers the
  * fetched chunk so its store never waits for the chunk being read; 1 stores in place and costs a
@@ -167,7 +216,8 @@ __device__ __forceinline__ float sink_inv(float m, float d, float sink) {
 template <int HG, bool WIDE, bool SEL, bool FUSED, int KB = 2>
 __device__ __forceinline__ void mla_sink_rows_body(
     const uint16_t* q, const uint16_t* qrot, const uint16_t* kv, const int* bt, const int* used,
-    const int* cu, const int* len, const float* sinks, uint16_t* out, float* scratch, SinkMeta m) {
+    const int* cu, const int* len, const float* sinks, uint16_t* out, float* scratch, SinkMeta m,
+    SinkPro pro, int* span_pages) {
     constexpr int NT = HG * 128, LOADS = (kPieces + NT - 1) / NT;
     static_assert(LOADS <= 32, "staged mask bits");
     static_assert(KB == 1 || KB == 2, "one key buffer or two");
@@ -178,22 +228,19 @@ __device__ __forceinline__ void mla_sink_rows_body(
     __shared__ __align__(32) float partial[HG * 4][32 * 8];
     __shared__ int visible[2][16];
     __shared__ long rows_at[2][16];
-    __shared__ int span_pages[kSpanPages];
     const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5, quarter = wave & 3,
               group = wave >> 2, r = blockIdx.x, split = blockIdx.z;
     const int head = blockIdx.y * 16 * HG + group * 16 + (lane & 15);
     const bool mine = head < m.heads;
-    int lo, hi, trow;
-    sink_range<SEL>(used, cu, len, m, r, lo, hi, trow);
-    int begin = lo, end = hi;
-    if (m.splits > 1) {
-        /* Slot `split` is the super-chunk [lo + SC split, lo + SC (split + 1)); the law's last
-         * slot takes the rest of the range. */
-        const long sc = (long)lo + ((long)split << m.sc_shift),
-                   sc_end = sc + (1L << m.sc_shift);
-        begin = sc < lo ? lo : sc < hi ? (int)sc : hi;
-        if (split + 1 < m.law) end = sc_end < begin ? begin : sc_end < hi ? (int)sc_end : hi;
+    /* The selection form's prologue reads a kernel of this pass, so it runs here, behind the
+     * acquire, and fills its slice the same way the paged form's wrapper did. */
+    if constexpr (SEL) {
+        pro = sink_pro<SEL>(bt, used, cu, len, m, r);
+        sink_spans(pro, m, tid, NT, span_pages);
+        __syncthreads();
     }
+    const int lo = pro.lo;
+    const int begin = pro.begin, end = pro.end;
     if (m.splits > 1 && begin >= end) {
         /* An empty slot: the merge skips it by its denominator and reads nothing else. */
         if (mine && !quarter && lane < 16) {
@@ -205,7 +252,7 @@ __device__ __forceinline__ void mla_sink_rows_body(
     }
     /* The 16-token chunks from the slot's first key; a slot is a whole number of them, so the
      * fused form's walk from `lo` meets every slot boundary at a chunk boundary. */
-    const int first = begin;
+    const int first = pro.first;
     auto slot_of = [&](int token) { return min((token - lo) >> m.sc_shift, m.law - 1); };
     /* Query fragments: eight latent k-steps of the wave's quarter, one rotary. */
     v8bf query[9];
@@ -258,16 +305,12 @@ __device__ __forceinline__ void mla_sink_rows_body(
         }
         query[8] = u.f;
     }
-    const int* const table = bt + (long)trow * m.bp;
+    const int* const table = pro.table;
     /* The cache offset of each token of a chunk, or -1 where nothing is visible, read from the
      * table two chunks ahead by sixteen lanes and passed through LDS, so a key load never waits
      * on a table load. */
-    /* A split's whole table slice, where it fits, is read into LDS at once in the prologue: one
-     * table round trip a workgroup instead of one every few chunks (a table read cold from
-     * memory otherwise stalls the chunk that crosses into its next cache line). */
-    const int first_block = begin >> m.bs_shift,
-              span = begin < end ? ((end - 1) >> m.bs_shift) - first_block + 1 : 0;
-    const bool spanned = span <= kSpanPages;
+    const int first_block = pro.first_block;
+    const bool spanned = pro.spanned;
     auto token_at = [&](int token) -> long {
         if (token < begin || token >= end) return -1;
         const int block = token >> m.bs_shift;
@@ -368,9 +411,7 @@ __device__ __forceinline__ void mla_sink_rows_body(
     };
     int slot = slot_of(first);
     if (begin < end) {
-        if (spanned)
-            for (int i = tid; i < span; i += NT) span_pages[i] = table[(long)(first_block + i) * m.bc];
-        __syncthreads();
+        /* The slice is in LDS: the wrapper's fill synced, or SEL's above did. */
         if (tid < 32) rows_at[tid >> 4][tid & 15] = token_at(first + tid);
         __syncthreads();
         fetch(0);
@@ -544,14 +585,27 @@ __device__ __forceinline__ void merge_sink_body(const float* scratch, const floa
 
 /* CH `r4dchain`: the chained forms (r4d_chain.h) of both kernels of the launch. The bodies keep
  * their early returns (!mine lanes, empty slots); the wrappers bracket them so every block counts
- * once. The sinks, block table and cu_seqlens are scalar loads, which the wait's acquire covers. */
+ * once. The sink's own reads -- the keys, the scratch, the rotary'd query, and the selection form's
+ * tables -- stay behind the acquire, and every load it does behind it is a vector load
+ * (tests/chain_scalar_audit.py: "scalar loads behind the acquire: 0" for every form), so the wait
+ * is the vector-cache one; the paged form's range and table slice are read in front of it (K-29). */
 template <int HG, bool WIDE, bool SEL, bool FUSED, class CH, int KB = 2>
 __global__ __launch_bounds__(HG * 128) void mla_sink_rows(
     const uint16_t* q, const uint16_t* qrot, const uint16_t* kv, const int* bt, const int* used,
     const int* cu, const int* len, const float* sinks, uint16_t* out, float* scratch, SinkMeta m) {
-    if (CH::on) r4d_chain_wait();
-    mla_sink_rows_body<HG, WIDE, SEL, FUSED, KB>(q, qrot, kv, bt, used, cu, len, sinks, out,
-                                                scratch, m);
+    __shared__ int span_pages[kSpanPages];
+    /* K-29: the paged form's prologue (the visible range, the table row, the slice's pages) in front
+     * of the wait, which then covers its round trips; the selection form's stays behind it, because
+     * its `len` is qsa_select's, a kernel of this pass. */
+    SinkPro pro{};
+    if constexpr (!SEL) {
+        pro = sink_pro<SEL>(bt, used, cu, len, m, blockIdx.x);
+        sink_spans(pro, m, threadIdx.x, HG * 128, span_pages);
+        __syncthreads();
+    }
+    if (CH::on) r4d_chain_wait_vec();
+    mla_sink_rows_body<HG, WIDE, SEL, FUSED, KB>(q, qrot, kv, bt, used, cu, len, sinks, out, scratch,
+                                                 m, pro, span_pages);
     if (CH::on) r4d_chain_done();
 }
 
