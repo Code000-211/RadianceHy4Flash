@@ -55,6 +55,9 @@ RadTensor tens(void* p, uint32_t dt, std::vector<int64_t> shape) {
  * selection form reads `sel_bt` / `sel_len`, one table row a query row. */
 struct Problem {
     int heads = 8, bs = 4, window = 0, pages = 0, blocks = 0;
+    /* The key-buffer axis the launch declares: 0 leaves it out (its default, two buffers), 1 is
+     * the single-buffer form. */
+    int kb = 0;
     std::vector<int> qlen, ctx;
     std::vector<int> bt, used, cu;          /* paged */
     std::vector<int> sel_bt, sel_len;       /* selection */
@@ -219,11 +222,11 @@ struct Rope {
  * `scr` (if given) gets the scratch's words after the call: the split form writes its slots' parts
  * there, the fused form only the accumulator of a row and head (`kAccWords` floats).
  * `rope` passes the optional `rope_pos` operand (and its parameters); `qr` replaces the rotary
- * operand's columns, so a folded launch can be compared with a rotated one. `kb` 0 leaves the
- * key-buffer axis out (its default, two buffers), 1 is the single-buffer form. */
+ * operand's columns, so a folded launch can be compared with a rotated one. The key-buffer axis
+ * comes from `p.kb`. */
 int launch(const Problem& p, bool sel, int form, std::vector<uint16_t>& out, int stable = -1,
            int64_t scratch_cut = 0, std::vector<uint32_t>* scr = nullptr,
-           const Rope* rope = nullptr, const std::vector<uint16_t>* qr = nullptr, int kb = 0) {
+           const Rope* rope = nullptr, const std::vector<uint16_t>* qr = nullptr) {
     const int M = p.rows();
     out.assign((size_t)M * p.heads * L, 0xffff);
     auto& P = const_cast<Problem&>(p);
@@ -250,7 +253,7 @@ int launch(const Problem& p, bool sel, int form, std::vector<uint16_t>& out, int
     ps.i("block_size", p.bs);
     ps.f("scale", kScale);
     if (stable >= 0) ps.i("stable", stable);
-    if (kb) ps.i("kb", kb);
+    if (p.kb) ps.i("kb", p.kb);
     if (rope && rope->pos) {
         ps.f("rope_theta", rope->theta);
         ps.f("rope_scale", rope->scale);
@@ -365,8 +368,10 @@ void check_forms(const std::string& name, const Problem& p, bool sel) {
             ok = false;
             note += " (bytes differ from the rule's form)";
         }
+        Problem single = p;
+        single.kb = 1;
         std::vector<uint16_t> one;
-        if (launch(p, sel, form, one, -1, 0, nullptr, nullptr, nullptr, 1) != RAD_OK || one != out) {
+        if (launch(single, sel, form, one) != RAD_OK || one != out) {
             ok = false;
             note += " (kb 1 differs)";
         }
@@ -482,9 +487,11 @@ void check_stable(const std::string& name, const Problem& p, bool forms_pins = t
         bool forms = true, kb1 = true;
         for (int form : { 1, 2, 3, 5, 6 }) {
             if ((form == 2 && p.heads <= 16) || (form == 5 && p.heads <= 32)) continue;
+            Problem single = p;
+            single.kb = 1;
             std::vector<uint16_t> o, k;
             forms = forms && launch(p, false, form, o, 1) == RAD_OK && o == all;
-            kb1 = kb1 && launch(p, false, form, k, 1, 0, nullptr, nullptr, nullptr, 1) == RAD_OK && k == o;
+            kb1 = kb1 && launch(single, false, form, k, 1) == RAD_OK && k == o;
         }
         report(name + " stable 1: HG 1 / 2 / 4, the element load and the fused form equal (bytes)",
                forms);
@@ -844,9 +851,9 @@ int main(int argc, char** argv) {
     {
         Problem p;
         make_paged(p, { 2 }, { 200 }, 16, 4, 512, false, rng);
+        p.kb = 3;
         std::vector<uint16_t> o;
-        report("kb 3 refused (RAD_E_SHAPE)",
-               launch(p, false, 0, o, -1, 0, nullptr, nullptr, nullptr, 3) == RAD_E_SHAPE);
+        report("kb 3 refused (RAD_E_SHAPE)", launch(p, false, 0, o) == RAD_E_SHAPE);
     }
     std::printf("%s\n", g_fail ? "FAILED" : "all passed");
     return g_fail ? 1 : 0;

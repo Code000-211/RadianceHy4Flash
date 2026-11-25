@@ -747,7 +747,7 @@ if(R4D_EMU_BUILT)
   endforeach()
   set_tests_properties(r4d_emu_attn_shard0 r4d_emu_attn_shard1 r4d_emu_attn_shard2 r4d_emu_pick
                        r4d_emu_norm r4d_emu_escale r4d_emu_qsa r4d_emu_lora r4d_emu_mla r4d_emu_moefuse
-                       r4d_emu_dsa r4d_emu_lili r4d_emu_mla_sink
+                       r4d_emu_dsa r4d_emu_lili
                        PROPERTIES LABELS "r4d_emu" TIMEOUT ${RAD_TEST_TIMEOUT})
   # The LoRA pair has a libref oracle, and the test holds the emulated kernels to it when it can
   # load one -- expand bit for bit, shrink to its bound. kda_update is held to libref's within
@@ -761,9 +761,12 @@ if(R4D_EMU_BUILT)
   # r4d_emu_topk: row_topk's one- and two-launch forms and cast_row_topk against the cast then
   # row_topk, byte for byte, and the cast's rounding over every f32 pattern.
   set_tests_properties(r4d_emu_topk PROPERTIES LABELS "r4d_emu" TIMEOUT ${RAD_TEST_TIMEOUT})
-  # r4d_emu_mla_sink: about 283 s, four times the other sink tests' budget, because every form is
-  # run at both key-buffer counts (`kb` 2 and 1) and the stable forms and the byte rules on top.
-  set_tests_properties(r4d_emu_mla_sink PROPERTIES LABELS "r4d_emu" TIMEOUT 600)
+  # r4d_emu_mla_sink: about 283 s, because every form runs at both key-buffer counts (`kb` 2 and 1)
+  # and the stable law and the byte rules on top. Five times the shared budget, derived from it so a
+  # Debug or sanitised build scales too.
+  math(EXPR RAD_TIMEOUT_MLA_SINK "${RAD_TEST_TIMEOUT} * 5")
+  set_tests_properties(r4d_emu_mla_sink PROPERTIES LABELS "r4d_emu"
+                       TIMEOUT ${RAD_TIMEOUT_MLA_SINK})
   set_tests_properties(r4d_emu_lora r4d_emu_kda r4d_emu_hy4 r4d_emu_mla_kv PROPERTIES
                        ENVIRONMENT "RADIANCE_HOME=${CMAKE_BINARY_DIR}/radiance_home")
   # A seeded random sweep, mostly prefill shapes on the WMMA kernel, which the emulator runs at
