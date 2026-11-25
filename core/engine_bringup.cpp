@@ -1984,6 +1984,12 @@ int Engine::plan() {
             f.queue_scratch = rad_dev_resident_scratch_bytes(&props);
             f.capacity = props.vram_bytes;
             f.free     = props.vram_free;
+            /* And what of the memory `free` excludes is device code: the code objects this card has
+             * loaded, each one whole from its module at its kernel's first launch (module_load in
+             * core/device/aql.cpp). The receipt prints it beside `already held`, so a lane can say
+             * what a build carrying only the kernel forms this model runs would give back (M-14).
+             * A backend that loads no device code says so, and the line stays out of its receipt. */
+            dev_code_resident(r->device, &f.code_bytes, &f.code_modules);
             /* Unified memory: the pinned host pool is the same RAM as the card, so the
              * budget charges it against the one ledger. */
             f.unified     = props.unified != 0;
