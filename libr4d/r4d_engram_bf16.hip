@@ -174,6 +174,31 @@ __global__ __launch_bounds__(64) void engram_state_kernel(EngramIds p) {
 __device__ __forceinline__ float eg_w(const uint16_t* p, uint32_t i) { return bf16_to_f32(p[i]); }
 __device__ __forceinline__ float eg_w(const float* p, uint32_t i) { return p[i]; }
 
+// Eight bf16 as one 16-byte register.
+union EgV8 { r4d_u32x4 v; uint16_t h[8]; };
+
+// Eight weights at i as 16-byte accesses: two of f32, one of bf16. The same values, bit for bit,
+// as eg_w at i .. i+7.
+template <typename WT>
+__device__ __forceinline__ void eg_w8(const WT* __restrict__ p, uint32_t i, float (&w)[8]) {
+    if constexpr (sizeof(WT) == 4) {
+        const r4d_u32x4 a = *(const r4d_u32x4*)(p + i), b = *(const r4d_u32x4*)(p + i + 4);
+        w[0] = __uint_as_float(a[0]);
+        w[1] = __uint_as_float(a[1]);
+        w[2] = __uint_as_float(a[2]);
+        w[3] = __uint_as_float(a[3]);
+        w[4] = __uint_as_float(b[0]);
+        w[5] = __uint_as_float(b[1]);
+        w[6] = __uint_as_float(b[2]);
+        w[7] = __uint_as_float(b[3]);
+    } else {
+        EgV8 x;
+        x.v = *(const r4d_u32x4*)(p + i);
+#pragma unroll
+        for (int e = 0; e < 8; ++e) w[e] = bf16_to_f32(x.h[e]);
+    }
+}
+
 // One wave a (row, head), eight to a workgroup.
 template <typename WT>
 __device__ __forceinline__ void engram_norm_body(
@@ -207,8 +232,10 @@ __global__ __launch_bounds__(256) void engram_norm_kernel(
 }
 
 // A workgroup-wide sum of K values: lanes through r4d_xor_sum, waves through LDS in wave order.
-// Every thread returns the totals. The trailing barrier lets the array be reused.
-template <int K>
+// Every thread returns the totals. `Reuse` keeps the trailing barrier that lets the same array be
+// summed into again; the gate's two reductions use two arrays, so its two barriers are the
+// write-to-read ones alone.
+template <int K, bool Reuse>
 __device__ __forceinline__ void eg_block_sum(float (&v)[K], float (*part)[K]) {
     const uint32_t lane = threadIdx.x & 31, wave = threadIdx.x >> 5;
 #pragma unroll
@@ -223,7 +250,7 @@ __device__ __forceinline__ void eg_block_sum(float (&v)[K], float (*part)[K]) {
         for (int w = 0; w < kEgWaves; ++w) s += part[w][k];
         v[k] = s;
     }
-    __syncthreads();
+    if constexpr (Reuse) __syncthreads();
 }
 
 template <int HC, typename WT>
@@ -232,7 +259,7 @@ __device__ __forceinline__ void engram_gate_body(
     const int32_t* __restrict__ mask, const WT* __restrict__ wk,
     const WT* __restrict__ wq, const WT* __restrict__ wv,
     const WT* __restrict__ wb, uint16_t* __restrict__ h, uint32_t n, float eps,
-    float inv_sqrt_n, uint64_t kp, uint64_t vp, uint64_t hp) {
+    float inv_sqrt_n, uint64_t kp, uint64_t vp, uint64_t hp, uint32_t vec) {
     constexpr int K1 = 1 + 2 * HC;
     __shared__ float part1[kEgWaves][K1];
     __shared__ float part2[kEgWaves][HC];
@@ -258,7 +285,7 @@ __device__ __forceinline__ void engram_gate_body(
             s1[2 + 2 * c] += hv * hv;
         }
     }
-    eg_block_sum<K1>(s1, part1);
+    eg_block_sum<K1, false>(s1, part1);
     const float inv_val = 1.0f / sqrtf(s1[0] / (float)n + eps);
     float ik[HC], iq[HC];
 #pragma unroll
@@ -280,7 +307,7 @@ __device__ __forceinline__ void engram_gate_body(
             dot[c] += kn * qn;
         }
     }
-    eg_block_sum<HC>(dot, part2);
+    eg_block_sum<HC, false>(dot, part2);
     float gate[HC];
 #pragma unroll
     for (int c = 0; c < HC; ++c) {
@@ -289,8 +316,36 @@ __device__ __forceinline__ void engram_gate_body(
         gate[c] = eg_sigmoid(sgn * sqrtf(fmaxf(fabsf(d), 1e-6f)));
     }
 
-    // The update, rounded once to bf16 and added to the stream, which rounds again.
-    for (uint32_t i = t; i < n; i += kEgThreads) {
+    // The update, rounded once to bf16 and added to the stream, which rounds again. An element's
+    // arithmetic does not depend on the thread that runs it, so eight elements a thread through
+    // 16-byte accesses give the same bits as the scalar loop (`vec`, host-checked); the tail below
+    // the last whole eight stays scalar.
+    const uint32_t n8 = vec ? (n & ~7u) : 0u;
+    for (uint32_t i = 8u * t; i < n8; i += 8u * kEgThreads) {
+        EgV8 vv;
+        vv.v = *(const r4d_u32x4*)(vr + i);
+        float mw[8], mn[8];
+        eg_w8(wv, i, mw);
+#pragma unroll
+        for (int e = 0; e < 8; ++e)
+            mn[e] = __fmul_rn(__fmul_rn(mw[e], bf16_to_f32(vv.h[e])), inv_val);
+#pragma unroll
+        for (int c = 0; c < HC; ++c) {
+            const uint32_t j = (uint32_t)c * n + i;
+            EgV8 hv;
+            hv.v = *(const r4d_u32x4*)(hr + j);
+            float bw[8];
+            eg_w8(wb, j, bw);
+#pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                const float upd = bf16_to_f32(f32_to_bf16(
+                    __fadd_rn(__fmul_rn(gate[c], mn[e]), __fmul_rn(bw[e], mn[e]))));
+                hv.h[e] = f32_to_bf16(__fadd_rn(bf16_to_f32(hv.h[e]), upd));
+            }
+            *(r4d_u32x4*)(hr + j) = hv.v;
+        }
+    }
+    for (uint32_t i = n8 + t; i < n; i += kEgThreads) {
         const float mn = eg_w(wv, i) * bf16_to_f32(vr[i]) * inv_val;
 #pragma unroll
         for (int c = 0; c < HC; ++c) {
@@ -308,9 +363,10 @@ __global__ __launch_bounds__(kEgThreads) void engram_gate_kernel(
     const int32_t* __restrict__ mask, const WT* __restrict__ wk,
     const WT* __restrict__ wq, const WT* __restrict__ wv,
     const WT* __restrict__ wb, uint16_t* __restrict__ h, uint32_t n, float eps,
-    float inv_sqrt_n, uint64_t kp, uint64_t vp, uint64_t hp) {
+    float inv_sqrt_n, uint64_t kp, uint64_t vp, uint64_t hp, uint32_t vec) {
     if (CH::on) r4d_chain_wait();
-    engram_gate_body<HC, WT>(key, val, mask, wk, wq, wv, wb, h, n, eps, inv_sqrt_n, kp, vp, hp);
+    engram_gate_body<HC, WT>(key, val, mask, wk, wq, wv, wb, h, n, eps, inv_sqrt_n, kp, vp, hp,
+                             vec);
     if (CH::on) r4d_chain_done();
 }
 
@@ -450,6 +506,10 @@ extern "C" int r4d_rad_engram_gate(const RadArgs* a, RadStream s) {
         !r4d_contig(wb))
         return R4D_NO(RAD_E_STRIDE);
     const float inv_sqrt_n = (float)std::pow((double)n, -0.5);
+    /* The update's 16-byte accesses: whole rows of eight at every boundary. */
+    const uint32_t vec = (uint32_t)((n % 8) == 0 && (hp % 8) == 0 && (vp % 8) == 0 &&
+                                    r4d_aligned(h->data, 16) && r4d_aligned(val->data, 16) &&
+                                    r4d_aligned(wv->data, 16) && r4d_aligned(wb->data, 16));
     const bool ch = r4d_geti_or(a, "chain", 0) != 0 && M <= 64;
 #define R4D_EGT_K(HC_, WT_, C_)                                                                  \
     R4D_EMIT(s, (engram_gate_kernel<HC_, WT_, C_>), dim3((uint32_t)M), dim3(kEgThreads), 0,      \
@@ -457,7 +517,7 @@ extern "C" int r4d_rad_engram_gate(const RadArgs* a, RadStream s) {
                     (const int32_t*)mask->data, (const WT_*)wk->data,                            \
                     (const WT_*)wq->data, (const WT_*)wv->data,                                  \
                     (const WT_*)wb->data, (uint16_t*)h->data, (uint32_t)n, eps, inv_sqrt_n,      \
-                    (uint64_t)kp, (uint64_t)vp, (uint64_t)hp)
+                    (uint64_t)kp, (uint64_t)vp, (uint64_t)hp, vec)
 #define R4D_EGT(HC_, WT_)                                                                        \
     return ch ? R4D_EGT_K(HC_, WT_, r4dchain) : R4D_EGT_K(HC_, WT_, R4dUnchained)
 #define R4D_EG(HC_) do { if (wf32) R4D_EGT(HC_, float); R4D_EGT(HC_, uint16_t); } while (0)
