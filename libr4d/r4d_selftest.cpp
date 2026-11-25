@@ -8513,14 +8513,20 @@ static void moe_iqr_gated_case(const Plugin& pl, const MoeIqrGatedShape& sh) {
         return rc == RAD_OK && st_stream_sync(nullptr) == hipSuccess ? RAD_OK : (rc ? rc : -1);
     };
 
+    /* The operands of both paths, kept past the byte compare so the timing below runs on exactly
+     * the tensors the parity check used. */
+    std::vector<RadTensor> ts_pair, tq_pair, ts_fuse;
+    std::vector<RadParam> ps_pair, pq_pair, ps_fuse;
+
     /* The pair: the routed gate_up GEMM into the [Tr, N] plane, then the clamped int8 quantiser over
      * that plane into [Tr, F] codes and [Tr, F / 128] scales. */
     {
-        std::vector<RadTensor> ts = { T(d_a, RAD_I8, { sh.Mtok, K }),
-                                      T(d_as, RAD_F32, { sh.Mtok, kb }) };
-        std::vector<RadParam> ps = { PI("M", sh.Mtok), PI("N", N), PI("K", K), PI("n_expert", E),
-                                     PI("top_k", top_k), PI("group", 128),
-                                     PS("a_order", "token"), PS("dtype", "i8a8h") };
+        std::vector<RadTensor>& ts = ts_pair;
+        std::vector<RadParam>& ps = ps_pair;
+        ts = { T(d_a, RAD_I8, { sh.Mtok, K }), T(d_as, RAD_F32, { sh.Mtok, kb }) };
+        ps = { PI("M", sh.Mtok), PI("N", N), PI("K", K), PI("n_expert", E),
+               PI("top_k", top_k), PI("group", 128),
+               PS("a_order", "token"), PS("dtype", "i8a8h") };
         if (ncls == 2) {
             /* one (weight, scale) a class, the second at `N_odd` rows */
             ts.push_back(T(wt[0], lw.dtype, { (E + 1) / 2, N, K }));
@@ -8561,19 +8567,21 @@ static void moe_iqr_gated_case(const Plugin& pl, const MoeIqrGatedShape& sh) {
         if (rc != RAD_OK) { ok(nm, false, "the pair's GEMM rc " + std::to_string(rc)); dfree_all(); return; }
     }
     {
-        std::vector<RadTensor> tq = { T(d_y, RAD_BF16, { Tr, N }), T(d_q1, RAD_I8, { Tr, F }),
-                                      T(d_s1, RAD_F32, { Tr, sg }), T(nullptr, RAD_BF16, { 1 }) };
+        std::vector<RadTensor>& tq = tq_pair;
+        std::vector<RadParam>& pq = pq_pair;
+        tq = { T(d_y, RAD_BF16, { Tr, N }), T(d_q1, RAD_I8, { Tr, F }),
+               T(d_s1, RAD_F32, { Tr, sg }), T(nullptr, RAD_BF16, { 1 }) };
         absent(tq[3]);
-        std::vector<RadParam> pq = { PI("M", Tr), PI("n", F), PF("limit", sh.limit),
-                                     PI("group", 128), PS("dtype", "bf16") };
+        pq = { PI("M", Tr), PI("n", F), PF("limit", sh.limit),
+               PI("group", 128), PS("dtype", "bf16") };
         const int rc = launch(rq, tq, pq);
         if (rc != RAD_OK) { ok(nm, false, "the quantiser rc " + std::to_string(rc)); dfree_all(); return; }
     }
 
     /* The fused row: the same GEMM, its epilogue writing those codes and scales itself. */
     {
-        std::vector<RadTensor> ts;
-        std::vector<RadParam> ps;
+        std::vector<RadTensor>& ts = ts_fuse;
+        std::vector<RadParam>& ps = ps_fuse;
         if (ncls == 2) {
             ts = { T(d_a, RAD_I8, { sh.Mtok, K }), T(d_as, RAD_F32, { sh.Mtok, kb }),
                    T(wt[0], lw.dtype, { (E + 1) / 2, N, K }),
@@ -8665,6 +8673,41 @@ static void moe_iqr_gated_case(const Plugin& pl, const MoeIqrGatedShape& sh) {
        "step 0 " + std::string(f0.op ? f0.op : "-") + " (" + std::to_string(c0) + "), step 1 " +
            std::string(f1.op ? f1.op : "-") + " (" + std::to_string(c1) + ") over M=" +
            std::to_string(m1) + " n=" + std::to_string(n1) + ", step 2 " + std::to_string(c2));
+    /* The measured basis, on the card that ran this case: the pair (the GEMM into the bf16 plane,
+     * then the quantiser over it) against the fused row, warm, on the same operands, one stream.
+     * The pair's number is its two launches; the launch cost is inside both sides. */
+    {
+        const int iters = 20;
+        auto time_row = [&](const RadKernelInfo* k, std::vector<RadTensor>& ts,
+                            std::vector<RadParam>& ps) {
+            RadArgs a;
+            std::memset(&a, 0, sizeof(a));
+            a.t = ts.data(); a.n_t = (int)ts.size();
+            a.p = ps.data(); a.n_p = (int)ps.size();
+            a.world_size = 1;
+            if (k->scratch) {
+                const int64_t need = k->scratch(&a);
+                if (need > 0) { a.scratch = dalloc((size_t)need); a.scratch_bytes = need; }
+            }
+            return st_time_us([&](int) { (void)k->launch(&a, (RadStream)nullptr); }, iters, nullptr);
+        };
+        const double us_gemm = time_row(ncls == 4 ? rq4 : r, ts_pair, ps_pair);
+        const double us_q = time_row(rq, tq_pair, pq_pair);
+        const double us_fuse = time_row(rg, ts_fuse, ps_fuse);
+        const double us_pair = us_gemm + us_q;
+        std::printf("  k53       M=%lld F=%lld K=%lld top_k=%lld E=%lld ncls=%d limit=%g: "
+                    "the pair %.1f us (gemm %.1f + quantise %.1f), the fused row %.1f us, %+.1f %%\n",
+                    (long long)sh.Mtok, (long long)F, (long long)K, (long long)top_k, (long long)E,
+                    ncls, sh.limit, us_pair, us_gemm, us_q, us_fuse,
+                    us_pair > 0.0 ? 100.0 * (us_fuse - us_pair) / us_pair : 0.0);
+        /* Loose on purpose: the shapes here are small enough for noise to beat a tight bound, and
+         * the byte compare above already holds the results. A fused row slower than the pair it
+         * replaces by more than a fifth is the regression this catches. */
+        ok((std::string(nm) + ": the fused row is not slower than the pair").c_str(),
+           us_fuse <= us_pair * 1.2,
+           "the fused row " + std::to_string(us_fuse) + " us against the pair " +
+               std::to_string(us_pair) + " us");
+    }
     dfree_all();
 }
 
@@ -8680,6 +8723,10 @@ static void moe_iqr_gated_cases(const Plugin& pl) {
     moe_iqr_gated_case(pl, { "dot", 3, 16, 16, 2, 64, 2, 40, 512, 1536, 7, 10.0 });
     /* and a checkpoint inside the step: the row takes the split the pair takes */
     moe_iqr_gated_case(pl, { "split", 3, 16, 16, 2, 8, 2, 34, 512, 1536, 3, 10.0, 9 });
+    /* the item's own shape, prefill: 2048 tokens a rank at top_k 16 is 32768 routed rows, the
+     * model's 1536-wide expert and hidden size. The epilogue's win is the plane's round trip, which
+     * only shows once the rows are many; the parity and the timing above hold at every shape. */
+    moe_iqr_gated_case(pl, { "prefill", 3, 16, 16, 2, 128, 16, 2048, 1536, 1536, 3, 10.0 });
 }
 
 /* moe_gemm_iqr's prefill maps at a large pass: the packed map's bytes at eight token tiles a block
