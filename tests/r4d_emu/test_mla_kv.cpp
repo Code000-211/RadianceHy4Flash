@@ -8,13 +8,22 @@
  *     same token run alone, at M 1, through the plain aligned path;
  *   - mla_expand_gate byte-equal to mla_project_kv's expand followed by gate_mul (its fusion
  *     claim, r4d_fuse.cpp), on both paths and every `mb`.
+ *   - mla_expand_gate_had_quant_i8g, the 1024-thread fused quantiser, at 32 heads: the grid
+ *     the K-17 pad steps (`r4d_cliff_rows`, one head past 32 at every multiple-of-2048 wave
+ *     count). The extra head's workgroup must return at once, so every head's bytes equal a
+ *     run of the same rows on their own and sit next to libref's, and the padded grid is what
+ *     the launcher launches wherever the rule says, and only there.
  *
  * The emulator's WMMA sums in its own order (emu.cpp), not the card's: what is checked is that the
  * kernels compute every output from the same fragments in the same chain, which is what the law
- * says; r4d_selftest holds the card's bytes to the same rules. Needs libref (RADIANCE_HOME). */
+ * says; r4d_selftest holds the card's bytes to the same rules. Needs libref (RADIANCE_HOME).
+ * The quantiser runs here through the real launcher: no engine record ever reaches an emulated
+ * launch, so its chained form is its plain one (r4d_chain.h) and the card's wait/done traffic
+ * stays the card's, with the 108-case kbench check pass as its byte evidence. */
 #include "rad_abi.h"
 #include "rad_plugin.h"
 #include "r4d_plugin.h"
+#include "r4d_common.h"  // r4d_cliff_rows: the grid math the quantiser's launcher calls
 #include "ref_host.h"
 #include <cmath>
 #include <cstdint>
@@ -191,6 +200,145 @@ static bool vs_libref(const Draw& d, bool absorb, const std::vector<uint16_t>& g
     return bad == 0;
 }
 
+/* ---- mla_expand_gate_had_quant_i8g, the quantiser the K-17 pad steps ---- */
+
+/* A [rows, cols] matrix with `elem`-byte elements (the i8 codes, the f32 scales) and a guard
+ * tail per row (cols..pitch stays 0x7e): a store into it, from the padded head or otherwise,
+ * fails the run. The vector's own allocation is 16-byte aligned, every alignment the launcher
+ * asks of these operands. */
+struct QMat {
+    int64_t rows = 0, cols = 0, pitch = 0;
+    size_t elem = 1;
+    std::vector<uint8_t> buf;
+    QMat() = default;
+    QMat(int64_t r, int64_t c, int64_t p, size_t e)
+        : rows(r), cols(c), pitch(p), elem(e), buf((size_t)(r * p + 16) * e, 0x7e) {}
+    uint8_t* data() { return buf.data(); }
+    uint8_t& at(int64_t i, int64_t j) { return buf[(size_t)(i * pitch + j) * elem]; }
+    void load_rows(const void* src) {  /* packed [rows, cols] into the strided matrix */
+        const uint8_t* s = (const uint8_t*)src;
+        for (int64_t i = 0; i < rows; ++i)
+            for (int64_t j = 0; j < cols; ++j)
+                std::memcpy(&at(i, j), s + (size_t)(i * cols + j) * elem, elem);
+    }
+    std::vector<uint8_t> packed() const {
+        std::vector<uint8_t> out((size_t)rows * cols * elem);
+        for (int64_t i = 0; i < rows; ++i)
+            for (int64_t j = 0; j < cols; ++j)
+                std::memcpy(&out[(size_t)(i * cols + j) * elem],
+                            &buf[(size_t)(i * pitch + j) * elem], elem);
+        return out;
+    }
+    bool tail_untouched() const {
+        for (int64_t i = 0; i < rows; ++i)
+            for (int64_t j = cols; j < pitch; ++j)
+                for (size_t e = 0; e < elem; ++e)
+                    if (buf[(size_t)(i * pitch + j) * elem + e] != 0x7e) return false;
+        return true;
+    }
+    RadTensor t(uint32_t dt) {
+        RadTensor x{};
+        x.data = data(); x.dtype = dt; x.rank = 2;
+        x.shape[0] = rows; x.shape[1] = cols; x.stride[0] = pitch; x.stride[1] = 1;
+        return x;
+    }
+};
+
+struct QuantOut {
+    std::vector<int8_t> q;     /* [n, H * kVd] codes  */
+    std::vector<float> sc;     /* [n, H * kVd / 128] scales */
+    std::vector<uint16_t> y;   /* [n, H * kVd], empty without the optional operand */
+    int rc = 0;                /* the launcher's code, or -999 when a guard tail was written */
+};
+
+/* One run of the real launcher over rows [r0, r0 + n) of the draw. The quantiser takes aligned,
+ * unpitched operands only (it refuses the skewed layout), so this is its one path. */
+static QuantOut quant(const Draw& d, int64_t r0, int64_t n, int chain, bool with_y) {
+    const int64_t H = d.H, W = H * kVd, GS = W / 128;
+    QuantOut o;
+    Mat x(n, H * kL, H * kL, 0), w(H * (kKd + kVd), kL, kL, 0), g(n, H * kVd, H * kVd, 0);
+    for (int64_t i = 0; i < n; ++i)
+        for (int64_t j = 0; j < H * kL; ++j) x.at(i, j) = d.x[(size_t)((r0 + i) * H * kL + j)];
+    for (int64_t i = 0; i < H * (kKd + kVd); ++i)
+        for (int64_t j = 0; j < kL; ++j) w.at(i, j) = d.w[(size_t)(i * kL + j)];
+    for (int64_t i = 0; i < n; ++i)
+        for (int64_t j = 0; j < H * kVd; ++j) g.at(i, j) = d.g[(size_t)((r0 + i) * H * kVd + j)];
+    QMat q(n, W, W + 8, 1), sc(n, GS, GS + 4, 4), y(with_y ? n : 1, W, W + 8, 2);
+    std::vector<RadTensor> t = { x.t(), w.t(), g.t(), q.t(RAD_I8), sc.t(RAD_F32) };
+    if (with_y) t.push_back(y.t(RAD_BF16));
+    o.rc = run(r4d_rad_mla_expand_gate_had_quant_i8g, t,
+               { pi("M", n), pi("heads", H), pi("k_dim", kKd), pi("v_dim", kVd), pi("latent_dim", kL),
+                 pi("group", 128), ps("dtype", "bf16"), pi("chain", chain) });
+    const auto qb = q.packed();
+    o.q.assign(qb.begin(), qb.end());
+    const auto sb = sc.packed();
+    o.sc.resize((size_t)n * GS);
+    std::memcpy(o.sc.data(), sb.data(), sb.size());
+    if (with_y) {
+        const auto yb = y.packed();
+        o.y.resize((size_t)n * W);
+        std::memcpy(o.y.data(), yb.data(), yb.size());
+        if (!y.tail_untouched()) o.rc = -999;
+    }
+    if (!q.tail_untouched() || !sc.tail_untouched()) o.rc = -999;
+    return o;
+}
+
+static bool quant_equal(const QuantOut& a, const QuantOut& b) {
+    return a.q == b.q &&
+           std::memcmp(a.sc.data(), b.sc.data(), a.sc.size() * sizeof(float)) == 0 &&
+           (a.y.empty() || a.y == b.y);
+}
+
+/* libref's mla_expand_gate_had_quant_i8g on the whole draw: the codes next to the reference's
+ * (its WMMA order differs, and a product sitting on a rounding boundary can code one step
+ * apart), its scales and y inside the bound vs_libref holds. */
+static bool quant_vs_libref(const Draw& d, const QuantOut& got, std::string* why) {
+    const RadKernelInfo* ref = libref_op("mla_expand_gate_had_quant_i8g");
+    if (!ref) { *why = "libref's mla_expand_gate_had_quant_i8g not loadable (set RADIANCE_HOME)"; return false; }
+    const int64_t H = d.H, M = d.M, W = H * kVd, GS = W / 128;
+    Mat x(M, H * kL, H * kL, 0), w(H * (kKd + kVd), kL, kL, 0), g(M, H * kVd, H * kVd, 0), y(M, W, W, 0);
+    std::memcpy(x.data(), d.x.data(), d.x.size() * 2);
+    std::memcpy(w.data(), d.w.data(), d.w.size() * 2);
+    std::memcpy(g.data(), d.g.data(), d.g.size() * 2);
+    QMat rq(M, W, W, 1), rs(M, GS, GS, 4);
+    if (run(ref->launch, { x.t(), w.t(), g.t(), rq.t(RAD_I8), rs.t(RAD_F32), y.t() },
+            { pi("M", M), pi("heads", H), pi("k_dim", kKd), pi("v_dim", kVd), pi("latent_dim", kL),
+              pi("group", 128), ps("dtype", "bf16"), pi("chain", 0) }) != RAD_OK) {
+        *why = "libref refused";
+        return false;
+    }
+    const auto rc = rq.packed(), rsc = rs.packed();
+    int64_t bad = 0;
+    char b[200];
+    for (int64_t i = 0; i < M * W; ++i) {
+        const int dq = std::abs((int)got.q[(size_t)i] - (int)(int8_t)rc[(size_t)i]);
+        if (dq > 1) {
+            if (!bad) std::snprintf(b, sizeof b, "code %lld got %d want %d", (long long)i,
+                                    (int)got.q[(size_t)i], (int)(int8_t)rc[(size_t)i]);
+            ++bad;
+        }
+    }
+    for (int64_t i = 0; i < M * GS; ++i) {
+        float e = 0.f;
+        std::memcpy(&e, &rsc[(size_t)i * 4], sizeof e);
+        const float g = got.sc[(size_t)i];
+        if (!std::isfinite(g) || std::fabs(g - e) > 2e-5f + 0.0079f * std::fabs(e)) {
+            if (!bad) std::snprintf(b, sizeof b, "scale %lld got %.9g want %.9g", (long long)i, g, e);
+            ++bad;
+        }
+    }
+    for (int64_t i = 0; i < M * W; ++i) {
+        const double e = b2f(y.data()[i]), g = b2f(got.y[(size_t)i]);
+        if (!std::isfinite(g) || std::fabs(g - e) > 2e-5 + 0.0079 * std::fabs(e)) {
+            if (!bad) std::snprintf(b, sizeof b, "y %lld got %.9g want %.9g", (long long)i, g, e);
+            ++bad;
+        }
+    }
+    if (bad) { *why = std::string(b) + " (+" + std::to_string(bad - 1) + " more)"; return false; }
+    return true;
+}
+
 int main() {
     struct G { int64_t H, M; };
     for (const bool absorb : { true, false })
@@ -243,6 +391,66 @@ int main() {
                 ok(rc == RAD_OK && std::equal(tail.begin(), tail.end(), alone.begin() + 5 * yw), w);
             }
         }
+    /* ---- the quantiser the K-17 pad stepped: 32 heads, a grid that steps to 33 ---- */
+    for (const int64_t M : { 1LL, 16LL, 32LL }) {
+        const Draw d = draw(32, M, false, (uint32_t)(1300 + M));
+        char wq[200];
+        const QuantOut all = quant(d, 0, M, 0, true);
+        std::snprintf(wq, sizeof wq, "quant heads 32 M %lld: the launch over all rows runs clean",
+                      (long long)M);
+        ok(all.rc == RAD_OK && !all.y.empty(), wq);
+        /* every token's bytes are its own: alone, and inside the M-row launch, bit for bit (a
+         * padded head that wrote anywhere, or a body that read its index, breaks this) */
+        bool law = all.rc == RAD_OK;
+        for (int64_t t = 0; law && t < std::min<int64_t>(M, 2); ++t) {
+            const QuantOut one = quant(d, t, 1, 0, true);
+            law &= one.rc == RAD_OK &&
+                   std::equal(one.q.begin(), one.q.end(), all.q.begin() + t * 32 * kVd) &&
+                   std::memcmp(one.sc.data(), all.sc.data() + t * 64, 64 * sizeof(float)) == 0 &&
+                   std::equal(one.y.begin(), one.y.end(), all.y.begin() + t * 32 * kVd);
+        }
+        /* and a slice that starts mid-draw, as its own launch */
+        if (M > 5) {
+            const QuantOut tail = quant(d, 5, M - 5, 0, true);
+            law &= tail.rc == RAD_OK &&
+                   std::equal(tail.q.begin(), tail.q.end(), all.q.begin() + 5 * 32 * kVd) &&
+                   std::memcmp(tail.sc.data(), all.sc.data() + 5 * 64, (size_t)(M - 5) * 64 * 4) == 0 &&
+                   std::equal(tail.y.begin(), tail.y.end(), all.y.begin() + 5 * 32 * kVd);
+        }
+        std::snprintf(wq, sizeof wq,
+                      "quant heads 32 M %lld: every row's bytes equal the row alone, bit for bit",
+                      (long long)M);
+        ok(law, wq);
+        std::snprintf(wq, sizeof wq, "quant heads 32 M %lld: codes, scales and y next to libref",
+                      (long long)M);
+        std::string why;
+        ok(all.rc == RAD_OK && quant_vs_libref(d, all, &why),
+           std::string(wq) + (why.empty() ? "" : ": " + why));
+        if (M == 1) {
+            /* the chained wrapper, padded head included (the emulator carries no engine record,
+             * so this drives the chained instantiation with the chain calls inert) */
+            const QuantOut ch = quant(d, 0, M, 1, true);
+            ok(ch.rc == RAD_OK && quant_equal(ch, all),
+               "quant heads 32 M 1: the chained form's bytes equal the plain form's");
+            /* and the optional output operand left out: the codes and scales are the same */
+            const QuantOut ny = quant(d, 0, M, 0, false);
+            ok(ny.rc == RAD_OK && ny.y.empty() && ny.q == all.q &&
+               std::memcmp(ny.sc.data(), all.sc.data(), all.sc.size() * sizeof(float)) == 0,
+               "quant heads 32 M 1: without the optional bf16 output the codes and scales stand");
+        }
+    }
+    /* The launcher's own grid math, called as the launcher calls it (per_row = (v_dim / group) *
+     * ceil(M / 16) = 2 zt, waves = 1024 / 32): the step at 32 heads fires at every one of the
+     * multiples of 2048 that ceil(M / 16) puts the grid on, and never on the counts clear of
+     * them. The M 1 / 16 / 32 rows of the item's verify are the zt 1 and 2 lines. */
+    for (const int zt : { 1, 2, 3, 4 }) {
+        char wg[160];
+        std::snprintf(wg, sizeof wg,
+                      "cliff rows: 32 heads x %d zt x 32 waves (a %d-wave multiple) steps to 33",
+                      zt, 2048 * zt);
+        ok(r4d_cliff_rows(32, 2 * zt, 32) == 33, wg);
+    }
+    ok(r4d_cliff_rows(8, 4, 32) == 8, "cliff rows: 8 heads x 2 zt x 32 waves (1024, off the window) stays");
     std::printf("%d case(s), %d failure(s)\n", g_cases, g_fails);
     return g_fails ? 1 : 0;
 }

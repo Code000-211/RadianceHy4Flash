@@ -2196,6 +2196,7 @@ The VAEs' convolutions are `conv3d_ndhwc` with `tpad` and the audio VAE's `conv2
 | `moe_gather_inv_i8g` | `M`(range) `n` `top_k` `dtype` `group` | `y_expert`, `expert_w`, `inverse` → `q8`, `q8_scale`, `y` |
 | `moe_gather` | `M`(range) `n` `top_k` `dtype` `act`:str/opt | `y_expert`, `expert_w`, `sorted_tok`, `shared`?, `shared_gate`? → `y` |
 | `row_topk` | `M`(range) `N` `R` `vocab_off`/opt `dtype` | `x` → `idx`, `val`, `pairs`? |
+| `cast_row_topk` | `M`(range) `N` `R` `vocab_off`/opt `dtype` | `x` → `idx`, `val`, `pairs`? |
 | `row_topk_merge` | `M` `R` `world_size` `dtype` | `gathered` → `idx`, `val` |
 | `pair_argmax` | `M`(range) `n` `dtype` | `pairs` → `idx`, `val`? |
 | `logit_rerank` | `M`(range) `R` `n_vocab` `n_embd` `vocab_off`/opt `dtype` | `x`, `head`w, `idx_in` → `idx`, `val`, `pairs`? |
@@ -2210,6 +2211,13 @@ candidate in the global top-R is in its own shard's top-R, and both stages break
 id, so the result equals a top-R over the unsharded plane. A slot a shard could not fill carries id
 -1 in `pairs` and is dropped; a sentinel id rather than a -inf value, because a masked logit can be
 -inf legitimately.
+
+**`cast_row_topk`** is `cast` f32 → bf16 followed by `row_topk` at dtype bf16, as one op: `x` is the
+f32 plane (`dtype` f32), each value is rounded to bf16 exactly as `cast` rounds it (to nearest even,
+with the implementation's own NaN rule), and the top-R is taken over the rounded values, which are
+what `val` reports. Its outputs are the pair's bytes; what goes is the cast's launch and its bf16
+plane. A draft head whose logits GEMM writes f32 takes it where a library serves it and the pair
+otherwise.
 
 **`pair_argmax`** is the merge at R = 1, for a vocab-sharded draft head that wants each position's
 winner: `idx` gets the id of the largest value among a row's `n` gathered pairs, ties to the lower
