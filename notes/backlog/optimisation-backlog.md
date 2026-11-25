@@ -911,6 +911,7 @@ Unit arithmetic: a u3 unit is 1,499,904 B a rank; **100 MiB = 70 units = 0.33 po
 #### M-11 Lend the sliding-window pages of unused sequence slots
 - Area core/mem · PL · Gain 73-129 units at 1-4 live sequences (0.35-0.6 points) · Conf medium · Effort M
 - Change: `kv_latent_sliding` 400 blocks = 8 slots x 50 = 211 MiB never lent (`core/mem/kv.h:472-474`).
+- Done: merged (`ae0aacde`, `ba69b153`, `2b4a214d`; the `liveN` probe phase `b930a11d`) — a fourth lender lends the window group's blocks no sequence occupies; its strips are carved after the KV cache's own, so on this config it holds 120 slots (172 MiB) a rank of the item's 211 MiB. Local lane, TP2, u3, `nospec.yaml`, three interleaved runs an arm (`measurements/M-11.md`): the loan's offer 8992.9 -> 9122.0 MiB (+129 MiB) with at most two live sequences and 8975.7 -> 9061.7 MiB (+86 MiB) at three and four; expert units in VRAM +90 at one live sequence, +88 at two, +60 at three and four (inside the item's 73-129 at 1-2, under it at 3-4); hit rate and c1/c4/c8 tok/s inside noise (c8 318.9 -> 320.3 tok/s); greedy byte-identical.
 
 #### M-12 Arena bytes: `edn` (192 MiB at the full plan), score plane, multi-interval liveness
 - pointer: K-19 (drops `edn`), P-10, P-11, P-12.

@@ -849,7 +849,11 @@ expert slab and the KV cache:
   with virtual memory management), the experts keep on the card what the pinned host pool cannot
   hold, plus one expert unit of packing slack. The cache takes the rest, up to what it could ever
   address (`max-num-seqs` x `max-model-len`), and lends every block no live request holds back
-  to the expert slab in place. The prefill staging region comes out of the cache's side.
+  to the expert slab in place. The prefill staging region comes out of the cache's side. A
+  sliding-window group pages one window per sequence slot, so the slots no request occupies go the
+  same way, on a loan of their own: what one such group can spare is sized by slots, not by the
+  token axis the other groups lend on, and a request needing one of those blocks takes it back
+  before it runs.
 - **Without a lender** (`deterministic`, an explicit `placement: all_vram` or `layer_offload`, or
   no virtual memory management), the experts come first and the cache keeps one `max-model-len`
   sequence.
