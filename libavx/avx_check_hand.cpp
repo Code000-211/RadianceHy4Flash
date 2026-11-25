@@ -2393,6 +2393,15 @@ void video_cases(std::vector<Hand>& hs) {
              .pi("M", M).pi("head_dim", 64).pi("n_head", 2).pi("n_head_kv", 1)
              .pf("theta", 10000.0).pf("scale", 2.0).ps("mode", "neox");
             hs.push_back(std::move(r));
+            /* The latent sinks' folded rotary (mla_attn_*_sink's `rope_pos`): a narrow gptj head,
+             * no rotary_dim (the head's own width), whole-number integer positions. */
+            Hand s(("rope of a folded query fragment, head_dim 8, gptj" + sfx).c_str(), "rope",
+                   norm_tol);
+            s.dense(dt, { 3, 2 * 8 }, hfill(481), true)
+             .idx({ 41, 42, 43 })
+             .pi("M", 3).pi("head_dim", 8).pi("n_head", 2).pi("n_head_kv", 0)
+             .pf("theta", 10000.0).pf("scale", 1.0).ps("mode", "gptj");
+            hs.push_back(std::move(s));
         }
 
         /* ---- the DiT's norm: three entries (one empty), [shift | scale] at a 6n pitch ------- */
@@ -5189,6 +5198,44 @@ static void hy4_cases(std::vector<Hand>& hs) {
          .dense(RAD_F32, { M, H, L }, sent, true)
          .pi("M", M).pi("heads", H).pi("latent_dim", L).pi("rope_dim", R).pi("blocks", B)
          .pi("block_size", bs).pf("scale", 0.2).ps("dtype", "f32");
+        hs.push_back(std::move(h));
+    }
+    {
+        /* The query's rotary folded into the sink (its optional `rope_pos`, the 9th operand): both
+         * backends turn the projection's columns with the same angle as `rope` and round each pair
+         * once, so a folded launch is a `rope` launch followed by the sink. */
+        const int64_t H = 2, L = 32, R = 8, bs = 4, blocks = 5, M = 3;
+        Hand h("the query's rotary folded in (gptj)", "mla_attn_paged_sink", 1e-5);
+        h.dense(RAD_F32, { M, H, L }, hfill(481))
+         .dense(RAD_F32, { M, H, R }, hfill(482))
+         .dense(RAD_F32, { 10, 1, bs, L + R }, hfill(483))
+         .dense(RAD_I32, { 1, blocks }, [](int64_t i) { return (float)((i * 3 + 1) % 10); })
+         .idx({ 9 })
+         .idx({ 0, M })
+         .dense(RAD_F32, { H }, [](int64_t i) { return 0.5f * (float)i; })
+         .dense(RAD_F32, { M, H, L }, sent, true)
+         .idx({ 41, 41, 41 })
+         .pi("M", M).pi("heads", H).pi("latent_dim", L).pi("rope_dim", R).pi("block_size", bs)
+         .pi("window", 0).pi("stable", 1).pf("scale", 0.1767766952966369).ps("dtype", "f32")
+         .pf("rope_theta", 10000.0).pf("rope_scale", 1.0).ps("rope_mode", "gptj");
+        hs.push_back(std::move(h));
+    }
+    {
+        /* The same fold with imrope's three position planes on the selection form. */
+        const int64_t H = 2, L = 24, R = 8, bs = 4, B = 3, M = 3;
+        Hand h("the query's rotary folded in (three imrope planes)", "mla_attn_sel_sink", 1e-5);
+        h.dense(RAD_F32, { M, H, L }, hfill(491))
+         .dense(RAD_F32, { M, H, R }, hfill(492))
+         .dense(RAD_F32, { 6, 1, bs, L + R }, hfill(493))
+         .dense(RAD_I32, { M, B }, [](int64_t i) { return (float)((i * 5 + 2) % 6); })
+         .idx({ 8, 9, 10 })
+         .dense(RAD_F32, { H }, [](int64_t i) { return 2.0f - 3.0f * (float)i; })
+         .dense(RAD_F32, { M, H, L }, sent, true)
+         .dense(RAD_I32, { 3, M }, [](int64_t i) { return 100.0f + 13.0f * (float)i; })
+         .pi("M", M).pi("heads", H).pi("latent_dim", L).pi("rope_dim", R).pi("blocks", B)
+         .pi("block_size", bs).pi("stable", 1).pf("scale", 0.2).ps("dtype", "f32")
+         .pf("rope_theta", 10000.0).pf("rope_scale", 1.0).ps("rope_mode", "imrope_gptj")
+         .ps("rope_sections", "2 1 1");
         hs.push_back(std::move(h));
     }
     {

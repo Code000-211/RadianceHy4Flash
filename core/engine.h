@@ -228,6 +228,7 @@ public:
 
 private:
     friend struct EngineBaseWeightsTestAccess;
+    friend struct TableFillTestAccess;
     /* One thread per tensor-parallel rank, each owning one device. Ranks share the address
      * space, so there is no IPC or serialisation and the step batch is shared by pointer rather
      * than broadcast (spec §1). */
@@ -372,9 +373,29 @@ private:
                                 int64_t host_late);
     /* --ngram-placement ram: one copy of the container's [src, src + n) at file offset `foff`,
      * shared by every rank. Locked for the host gather, or pinned for a device kernel to read
-     * over the link (`card`); with ram=DIR the pinned copy is a file other engines map too. */
+     * over the link (`card`); with ram=DIR the pinned copy is a file other engines map too.
+     * The memory is reserved and published here; the bytes are read by a TableFill that
+     * join_table_fills joins after the container pass, so the four Engram tables fill beside it
+     * (B-01) instead of one after the other before it. */
     int copy_table(const uint8_t* src, int64_t n, int64_t foff, bool card, void** out,
                    std::string* why);
+    /* An Engram table whose bytes are still being read: copy_table has reserved and published its
+     * memory, and the load may not use it until join_table_fills has joined it. */
+    struct PendingTable {
+        TableFill   fill;
+        std::string line;         /* "n-gram table ... <size>", the placement line's subject */
+        void*       base = nullptr;
+        int64_t     bytes = 0;
+        TableCopy   copy;         /* the locked region, when `locked` */
+        TableShare  share;        /* the shared file to mark ready, when `shared` */
+        std::string id;           /* the share's id, with `shared` */
+        bool        locked = false;
+        bool        shared = false;
+    };
+    /* Waits for every fill copy_table started, checks each, marks a shared file ready and releases
+     * what failed; logs one line per table. RAD_OK, or the first failure. */
+    int join_table_fills();
+    std::vector<PendingTable> pending_tables_;
     /* An auto-chosen pinned copy failed: move every rank's n-gram gather to the host. */
     bool ngram_gather_to_host();
     /* The table copies: locked ones as [base, base + bytes), pinned ones as rad_dev_alloc

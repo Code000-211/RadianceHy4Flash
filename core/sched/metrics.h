@@ -38,6 +38,10 @@ struct SchedMetrics {
     /* --prefill-interleave: decode-only steps the hold inserted, issued ahead or not; each kept a
      * ready chunk out. */
     int64_t steps_held = 0;
+    /* --chunk-slices: chunk groups started, and the layer-sliced sub-steps they issued (a group
+     * of m contributes m, its first included). */
+    int64_t steps_sliced = 0;
+    int64_t substeps = 0;
     int64_t decode_rows_unspeculated = 0;
     /* Steps whose forward pass was enqueued behind the previous step before it committed
      * (Scheduler::step_next). Every other step leaves the card idle during the host's commit and

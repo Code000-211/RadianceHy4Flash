@@ -182,6 +182,8 @@ struct Model {
      * over the ranks (exactly: one non-zero term) before they replace the lookup's. */
     rad_buf mm_rows = 0;
     rad_op op_mm_scatter = 0, op_mm_copy = 0, op_mm_reduce = 0;
+    rad_buf tail_meta = 0;
+    rad_op pack_h = 0, pack_post = 0, unpack_hidden = 0;
     Dfly df{};       /* DFly2, the block drafter (hyv4flash_dfly.h) */
     int arm = kArmBf16;   /* the routed arms' activation codes (Ffn::arm) */
     /* The pipelined prefill (docs/TP4.md, "the pipelined prefill"): a chunk wider than two shape
@@ -616,25 +618,35 @@ static int drafter(RadBuilder* b, Model& m) {
     }
     Decl d{ b, m, (int)(s.n_layer + s.dfly_layers), access, &m.df.w, 1, &defer };
     const int64_t E = s.n_embd;
-    struct { const char* name; const char* src; bool gain; int64_t rows, cols; bool linear; } one[] = {
-        { "dfly.fusion.weight", "mtp_fusion.eh_proj.weight", false, E, 2 * E, true },
-        { "dfly.fusion_embed_norm.weight", "mtp_fusion.enorm.weight", true, E, 0 },
-        { "dfly.fusion_hidden_norm.weight", "mtp_fusion.hnorm.weight", true, E, 0 },
-        { "dfly.fusion_gate", "mtp_fusion.gate", true, E, 0 },
-        { "dfly.correct_embed_norm.weight", "hidden_correction.embed_norm.weight", true, E, 0 },
-        { "dfly.correct_hidden_norm.weight", "hidden_correction.hidden_norm.weight", true, E, 0 },
-        { "dfly.correct_gate.weight", "hidden_correction.gate_proj.weight", false, E, 2 * E, true },
-        { "dfly.correct_up.weight", "hidden_correction.up_proj.weight", false, E, 2 * E, true },
-        { "dfly.correct_down.weight", "hidden_correction.down_proj.weight", false, E, E, true },
-        { "dfly.output_norm.weight", "final_norm.weight", true, E, 0 },
-        { "dfly.confidence.weight", "confidence_head.proj.weight", false, 1, E },
-        { "dfly.confidence.bias", "confidence_head.proj.bias", true, 1, 0 },
+    /* The correction's three linears split over the ranks as the drafter's own declare reads them
+     * (hyv4flash_dfly.h): gate and up by rows, down by columns. A plain weight takes this rank's
+     * share here, which the drafter's bf16 gemm_nt reads directly; a quantised one stays whole and
+     * the drafter's Lin slices its views. */
+    Decl ds{ b, m, (int)(s.n_layer + s.dfly_layers), access, &m.df.w, s.world, &defer };
+    const bool chain_split = s.world > 1 && E % s.world == 0;
+    const int chain_row = chain_split ? RAD_SHARD_ROW : RAD_SHARD_NONE;
+    const int chain_col = chain_split ? RAD_SHARD_COL : RAD_SHARD_NONE;
+    struct { const char* name; const char* src; bool gain; int64_t rows, cols; bool linear; int shard; } one[] = {
+        { "dfly.fusion.weight", "mtp_fusion.eh_proj.weight", false, E, 2 * E, true, RAD_SHARD_NONE },
+        { "dfly.fusion_embed_norm.weight", "mtp_fusion.enorm.weight", true, E, 0, false, RAD_SHARD_NONE },
+        { "dfly.fusion_hidden_norm.weight", "mtp_fusion.hnorm.weight", true, E, 0, false, RAD_SHARD_NONE },
+        { "dfly.fusion_gate", "mtp_fusion.gate", true, E, 0, false, RAD_SHARD_NONE },
+        { "dfly.correct_embed_norm.weight", "hidden_correction.embed_norm.weight", true, E, 0, false, RAD_SHARD_NONE },
+        { "dfly.correct_hidden_norm.weight", "hidden_correction.hidden_norm.weight", true, E, 0, false, RAD_SHARD_NONE },
+        { "dfly.correct_gate.weight", "hidden_correction.gate_proj.weight", false, E, 2 * E, true, chain_row },
+        { "dfly.correct_up.weight", "hidden_correction.up_proj.weight", false, E, 2 * E, true, chain_row },
+        { "dfly.correct_down.weight", "hidden_correction.down_proj.weight", false, E, E, true, chain_col },
+        { "dfly.output_norm.weight", "final_norm.weight", true, E, 0, false, RAD_SHARD_NONE },
+        { "dfly.confidence.weight", "confidence_head.proj.weight", false, 1, E, false, RAD_SHARD_NONE },
+        { "dfly.confidence.bias", "confidence_head.proj.bias", true, 1, 0, false, RAD_SHARD_NONE },
     };
     for (const auto& w : one) {
         const char* name = nm.f("%s", w.name);
         RAD_ARCH_TRY(map_copy(b, name, nm.ckpt("%s.%s", dp, w.src)));
-        if (w.gain) RAD_ARCH_TRY(d.f32(name, { w.rows }));
-        else RAD_ARCH_TRY(w.linear ? d.linear(name, { w.rows, w.cols }) : d.mat(name, { w.rows, w.cols }));
+        Decl& dd = w.shard == RAD_SHARD_NONE ? d : ds;
+        if (w.gain) RAD_ARCH_TRY(dd.f32(name, { w.rows }));
+        else RAD_ARCH_TRY(w.linear ? dd.linear(name, { w.rows, w.cols }, w.shard)
+                                   : dd.mat(name, { w.rows, w.cols }, w.shard));
     }
     /* A draft-owned embedding (vLLM loads `dfly_layers.embed_tokens` where the checkpoint has
      * one, else shares the target's). Declared only where the model has it. */
@@ -818,6 +830,11 @@ static int trunk_layer(RadBuilder* b, Model& m, int l, MoeFP8::Src* msrc) {
     }
     RAD_ARCH_TRY(lay.attn.declare_core(b, nm, ap, lay.sliding ? 0 : m.iw.sel,
                                        lay.sliding ? 0 : m.iw.len, lay.sliding ? 0 : m.iw.nsel));
+    if (l + 1 == s.n_layer) {
+        m.pack_h = decl_copy(b, T, s.hc * E, RAD_BF16, m.tr.h, m.tr.h);
+        m.pack_post = decl_copy(b, T, s.hc, RAD_F32, m.tr.post, m.tr.post);
+        HY4_NEED(m.pack_h && m.pack_post, "cast (last layer streams and post)");
+    }
     RAD_ARCH_TRY(lay.hc_attn.declare_post(b, s, T, m.tr.h, m.tr.post, m.tr.y));
     RAD_ARCH_TRY(lay.t_mid.declare(b, nm, T, "resid_mid", l, RAD_BF16, s.hc * E, m.tr.h));
 
@@ -900,6 +917,18 @@ static int split_ranks(Shape& s, int world, int rank) {
     s.n_ff_shared_r = s.n_ff_shared / world;
     return RAD_OK;
 }
+
+/* The prefill_tail derivation's layout (abi/rad_runtime.h, RadBatch::prefill_tail_h; written by
+ * core/sched/derive.cpp, d_prefill_tail): [rows, decode_rows, cu[S+1], prefill_cu[P+1],
+ * original_row[m], position[m], three rotary planes of m when the step carries rope_pos (an
+ * encoder is declared), ckpt_cu[3] when it carries ckpt_cut]. The reader in step() and the
+ * capacity declare() gives the buffer both take their offsets from here. */
+struct TailLayout {
+    int64_t cu, pf_cu, ids, pos, rope, ckpt, end;
+    TailLayout(int64_t S, int64_t P, int64_t m, bool rope_planes)
+        : cu(2), pf_cu(cu + S + 1), ids(pf_cu + P + 1), pos(ids + m), rope(pos + m),
+          ckpt(rope + (rope_planes ? 3 * m : 0)), end(ckpt + 3) {}
+};
 
 static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* ctx) {
     if (!b || !meta || !ctx || ctx->is_draft || ctx->rank < 0 || ctx->rank >= MAX_RANKS ||
@@ -1101,6 +1130,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                 if (v) rad_buf_concurrent(b, v);
     }
     RAD_ARCH_TRY(m.t_final.declare(b, nm, T, "final_hidden", -1, RAD_BF16, E, m.final_hidden));
+    m.unpack_hidden = decl_copy(b, T, E, RAD_BF16, m.final_hidden, m.final_hidden);
+    HY4_NEED(m.unpack_hidden, "cast (last layer hidden)");
     m.op_gather = mk(b, "gather_rows",
                      { RAD_RANGE("M", 1, g.max_logit_rows), RAD_INT("n", E),
                        RAD_STR("dtype", "bf16") },
@@ -1141,6 +1172,22 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         if (why_not) rad_note(b, "the vision tower is declared and not served: %s", why_not);
     }
 
+    if (!taps_on() && !m.calib.on()) {
+        RadBufDecl d{};
+        d.dtype = RAD_I32;
+        d.rank = 1;
+        /* The largest tail: no decode sequence (P = max_seqs), every logit row kept, a
+         * checkpoint cut. The derivation writes rotary planes when the step carries rope_pos,
+         * which the core hands only a program that declares an encoder (batch.cpp, mm_on_); the
+         * tower declares one only when served (hyv4flash_vision.h: `if (!serve) return`), so
+         * s.mrope (served) covers every step whose tail has the planes. */
+        d.shape[0] = TailLayout(g.max_seqs, g.max_seqs, g.max_logit_rows, s.mrope).end;
+        d.kind = RAD_BUF_DERIVED;
+        d.domain = RAD_DOMAIN_DEVICE;
+        d.derive = m.df.served ? "prefill_tail_anchors" : "prefill_tail";
+        m.tail_meta = rad_decl_buffer(b, nm.f("prefill_tail"), &d);
+        if (!m.tail_meta) return RAD_E_INVAL;
+    }
     int64_t n_sparse = 0, n_moe = 0;
     for (int64_t l = 0; l < s.n_layer; ++l) {
         n_sparse += !s.is_sliding[(size_t)l];
@@ -1207,6 +1254,38 @@ static StepPlan plan(const Model& m, const RadBatch* batch) {
     return p;
 }
 
+/* P-08: a step whose every row is an output row. The scheduler appends out_ids per entry from that
+ * entry's own rows only, so n_out == T forces every entry to contribute all of its rows, in entry
+ * order = 0..T-1. With no prefill entries (D == S, DT == T) this is a plain decode/verify step and
+ * the gather before the head is an identity copy; the head can read final_hidden directly. */
+static bool head_reads_all_rows(const RadBatch* batch, const StepPlan& p) {
+    return batch->n_out == p.T && p.D == p.S && p.DT == p.T;
+}
+
+/* The compact pass reads its rows [0, DT) as the batch's decode rows: paged() hands them the
+ * batch's block table, seqused and decode bounds, and the stable instance. The derivation keeps
+ * every decode row (d_prefill_tail); a tail whose kept rows do not start with exactly those runs
+ * the full pass instead. The kept rows ascend, so the last decode row in place means all are. */
+static bool tail_keeps_decode(const int32_t* meta, const TailLayout& tl, int64_t DT) {
+    if (DT == 0) return true;
+    return meta[0] >= DT && meta[1] == DT && meta[tl.ids + DT - 1] == DT - 1;
+}
+
+/* In-place row moves issue disjoint slices: kernels copy in parallel within a launch.
+ * Pack low to high, expand high to low, including when two spans overlap each other. */
+static void move_rows(RadCtx* c, rad_op op, rad_buf buf, int64_t width, int64_t src,
+                      int64_t dst, int64_t n) {
+    if (src == dst) return;
+    const int64_t gap = std::abs(dst - src);
+    for (int64_t done = 0; done < n;) {
+        const int64_t count = std::min(n - done, gap);
+        const int64_t at = dst < src ? done : n - done - count;
+        RAD_ISSUE_N(c, op, count, brow_slice(buf, src + at, count, width),
+                    brow_slice(buf, dst + at, count, width));
+        done += count;
+    }
+}
+
 static void step(RadCtx* c, const RadBatch* batch) {
     Model& m = *models[rad_slot(c)];
     const auto& s = m.s;
@@ -1266,6 +1345,9 @@ static void step(RadCtx* c, const RadBatch* batch) {
 
     /* A junction (WP16.2) runs the chain from a block's reduction to the next block's input norm
      * in one launch; the taps behind it read what the chain would have left. */
+    RadBatch compact{};
+    const RadBatch* queries = batch;
+    QueryRows rows{nullptr, T};
     bool entered = false;   /* the previous junction ran this layer's connection and input norm */
     for (size_t i = 0; i < m.layers.size(); ++i) {
         const Layer& l = m.layers[i];
@@ -1279,35 +1361,82 @@ static void step(RadCtx* c, const RadBatch* batch) {
         l.t_attn_post.step(c, brows(m.tr.post, T), T);
         if (!entered)
             RAD_ISSUE_N(c, l.op_attn_norm, T, brows(m.tr.x, T), RAD_W(l.attn_gain), brows(m.tr.xn, T));
-        if (!l.attn.front(c, batch)) return;
+        StepPlan lp = p;
+        const int32_t* meta = batch->prefill_tail_h;
+        const TailLayout tl(p.S, p.P, meta ? meta[0] : 0, batch->rope_pos != nullptr);
+        if (i + 1 == m.layers.size() && m.tail_meta && meta && p.P && meta[0] < T &&
+            tail_keeps_decode(meta, tl, p.DT)) {
+            lp.T = meta[0];
+            rows.n = lp.T;
+            if (rows.n) {
+                lp.DT = meta[1];
+                const auto* device = static_cast<const int32_t*>(rad_buf_ptr(c, m.tail_meta));
+                rows.ids = meta + tl.ids;
+                rows.pf_cu = device + tl.pf_cu;
+                compact = *batch;
+                compact.n_tok = lp.T;
+                compact.n_tok_decode = lp.DT;
+                compact.cu_seqlens = device + tl.cu;
+                compact.positions = device + tl.pos;
+                compact.positions_h = meta + tl.pos;
+                /* An interior checkpoint is a single sequence. The retained queries are a
+                 * suffix. Only a cut inside that suffix can split its MoE pass. */
+                if (batch->ckpt_cut) {
+                    const int cut = meta[tl.ckpt + 1];
+                    compact.ckpt_cut = cut > 0 && cut < lp.T ? cut : 0;
+                    compact.ckpt_cu = compact.ckpt_cut ? device + tl.ckpt : nullptr;
+                }
+                compact.rope_pos = batch->rope_pos ? device + tl.rope : nullptr;
+                queries = &compact;
+            }
+        }
+        if (!l.attn.front(c, batch, queries, rows, lp)) return;
         m.calib.after_front(c, (int)i, l.attn, T);
         /* A pass on a streamed group's ring attends through the selection at every context
          * (hyv4flash_attn.h); every sparse layer of a pass agrees, the view being the pass's. */
-        StepPlan lp = p;
         if (!l.sliding && !lp.select && l.attn.ring_bound(c, batch)) lp.select = true;
-        if (!l.sliding && !l.ix.step(c, batch, lp)) return;
-        if (!l.sliding) m.df.snap_step(c, (int)i, m.iw, T, lp.select);
+        if (!l.sliding && !l.ix.step(c, batch, lp, queries, rows)) return;
+        if (!rows.n) {
+            const auto* kb = kv_batch(batch, l.attn.kv);
+            if (!l.j_mid && kb && kb->stream) kv_stage_next(c, l.attn.kv, l.attn.layer);
+            return;
+        }
+        if (!l.sliding) m.df.snap_step(c, (int)i, m.iw, lp.select, rows);
         const bool jm = (bool)l.j_mid;
         const bool je = (bool)l.j_end;
-        l.attn.core(c, batch, lp, m.iw.sel, m.iw.len, m.iw.nsel, jm);
+        l.attn.core(c, batch, lp, m.iw.sel, m.iw.len, m.iw.nsel, jm, queries, rows);
+        if (rows.ids)
+            rows.spans([&](int64_t src, int64_t dst, int64_t n) {
+                move_rows(c, m.pack_h, m.tr.h, s.hc * E, src, dst, n);
+                move_rows(c, m.pack_post, m.tr.post, s.hc, src, dst, n);
+            });
+        const bool pipe_tail = pipe && jm && je;
+        auto junction = [&](const Junction& j) {
+            if (pipe_tail) {
+                pipe_issue(c, [&] { j.step(c, 0, rows.n, pipe_lane()); });
+                pipe_join(c);
+            } else {
+                j.step(c, rows.n);
+            }
+        };
         if (jm) {
             /* With both junctions split, the pieces below are this junction: running it whole here
              * as well would add the connection twice (and reduce twice). */
-            if (!(pipe && je)) l.j_mid.step(c, T);
-            l.attn.tail_taps(c, T);
+            if (!pipe_tail || rows.ids) junction(l.j_mid);
+            l.attn.tail_taps(c, rows.n);
         }
-        m.calib.after_attn(c, (int)i, T);
-        if (!jm) l.hc_attn.post_add(c, m.tr.y, m.tr.post, m.tr.h, T);
-        l.t_mid.step(c, brows(m.tr.h, T), T);
+        m.calib.after_attn(c, (int)i, rows.n);
+        if (!jm) l.hc_attn.post_add(c, m.tr.y, m.tr.post, m.tr.h, rows.n);
+        l.t_mid.step(c, brows(m.tr.h, rows.n), rows.n);
 
-        if (!jm) l.hc_ffn.pre(c, m.tr.h, m.tr.x, m.tr.post, T);
-        l.t_ffn_x.step(c, brows(m.tr.x, T), T);
-        l.t_ffn_post.step(c, brows(m.tr.post, T), T);
+        if (!jm) l.hc_ffn.pre(c, m.tr.h, m.tr.x, m.tr.post, rows.n);
+        l.t_ffn_x.step(c, brows(m.tr.x, rows.n), rows.n);
+        l.t_ffn_post.step(c, brows(m.tr.post, rows.n), rows.n);
         if (!jm)
-            RAD_ISSUE_N(c, l.op_ffn_norm, T, brows(m.tr.x, T), RAD_W(l.ffn_gain), brows(m.tr.xn, T));
-        l.t_ffn_in.step(c, brows(m.tr.xn, T), T);
-        m.calib.after_ffn_norm(c, (int)i, T);
-        if (pipe && jm && je) {
+            RAD_ISSUE_N(c, l.op_ffn_norm, rows.n, brows(m.tr.x, rows.n), RAD_W(l.ffn_gain), brows(m.tr.xn, rows.n));
+        l.t_ffn_in.step(c, brows(m.tr.xn, rows.n), rows.n);
+        m.calib.after_ffn_norm(c, (int)i, rows.n);
+        if (pipe_tail && !rows.ids) {
             /* The pipelined prefill: piece 0's junction exposed, then piece 1's junction beside
              * piece 0's arms, then piece 0's junction beside piece 1's arms. Every piece's chain
              * steps inside its rows (the reduction sums the same rank order element by element),
@@ -1322,10 +1451,10 @@ static void step(RadCtx* c, const RadBatch* batch) {
             pipe_issue(c, [&] { l.j_mid.step(c, 0, n0, pipe_lane()); });
             pipe_join(c);
             pipe_issue(c, [&] { l.j_mid.step(c, n0, n1, pipe_lane()); });
-            l.ffn.body(c, T, 0, n0);
+            l.ffn.body(c, rows.n, 0, n0);
             pipe_join(c);
             pipe_issue(c, [&] { l.j_end.step(c, 0, n0, pipe_lane()); });
-            l.ffn.body(c, T, n0, n1);
+            l.ffn.body(c, rows.n, n0, n1);
             l.ffn.route_report(c);
             pipe_join(c);
             pipe_issue(c, [&] { l.j_end.step(c, n0, n1, pipe_lane()); });
@@ -1333,26 +1462,43 @@ static void step(RadCtx* c, const RadBatch* batch) {
             entered = je && l.j_end.tail;
             continue;
         }
-        if (!l.ffn.step(c, batch, je)) return;
+        if (!l.ffn.step(c, queries, je)) return;
         if (je) {
-            l.j_end.step(c, T);
-            l.ffn.tail_taps(c, T);
+            junction(l.j_end);
+            l.ffn.tail_taps(c, rows.n);
         }
-        m.calib.after_ffn(c, (int)i, T);
-        if (!je) l.hc_ffn.post_add(c, m.tr.y, m.tr.post, m.tr.h, T);
-        l.t_resid.step(c, brows(m.tr.h, T), T);
+        m.calib.after_ffn(c, (int)i, rows.n);
+        if (!je) l.hc_ffn.post_add(c, m.tr.y, m.tr.post, m.tr.h, rows.n);
+        l.t_resid.step(c, brows(m.tr.h, rows.n), rows.n);
         entered = je && l.j_end.tail;
     }
-    if (!entered) m.hc_head.pre(c, m.tr.h, m.tr.x, 0, T);
-    m.t_hc_head.step(c, brows(m.tr.x, T), T);
+    if (!entered) m.hc_head.pre(c, m.tr.h, m.tr.x, 0, rows.n);
+    m.t_hc_head.step(c, brows(m.tr.x, rows.n), rows.n);
     if (!entered)
-        RAD_ISSUE_N(c, m.op_norm, T, brows(m.tr.x, T), RAD_W(m.final_gain), brows(m.final_hidden, T));
-    m.t_final.step(c, brows(m.final_hidden, T), T);
+        RAD_ISSUE_N(c, m.op_norm, rows.n, brows(m.tr.x, rows.n), RAD_W(m.final_gain), brows(m.final_hidden, rows.n));
+    m.t_final.step(c, brows(m.final_hidden, rows.n), rows.n);
+    if (rows.ids) {
+        /* The sampler and the next draft pass both address the original trunk rows. */
+        for (int64_t end = rows.n; end > 0;) {
+            int64_t start = end - 1;
+            while (start && rows.ids[start - 1] + 1 == rows.ids[start]) --start;
+            move_rows(c, m.unpack_hidden, m.final_hidden, E, start, rows.ids[start], end - start);
+            end = start;
+        }
+    }
     if (batch->n_out > 0) {
-        RAD_ISSUE_N(c, m.op_gather, batch->n_out, brows(m.final_hidden, T),
-                    praw(batch->out_ids, RAD_I32, batch->n_out), brows(m.logit_input, batch->n_out));
-        RAD_ISSUE_N(c, m.op_head, batch->n_out, brows(m.logit_input, batch->n_out), RAD_W(m.head),
-                    brows(m.logits, batch->n_out));
+        if (head_reads_all_rows(batch, p)) {
+            /* P-08: every row outputs, so out_ids is 0..T-1 and the gather would copy
+             * final_hidden onto itself; the head reads final_hidden directly. */
+            RAD_ISSUE_N(c, m.op_head, batch->n_out, brows(m.final_hidden, T), RAD_W(m.head),
+                        brows(m.logits, batch->n_out));
+        } else {
+            RAD_ISSUE_N(c, m.op_gather, batch->n_out, brows(m.final_hidden, T),
+                        praw(batch->out_ids, RAD_I32, batch->n_out),
+                        brows(m.logit_input, batch->n_out));
+            RAD_ISSUE_N(c, m.op_head, batch->n_out, brows(m.logit_input, batch->n_out), RAD_W(m.head),
+                        brows(m.logits, batch->n_out));
+        }
     }
     m.calib.after_step(c, T);
 }
@@ -1376,6 +1522,12 @@ static int probe(const RadModelMeta* meta, RadArchProbe* out) {
     out->draft_depth_fixed = top(meta, "dfly_num_hidden_layers", 0) > 0 ? 1 : 0;
     out->chain_pays = RAD_CHAIN_ALWAYS;
     out->kv_stream_ok = 1;
+    /* S-02: whether this step can run the trunk over a layer range and resume the next sub-step
+     * from a persistent set. S-02a only wires the report: the step still runs the whole trunk and
+     * declares no such set (RadBuildCtx::layer_slices), so it must say 0 and a --chunk-slices
+     * request keeps m = 1. S-02b declares the set and reports 1 here when the trunk can stop
+     * between two layers (no taps, no calibration window). */
+    out->slice_layers_ok = 0;
     /* declare() honours RadBuildCtx::shape_probe (probe_model above): the core sizes the arena's
      * levels, lends their tops to the expert slab and arms the prefill stager. */
     {   /* RADIANCE_HY4_SHAPE_PROBE=0: no sizing declares (an A/B switch, hy4-perf). */
@@ -1400,7 +1552,9 @@ static uint64_t pass_key(RadCtx* c, const RadBatch* batch, const int32_t*) {
     if (batch->draft_pass) return batch->draft_pass > 0 ? 9u : 17u;
     if (batch->phase != RAD_PHASE_DECODE) return 0;
     const StepPlan p = plan(*models[rad_slot(c)], batch);
-    return 1u | (p.select ? 2u : 0u) | (p.nonabs ? 4u : 0u);
+    /* The gather-or-direct head choice (P-08) changes what the step issues; the key separates it. */
+    return 1u | (p.select ? 2u : 0u) | (p.nonabs ? 4u : 0u) |
+           (head_reads_all_rows(batch, p) ? 8u : 0u);
 }
 } // namespace hyv4flash
 

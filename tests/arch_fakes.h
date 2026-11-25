@@ -194,6 +194,8 @@ struct RadCtx {
     std::vector<SnapRec>  snaps;     /* rad_ckpt_snap calls */
     /* kv_stage_next: after which issue index the next layer's copy was handed over. */
     std::vector<StageRec> stages_next;
+    /* The ops this fake's step dispatches to the host (rad_op_domain); every other op is device. */
+    std::vector<rad_op>   host_ops;
 };
 
 /* -------------------------------------------------------------------- the declare-side ABI */
@@ -538,6 +540,13 @@ extern "C" int rad_issue(RadCtx* c, rad_op op, const RadOperand* opd, int n_opd,
     r.lane = c->lane;
     c->issues.push_back(r);
     return RAD_OK;
+}
+/* The domain the fake's step dispatches: an op in RadCtx::host_ops is host, every other device. */
+extern "C" int rad_op_domain(RadCtx* c, rad_op op) {
+    if (!c) return RAD_E_INVAL;
+    for (rad_op h : c->host_ops)
+        if (h == op) return RAD_DOMAIN_HOST;
+    return RAD_DOMAIN_DEVICE;
 }
 /* The second lane, recorded: each issue's lane, and each join's position among the issues. */
 extern "C" int rad_lane(RadCtx* c, int lane) {

@@ -118,7 +118,7 @@ constexpr int kvp_chunk() {
     return best;
 }
 
-template <bool ABSORB, int MB, int NC, bool VEC, bool GATE>
+template <bool ABSORB, int MB, int NC, bool VEC, bool GATE, class CH>
 __device__ __forceinline__ void kvp_body(const uint16_t* __restrict__ x,
                                          const uint16_t* __restrict__ w,
                                          const uint16_t* __restrict__ g, uint16_t* __restrict__ y,
@@ -158,6 +158,24 @@ __device__ __forceinline__ void kvp_body(const uint16_t* __restrict__ x,
             for (int r = 0; r < MB; ++r) b[q][r] = kvp_ld8<VEC>(xp[r] + k0);
         }
     };
+    /* The quarter's weight fragments (the `load`'s a half) and token fragments (its b half) on
+     * their own, so that a chained launch can ask for the weight before the acquire. */
+    auto wload = [&](v8s (&a)[KC][NC], int c) {
+#pragma unroll
+        for (int q = 0; q < KC; ++q) {
+            const int k0 = 16 * (c * KC + q);
+#pragma unroll
+            for (int n = 0; n < NC; ++n) a[q][n] = kvp_wfrag<ABSORB, VEC>(wb, m.wp, o0 + 16 * n, k0, lane);
+        }
+    };
+    auto xload = [&](v8s (&b)[KC][MB], int c) {
+#pragma unroll
+        for (int q = 0; q < KC; ++q) {
+            const int k0 = 16 * (c * KC + q);
+#pragma unroll
+            for (int r = 0; r < MB; ++r) b[q][r] = kvp_ld8<VEC>(xp[r] + k0);
+        }
+    };
     auto step = [&](const v8s (&a)[KC][NC], const v8s (&b)[KC][MB]) {
 #pragma unroll
         for (int q = 0; q < KC; ++q)
@@ -166,7 +184,19 @@ __device__ __forceinline__ void kvp_body(const uint16_t* __restrict__ x,
 #pragma unroll
                 for (int r = 0; r < MB; ++r) acc[n][r] = kvp_wmma(a[q][n], b[q][r], acc[n][r]);
     };
-    load(a0, b0, 0);
+    /* Chained, the block waits in the poll while its predecessor runs (aql.cpp's chain plan), so
+     * the first quarter of kv_b is issued before the acquire: a static weight's bytes are written
+     * by no op of a pass (operand role RAD_OPD_WEIGHT, core/runtime/issue.cpp's haz_note orders no
+     * read of one), so neither load can see a partial write, and the fragments stay in registers
+     * across the acquire. The tokens, the attention output the predecessor wrote, stay behind the
+     * wait, exactly where the plain form's single `load` has them. */
+    if constexpr (CH::on) {
+        wload(a0, 0);
+        r4d_chain_wait();
+        xload(b0, 0);
+    } else {
+        load(a0, b0, 0);
+    }
 #pragma unroll 1
     for (int c = 0; c < NCH; c += 2) {
         load(a1, b1, c + 1);
@@ -233,8 +263,7 @@ __global__ __launch_bounds__(kvp_threads(ABSORB)) void kv_project_wmma(const uin
                                                        const uint16_t* __restrict__ w,
                                                        const uint16_t* __restrict__ g,
                                                        uint16_t* __restrict__ y, KvProjectMeta m) {
-    if constexpr (CH::on) r4d_chain_wait();
-    kvp_body<ABSORB, MB, NC, VEC, GATE>(x, w, g, y, m);
+    kvp_body<ABSORB, MB, NC, VEC, GATE, CH>(x, w, g, y, m);
     if constexpr (CH::on) r4d_chain_done();
 }
 
@@ -259,6 +288,7 @@ constexpr int kQG = 128;          // the quantiser's group: the rotation width a
 constexpr int kQTiles = kQG / 16; // column tiles of a group
 constexpr int kQThreads = 32 * kQTiles * 4;   // 8 tiles x 4 quarters of the contraction = 1024
 
+template <class CH>
 __device__ __forceinline__ void kvq_body(const uint16_t* __restrict__ x, const uint16_t* __restrict__ w,
                                          const uint16_t* __restrict__ g, signed char* __restrict__ q,
                                          float* __restrict__ sc, uint16_t* __restrict__ y,
@@ -285,11 +315,35 @@ __device__ __forceinline__ void kvq_body(const uint16_t* __restrict__ x, const u
             b[qq] = kvp_ld8<true>(xp + k0);
         }
     };
+    /* kvp_body's wload / xload, over one column tile a wave: the weight's fragments of the first
+     * chunk on their own, so a chained launch can ask for them before the acquire. */
+    auto wload = [&](v8s (&a)[KC], int c) {
+#pragma unroll
+        for (int qq = 0; qq < KC; ++qq) {
+            const int k0 = 16 * (c * KC + qq);
+            a[qq] = kvp_wfrag<false, true>(wb, m.wp, o0, k0, lane);
+        }
+    };
+    auto xload = [&](v8s (&b)[KC], int c) {
+#pragma unroll
+        for (int qq = 0; qq < KC; ++qq) {
+            const int k0 = 16 * (c * KC + qq);
+            b[qq] = kvp_ld8<true>(xp + k0);
+        }
+    };
     auto step = [&](const v8s (&a)[KC], const v8s (&b)[KC]) {
 #pragma unroll
         for (int qq = 0; qq < KC; ++qq) acc = kvp_wmma(a[qq], b[qq], acc);
     };
-    load(a0, b0, 0);
+    /* Chained, the weight's first chunk goes out before the acquire and the tokens' after it, as
+     * kvp_body's do (a static weight's bytes; see the note there). */
+    if constexpr (CH::on) {
+        wload(a0, 0);
+        r4d_chain_wait();
+        xload(b0, 0);
+    } else {
+        load(a0, b0, 0);
+    }
 #pragma unroll 1
     for (int c = 0; c < NCH; c += 2) {
         load(a1, b1, c + 1);
@@ -348,8 +402,7 @@ template <typename CH>
 __global__ __launch_bounds__(kQThreads) void kv_expand_gate_quant(
     const uint16_t* __restrict__ x, const uint16_t* __restrict__ w, const uint16_t* __restrict__ g,
     signed char* __restrict__ q, float* __restrict__ sc, uint16_t* __restrict__ y, KvQuantMeta m) {
-    if constexpr (CH::on) r4d_chain_wait();
-    kvq_body(x, w, g, q, sc, y, m);
+    kvq_body<CH>(x, w, g, q, sc, y, m);
     if constexpr (CH::on) r4d_chain_done();
 }
 

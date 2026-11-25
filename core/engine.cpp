@@ -1508,6 +1508,10 @@ int Engine::step_loop() {
                                 b->phase == RAD_PHASE_DECODE  ? "decode"  : "MIXED",
                                 (long long)b->n_seq, (long long)b->n_tok);
             if (issued) s += " ahead";
+            /* A chunk group's sub-step (S-02): which layers of the trunk this pass runs. */
+            if (plan.slice_m > 0)
+                s += fmt(" layers=%d-%d slice=%d/%d", (int)plan.layer_lo, (int)plan.layer_hi,
+                         (int)plan.slice_j + 1, (int)plan.slice_m);
             for (int i = 0; i < b->n_seq && i < 8; ++i) {
                 s += fmt("  [%d] slot=%d q=%d ctx=%d", i, plan.e[(size_t)i].slot,
                          plan.e[(size_t)i].n_tokens, plan.e[(size_t)i].ctx_len);
@@ -2464,6 +2468,9 @@ int Engine::arena_step(const RadBatch* b, bool ahead) {
      * for it (`plan_next_`). Either way the question is whether that plan leaves a chunk, which is
      * nothing to stage when the hold follows it. */
     const bool more = b->phase != RAD_PHASE_DECODE && sched_.prefill_continues(ahead);
+    /* Inside a chunk group the next pass starts at its slice's first layer (S-02); 0 everywhere
+     * else, a whole trunk. */
+    const int32_t first_layer = more ? sched_.next_prefill_first_layer(ahead) : 0;
     for (auto& r : ranks_) {
         const int64_t allow = r->arena_lent[(size_t)level];
         if (r->mover.loan(Mover::kLendArena) > allow ||
@@ -2488,7 +2495,7 @@ int Engine::arena_step(const RadBatch* b, bool ahead) {
          * top that no level's buffers use. At the shared level the ring is memory the full plan
          * computes in, and a copy still going there when such a step starts would race it; a
          * pass's own copies are behind its own ops, which wait for them. */
-        r->stager.set_next_prefill(more && level == 0);
+        r->stager.set_next_prefill(more && level == 0, first_layer);
     }
     if (ranks_.size() > 1) (void)rad_dev_set(ranks_[0]->device);
     return RAD_OK;

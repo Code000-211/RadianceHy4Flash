@@ -979,10 +979,11 @@ models:
 *An n-gram table* (Qwen3.8-Flash-Next's is 47.7 GiB) is read a few rows a token. `disk` reads rows
 from the container through a row cache with direct reads on the host; about half of a step's rows
 are first-seen, so steps wait on the drive. `ram` copies the table into host memory at load (12 to
-40 s more startup, depending on the page cache) and the card's gather kernel reads the pinned copy,
-so a step has no host work. `vram` puts all of it on every card. `ram` needs the table's size free
-after the pinned host pools and the prefix cache's host tier, with `memory.host-headroom-mib` to spare
-(default 4 GiB), under every memory cgroup the process sits in, and refuses the start otherwise.
+40 s of reading, run beside the container pass, depending on the page cache) and the card's gather
+kernel reads the pinned copy, so a step has no host work. `vram` puts all of it on every card.
+`ram` needs the table's size free after the pinned host pools and the prefix cache's host tier, with
+`memory.host-headroom-mib` to spare (default 4 GiB), under every memory cgroup the process sits in,
+and refuses the start otherwise.
 `auto` takes the first of `vram`, `ram` and `disk` that holds the table. Without a device kernel
 for the gather (no libr4d) the table is read on the host: `vram` is refused, and `ram` is a copy in
 locked huge pages, which also needs a memlock limit that large (`--ulimit memlock=-1` in Docker,
@@ -1667,6 +1668,19 @@ prefill run in a different order, and at a tie that is a different token. Each s
 byte-identical across runs and restarts; reproducibility holds per configuration, and this key is
 part of the configuration like `tp` and `num-speculative-tokens`. Pin it before recording
 anything you will compare against later.
+
+**Slicing a chunk between layers** (`chunk-slices: MODE`, default off). A mixed step that carries
+one prefill chunk can be planned as m sub-steps over layer ranges instead of one pass over the whole
+trunk, with the decoding rows between them, so a long chunk no longer holds the other streams still
+for its whole duration. `auto` picks m from the measured chunk and decode step times against
+`chunk-slice-target-ms` (default 150 ms) and `chunk-slice-cost-pct` (default 10, the share of a
+chunk step's time the decodes may wait between two slices); `N` (1-8) sets m itself, capped at the
+trunk's layers and at a chunk of at least 128 rows. A sliced pass runs whole and serial, with the
+same KV bytes and the same `final_hidden` row as the unsliced one; a checkpoint is taken only at
+the group's last sub-step. Only a model whose plugin reports it can run its trunk over a layer
+range (`RadArchProbe::slice_layers_ok`) is sliced, so the flag is a no-op until a plugin reports
+that; the scheduler logs which of the two applied. `radiance:engine_steps_sliced_total` counts
+sliced chunks and `radiance:engine_substeps_total` the sub-steps they issued.
 
 ### 4.6 Speculative decoding
 
@@ -2699,6 +2713,9 @@ switch is set with `true`. The fleet's own keys (a model's `aliases`, `priority`
 | `prefill-room-gate: MODE` | off | `on`: a fresh prompt is admitted only when the whole prompt and one decode position fit the KV cache beside every running sequence and every prompt admitted ahead of it, and the requests behind it wait with it; a prompt that cannot fit even with nothing running fails (`idle_admission`) instead of waiting; long prompts then run one after another. `off`: a prompt is admitted when its first chunk fits, so a long one may fill the cache mid-prompt and be preempted, recomputing from its start |
 | `prefill-interleave: N` | auto:1 (0 under `deterministic: true`, KL mode, generators) | decode-only steps after each prefill chunk while other sequences decode (§4.5), at most 64; `auto` fits them in a quarter of the chunk step's measured time, `auto:SHARE` in SHARE of it (0 < SHARE <= 4); `0` lets every step carry a chunk |
 | `mixed-step-target-ms: N` | 0 (off) | soft completed-service-time target for mixed prefill/decode steps; learns one aggregate prefill cap while decoders are active and leaves uncontended prefill unchanged (§4.5) |
+| `chunk-slices: MODE` | off | `auto`: plan one prefill chunk as m layer-sliced sub-steps with the decoding rows between them, m from the measured chunk and decode step times against `chunk-slice-target-ms` and `chunk-slice-cost-pct`; `N` (1-8): m itself, capped at the trunk's layers and at a chunk of at least 128 rows. Only a model whose plugin reports it can run the trunk over a layer range (`RadArchProbe::slice_layers_ok`) is sliced; on any other a chunk keeps one step and the scheduler logs it (§4.5) |
+| `chunk-slice-target-ms: N` | 150 | the duration one layer-sliced sub-step targets, in milliseconds; `chunk-slices: auto` sizes m from it (§4.5) |
+| `chunk-slice-cost-pct: N` | 10 | the share of a chunk step's time the decodes may wait between two slices, in percent; with `chunk-slices: auto`, `0` makes the budget reject every split and keeps m at 1 (§4.5) |
 | `preempt-wait-ms: N` | 5000 | how long a preempted prefill may wait for its whole-recompute gate before reclaiming cache blocks and preempting lowest-priority running requests until one overdue request can prefill; `0` falls back on the next step. A preempted request publishes what it computed to the prefix cache, as a finished one does, so its recompute adopts its prompt instead of computing it again; under pressure the cache gives those blocks back, the newest last, before another request is preempted |
 | `busy-prefill-chunk: MODE` | auto | a prefill chunk's share of a step that has other work: `auto` leaves decode rows and waiting requests their room (§4.5), `off` takes the whole step, `N` holds it to N tokens |
 | `max-num-seqs: N` | 256 | largest number of sequences one step may carry |
@@ -4872,9 +4889,12 @@ curl -s -H "Authorization: Bearer $KEY" localhost:8000/diagnostics | jq '.findin
 
 Before the report the bring-up logs one `startup: <phase> in <x.x> s (at <y.y> s)` line per phase:
 `declare` (with `arena levels` in it), `plan` (with `host pool pin` in it), `weights` (the one pass
-over the container and the Engram table copies), `kv`, `contexts`, `settle` and `ready`, where `in`
-is the phase's own duration and `at` the seconds since the engine started; the n-gram table and
-container-pass lines give their own duration and take only the `(at <y.y> s)` suffix.
+over the container, which the Engram table copies run beside), `kv`, `contexts`, `settle` and
+`ready`, where `in` is the phase's own duration and `at` the seconds since the engine started; each
+n-gram table's line gives that table's own fill duration (`filled beside the container pass`) and
+the container-pass line its own, both taking only the `(at <y.y> s)` suffix. The tables start
+reading as the pass meets them and are joined after it, so the phase is the longer of the pass and
+the tables rather than their sum.
 
 ### 7.2 Messages and what they mean
 

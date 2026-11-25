@@ -332,7 +332,7 @@ but the tier, which is what the A/B measures.
 Merge when all three hold:
 
 1. The output is byte-identical, or inside the item's stated bound (ORD / PF; see the field key at the top of the backlog's §3).
-2. The kernel, op or step the item targets is measurably faster in ms (AQL stamps, rad-kbench or profile-ops) on its lane.
+2. The kernel, op or step the item targets is measurably faster in ms (AQL stamps, rad-kbench or profile-ops), before and after on one machine (§6 step 3).
 3. End-to-end tok/s or TTFT is not worse beyond noise.
 
 A kernel gain whose end-to-end effect is inside noise still merges: gains compound.
@@ -363,7 +363,7 @@ design agent: Opus 5.5, thinking medium.
 
 ## 6. Working from outside (no lane)
 
-A worker without access to the lanes can still do a card:
+A worker without access to the lanes can still do a card, and measures it as far as their own hardware allows:
 
 1. Write the change and its tests.
 2. Run what needs no GPU:
@@ -374,8 +374,39 @@ A worker without access to the lanes can still do a card:
    - the plugin lints (`hyv4flash_arch_test`)
    - the scheduler tests (`sched_test`)
    - every ctest that runs without a card
-3. Push a branch and open a PR titled `[needs lane]`. List in it the GPU checks from the item's "Verify" part, and the stamps
-   or kbench rows that the merge bar needs.
-4. A lane run here measures the PR (before / after on one lane) and merges or closes it by §2.
+3. With a GPU, measure the change yourself: before (the PR's merge base) and after (your code commit) on the same
+   machine, same settings, at least three runs each, interleaved. Take the rows the item's merge bar (§2) names: the
+   stamps, `rad-kbench` or `profile-ops` rows of the targeted kernel, op or step, and the output parity (§2.1). Write
+   them to `notes/backlog/measurements/<item>.md` (for example `K-47.md`) and commit that file to the PR, with:
+   - the commit ids of before and after (after is the commit of the code you measured; the commit that adds this file
+     comes on top of it and changes nothing else),
+   - who measured, the GPUs (model, count, TP), power cap, ROCm / driver version,
+   - the container and the `ngram-placement` you ran with (any placement is fine on your machine),
+   - the raw lines of each run for the rows the bar names (not only a summary). Keep the file under 40 KB: the
+     review reads the PR as text and refuses larger files.
+   Numbers from your machine are compared with each other only, never with another machine's.
+4. Push a branch and open a PR whose title or body holds `Fixes #<issue>`. Title it `[measured] <item>: <subject>`
+   when the file covers the item's whole merge bar, `[needs testing] <item>: <subject>` when it does not (no GPU).
+5. **Write `/done` as a comment on the item's issue** (not on the PR): only that starts the review, and only the PR's
+   author can. After every push you want reviewed, write `/done` again. A PR gets at most three review rounds, so
+   push your fixes and the measurement together where you can.
+6. The review reads the PR's diff and files and the issue's title and body, nothing else. It checks the code and the
+   measurement file: the rows are the ones §2 asks for, before and after come from one machine, the raw lines carry
+   the numbers. When both hold it approves and the PR merges at once. When only the measurement is missing, the issue
+   gets the label `ready-for-testing` (§6.1).
 
-Items whose whole value is a measurement (marked "lane required" in their issue) need a lane from the start.
+### 6.1 Testing a `ready-for-testing` issue
+
+No lane on the Moebius server measures anything. Anyone with a free GPU can measure a change that waits on the label
+`ready-for-testing`, without writing code:
+
+1. Check out the PR's head and its merge base (`git merge-base origin/<base> <head>`).
+2. Measure both as step 3 above says.
+3. Post the result as a comment on the issue, starting with a `## Measurement` heading.
+
+For an own card, the board picks it up within the hour: the Reviewer checks it, and the change merges, or the issue is
+told what is missing. For a PR from outside, the PR's author commits the posted measurement as
+`notes/backlog/measurements/<item>.md` and writes `/done`; the board reminds them on the issue.
+
+Items whose whole value is a measurement (marked "lane required" in their issue) need a lane from the start. Lossy items
+keep §3.

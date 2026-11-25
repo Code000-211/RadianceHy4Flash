@@ -144,6 +144,23 @@ class ProbePhasesTest(unittest.TestCase):
         for ph in ("longctx()", "long8(", "idle(", "resume("):
             self.assertIn(f"record({ph}", self.src, f"{ph} is recorded through record()")
 
+    def test_record_runs_and_lifts_the_waves(self):
+        """record() itself, run on dicts: a composite phase keeps its summary and its stamped waves
+        follow as phases of their own; a plain phase and a wave without stamps add nothing."""
+        a = self.src.index("R = {")
+        b = self.src.index('if "nowarm"')
+        ns = {}
+        exec(self.src[a:b], ns)
+        pre = {"name": "longctx-pre", "mono_ns": [1, 2], "decode_steps": 0}
+        dec = {"name": "longctx-decode", "mono_ns": [3, 4], "decode_steps": 5}
+        bare = {"name": "x", "decode_steps": 1}
+        ns["record"]({"name": "longctx", "prefill": pre, "decode": dec, "other": bare})
+        names = [o["name"] for o in ns["R"]["phases"]]
+        self.assertEqual(names, ["longctx", "longctx-pre", "longctx-decode"])
+        ns["record"]({"name": "plain", "mono_ns": [1], "decode_steps": 2})
+        self.assertEqual(ns["R"]["phases"][-1]["name"], "plain")
+        self.assertEqual(len(ns["R"]["phases"]), 4)
+
 
 if __name__ == "__main__":
     if not shutil.which("c++filt") and not shutil.which("llvm-cxxfilt"):

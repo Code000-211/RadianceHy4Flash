@@ -1518,6 +1518,12 @@ int             rad_ctx_wgp_count(RadCtx* c) {
 }
 RadStream       rad_stream(RadCtx* c)     { return c ? static_cast<rad::Ctx*>(c)->stream() : nullptr; }
 
+/* The domain this deployment's issue dispatches `op` to: RAD_DOMAIN_DEVICE or RAD_DOMAIN_HOST.
+ * See abi/rad_runtime.h. */
+int rad_op_domain(RadCtx* c, rad_op op) {
+    return c ? static_cast<rad::Ctx*>(c)->op_domain(op) : RAD_E_INVAL;
+}
+
 /* The second lane. `rad_lane` selects the lane subsequent issues launch on; `rad_lane_join`
  * orders one behind the other with an event, blocking neither the host nor a stream. The runtime
  * joins lane 1 back into lane 0 at the end of every step, so a missing join costs performance,

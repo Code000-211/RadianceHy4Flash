@@ -185,6 +185,8 @@ void Metrics::sample(const SchedMetrics& m) {
     c_steps_ahead_.advance_to(m.steps_ahead);
     c_prefill_capped_.advance_to(m.prefill_chunks_capped);
     c_steps_held_.advance_to(m.steps_held);
+    c_steps_sliced_.advance_to(m.steps_sliced);
+    c_substeps_.advance_to(m.substeps);
     c_mixed_step_target_steps_.advance_to(m.mixed_step_target_steps);
     c_mixed_step_target_misses_.advance_to(m.mixed_step_target_misses);
     c_rows_unspec_.advance_to(m.decode_rows_unspeculated);
@@ -425,6 +427,12 @@ std::string Metrics::render() const {
     w.counter("radiance:engine_steps_held_total",
               "Decode-only steps run after a prefill chunk while other sequences decode "
               "(--prefill-interleave).", L, c_steps_held_.get());
+    w.counter("radiance:engine_steps_sliced_total",
+              "Prefill chunks planned as layer-sliced sub-steps (--chunk-slices, S-02).",
+              L, c_steps_sliced_.get());
+    w.counter("radiance:engine_substeps_total",
+              "Layer-sliced sub-steps issued, the first of each group included.",
+              L, c_substeps_.get());
     w.counter("radiance:mixed_step_target_steps_total",
               "Mixed prefill/decode steps observed by --mixed-step-target-ms.",
               L, c_mixed_step_target_steps_.get());

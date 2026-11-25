@@ -32,6 +32,14 @@ struct GatedMlp {
      * fused_quant_on), where down is rotated int8 and libr4d serves it: `ff` carries the codes and
      * down declares no quantiser. Byte-identical to silu_mul followed by had_quant_act_i8g. */
     bool gfuse = false;
+    /* The same fold one launch further (decl_gated_fold_iqr, `gemm_nt_q_gated` at i8a8h): the
+     * gate_up GEMM's epilogue writes the codes the pair's gated_had_quant_i8g writes, for the rows
+     * that row serves (M <= 16, `gated_rows`), and the pair stays for the longer ones. Declared
+     * over an IQR gate_up weight only: gemm_iqr_gated decodes that layout. Byte-identical to the
+     * pair (docs/OPS.md, "gemm_nt_q_gated"; K-23). It writes the codes only, like the fused gate
+     * it replaces. */
+    rad_op  op_gated = 0;
+    int64_t gated_rows = 0;
     /* `feed`: gate_up reads the codes that linear wrote of the same input (Lin::feed). */
     int declare(RadBuilder* b, Names& nm, const Geom& g, const Shape& s, int l, const char* gu_name,
                 const char* dn_name, const char* mp, int64_t ff_w, rad_buf x, rad_buf y,
@@ -76,25 +84,50 @@ struct GatedMlp {
             }
         }
         if (!gfuse) RAD_ARCH_TRY(act.declare(b, g, gu, ff, ff_w, "silu"));
+        /* The fold: gate_up, the gate and the codes of the product in one epilogue (the rule every
+         * gated MLP shares, gated_fold_iqr_ok). Declared beside the pair, after `act`, so the codes
+         * it writes exist; the gate write the codes alone (the fold has no bf16 product) and the
+         * library must serve the op (a CPU-only engine keeps the pair). A gate_up whose input codes
+         * are fed (the shared expert behind the latent linear, Lin::feed) declares no quantiser, so
+         * the fold reads the producer's pair; the others quantise their input in front of it. */
+        const ActFP8 in_fold = gate_up.with_codes(in);
+        if (gfuse && !act.want_x && gated_fold_iqr_ok(gate_up, in_fold, ff, in_fold.q8_fed) &&
+            rad_op_declared(b, "gemm_nt_q_gated"))
+            op_gated = decl_gated_fold_iqr(b, g.max_tok, gate_up.N, gate_up.K, gate_up.w,
+                                           gate_up.ws, { in_fold.q8, in_fold.s8 },
+                                           { ff.q8, ff.s8 }, &gated_rows);
         down.fed_codes = gfuse ? &ff : nullptr;
         RAD_ARCH_TRY(down.declare(b, nm, g, dn_name, s.n_embd, ff_w, RAD_SHARD_COL, grp,
                                   { nm.ckpt("%s.down_proj.weight", mp) }, ff, y));
         down.fed_codes = nullptr;
         return RAD_OK;
     }
+    /* gate_up, the gate and its quantiser over rows [r0, r0 + n): the fold where it serves these
+     * rows, the pair otherwise. */
+    void gate(RadCtx* c, const ActFP8& in, int64_t T, int64_t r0, int64_t n) const {
+        if (op_gated && n > 0 && n <= gated_rows) {
+            const ActFP8 a = gate_up.with_codes(in);
+            gate_up.quantise(c, a, T, r0, n);   /* nothing when the codes are fed */
+            RAD_ISSUE_N(c, op_gated, n, brow_slice(a.q8, r0, n, gate_up.K),
+                        brow_slice(a.s8, r0, n, gate_up.K / a.g8), RAD_W(gate_up.w),
+                        RAD_W(gate_up.ws), brow_slice(ff.q8, r0, n, down.K),
+                        brow_slice(ff.s8, r0, n, down.K / ff.g8));
+            return;
+        }
+        gate_up.step(c, in, gu, T, r0, n);
+        act.step(c, gu, T, r0, n);
+    }
     void step(RadCtx* c, rad_buf x, rad_buf y, int64_t T) const {
         ActFP8 in{};
         in.x = x;
-        gate_up.step(c, in, gu, T);
-        act.step(c, gu, T);
+        gate(c, in, T, 0, T);
         down.step(c, ff, y, T);
     }
     /* Rows [r0, r0 + n): the pipelined prefill runs the arm a piece at a time. */
     void step(RadCtx* c, rad_buf x, rad_buf y, int64_t T, int64_t r0, int64_t n) const {
         ActFP8 in{};
         in.x = x;
-        gate_up.step(c, in, gu, T, r0, n);
-        act.step(c, gu, T, r0, n);
+        gate(c, in, T, r0, n);
         down.step(c, ff, y, T, r0, n);
     }
 };
@@ -105,6 +138,9 @@ enum { kArmBf16 = 0, kArmE4M3 = 1, kArmI8 = 2 };
 /* The routed arm's planes and the shared arm's, shared by every MoE layer. */
 struct MoeWire {
     ActFP8 lat{};          /* [T, latent] latent_in's output, then the routed sum */
+    /* The routed sum's rotated int8 codes and scales, where ffn_latent_out takes them and the
+     * gather writes them (K-19): see Ffn::declare. Empty (g8 0) otherwise. */
+    ActFP8 sum{};
     rad_buf routed = 0;    /* [T, n] latent_out's output, then routed + shared */
     rad_buf sgu = 0;       /* [T, 2 * ff_shared] */
     rad_buf sff = 0;       /* [T, ff_shared] */
@@ -135,6 +171,10 @@ struct MoeWire {
         w.eoff = decl_b(b, nm.f("moe.expert_offsets"), RAD_I32, { s.n_expert_r + 1 });
         w.ecnt = decl_b(b, nm.f("moe.expert_counts"), RAD_I32, { s.n_expert_r });
         w.sorted = decl_b(b, nm.f("moe.expert_sorted"), RAD_I32, { T * k });
+        /* The sort's inverse table, so `moe_scatter_inv` writes the gather's slot table and
+         * `moe_gather_inv` reads it: without it a pass above the gather's self-scan bound adds two
+         * prepass launches and loses the chained form (K-18). */
+        w.inv = decl_b(b, nm.f("moe.expert_slot"), RAD_I32, { T * k });
         w.egu = bf("moe.expert_gate_up", { T * k, 2 * F });
         w.eff.x = bf("moe.expert_ff", { T * k, F });
         w.edn = bf("moe.expert_down", { T * k, L });
@@ -199,6 +239,7 @@ struct Ffn {
         c.topk_group = 1;
         c.swiglu_limit = s.swiglu_limit;
         c.router_k = s.n_embd;
+        c.router_weight_bf16 = true;
         c.no_reduce = 1;
         /* Only a layer inside --calib-layers taps, as the trunk's CalibFull::records; without it,
          * RADIANCE_CALIB_LAYERS decides (calib_layer_on). A layer outside keeps no per-expert Grams on
@@ -324,13 +365,41 @@ struct Ffn {
             MoeFP8::Wire mw = w.moe;
             mw.h = w.lat;
             mw.route = xf;
+            /* K-19: the gather writes the sum's rotated int8 codes in the launch that sums it, and
+             * ffn_latent_out reads them in place of its own quantiser, where that linear's weight is
+             * rotated int8 at a group the latent divides (probed here, as lat_in's is above; the
+             * linear checks the form again and quantises for itself if it disagrees). The pair is the
+             * trunk's, shared by every layer of this width and group (Codes). */
+            if (gather_q8_on() && s.latent % 256 == 0 && src->cfg.top_k == 16) {
+                const char* lwn = nm.f("blk.%d.ffn_latent_out.weight", l);
+                if (!lat_out.mapped) {
+                    RAD_ARCH_TRY(map_linear(b, lwn,
+                                            { nm.ckpt("%s.routed_expert_up_proj.weight", mp) }));
+                    lat_out.mapped = true;
+                }
+                const CodeForm f = code_form(b, lwn);
+                Codes* cp = codes_of(b);
+                const Codes::Pair* pr = cp && f.i8 && f.rot && f.g8 > 0 && s.latent % f.g8 == 0
+                                            ? cp->get(s.latent, f.g8, "sum")
+                                            : nullptr;
+                if (pr) {
+                    w.sum.q8 = pr->q8;
+                    w.sum.s8 = pr->s8;
+                    w.sum.g8 = f.g8;
+                    w.sum.q8_rot = true;
+                    mw.sum = w.sum;
+                }
+            }
             /* Quantised experts read their codes (MoeWire); bf16 ones the bf16 plane. */
             ge.w_bf16 = src->cfg.expert_bf16 != 0;
             RAD_ARCH_TRY(moe.declare(b, nm, ge, l, mw, *src, false, false));
+            /* The codes the gather wrote, if it took the quantising form (declare sets it). */
+            if (w.sum.q8 && moe.gather_q8) lat_out.fed_codes = &w.sum;
             RAD_ARCH_TRY(lat_out.declare(b, nm, g, nm.f("blk.%d.ffn_latent_out", l), s.n_embd,
                                          s.latent, RAD_SHARD_NONE, grp,
                                          { nm.ckpt("%s.routed_expert_up_proj.weight", mp) }, w.lat,
                                          w.routed));
+            lat_out.fed_codes = nullptr;
             RAD_ARCH_TRY(shared.declare(b, nm, g, s, l, nm.f("blk.%d.ffn_gate_up_shexp", l),
                                         nm.f("blk.%d.ffn_down_shexp", l),
                                         nm.ckpt("%s.shared_experts", mp), s.n_ff_shared_r, xf,
