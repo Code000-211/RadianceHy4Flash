@@ -948,12 +948,15 @@ costs more than it saves and every rank runs the replicated or head-split form.
   bit-identical: the router splits its output columns, the mHC projection its 16384-wide input
   into eight 2048-column chunks, whose partials `mhc_pre_finish` completes on every rank, and the
   head gates go with the indexer's rows (above). Below the threshold, as in decode, the
-  collective costs more than it saves. The router's split part can run on the bf16 WMMA tile
-  instead: `RADIANCE_HY4_ROUTER_WMMA=1` (off by default, lossy) declares `gemm_nt_f32_wmma`
-  (`gemm_nt_f32_bf16_wmma`, docs/OPS.md) for that part only, which sums K in the tile's order
-  rather than `gemm_nt_f32`'s. The weight stays the stored bf16, the accumulation and the output
-  stay f32, and every decode and verify row keeps `gemm_nt_f32`; the split itself still applies
-  (notes/backlog/lossy/P-13.md reports the KL and the question of whether it still pays).
+  collective costs more than it saves. The router's prefill projection can run on the bf16 WMMA
+  tile instead: `RADIANCE_HY4_ROUTER_WMMA=1` (off by default, lossy) declares
+  `gemm_nt_f32_wmma` (`gemm_nt_f32_bf16_wmma`, docs/OPS.md) for the prefill rows of whichever
+  projection serves them, which sums K in the tile's order rather than `gemm_nt_f32`'s -- the
+  split part where the split applies, and otherwise the replicated projection's own rows from
+  the threshold up (`GlmRouter::declare`, a second op with `gemm_nt_f32` left below it). The
+  weight stays the stored bf16, the accumulation and the output stay f32, and every row below the
+  threshold (decode, and a verify step that short) keeps `gemm_nt_f32`; the split itself still
+  applies (notes/backlog/lossy/P-13.md reports the KL and the question of whether it still pays).
 
 **Vision.** The tower (`arch/common/rad_block_glm_vision.h`, transformers' `Glm5NextVisionModel`)
 is declared last, so an encoder pass shares the arena with the step's buffers. Every rank runs it
