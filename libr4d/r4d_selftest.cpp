@@ -26448,6 +26448,19 @@ static void moe_w4_gemm(const Plugin& pl, int64_t Tr, const MoeW4Shape& sh, int 
                              " elements differ");
         }
     }
+    /* A value the axis does not name is refused on the shape that does read it, not read as the
+     * rule (the misspelt-pin case the review named). */
+    if (act8 == 1 && dn_wide && !two_cls[0].empty()) {
+        std::vector<RadParam> p4x = ps4;
+        p4x.push_back(PI("dmt", 8));
+        RadArgs a4x = a4;
+        a4x.p = p4x.data(); a4x.n_p = (int)p4x.size();
+        a4x.scratch = d_map; a4x.scratch_bytes = map_bytes;
+        const int rc = r4->launch(&a4x, nullptr);
+        st_stream_sync(nullptr);
+        ok((what4 + ": a dmt value the tile does not name is refused").c_str(),
+           rc == RAD_E_UNSUPPORTED, "rc=" + std::to_string(rc));
+    }
 }
 
 static void moe_w6_cases(const Plugin& pl) {
