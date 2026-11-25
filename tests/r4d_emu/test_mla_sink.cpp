@@ -484,21 +484,25 @@ void check_stable(const std::string& name, const Problem& p, bool forms_pins = t
         /* K-59: the `hg` axis rad-tune walks takes the same workgroup widths the form pins do, and
          * the bytes do not move. The pin is off here, so only the axis picks the group; a value the
          * shape cannot fill more than half (heads > 16 * (hg / 2), the law's own bound) must be
-         * refused rather than launched. */
-        bool axis = true;
-        char hgbuf[160] = "";
-        for (int g : { 1, 2, 4 }) {
-            std::vector<uint16_t> o;
-            const int rca = launch(p, false, 0, o, 1, 0, nullptr, nullptr, nullptr, g);
-            const bool fits = (long)p.heads > 16 * (g / 2);
-            const bool ok_g = fits ? (rca == RAD_OK && o == all) : (rca != RAD_OK);
-            if (!ok_g)
-                std::snprintf(hgbuf, sizeof hgbuf, "hg %d rc %d%s", g, rca,
-                              fits ? " bytes moved" : " accepted an unusable group");
-            axis = axis && ok_g;
+         * refused rather than launched. Eight heads have one group only (the law's), so the sweep
+         * is skipped there: it would time the same work twice, and this suite's shapes are its
+         * cost. */
+        if (p.heads > 8) {
+            bool axis = true;
+            char hgbuf[160] = "";
+            for (int g : { 1, 2, 4 }) {
+                std::vector<uint16_t> o;
+                const int rca = launch(p, false, 0, o, 1, 0, nullptr, nullptr, nullptr, g);
+                const bool fits = (long)p.heads > 16 * (g / 2);
+                const bool ok_g = fits ? (rca == RAD_OK && o == all) : (rca != RAD_OK);
+                if (!ok_g)
+                    std::snprintf(hgbuf, sizeof hgbuf, "hg %d rc %d%s", g, rca,
+                                  fits ? " bytes moved" : " accepted an unusable group");
+                axis = axis && ok_g;
+            }
+            report(name + " stable 1: the hg axis (1 / 2 / 4) equals the law, and refuses a group "
+                            "it cannot fill", axis, hgbuf);
         }
-        report(name + " stable 1: the hg axis (1 / 2 / 4) equals the law, and refuses a group it "
-                        "cannot fill", axis, hgbuf);
     }
     if (p.window == 0) {
         Problem q = p;

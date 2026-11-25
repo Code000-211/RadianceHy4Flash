@@ -688,6 +688,18 @@ static RadParam PS(const char* k, const char* v) {
     RadParam p; std::memset(&p, 0, sizeof(p));
     p.key = k; p.kind = RAD_P_STR; p.sval = v; return p;
 }
+/* The test's own arguments with one parameter more on top -- the pin rad-tune would write (K-59's
+ * axis cases). RadArgs names its parameter array by pointer, so `keep` is the caller's and must
+ * outlive the launch. */
+static RadArgs args_with(const std::vector<RadParam>& ps, const RadArgs& a, const char* name,
+                         long long v, std::vector<RadParam>& keep) {
+    keep = ps;
+    keep.push_back(PI(name, v));
+    RadArgs a2 = a;
+    a2.p = keep.data();
+    a2.n_p = (int)keep.size();
+    return a2;
+}
 /* A real-valued parameter, RAD_P_F64 as in the schemas (docs/OPS.md). This file calls launches
  * directly with no declare to catch a kind mismatch, so a string would silently fall back to the
  * shim's default. */
@@ -3586,10 +3598,8 @@ static void moe_gather_at(const Plugin& pl, const RadKernelInfo* r, const MoeGat
         auto run_axis = [&](long long form, std::vector<uint16_t>& out) -> int {
             std::vector<uint16_t> junk((size_t)(M * n), 0x7f7fu);
             st_memcpy(d_y, junk.data(), junk.size() * 2, hipMemcpyHostToDevice);
-            std::vector<RadParam> p2 = ps;
-            p2.push_back(PI("form", form));
-            RadArgs a2 = a;
-            a2.p = p2.data(); a2.n_p = (int)p2.size();
+            std::vector<RadParam> p2;
+            RadArgs a2 = args_with(ps, a, "form", form, p2);
             const int rc = r->launch(&a2, nullptr);
             const hipError_t he = (hipError_t)st_stream_sync(nullptr);
             if (rc == RAD_OK && he != hipSuccess) return RAD_E_DEVICE;
@@ -8615,10 +8625,8 @@ static void moe_iqr_pack_case(const Plugin& pl, int64_t Mtok, bool down, int B =
     {
         auto run_axis = [&](long long m, std::vector<uint16_t>& out, int64_t& entries,
                             int64_t& with_rows, int& rca) {
-            std::vector<RadParam> p2 = ps;
-            p2.push_back(PI("map", m));
-            RadArgs a2 = a;
-            a2.p = p2.data(); a2.n_p = (int)p2.size();
+            std::vector<RadParam> p2;
+            RadArgs a2 = args_with(ps, a, "map", m, p2);
             st_memcpy(d_y, poison.data(), poison.size() * 2, hipMemcpyHostToDevice);
             rca = r->launch(&a2, (RadStream) nullptr);
             const bool fine = rca == RAD_OK && st_stream_sync(nullptr) == hipSuccess;
@@ -8651,6 +8659,15 @@ static void moe_iqr_pack_case(const Plugin& pl, int64_t Mtok, bool down, int B =
                     : std::to_string(with_rows) + " of " + std::to_string(entries) +
                           " entries carry a row count (" + (want_rows ? "the run" : "the packed") +
                           " map was built)");
+        }
+        /* A value the axis does not name is refused, not read as the rule: a misspelt
+         * RADIANCE_TUNE= must not look like a pin that took. */
+        {
+            std::vector<RadParam> p3;
+            RadArgs a3 = args_with(ps, a, "map", 3, p3);
+            const int rc3 = r->launch(&a3, (RadStream) nullptr);
+            ok((std::string(nm) + ": a map value the axis does not name is refused").c_str(),
+               rc3 == RAD_E_INVAL, "rc=" + std::to_string(rc3));
         }
     }
     /* `split` (a checkpoint inside the step): with each expert's slots ascending, as the router's
@@ -20063,10 +20080,8 @@ static void moe_down_mt_case(const Plugin& pl, int64_t Mtok) {
      * as the rule. */
     {
         auto run_axis = [&](long long dm, std::vector<uint16_t>& out, int& rca) {
-            std::vector<RadParam> p2 = ps;
-            p2.push_back(PI("dmt", dm));
-            RadArgs a2 = a;
-            a2.p = p2.data(); a2.n_p = (int)p2.size();
+            std::vector<RadParam> p2;
+            RadArgs a2 = args_with(ps, a, "dmt", dm, p2);
             st_memcpy(d_y, poison.data(), poison.size() * 2, hipMemcpyHostToDevice);
             rca = r->launch(&a2, (RadStream) nullptr);
             const bool fine = rca == RAD_OK && st_stream_sync(nullptr) == hipSuccess;
@@ -20099,10 +20114,8 @@ static void moe_down_mt_case(const Plugin& pl, int64_t Mtok) {
      * rotated so a clock ramp falls on both. */
     {
         auto us_of = [&](long long dm) {
-            std::vector<RadParam> p2 = ps;
-            p2.push_back(PI("dmt", dm));
-            RadArgs a2 = a;
-            a2.p = p2.data(); a2.n_p = (int)p2.size();
+            std::vector<RadParam> p2;
+            RadArgs a2 = args_with(ps, a, "dmt", dm, p2);
             return st_time_us([&](int) { r->launch(&a2, (RadStream) nullptr); }, 8, nullptr);
         };
         std::vector<double> u2, u4;
