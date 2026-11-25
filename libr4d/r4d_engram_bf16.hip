@@ -39,9 +39,6 @@ namespace {
 
 enum { kEgThreads = r4d_eg::kThreads, kEgWaves = r4d_eg::kWaves };
 
-
-__device__ __forceinline__ float eg_sigmoid(float x) { return r4d_eg::sigmoid(x); }
-
 __device__ __forceinline__ int64_t eg_floor_mod(int64_t a, int64_t b) {
     const int64_t r = a % b;
     return r < 0 ? r + b : r;
@@ -208,26 +205,9 @@ __global__ __launch_bounds__(256) void engram_norm_kernel(
     if (CH::on) r4d_chain_done();
 }
 
-// A workgroup-wide sum of K values: lanes through r4d_xor_sum, waves through LDS in wave order.
-// Every thread returns the totals. The trailing barrier lets the array be reused.
-template <int K>
-__device__ __forceinline__ void eg_block_sum(float (&v)[K], float (*part)[K]) {
-    const uint32_t lane = threadIdx.x & 31, wave = threadIdx.x >> 5;
-#pragma unroll
-    for (int k = 0; k < K; ++k) {
-        const float s = r4d_xor_sum<32>(v[k]);
-        if (lane == 0) part[wave][k] = s;
-    }
-    __syncthreads();
-#pragma unroll
-    for (int k = 0; k < K; ++k) {
-        float s = 0.0f;
-        for (int w = 0; w < kEgWaves; ++w) s += part[w][k];
-        v[k] = s;
-    }
-    __syncthreads();
-}
-
+// The row is r4d_eg::row, the one the junction form runs too (r4d_engram_gate.h): the two forms
+// have to write the same bytes, which one copy of the arithmetic makes true. A masked row leaves h
+// untouched; the whole block returns together, the mask being the row's.
 template <int HC, typename WT>
 __device__ __forceinline__ void engram_gate_body(
     const uint16_t* __restrict__ key, const uint16_t* __restrict__ val,
@@ -240,68 +220,8 @@ __device__ __forceinline__ void engram_gate_body(
     __shared__ float part2[kEgWaves][HC];
     const uint64_t row = blockIdx.x;
     if (!mask[row]) return;
-    const uint32_t t = threadIdx.x;
-    const uint16_t* __restrict__ kr = key + row * kp;
-    const uint16_t* __restrict__ vr = val + row * vp;
-    uint16_t* __restrict__ hr = h + row * hp;
-
-    // The squares: val, then key and h of each stream.
-    float s1[K1];
-#pragma unroll
-    for (int k = 0; k < K1; ++k) s1[k] = 0.0f;
-    for (uint32_t i = t; i < n; i += kEgThreads) {
-        const float v = bf16_to_f32(vr[i]);
-        s1[0] += v * v;
-#pragma unroll
-        for (int c = 0; c < HC; ++c) {
-            const float kv = bf16_to_f32(kr[(uint32_t)c * n + i]);
-            const float hv = bf16_to_f32(hr[(uint32_t)c * n + i]);
-            s1[1 + 2 * c] += kv * kv;
-            s1[2 + 2 * c] += hv * hv;
-        }
-    }
-    eg_block_sum<K1>(s1, part1);
-    const float inv_val = 1.0f / sqrtf(s1[0] / (float)n + eps);
-    float ik[HC], iq[HC];
-#pragma unroll
-    for (int c = 0; c < HC; ++c) {
-        ik[c] = 1.0f / sqrtf(s1[1 + 2 * c] / (float)n + eps);
-        iq[c] = 1.0f / sqrtf(s1[2 + 2 * c] / (float)n + eps);
-    }
-
-    // The dots of the normed key and query.
-    float dot[HC];
-#pragma unroll
-    for (int c = 0; c < HC; ++c) dot[c] = 0.0f;
-    for (uint32_t i = t; i < n; i += kEgThreads) {
-#pragma unroll
-        for (int c = 0; c < HC; ++c) {
-            const uint32_t j = (uint32_t)c * n + i;
-            const float kn = eg_w(wk, j) * bf16_to_f32(kr[j]) * ik[c];
-            const float qn = eg_w(wq, j) * bf16_to_f32(hr[j]) * iq[c];
-            dot[c] += kn * qn;
-        }
-    }
-    eg_block_sum<HC>(dot, part2);
-    float gate[HC];
-#pragma unroll
-    for (int c = 0; c < HC; ++c) {
-        const float d = dot[c] * inv_sqrt_n;
-        const float sgn = d > 0.0f ? 1.0f : (d < 0.0f ? -1.0f : 0.0f);
-        gate[c] = eg_sigmoid(sgn * sqrtf(fmaxf(fabsf(d), 1e-6f)));
-    }
-
-    // The update, rounded once to bf16 and added to the stream, which rounds again.
-    for (uint32_t i = t; i < n; i += kEgThreads) {
-        const float mn = eg_w(wv, i) * bf16_to_f32(vr[i]) * inv_val;
-#pragma unroll
-        for (int c = 0; c < HC; ++c) {
-            const uint32_t j = (uint32_t)c * n + i;
-            const float upd = bf16_to_f32(f32_to_bf16(
-                __fadd_rn(__fmul_rn(gate[c], mn), __fmul_rn(eg_w(wb, j), mn))));
-            hr[j] = f32_to_bf16(__fadd_rn(bf16_to_f32(hr[j]), upd));
-        }
-    }
+    r4d_eg::row<HC, WT>(key + row * kp, val + row * vp, wk, wq, wv, wb, h + row * hp, n, eps,
+                        inv_sqrt_n, part1, part2, true);
 }
 
 template <int HC, typename WT, class CH>
