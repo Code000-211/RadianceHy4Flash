@@ -782,9 +782,14 @@ struct Dfly {
                 if (d.op_row_front && !rad_op_resolved(b, d.op_row_front)) d.op_row_front = 0;
             }
             const CodeForm fo = wform("attn_output");
+            /* libr4d's expansion row is the 128 group only (r4d_shape_mla_expand_gate_had_quant_i8g
+             * refuses any group but RAD_FP8_BLOCK, its FWHT and its scale alike); the trunk guards
+             * it at the same group. An IQ8R output projection (256 a group) would resolve a host
+             * kernel and no device one, and the planner, placing o_proj's widened weight in the
+             * container's mapping, refuses to start. The chain (and its own quantiser) stays. */
             if (fuse_on("RADIANCE_HY4_FUSE_EXPAND_QUANT") && calib_dir() == nullptr &&
-                rad_op_declared(b, "mla_expand_gate_had_quant_i8g") &&
-                feeds(d.p_out.lin, H * VD, fo)) {
+                rad_op_declared(b, "mla_expand_gate_had_quant_i8g") && fo.i8 &&
+                fo.g8 == RAD_FP8_BLOCK && feeds(d.p_out.lin, H * VD, fo)) {
                 d.op_expand_q = mk(b, "mla_expand_gate_had_quant_i8g",
                                    { RAD_RANGE("M", 1, Md < kFuseRows ? Md : kFuseRows),
                                      RAD_INT("heads", H), RAD_INT("k_dim", N),
