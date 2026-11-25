@@ -167,7 +167,7 @@ TEST(the_sites_are_the_plans_table) {
 
 /* libquant finds a Gram by the weight's own stem, so every linears entry must be a declared weight
  * `<stem>.weight` whose input width is the site's, and every quantisable trunk linear must be in
- * exactly one site. Not linears a recipe quantises: the router (f32), norms and parameters (f32 or
+ * exactly one site. Not linears a recipe quantises: the router (full-precision logits), norms and parameters (f32 or
  * one-dimensional), the indexer's pooling projections (f32), the Engram table and the experts
  * (their own tap). */
 TEST(every_linears_entry_is_a_declared_weight_of_the_sites_width_and_every_trunk_linear_has_a_site) {
@@ -192,6 +192,7 @@ TEST(every_linears_entry_is_a_declared_weight_of_the_sites_width_and_every_trunk
         const std::string& n = w.name;
         if (n.compare(0, 4, "blk.") != 0 && n != "output.weight") continue;
         if (w.d.dtype != RAD_BF16 || w.d.shape[1] <= 0) continue;   /* f32 parameters, 1-D */
+        if (n.ends_with(".glm_router.weight")) continue;
         if (n.find("_exps.") != std::string::npos || n.find("engram_table") != std::string::npos) continue;
         const std::string stem = n.substr(0, n.size() - 7);
         if (!covered.count(stem)) fprintf(stderr, "linear %s has no calibration site\n", n.c_str());

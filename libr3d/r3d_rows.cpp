@@ -228,10 +228,11 @@ static const RadOperandSpec oDequant[] = { { "q", RAD_OPD_IN, 0 }, { "scale", RA
                                            { "y", RAD_OPD_OUT, 0 } };
 
 /* --- gemm --- */
+static const RadParamSpec pGemmF32[] = { P_INT("M"), P_INT("N"), P_INT("K"), P_STR("dtype"),
+                                         P_INTO("weight_bf16") };
 static const RadParamSpec pGemm[] = { P_INT("M"), P_INT("N"), P_INT("K"), P_STR("dtype") };
 
-/* pGemmNt/oGemmNt (gemm_nt_f32) reuse pGemm/oGemm above: the pair is byte-identical to
- * libr4d's, and the loader compares positionally. */
+/* gemm_nt and gemm_nt_f32 share the positional operand list. */
 static const RadOperandSpec oGemm[] = { { "a", RAD_OPD_IN, 0 }, { "b", RAD_OPD_WEIGHT, 0 },
                                         { "y", RAD_OPD_OUT, 0 } };
 
@@ -743,8 +744,8 @@ static const RadOpSchema kSchemas[] = {
            "y = code * scale, the read of a container's own quantised weight: `group`-wide f32 "
            "scales against E4M3, E5M2 or int8 codes."),
     SCHEMA("gemm_nt", pGemm, oGemm, "y[M,N] = a[M,K] @ b[N,K]^T, f32 accumulate."),
-    SCHEMA("gemm_nt_f32", pGemm, oGemm,
-           "BF16 activations times F32 weights, F32 accumulation and output; preserves routing "
+    SCHEMA("gemm_nt_f32", pGemmF32, oGemm,
+           "BF16 activations times F32 or stored BF16 weights, F32 accumulation and output; preserves routing "
            "and index gate precision."),
     SCHEMA("gemm_nt_q", pGemmQ, oGemmQ,
            "The same product against a quantised weight. `dtype` names the scheme: fp8a16 a bf16 "
@@ -2096,14 +2097,15 @@ static const RadKernelInfo kKernels[] = {
 
 /* ------------------------------------------------------------------ r3d_gemm_nt_f32.hip
  *
- * The router's F32 projection: a bf16 activation against an f32 weight, f32 out, no narrowing.
+ * The router's F32 projection: a bf16 activation against an f32 weight or a stored bf16 one
+ * (widened exactly), f32 out, no narrowing.
  * One wave R rows by C columns, lane l folding k = l, l+32, ... with fmaf and the xor butterfly;
  * the tile form its rule picks for M, every form byte-identical.
  */
 { "gemm_nt_f32_bf16", "gemm_nt_f32", "gemm",
   "F32 routing and index gate projection",
   "N<=512, K<=16384; pitched rows",
-  "bf16 input, f32 weights and output",
+  "bf16 input, f32 or bf16 weights, f32 output",
   RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
   ROW(cGemmNtF32), NOTUNE,
   nullptr, nullptr, r3d_rad_gemm_nt_f32, nullptr, nullptr, nullptr,

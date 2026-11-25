@@ -202,14 +202,30 @@ int Sampler::declare(RadBuilder* b, const SamplerConfig& cfg) {
         return rad_decl_buffer(b, name, &d);
     };
 
+    auto decl1 = [&](const char* name, uint32_t dt, int64_t d0, int kind) -> rad_buf {
+        RadBufDecl d{};
+        d.dtype = dt;
+        d.rank  = 1;
+        d.shape[0] = d0;
+        d.kind = kind;
+        d.domain = RAD_DOMAIN_DEVICE;
+        return rad_decl_buffer(b, name, &d);
+    };
+
     buf_params_ = decl("sampler.params", RAD_U32, rows,
                        (int64_t)(sizeof(DeviceSampleParams) / 4), RAD_BUF_PERSIST);
     buf_params_late_ = decl("sampler.params_late", RAD_U32, rows,
                             (int64_t)(sizeof(DeviceSampleParams) / 4), RAD_BUF_PERSIST);
-    buf_hist_   = decl("sampler.history", RAD_I32, rows, cfg_.max_hist, RAD_BUF_PERSIST);
+    /* C-06: the history planes are rank 1 on purpose. Every consumer — the libr4d kernels, the
+     * libavx host forms and libref — reads the row pitch as numel/M of the operand it is
+     * handed, so an operand of `n_seq_ * w` cells is w columns a row. run() uploads the step's
+     * rows at the width they use, and the kernels see that width as the pitch; a declared 2-D
+     * [rows, max_hist] would fix the pitch at max_hist and force the full-width copy. */
+    buf_hist_   = decl1("sampler.history", RAD_I32, rows * cfg_.max_hist, RAD_BUF_PERSIST);
     /* One byte per history token, nonzero where the token is a whole DRY sequence breaker (never
-     * penalised). Resolved on the host, which has the vocabulary. */
-    buf_brk_    = decl("sampler.dry_breakers", RAD_U8, rows, cfg_.max_hist, RAD_BUF_PERSIST);
+     * penalised). Resolved on the host, which has the vocabulary. Same rank-1 trick: the
+     * breakers travel at the history's width so DRY reads them at the same pitch. */
+    buf_brk_    = decl1("sampler.dry_breakers", RAD_U8, rows * cfg_.max_hist, RAD_BUF_PERSIST);
     /* The n-gram ban's per-row {n-gram length, window}. Its own tiny plane because the params row
      * is the fixed RadSampleParams wire format every sampler op shares. */
     buf_ngram_  = decl("sampler.ngram", RAD_I32, rows, 2, RAD_BUF_PERSIST);
@@ -393,6 +409,10 @@ int Sampler::stage_alloc() {
     greedy_ready_ = false;
     hist_stage_   = (int32_t*)rad_dev_alloc(rows * cfg_.max_hist * 4, RAD_MEM_HOST_PINNED);
     brk_stage_    = (uint8_t*)rad_dev_alloc(rows * cfg_.max_hist, RAD_MEM_HOST_PINNED);
+    /* C-06: the compacted uploads, pinned like the staging they are cut from; only used when a
+     * step's rows stage less than the full width (see run()). */
+    hist_pack_    = (int32_t*)rad_dev_alloc(rows * cfg_.max_hist * 4, RAD_MEM_HOST_PINNED);
+    brk_pack_     = (uint8_t*)rad_dev_alloc(rows * cfg_.max_hist, RAD_MEM_HOST_PINNED);
     ngram_stage_  = (int32_t*)rad_dev_alloc(rows * 2 * 4, RAD_MEM_HOST_PINNED);
     ngram_wl_stage_ = (uint32_t*)rad_dev_alloc(rows * mask_words_ * 4, RAD_MEM_HOST_PINNED);
     mask_stage_   = (uint32_t*)rad_dev_alloc(rows * mask_words_ * 4, RAD_MEM_HOST_PINNED);
@@ -419,10 +439,11 @@ int Sampler::stage_alloc() {
     }
 
     if (!params_stage_ || !greedy_stage_ || !late_stage_ || !hist_stage_ || !brk_stage_ ||
+        !hist_pack_ || !brk_pack_ ||
         !ngram_stage_ || !ngram_wl_stage_ || !mask_stage_ || (couple_ && !couple_stage_) ||
         (trav_ && !trav_stage_)) {
         RAD_ERR("sampler: could not pin %s of staging",
-                humanb(rows * (3 * (int64_t)sizeof(DeviceSampleParams) + cfg_.max_hist * 5 +
+                humanb(rows * (3 * (int64_t)sizeof(DeviceSampleParams) + cfg_.max_hist * 10 +
                                mask_words_ * 8 + 8)).c_str());
         stage_free();
         return RAD_E_NOMEM;
@@ -436,6 +457,8 @@ void Sampler::stage_free() {
     if (late_stage_)   rad_dev_free(late_stage_,   RAD_MEM_HOST_PINNED);
     if (hist_stage_)   rad_dev_free(hist_stage_,   RAD_MEM_HOST_PINNED);
     if (brk_stage_)    rad_dev_free(brk_stage_,    RAD_MEM_HOST_PINNED);
+    if (hist_pack_)    rad_dev_free(hist_pack_,    RAD_MEM_HOST_PINNED);
+    if (brk_pack_)     rad_dev_free(brk_pack_,     RAD_MEM_HOST_PINNED);
     if (ngram_stage_)    rad_dev_free(ngram_stage_,    RAD_MEM_HOST_PINNED);
     if (ngram_wl_stage_) rad_dev_free(ngram_wl_stage_, RAD_MEM_HOST_PINNED);
     if (mask_stage_)   rad_dev_free(mask_stage_,   RAD_MEM_HOST_PINNED);
@@ -455,6 +478,8 @@ void Sampler::stage_free() {
     cur_stage_    = nullptr;
     hist_stage_   = nullptr;
     brk_stage_    = nullptr;
+    hist_pack_    = nullptr;
+    brk_pack_     = nullptr;
     ngram_stage_    = nullptr;
     ngram_wl_stage_ = nullptr;
     mask_stage_   = nullptr;
@@ -704,6 +729,7 @@ int Sampler::build_step(const std::vector<Request*>& reqs, int64_t step) {
     any_ngram_ = false;
     any_ngram_wl_ = false;
     any_couple_ = false;
+    hist_w_ = 0;
     cur_stage_ = params_stage_;
     lp_rows_.clear();
     /* The evidence snapshot this build owns; build_greedy never touches it. */
@@ -971,6 +997,9 @@ int Sampler::build_step(const std::vector<Request*>& reqs, int64_t step) {
             if (pen || dry || ngram) {
                 const int64_t len  = n_total + dk;
                 const int64_t take = std::min<int64_t>(len, cfg_.max_hist);
+                /* C-06: record the widest row this step stages; run() weighs uploading the
+                 * planes at that width against the full width. */
+                hist_w_ = std::max(hist_w_, take);
                 int32_t* h = hist_stage_ + row * cfg_.max_hist;
                 /* The three sources are contiguous runs of one logical sequence, so the tail
                  * `take` long is at most three memcpys where the element loop branched per token
@@ -1238,13 +1267,46 @@ int Sampler::run(RadCtx* c, rad_buf logits, rad_buf out_tokens) {
     if (late)
         RAD_TRY(rad_memcpy_async(rad_buf_ptr(c, buf_params_late_), late_stage_,
                                  n_seq_ * (int64_t)sizeof(DeviceSampleParams), s));
-    if (any_penalty || any_dry || any_ngram)
-        RAD_TRY(rad_memcpy_async(rad_buf_ptr(c, buf_hist_), hist_stage_,
-                                 n_seq_ * cfg_.max_hist * 4, s));
+    /* C-06: a step whose rows read short histories can ride the history planes at the width
+     * those rows use instead of at max_hist. Every row addresses its own [hist_off, hist_len)
+     * span and clamps it to the operand's width, so a row that staged `take` cells reads the
+     * same values at a pitch of max(take) as at max_hist; a row that staged nothing reads none
+     * of it (its hist_len is 0). The kernels, the libavx host forms and libref all read the
+     * pitch as numel/M of the operand, so the upload width and the cell-count operands at
+     * issue are the whole change.
+     *
+     * Compacting is a trade, though: it costs a host copy of n_seq_ * hist_w cells (and the
+     * same again for the breakers) to save an upload of exactly that many, against the full
+     * upload of n_seq_ * max_hist. Below half the full width the copy is at most as large as
+     * the upload it removes and the transfer saved is at least as large again; at a width only
+     * slightly short of max_hist the two are of a size, so such a step keeps the plain
+     * full-width upload instead of paying a copy to shave a similar-sized transfer. */
+    const int64_t hist_w = std::max<int64_t>(hist_w_, 1);
+    const bool pack_hist = hist_w * 2 <= cfg_.max_hist;
+    const int64_t hist_pitch = pack_hist ? hist_w : cfg_.max_hist;
+    const int64_t hist_cells = n_seq_ * hist_pitch;
+    if (any_penalty || any_dry || any_ngram) {
+        const int32_t* hist_up = hist_stage_;
+        if (pack_hist) {
+            for (int64_t r = 0; r < n_seq_; ++r)
+                std::memcpy(hist_pack_ + r * hist_w, hist_stage_ + r * cfg_.max_hist,
+                            (size_t)hist_w * sizeof(int32_t));
+            hist_up = hist_pack_;
+        }
+        RAD_TRY(rad_memcpy_async(rad_buf_ptr(c, buf_hist_), hist_up,
+                                 hist_cells * (int64_t)sizeof(int32_t), s));
+    }
     const bool pass_brk = any_dry && any_brk_;
-    if (pass_brk)
-        RAD_TRY(rad_memcpy_async(rad_buf_ptr(c, buf_brk_), brk_stage_,
-                                 n_seq_ * cfg_.max_hist, s));
+    if (pass_brk) {
+        const uint8_t* brk_up = brk_stage_;
+        if (pack_hist) {
+            for (int64_t r = 0; r < n_seq_; ++r)
+                std::memcpy(brk_pack_ + r * hist_w, brk_stage_ + r * cfg_.max_hist,
+                            (size_t)hist_w);
+            brk_up = brk_pack_;
+        }
+        RAD_TRY(rad_memcpy_async(rad_buf_ptr(c, buf_brk_), brk_up, hist_cells, s));
+    }
     /* The ban's whitelist rides with the ban, and only a row that runs the ban reads it. */
     const bool pass_wl = any_ngram && any_ngram_wl_;
     if (any_ngram)
@@ -1265,8 +1327,8 @@ int Sampler::run(RadCtx* c, rad_buf logits, rad_buf out_tokens) {
 
     const RadOperand o_logits = opd_rows(logits, n_seq_);
     const RadOperand o_params = opd_rows(buf_params_, n_seq_);
-    const RadOperand o_hist = opd_rows(buf_hist_, n_seq_);
-    const RadOperand o_brk = opd_rows(buf_brk_, n_seq_);
+    const RadOperand o_hist = opd_rows(buf_hist_, hist_cells);
+    const RadOperand o_brk = opd_rows(buf_brk_, hist_cells);
     const RadOperand o_ngram = opd_rows(buf_ngram_, n_seq_);
     const RadOperand o_ngram_wl = opd_rows(buf_ngram_wl_, n_seq_);
     const RadOperand o_mask = opd_rows(buf_mask_, n_seq_);

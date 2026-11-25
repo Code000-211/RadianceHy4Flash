@@ -1,0 +1,37 @@
+{
+  "mode": "project",
+  "dir": "per-layer",
+  "rank": 8,
+  "per_stream": true,
+  "layer_range": [
+    1,
+    41
+  ],
+  "scale": 1.0,
+  "method": "per-stream refusal directions: per layer and hc stream, mean(harmful) - mean(harmless) at the last prompt token, the harmless-mean span projected out, two groups over four framings (N,NA|H,HA) orthonormalised within a stream, unit per stream",
+  "groups": "N,NA | H,HA (thinking off/on, with and without a coding-agent system prompt)",
+  "harmful_samples": {
+    "N": 256,
+    "H": 256,
+    "NA": 256,
+    "HA": 256
+  },
+  "harmless_samples": {
+    "N": 256,
+    "H": 256,
+    "NA": 256,
+    "HA": 256
+  },
+  "prompts": "alesha-pro/Hy4-flash-Uncensored-GGUF collection prompts (AdvBench train / Alpaca train)",
+  "base_model": "tencent-hy Hy4-flash, iqr v4 u3 4-bit -- the quant this host serves",
+  "derivation": "the published recipe, run here on this quant's taps rather than on their FP8 weights",
+  "vector_sha256": "44670f003b16bcce5840a112c04eef25ecef55397b5142eb21bfe30fbe4c55e5",
+  "measured": {
+    "kl_mean_vs_stock": 0.199,
+    "kl_median_vs_stock": 0.082,
+    "probe_refusal_mass_8_prompts": 0.167,
+    "refusals_heldout_146": 29,
+    "note": "held-out sets are the publisher's advbench-val (64) + jailbreakbench (82), greedy, 448 tokens"
+  },
+  "note": "projection h -= (h . v) v, once per group per layer, each stream against its own row. Loaded only when the deployment asks (--control-vector); the request default is off, because what it removes is a safety behaviour."
+}

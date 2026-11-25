@@ -53,6 +53,14 @@ __device__ __forceinline__ void arij_store_rel(unsigned int* p, unsigned int v) 
 __device__ __forceinline__ unsigned int arij_load_acq(const unsigned int* p) {
     return __hip_atomic_load(p, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM);
 }
+/* K-13: the split junction's two words are this rank's own memory, so agent scope is enough (the
+ * wire's flags above cross cards and stay system wide). */
+__device__ __forceinline__ void arij_store_rel_ag(unsigned int* p, unsigned int v) {
+    __hip_atomic_store(p, v, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
+}
+__device__ __forceinline__ unsigned int arij_load_acq_ag(const unsigned int* p) {
+    return __hip_atomic_load(p, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT);
+}
 
 // The two-rank fold of a word: mine + peer in f32, rounded as (__hip_bfloat16) rounds.
 __device__ __forceinline__ int4 arij_fold2(const int4 a, const int4 b) {
@@ -122,6 +130,26 @@ __device__ __forceinline__ void arij_rows(JuncLds<HC, POST>& L, uint16_t* ybuf, 
     }
 }
 
+// K-13: one row over the blocks of its split, the operands and offsets of arij_rows' row.
+template <int HC, bool POST, bool TAIL>
+__device__ __forceinline__ void arij_row_split(JuncLds<HC, POST>& L, uint16_t* ybuf, uint16_t* a,
+                                               JuncRow r, int row, int wlo, int whi, uint64_t pp,
+                                               uint64_t hp, uint64_t xnp, uint64_t yp, uint64_t xp,
+                                               int parts, float* part, unsigned int* arrive,
+                                               unsigned int* folded) {
+    const uint32_t n = r.n, wpr = n / 8u;
+    const uint4* ar = (const uint4*)(a + (size_t)row * n);
+    for (uint32_t q = threadIdx.x; q < wpr; q += kThreads) ((uint4*)ybuf)[q] = ar[q];
+    JuncRow t = r;
+    t.post_row += (size_t)row * pp;
+    t.hr += (size_t)row * hp;
+    if (TAIL) t.xnr += (size_t)row * xnp;
+    if (t.cq) { t.cq += (size_t)row * t.cqp; t.cs += (size_t)row * t.csp; }
+    if (t.yr) t.yr += (size_t)row * yp;
+    if (t.xr) t.xr += (size_t)row * xp;
+    junction_row_split<HC, POST, TAIL>(L, ybuf, t, wlo, whi, parts, part, arrive, folded);
+}
+
 #define R4D_ARIJ_ROWPARAMS                                                                         \
     uint16_t* __restrict__ a, const uint16_t* __restrict__ b, JuncRow r, uint64_t bp, uint64_t pp, \
     uint64_t hp, uint64_t xnp, uint64_t yp, uint64_t xp, int64_t M
@@ -132,14 +160,22 @@ template <int HC, bool POST, bool TAIL, bool ADD, bool CODED, class CH>
 __global__ __launch_bounds__(kThreads) void ar_ihc_junction_2rank_kernel(
     R4D_ARIJ_ROWPARAMS, int4* peer_base, const int4* my_base, unsigned int* peer_flags,
     unsigned int* my_flags, unsigned int* seq_ctrs, int slot_stride16, int drain, int acq,
-    unsigned int nbw, long stage) {
+    unsigned int nbw, long stage, JuncSplit* jsplit, int parts) {
     if (CH::on) r4d_chain_wait();
     R4D_DYN_LDS(uint4, jbuf);
     __shared__ JuncLds<HC, POST> L;
     __shared__ unsigned int s_seq, s_slot;
     const int bk = (int)blockIdx.x, nb = (int)gridDim.x;
     const int tid = (int)threadIdx.x, lane = tid & 31;
-    const int r0 = (int)(((long)bk * M) / nb), r1 = (int)(((long)(bk + 1) * M) / nb);
+    /* K-13: `parts` blocks a row at decode heights (block bk = row * parts + part), each owning
+     * kWaves / parts of the 16 waves; with parts == 1 a block owns the rows it always did. The wire
+     * stays the row's own: only the block of part 0 pushes and folds it. */
+    const int row = parts > 1 ? bk / parts : 0;
+    const int pno = parts > 1 ? bk - row * parts : 0;
+    const int wlo = parts > 1 ? pno * (kWaves / parts) : 0;
+    const int whi = parts > 1 ? wlo + kWaves / parts : kWaves;
+    const int r0 = parts > 1 ? (pno == 0 ? row : 0) : (int)(((long)bk * M) / nb);
+    const int r1 = parts > 1 ? (pno == 0 ? row + 1 : 0) : (int)(((long)(bk + 1) * M) / nb);
     const int wpr = (int)(r.n >> 3);
     const int k0 = r0 * wpr, k1 = r1 * wpr;
     int4* const a4 = (int4*)a;
@@ -156,8 +192,8 @@ __global__ __launch_bounds__(kThreads) void ar_ihc_junction_2rank_kernel(
     for (int k = k0 + tid; k < k1; k += kThreads) {
         int4 v = a4[k];
         if (ADD) {
-            const int row = k / wpr, q = k - row * wpr;
-            v = arij_add(v, b + (size_t)row * bp + 8 * q);
+            const int kr = k / wpr, q = k - kr * wpr;
+            v = arij_add(v, b + (size_t)kr * bp + 8 * q);
             a4[k] = v;
         }
         if (CODED) {
@@ -193,8 +229,28 @@ __global__ __launch_bounds__(kThreads) void ar_ihc_junction_2rank_kernel(
         const int4 pv = CODED ? r4d_arc2_get(r4d_arc2_at(ms, n16), k - lane) : ms[k];
         a4[k] = arij_fold2(a4[k], pv);
     }
+    if (parts > 1) __threadfence();   /* K-13: my fold device-wide before my block publishes it */
     __syncthreads();
-    arij_rows<HC, POST, TAIL>(L, (uint16_t*)jbuf, a, r, r0, r1, pp, hp, xnp, yp, xp);
+    if (parts > 1) {
+        /* K-13: the row's reduced bytes for the blocks that did not push it (agent scope: the
+         * reduction is this rank's own memory). */
+        if (pno == 0) {
+            if (tid == 0) arij_store_rel_ag(&jsplit->folded[s_slot][row], 1u);
+        } else {
+            if (tid == 0) {
+                unsigned long long z = 0, t0 = 0ull;
+                while (arij_load_acq_ag(&jsplit->folded[s_slot][row]) != 1u)
+                    if (++z > R4D_ARIJ_SPIN_MAX || r4d_ar_spin_late(z, t0)) __builtin_trap();
+            }
+            __syncthreads();
+            __threadfence();
+        }
+        arij_row_split<HC, POST, TAIL>(L, (uint16_t*)jbuf, a, r, row, wlo, whi, pp, hp, xnp, yp, xp,
+                                       parts, jsplit->part[s_slot][row][0],
+                                       &jsplit->arrive[s_slot][row], &jsplit->folded[s_slot][row]);
+    } else {
+        arij_rows<HC, POST, TAIL>(L, (uint16_t*)jbuf, a, r, r0, r1, pp, hp, xnp, yp, xp);
+    }
     if (CH::on) r4d_chain_done();
 }
 
@@ -278,8 +334,8 @@ inline int arij_off_cliff(int nb) {
 // floor and r4d_ar_coded2_ok; it is taken only for n % 256 == 0). Returns 0 or a negative code.
 extern "C" int r4d_ar_ihc_junction_2rank(long peer_scratch, long my_scratch, long peer_flags,
                                          long my_flags, long seq_ctrs, long slot_stride16,
-                                         const void* jv, long stream, int nblocks, int drain,
-                                         int acq, long stage, int chain, int coded) {
+                                         long jparts, const void* jv, long stream, int nblocks,
+                                         int drain, int acq, long stage, int chain, int coded) {
     const R4dIhcJunction& j = *(const R4dIhcJunction*)jv;
     if (!peer_scratch || !my_scratch || !peer_flags || !my_flags || !seq_ctrs) return -1;
     if (j.ap != (long long)j.r.n) return -2;                         /* the message is tight */
@@ -287,10 +343,20 @@ extern "C" int r4d_ar_ihc_junction_2rank(long peer_scratch, long my_scratch, lon
     if (coded && (j.r.n % 256 || stage)) return -3;
     const int M = (int)j.M;
     int nb = nblocks < 1 ? 1 : nblocks;
-    if (nb > M) nb = M;
+    /* K-13: a count of whole multiples of M is that many blocks a row, each owning kWaves / parts of
+     * the 16 waves (the shim's split at decode heights, which is the same on both ranks); any other
+     * count keeps one block a row, as every height above kSplitRows does. */
     const int nbw = r4d_ar_max_blocks();
-    if (nb > nbw) nb = nbw;
-    nb = arij_off_cliff(nb);
+    int parts = 1;
+    if (jparts && M > 0 && M <= (int)kSplitRows && nb > M && nb % M == 0) {
+        const int b = nb / M;
+        if (b >= 2 && b <= (int)kWaves && (int)kWaves % b == 0 && nb <= nbw) parts = b;
+    }
+    if (parts == 1) {
+        if (nb > M) nb = M;
+        if (nb > nbw) nb = nbw;
+        nb = arij_off_cliff(nb);
+    }
     const bool ch = chain != 0;
     const bool add = j.b != nullptr;
     const uint32_t lds = j.r.n * 2u;
@@ -300,7 +366,7 @@ extern "C" int r4d_ar_ihc_junction_2rank(long peer_scratch, long my_scratch, lon
              (uint64_t)j.pp, (uint64_t)j.hp, (uint64_t)j.xnp, (uint64_t)j.yp, (uint64_t)j.xp,       \
              (int64_t)M, (int4*)peer_scratch, (const int4*)my_scratch, (unsigned int*)peer_flags,              \
              (unsigned int*)my_flags, (unsigned int*)seq_ctrs, (int)slot_stride16, drain, acq,    \
-             (unsigned)nbw, stage)
+             (unsigned)nbw, stage, (JuncSplit*)(uintptr_t)jparts, parts)
 #define R4D_ARIJ2_C(HC_, PO_, TA_, AD_)                                                            \
     (coded ? (ch ? R4D_ARIJ2_K(HC_, PO_, TA_, AD_, true, r4dchain)                                 \
                  : R4D_ARIJ2_K(HC_, PO_, TA_, AD_, true, R4dUnchained))                            \
