@@ -947,10 +947,24 @@ void rad_dev_host_wrote(void)                     { dev()->host_wrote(); }
  * scratch memory at the first such dispatch, and the card showed +114 MiB after the first
  * speculative step and kept it, 150 MiB with a larger segment. Left out of the budget, it is
  * taken from the margin: serving ran with 27-65 MiB of a card free. 5 MiB a CU (the R9700 reports
- * 32), 160 MiB, over the measured. */
+ * 32), 160 MiB, over the measured.
+ *
+ * That is a bound over the worst case anyone has measured, not the cost of every workload: the
+ * spread above is 36 MiB, which is expert residency a plan cannot spend while the bound stands.
+ * RADIANCE_QUEUE_SCRATCH_MIB sets the MiB a CU for a deployment whose own peak is known smaller,
+ * clamped to 1..64 and defaulting to 5 -- the measured bound. Lowering it is a bet on that
+ * workload's peak, so it is a knob an operator turns with the measurement in hand; the default
+ * stays the number the comment above justifies. */
 extern "C" int64_t rad_dev_resident_scratch_bytes(const RadDeviceProps* p) {
     if (!p || p->is_host_backend || p->unified) return 0;
-    return (int64_t)p->n_cu * (5LL * 1024 * 1024);
+    static const int64_t mib = [] {
+        const char* s = std::getenv("RADIANCE_QUEUE_SCRATCH_MIB");
+        int64_t v = s && *s ? std::strtoll(s, nullptr, 10) : 5;
+        if (v < 1) v = 1;
+        if (v > 64) v = 64;
+        return v;
+    }();
+    return (int64_t)p->n_cu * (mib * 1024 * 1024);
 }
 
 /* Whether launches chain, by engine: rad_dev_chain_infer on a thread of an engine (EngineScope)
