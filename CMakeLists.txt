@@ -402,6 +402,9 @@ install(FILES
         ${CMAKE_CURRENT_BINARY_DIR}/radiance-config-version.cmake
         # The config includes this exact file, so there is one copy for both builds.
         ${CMAKE_CURRENT_SOURCE_DIR}/cmake/RadAddPlugin.cmake
+        # ...and the source rad_add_kernel_override compiles into an override, which it looks for
+        # beside that file.
+        ${CMAKE_CURRENT_SOURCE_DIR}/cmake/rad_kernel_override.cpp
         DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/radiance)
 
 # (d) License and notices. Apache-2.0 and the bundled components' licenses require them to travel

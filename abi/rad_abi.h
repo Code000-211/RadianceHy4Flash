@@ -607,6 +607,28 @@ typedef int  (*RadPluginReferenceFn)(void);
  * `rad_kernel_reference`. */
 typedef int  (*RadKernelReferenceFn)(int i);
 
+/* Optional, for a library whose rows' hooks can be rebuilt under a running engine: the override
+ * rad_add_kernel_override builds (cmake/rad_kernel_override.cpp, docs/PLUGIN.md §14) exports it,
+ * and an ordinary library does not. Symbol name: `rad_kernel_reload`. The engine calls it with
+ * every engine using the library quiet, in two steps:
+ *
+ *   RAD_RELOAD_PREPARE  read the rebuilt build of the library's hooks and hold it beside the rows
+ *                       served now, which do not change. Returns how many rows the rebuilt build
+ *                       gives other hooks, or a negative status with the reason in `why`.
+ *   RAD_RELOAD_COMMIT   put the prepared hooks into the served rows, in place, so every pointer
+ *                       the engine holds to a row reads them from then on.
+ *   RAD_RELOAD_ABORT    drop the prepared build; the served rows stay as they were.
+ *
+ * Between the two, `rad_kernel_reload_at(i)` (RadKernelReloadAtFn) is row `i` as the prepared
+ * build would serve it, so the engine can ask its hooks the questions declare asked (a scratch
+ * size) before it commits. Only the hooks may differ from the served row; a rebuild that changes
+ * anything else of a row is refused at PREPARE. Code the library loaded stays mapped for the life of
+ * the process, since a launch already issued or a device kernel registered by address may still
+ * refer to it. */
+enum { RAD_RELOAD_PREPARE = 0, RAD_RELOAD_COMMIT = 1, RAD_RELOAD_ABORT = 2 };
+typedef int                  (*RadKernelReloadFn)  (int step, char* why, int why_bytes);
+typedef const RadKernelInfo* (*RadKernelReloadAtFn)(int i);
+
 #ifdef __cplusplus
 }   /* extern "C" */
 #endif
