@@ -579,6 +579,7 @@ int r4d_rad_gemm_mxfp4a8_gemv(const RadArgs*, RadStream);
  * plane more (r4d_layout.cpp, m2xfp4). */
 int r4d_rad_dequant_w4      (const RadArgs*, RadStream);
 int r4d_rad_rowtopk         (const RadArgs*, RadStream);
+int r4d_rad_cast_rowtopk    (const RadArgs*, RadStream);
 int64_t r4d_rad_rowtopk_scratch(const RadArgs*);
 int r4d_rad_rowtopk_merge   (const RadArgs*, RadStream);
 int r4d_rad_logit_rerank_i8 (const RadArgs*, RadStream);
@@ -674,6 +675,9 @@ int r4d_rad_gemm_iqr_gated(const RadArgs*, RadStream);
 int64_t r4d_rad_gemm_iqr_gated_scratch(const RadArgs*);
 int r4d_rad_gemm_iqr_tiled(const RadArgs*, RadStream);
 int64_t r4d_rad_gemm_iqr_tiled_scratch(const RadArgs*);
+/* `gemm_nt_q_dual`: two IQR weights of one activation in one launch -- the two launches' blocks in
+ * one grid, each part's the blocks of its own launch (K-02: q_nope and q_rope at a decode step). */
+int r4d_rad_gemm_iqr_dual(const RadArgs*, RadStream);
 /* The routed experts as IQR weights, a run's rows against each decoded tile (r4d_moe_iqr.hip). */
 int r4d_rad_moe_gemm_iqr(const RadArgs*, RadStream);
 int r4d_rad_moe_gemm_iqr_mod4(const RadArgs*, RadStream);
@@ -707,6 +711,7 @@ int r4d_rad_kv_store_streamed(const RadArgs*, RadStream);
 int r4d_rad_qsa_tail_store  (const RadArgs*, RadStream);
 int r4d_rad_qsa_work        (const RadArgs*, RadStream);
 int r4d_rad_idx_pool_gated  (const RadArgs*, RadStream);
+int r4d_rad_qsa_work_pool_tail(const RadArgs*, RadStream);   /* K-24: work + pool + the tail rows */
 int r4d_rad_idx_pool_gated_fp8(const RadArgs*, RadStream);
 int r4d_rad_idx_pool_gated_i8(const RadArgs*, RadStream);
 int r4d_rad_idx_score       (const RadArgs*, RadStream);
@@ -729,6 +734,7 @@ int r4d_rad_sample_chain    (const RadArgs*, RadStream);
 R4D_HOOKS(fp8_block)
 R4D_HOOKS(i8_block)
 R4D_HOOKS(iqr)
+R4D_HOOKS(iqr_dual)
 R4D_HOOKS(iqr_logits)
 R4D_HOOKS(iqr_vocab)
 R4D_HOOKS(moe_iqr)
@@ -1106,6 +1112,7 @@ int r4d_shape_qsa_select         (const RadParam*, int, int operand, RadOpdDesc*
 int r4d_shape_kv_resolve         (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_qsa_tail_store     (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_qsa_work           (const RadParam*, int, int operand, RadOpdDesc*);
+int r4d_shape_qsa_work_pool_tail (const RadParam*, int, int operand, RadOpdDesc*);
 
 int r4d_shape_dflash_conv    (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_dflash_select  (const RadParam*, int, int operand, RadOpdDesc*);
@@ -1134,12 +1141,14 @@ int r4d_fuse_gate_quant_fp8      (const RadParam*, int, uint64_t, int, RadFuseSt
 int r4d_fuse_gemm_nt_q_gated     (const RadParam*, int, uint64_t, int, RadFuseStep*);
 int r4d_fuse_gemm_nt_q_gated_mx  (const RadParam*, int, uint64_t, int, RadFuseStep*);
 int r4d_fuse_gemm_nt_q_gated_iqr (const RadParam*, int, uint64_t, int, RadFuseStep*);
+int r4d_fuse_gemm_nt_q_dual_iqr (const RadParam*, int, uint64_t, int, RadFuseStep*);
 int r4d_fuse_gdn_conv_recurrent_update(const RadParam*, int, uint64_t, int, RadFuseStep*);
 int r4d_fuse_qk_norm_rope_gate_kv_store(const RadParam*, int, uint64_t, int, RadFuseStep*);
 int r4d_fuse_qkv_norm_rope_kv_store(const RadParam*, int, uint64_t, int, RadFuseStep*);
 int r4d_fuse_add_rmsnorm(const RadParam*, int, uint64_t, int, RadFuseStep*);
 int r4d_fuse_mla_expand_gate(const RadParam*, int, uint64_t, int, RadFuseStep*);
 int r4d_fuse_mla_expand_gate_had_quant_i8g(const RadParam*, int, uint64_t, int, RadFuseStep*);
+int r4d_fuse_qsa_work_pool_tail (const RadParam*, int, uint64_t, int, RadFuseStep*);
 int r4d_fuse_qk_norm_rope_gate_kv_store_streamed(const RadParam*, int, uint64_t, int,
                                                  RadFuseStep*);
 int r4d_fuse_ar_rmsnorm_quant_fp8(const RadParam*, int, uint64_t, int, RadFuseStep*);

@@ -471,7 +471,16 @@ public:
      *
      * The loan is in tokens, counted down from the top of the carve. FULL groups are sized to run
      * out at the same token count, so a loan of T tokens is the top floor(T / block_size) blocks
-     * of every FULL group. WINDOW groups are sized per sequence and never lent.
+     * of every FULL group.
+     *
+     * A WINDOW group lends the blocks of the sequence slots nobody occupies, through a second loan
+     * of its own (set_window_loan, below). Its spare is sized by slots -- a pool holds one window
+     * per slot, so with k sequences live the top of the carve is unused -- and a window block is
+     * not a FULL block: one number cannot mark both without either lending a window a sequence is
+     * using or starving the FULL groups, since the min over groups would be a window pool's few
+     * thousand spare tokens against the FULL groups' hundreds of thousands. So the window lends on
+     * its own number, in its own tokens, and the marks stay apart. Only a fixed window lends: a
+     * runtime window's blocks are the reference itself and a streamed group's are a launch's.
      *
      * A held block (owned by a sequence or indexed by the prefix cache) is never lent, so a loan
      * evicts nothing. The min-heap free list keeps free blocks at the top, where a loan reaches
@@ -490,21 +499,67 @@ public:
      * held blocks). Also decays the buffer's shortfall term, so call it once per arbiter tick. */
     int64_t spare_tokens();
 
+    /* What spare_tokens() is made of, for the group that lends least: the group whose distance to
+     * the top bounds the loan, and in its blocks where that distance ends (`held_top`), what the
+     * pool holds under it (`held`), the buffer it keeps (`buffer_blocks`) and the live mark as it
+     * stands (`live`). `spare_tokens` is the same number spare_tokens() returns, and
+     * `loan_tokens` the loan set through set_loan. It reports, it does not decay the shortfall
+     * peak, so it is safe to call from /stats every tick.
+     *
+     * The two gaps say why the loan stops where it does: `live - held_top - buffer_blocks` is room
+     * the arbiter has not lent yet, and `held_top - held` is free blocks no loan can reach,
+     * because the loan never crosses a held one. A compaction that moved the held blocks down
+     * to `held` would recover the second. `group` is -1 when nothing can lend (no paged FULL
+     * group, or rank 1, which tracks no held blocks). Rank 0 only. */
+    struct SpareSplit {
+        int32_t group         = -1;
+        int64_t block_tokens  = 0;   /* block size of `group`, the unit of the counts below */
+        int64_t block_bytes   = 0;   /* and its bytes, so a count can be read as VRAM */
+        int64_t n_blocks      = 0;
+        int64_t held          = 0;
+        int64_t held_top      = 0;
+        int64_t buffer_blocks = 0;
+        int64_t live          = 0;
+        int64_t spare_tokens  = 0;
+        int64_t loan_tokens   = 0;
+    };
+    SpareSplit spare_split() const;
+
     /* Lends `tokens` from the top, or takes back what a smaller number no longer covers. Lending
      * past a held block is refused (RAD_E_STATE). Taking back always succeeds here; the caller
      * must have moved the slab out of those blocks first. */
     int     set_loan(int64_t tokens);
     int64_t loan_tokens() const { return loan_; }
 
+    /* The window loan, in tokens of a WINDOW group (its block size times the blocks lent): the same
+     * contract as set_loan, over the windowed groups alone. Its marks are separate, so a window
+     * recall never moves a FULL group and the FULL arbiter never moves a window. */
+    int     set_window_loan(int64_t tokens);
+    int64_t window_loan_tokens() const { return win_loan_; }
+
+    /* True for the fixed-window paged groups, the ones with a slot's worth of spare: see above. */
+    bool    win_lendable(int32_t group) const;
+
+    /* Tokens of a window group the cache can lend now: over the window groups, the least distance
+     * from the top of the carve down to the highest held block plus the buffer. Rank 0 only, and
+     * call it after spare_tokens(): that is where the buffer's shortfall term decays. */
+    int64_t spare_window_tokens();
+
+    /* The step a window loan grows in: one slot's window, since the slack a window pool has comes
+     * and goes a sequence at a time. Growing by less would only move the mark. */
+    int64_t window_loan_step() const;
+
     /* Recall hook. A request needing more blocks than the cache has in hand calls it with the
-     * loan it can still afford, and the slab owner drains to that before returning, so admission
-     * is decided against the whole carve. Without a hook, lent blocks are not recalled and the
-     * request gets RAD_E_FULL. */
-    void set_reclaim(std::function<int(int64_t tokens)> f) {
+     * group it is short of and the loan it can still afford, and the slab owner drains the lender
+     * that answers for that group before returning, so admission is decided against the whole
+     * carve. Without a hook, lent blocks are not recalled and the request gets RAD_E_FULL. */
+    void set_reclaim(std::function<int(int32_t group, int64_t tokens)> f) {
         if (!f) { reclaim_ = {}; return; }
-        reclaim_ = [f = std::move(f)](int64_t tokens, bool*) { return f(tokens); };
+        reclaim_ = [f = std::move(f)](int32_t group, int64_t tokens, bool*) {
+            return f(group, tokens);
+        };
     }
-    void set_fleet_reclaim(std::function<int(int64_t tokens, bool* waiting)> f) {
+    void set_fleet_reclaim(std::function<int(int32_t group, int64_t tokens, bool* waiting)> f) {
         reclaim_ = std::move(f);
     }
 
@@ -796,13 +851,14 @@ private:
     std::vector<int64_t>  short_peak_;
     Pool*    pool_ = nullptr;
     int64_t  loan_ = 0;                     /* tokens lent from the top of every lendable group */
+    int64_t  win_loan_ = 0;                 /* the same for the window groups, in their tokens */
     int64_t  flex_backed_ = 0;              /* set_flex: the bytes the carve backs at start */
     int64_t  flex_floor_loan_ = 0;          /* the loan the carve started at */
     int64_t  flex_room_ = 0;                /* set_flex_room */
     /* Backs (or unbacks) every lendable group's stripes between the live marks of two loans. */
     int      flex_span(int64_t lo_loan, int64_t hi_loan, bool back);
     uint64_t seq_frees_ = 0;
-    std::function<int(int64_t, bool*)> reclaim_;
+    std::function<int(int32_t, int64_t, bool*)> reclaim_;
     std::vector<int64_t>  live_;            /* per group: blocks the cache may hand out */
     std::vector<int64_t>  free_usable_;     /* per group: free ids below live_ */
     std::vector<int64_t>  bucket_blocks_;   /* per group: blocks one held_hist_ bucket covers */
@@ -813,8 +869,12 @@ private:
     int64_t  held_top(size_t i) const;
     /* The blocks a loan of `tokens` takes off the top of group i. */
     int64_t  lent_blocks(size_t i, int64_t tokens) const;
+    /* The same for a window group under the window loan. */
+    int64_t  window_lent_blocks(size_t i, int64_t tokens) const;
     /* Moves every lendable group's mark to a loan of `tokens`, unchecked (set_loan checks). */
     void     apply_loan(int64_t tokens);
+    /* The same for the window groups under the window loan. */
+    void     apply_window_loan(int64_t tokens);
     int  grow_for(int32_t g, int64_t blocks, bool* waiting_for_fleet = nullptr);
     void note_held(int32_t g, int32_t b, int delta);
     bool      configured_ = false;

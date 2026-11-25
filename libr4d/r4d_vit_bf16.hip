@@ -446,12 +446,15 @@ __device__ __forceinline__ unsigned short vit_finish(float acc, float bv, unsign
     return t;
 }
 
+// CH `r4dchain`: the chained form (r4d_chain.h), taken at decode heights (M <= 64: one row of
+// blocks); no block returns early.
 /* `vec` (host-checked): C, R and the bias take 16-byte accesses at every eight-column boundary. */
-template <int ACT, bool RES, bool BF32>
+template <int ACT, bool RES, bool BF32, class CH = R4dUnchained>
 __global__ __launch_bounds__(kVThreads) R4D_WAVES(6) void vit_gemm_wa_kernel(
     const unsigned short* __restrict__ A, unsigned lda, const unsigned short* __restrict__ W,
     unsigned ldw_, const void* __restrict__ bias, const unsigned short* R, unsigned ldr,
     unsigned short* C, unsigned ldc, int M, int K, int N, unsigned vec) {
+    if (CH::on) r4d_chain_wait();
     typedef r4d_u32x4 U4;
     // Double-buffered: one barrier a staged tile, which publishes it.
     __shared__ __attribute__((aligned(16))) unsigned char s_a[2][kVBM * kVPB];
@@ -613,6 +616,7 @@ __global__ __launch_bounds__(kVThreads) R4D_WAVES(6) void vit_gemm_wa_kernel(
                 }
             }
         }
+    if (CH::on) r4d_chain_done();
 }
 
 }  // namespace
@@ -828,6 +832,9 @@ extern "C" int r4d_rad_gemm_nt_bias(const RadArgs* a, RadStream stream) {
      * below that the 64 x 64 tile, whose four times the blocks fill more of the card. */
     const long long g128 = ((N + 127) / 128) * ((M + 127) / 128);
     const bool big = g128 >= 32;
+    /* Both forms chain at decode heights (M <= 64), where the row is a launch-bound pass; the
+     * chained instantiation is compiled only for the forms this choice can reach. */
+    const bool vch = r4d_geti_or(a, "chain", 0) != 0 && M <= 64;
     auto Ap = (const unsigned short*)r4d_p(A);
     auto Wp = (const unsigned short*)r4d_p(W);
     auto Rp = (const unsigned short*)r4d_p(R);
@@ -838,10 +845,13 @@ extern "C" int r4d_rad_gemm_nt_bias(const RadArgs* a, RadStream stream) {
         const unsigned vec = (ldc % 8) == 0 && r4d_aligned(Cp, 16) && r4d_aligned(Bp, 16) &&
                              (!res || ((ldr % 8) == 0 && r4d_aligned(Rp, 16)));
         const dim3 grid((unsigned)((M + kVBM - 1) / kVBM), (unsigned)((N + kVBN - 1) / kVBN));
-#define VB_L(AC, RS, BF)                                                                          \
-        return R4D_EMIT(stream, (vit_gemm_wa_kernel<AC, RS, BF>), grid, dim3(kVThreads), 0, Ap,  \
-                        (unsigned)lda, Wp, (unsigned)K, Bp, Rp, (unsigned)ldr, Cp, (unsigned)ldc,  \
-                        (int)M, (int)K, (int)N, vec)
+#define VB_L(AC, RS, BF)                                                                           \
+        return vch ? R4D_EMIT(stream, (vit_gemm_wa_kernel<AC, RS, BF, r4dchain>), grid,            \
+                             dim3(kVThreads), 0, Ap, (unsigned)lda, Wp, (unsigned)K, Bp, Rp,       \
+                             (unsigned)ldr, Cp, (unsigned)ldc, (int)M, (int)K, (int)N, vec)        \
+                   : R4D_EMIT(stream, (vit_gemm_wa_kernel<AC, RS, BF>), grid, dim3(kVThreads), 0,  \
+                             Ap, (unsigned)lda, Wp, (unsigned)K, Bp, Rp, (unsigned)ldr, Cp,        \
+                             (unsigned)ldc, (int)M, (int)K, (int)N, vec)
 #define VB_ACT(RS, BF)                                                                            \
         do {                                                                                      \
             if (act == 1) VB_L(1, RS, BF);                                                        \
@@ -857,7 +867,6 @@ extern "C" int r4d_rad_gemm_nt_bias(const RadArgs* a, RadStream stream) {
 #undef VB_L
     }
     const dim3 grid((unsigned)((N + 63) / 64), (unsigned)((M + 63) / 64)), block(256);
-    const bool vch = r4d_geti_or(a, "chain", 0) != 0 && M <= 64;
 #define VB_L(AC, RS, BF)                                                                          \
     return vch ? R4D_EMIT(stream, (vit_gemm_kernel<2, 1, AC, RS, BF, r4dchain>), grid, block, 0,  \
                           Ap, (unsigned)lda, Wp, (unsigned)K, Bp, Rp, (unsigned)ldr, Cp,         \

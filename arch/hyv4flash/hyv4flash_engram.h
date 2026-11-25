@@ -111,6 +111,13 @@ struct Engram {
     int layer = 0;
     rad_buf h = 0;
     rad_kvgroup hist = 0;
+    /* P-06: one CONV window serves every Engram layer, because they hash the same tokens and so
+     * keep the same last ngram - 1 ids. `hist_layer` is the layer bound to the group (the first
+     * Engram layer's; the others read its window), and `hist_advance` says whose engram_ids issues
+     * move the window on: the last Engram layer of the step, so that the window every layer of the
+     * step hashes is the one the step opened with (kernels/engram.md §1). */
+    int hist_layer = 0;
+    bool hist_advance = true;
     bool table_bf16 = true, roundtrip = false;
     bool hashless = false;   /* the container lacks the hash constants (an optional --add) */
     rad_weight table = 0, table_scale = 0, map = 0, mult = 0, vsz = 0, off = 0, head_gain = 0;
@@ -147,7 +154,17 @@ struct Engram {
                       W = H * HD;
         const auto grp = grp_layer(l);
         const char* ep = nm.ckpt("model.layers.%d.engram_layer", l);
-        RAD_ARCH_TRY(rad_bind_layer_kv(b, l, hist));
+        /* The one window: the first Engram layer binds it, every layer hashes through it, and the
+         * last one's issues are the ones that commit the step to it -- the trunk issues its layers
+         * in ascending order, so the last Engram layer is the last of them to hash a step. */
+        int lo = l, hi = l;
+        for (int e : s.engram_layers) {
+            if (e < lo) lo = e;
+            if (e > hi) hi = e;
+        }
+        hist_layer = lo;
+        hist_advance = hi == l;
+        if (l == hist_layer) RAD_ARCH_TRY(rad_bind_layer_kv(b, l, hist));
 
         /* The table: E4M3 rows and a bf16 or f32 scale a row (a recipe), or bf16 as shipped. A vocabulary
          * table, though not the token one: a few rows a token, far too large for a card. Model-level
@@ -254,17 +271,21 @@ struct Engram {
             return RAD_E_INVAL;
 
         const double eps = engram_eps();
+        /* `advance`: the four Engram layers hash through one CONV window, and only the last of
+         * them commits the step to it -- the three before it read the window the step opened
+         * with, as the first of them would have on its own. */
+        const int64_t adv = hist_advance ? 1 : 0;
         for (int dec = 0; dec < 2; ++dec) {
             const RadParam ps[] = { RAD_RANGE("M", 1, T), RAD_INT("heads", H),
                                     RAD_INT("ngram", s.engram_ngram), RAD_INT("pad", s.engram_pad),
                                     RAD_INT("map_size", s.engram_map),
                                     RAD_INT("image", s.image_token),
-                                    RAD_INT("video", s.video_token) };
+                                    RAD_INT("video", s.video_token), RAD_INT("advance", adv) };
             const rad_weight ws[] = { map, mult, vsz, off };
             rad_op& op = dec ? op_ids_dec : op_ids;
             /* The prefill form also writes the following prompt's ids (`ahead`). */
-            op = dec ? rw(b, rad_decl_op(b, "engram_ids", ps, 7, ws, 4), {}, { w.ids, w.mask })
-                     : rw(b, rad_decl_op(b, "engram_ids", ps, 7, ws, 4), {},
+            op = dec ? rw(b, rad_decl_op(b, "engram_ids", ps, 8, ws, 4), {}, { w.ids, w.mask })
+                     : rw(b, rad_decl_op(b, "engram_ids", ps, 8, ws, 4), {},
                           { w.ids, w.mask, w.ahead });
             HY4_NEED(op, "engram_ids");
         }
@@ -359,7 +380,7 @@ struct Engram {
         if (D > 0) {
             RadOperand sd = praw2(sidx, RAD_I32, D, pitch);
             sd.cols = 1;
-            RAD_ISSUE_N(c, op_ids_dec, T, tok, kv_cache(hist, layer),
+            RAD_ISSUE_N(c, op_ids_dec, T, tok, kv_cache(hist, hist_layer),
                         praw(batch->cu_seqlens, RAD_I32, D + 1), pos, RAD_W(map), RAD_W(mult),
                         RAD_W(vsz), RAD_W(off), praw(batch->num_accepted, RAD_I32, D), sd,
                         brows(w.ids, T), brows(w.mask, T));
@@ -377,7 +398,8 @@ struct Engram {
         if (P > 0) {
             RadOperand sp = praw2(sidx + D * pitch, RAD_I32, P, pitch);
             sp.cols = 1;
-            RAD_ISSUE_N(c, op_ids, T, praw(batch->token_ids, RAD_I32, T + A), kv_cache(hist, layer),
+            RAD_ISSUE_N(c, op_ids, T, praw(batch->token_ids, RAD_I32, T + A),
+                        kv_cache(hist, hist_layer),
                         praw(batch->cu_seqlens + D, RAD_I32, P + 1), pos, RAD_W(map), RAD_W(mult),
                         RAD_W(vsz), RAD_W(off), RAD_NONE, sp, brows(w.ids, T), brows(w.mask, T),
                         A > 0 ? brows(w.ahead, A) : RAD_NONE);

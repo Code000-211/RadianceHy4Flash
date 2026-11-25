@@ -4818,6 +4818,9 @@ SchedMetrics Scheduler::metrics_locked() const {
         m.kv[i].bytes_used   = kv_->pool_bytes_used(i);
         m.kv[i].bytes_carved = kv_->pool_bytes_carved(i);
     }
+    /* What the loan reaches, for the group that lends least. Read here, where the groups are
+     * walked, so /stats can tell free room above the held top from free blocks under it. */
+    m.kv_spare = kv_->kv_spare_split();
     /* Zero on a server whose groups are all resident. */
     m.kv_resident_blocks = kv_->stream_resident_blocks();
     m.kv_stream_misses   = kv_->stream_misses();

@@ -561,9 +561,15 @@ public:
      * is a change of address: a recall waits only for kernels to stop naming the slot.
      *
      * The fleet is the third lender (docs/MULTIMODEL.md §6.7): VRAM no model of the fleet holds,
-     * backed into a range the engine reserved for it and given back when the fleet needs it. */
+     * backed into a range the engine reserved for it and given back when the fleet needs it.
+     *
+     * The sliding-window KV groups are the fourth, on a loan of their own (M-11): their pools hold
+     * one window per sequence slot, so the slots no sequence occupies are unused VRAM, but the
+     * spare is sized by slots and never runs out on the FULL groups' token axis, so the two cannot
+     * share one number. It lends in window tokens, and its slots are not donors: its recall must be
+     * an address change too, since a sequence needs those blocks back at an admission. */
 
-    enum Lender { kLendKV = 0, kLendArena = 1, kLendFleet = 2, kLenders = 3 };
+    enum Lender { kLendKV = 0, kLendArena = 1, kLendFleet = 2, kLendKvWindow = 3, kLenders = 4 };
 
     /* The bytes one stretch must span for lend_from to cut a slot for every unit it would carve
      * one for (each movable unit in the pinned pool), with each slot's alignment and the empty
@@ -572,8 +578,12 @@ public:
 
     /* Registers the stretches a lender may ever lend; once per lender, after its memory is
      * carved. Each stretch is cut into slots of each class's stride from the top down, so a small
-     * loan covers a prefix of a large loan's slots and the deepest slot is given back first. */
-    int     lend_from(int lender, const std::vector<LoanStrip>& strips);
+     * loan covers a prefix of a large loan's slots and the deepest slot is given back first.
+     * `share_unit_budget`: a class's slots stand for the units that can fill them, so a lender
+     * lending a region the units an earlier lender already carved for could occupy takes only what
+     * is left. The sliding window's loan passes it (its slots and the KV cache's hold the same
+     * experts); the arena's and the fleet's do not, their regions belonging to other budgets. */
+    int     lend_from(int lender, const std::vector<LoanStrip>& strips, bool share_unit_budget = false);
 
     /* How much a lender lends, in its own measure. A target, not a transaction: newly covered
      * slots can be filled at once, while uncovered ones empty as their units drop and their
@@ -659,6 +669,16 @@ public:
             }
         return n;
     }
+
+    /* The pool slots that hold a resident unit's bytes rather than a pooled unit's (M-01), and
+     * their bytes: what fill_mirrors() writes at load, so their demotions are address changes. */
+    int64_t mirror_slots() const { return mirror_slots_; }
+    int64_t mirror_bytes() const { return mirror_bytes_; }
+    /* Copies every mirrored unit's bytes from its slab slot into its pool slot, once, after the
+     * load and before the first dispatch. The bytes never change, so this is the only copy the
+     * mirror costs: a demotion is then a relabel (issue()), and promote_to() keeps the slot. A
+     * no-op when the host pool had no room left to mirror anything. */
+    int fill_mirrors();
 
     /* Where a unit's bytes are right now, as a device-visible address, or null for a file-tier
      * unit that has not been staged. */
@@ -838,6 +858,10 @@ private:
                                   : flex_ptr[(size_t)(slot - n_fixed)];
         }
         bool is_flex(int64_t slot) const { return slot >= n_fixed; }
+        /* The pool holds a slot for every unit of the class that can move, and none of the class
+         * is in the file tier to be deposited later (M-01): a promotion keeps its slot, because
+         * no unit of the class needs one handed back to it. */
+        bool pool_full = false;
     };
 
     const Program* prog_ = nullptr;
@@ -909,6 +933,10 @@ private:
      * order, so a layer's pooled units start out adjacent (pool_slot_for). */
     std::vector<std::vector<int32_t>> pool_layer_;
     int32_t n_layers_ = 0;
+    /* The pool slots sized past the plan's pooled units, for resident units (M-01): how many, and
+     * the bytes fill_mirrors() writes into them once. */
+    int64_t mirror_slots_ = 0;
+    int64_t mirror_bytes_ = 0;
 
     void*   static_vram_ = nullptr;
     int64_t static_bytes_ = 0;

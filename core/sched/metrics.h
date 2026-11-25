@@ -10,6 +10,25 @@ namespace rad {
 
 enum { RAD_SCHED_MAX_KV_GROUPS = 16 };
 
+/* The pieces of the KV loan's headroom for the group that lends least, in that group's blocks:
+ * where the loan stops (`held_top`), what the pool holds under it (`held`), the buffer it keeps
+ * (`buffer_blocks`) and the live mark as it stands (`live`). A block released under the highest
+ * held one is free and still unlendable, so `held_top - held` is the fragmentation a compaction
+ * would recover, and `live - held_top - buffer_blocks` the headroom the arbiter has not lent yet.
+ * `group` is -1 when nothing can lend (no paged FULL group, or a follower that tracks no held
+ * blocks). Zero everywhere else. */
+struct KvSpareSplit {
+    int32_t group         = -1;
+    int64_t block_tokens  = 0;
+    int64_t block_bytes   = 0;
+    int64_t held          = 0;
+    int64_t held_top      = 0;
+    int64_t buffer_blocks = 0;
+    int64_t live          = 0;
+    int64_t spare_tokens  = 0;
+    int64_t loan_tokens   = 0;
+};
+
 struct SchedMetrics {
     int64_t step = 0;
 
@@ -101,6 +120,10 @@ struct SchedMetrics {
          * difference is the VRAM the elastic pool released behind unheld blocks. */
         int64_t bytes_carved = 0;
     } kv[RAD_SCHED_MAX_KV_GROUPS];
+    /* Where the loan stops and what keeps it there, for the group that lends least: the counters
+     * that turn kv[].bytes_used into a fragmentation reading (a block under the highest held one is
+     * free and still unlendable). group is -1 when the manager cannot answer. */
+    KvSpareSplit kv_spare;
     /* KV streaming: the rings' depth over every streamed group, and the resolve's cumulative misses
      * and bytes copied in from the host mirrors. Zero when nothing streams. */
     int64_t kv_resident_blocks = 0;

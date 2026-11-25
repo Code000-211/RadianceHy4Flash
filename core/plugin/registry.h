@@ -155,6 +155,35 @@ struct SelectionTrace {
     bool other_domain_has_rows = false;   /* the op exists, just not in the domain asked for */
 };
 
+/* ------------------------------------------------------------------ a reload of rebuilt hooks */
+/* The overrides' rebuilt hooks, read and held beside the rows served (Registry::reload_prepare,
+ * docs/PLUGIN.md §14) until reload_finish puts them into those rows or drops them. `next` maps a
+ * served row whose hooks the rebuild changes to the row as the rebuild serves it: the same
+ * declaration, other hooks. The engine checks those against what declare asked of the served ones
+ * before it commits. */
+struct HookReload {
+    struct Lib {
+        std::string       name;
+        std::string       path;
+        RadKernelReloadFn step = nullptr;
+        int               rows = 0;      /* rows the rebuild gives other hooks */
+    };
+    std::vector<Lib> libs;
+    std::unordered_map<const RadKernelInfo*, const RadKernelInfo*> next;
+
+    /* The rebuilt form of a served row, or null when the rebuild leaves it as it is. */
+    const RadKernelInfo* rebuilt(const RadKernelInfo* served) const {
+        auto it = next.find(served);
+        return it == next.end() ? nullptr : it->second;
+    }
+};
+
+/* The first hook `rebuilt` holds differently from `served` among those a reload may not change
+ * under an engine that resolved the row -- every hook but launch, scratch and tune_valid, whose
+ * answers declare used (a stored layout, an instance's state, a fusion) -- or null when none
+ * differs. */
+const char* hook_reload_fixed(const RadKernelInfo& served, const RadKernelInfo& rebuilt);
+
 /* ------------------------------------------------------------------ the registry */
 class Registry {
 public:
@@ -213,6 +242,17 @@ public:
     /* Fini this registry's instances and forget its selections. The last registry holding the
      * set also runs the plugins' close hooks, dlcloses them and forgets everything. */
     void close();
+
+    /* ---------------------------------------------------------- reloading hooks (§14) */
+    /* Reads the rebuilt hooks of every loaded override (a kernel library exporting
+     * rad_kernel_reload) into `out`, all or none: a refusal of any leaves every override as it
+     * was, with the reason in `why`. Refused when no loaded library is an override, and when a
+     * rebuild carries no device code for the card the set was checked against. The served rows do
+     * not change until reload_finish. Every engine selecting from the set must be quiet from here
+     * to reload_finish, and no registry may select or load meanwhile. */
+    int  reload_prepare(HookReload* out, std::string* why);
+    /* Puts the prepared hooks into the served rows (`commit`), or drops them. */
+    static void reload_finish(HookReload& r, bool commit);
 
     const std::vector<Plugin>&      plugins() const { return set_->plugins; }
     const Plugin*                   plugin(std::string_view name) const;

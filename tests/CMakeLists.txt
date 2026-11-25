@@ -49,7 +49,10 @@ set(RAD_TESTS_WITH_LEGACY chatparse_test chatparse_gemma4_test)
 # r4d_ar_links_test checks libr4d's header-only link reader, so it needs only the include path.
 # relayout_iqr_test holds the IQR relayout to the stored form r4d_iqr.h describes, so it also
 # compiles r4d_iqr_layout.cpp.
-set(RAD_TESTS_WITH_R4D_HOST relayout_parity_test r4d_ar_links_test relayout_iqr_test)
+# r4d_fuse_test holds the chains libr4d's fused rows declare (r4d_fuse.cpp) to their steps' ops and
+# operands, and the operand descriptions those rows publish (r4d_shapes.cpp) to what their kernels
+# accept, so it compiles both.
+set(RAD_TESTS_WITH_R4D_HOST relayout_parity_test r4d_ar_links_test relayout_iqr_test r4d_fuse_test)
 # Their relayouts' vector loops, at every CPU level (libr4d/r4d_hsimd.h), built for these tests
 # whether or not libr4d itself is.
 include(${CMAKE_SOURCE_DIR}/cmake/RadSimdLevels.cmake)
@@ -173,6 +176,9 @@ string(APPEND RAD_PERF_SCRIPT "include([==[${CMAKE_CURRENT_SOURCE_DIR}/perf_entr
 # back to the host at dlopen, so like the engine it carries all of rad_core and exports it.
 set(RAD_TESTS_WHOLE_CORE shipped_plugins_test)
 
+# issue_link_hold_test: which collectives take the link hold (--wrap=rad_link_hold, below).
+set(RAD_TESTS_WRAP_LINK_HOLD issue_link_hold_test)
+
 file(GLOB RAD_TESTS CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/*_test.cpp)
 if(NOT RAD_HIP_FOUND)
   list(FILTER RAD_TESTS EXCLUDE REGEX "/dspark_device_test\\.cpp$")
@@ -239,6 +245,14 @@ foreach(t ${RAD_TESTS})
     if(n STREQUAL relayout_iqr_test)
       target_sources(${n} PRIVATE ${CMAKE_SOURCE_DIR}/libr4d/r4d_iqr_layout.cpp)
     endif()
+    # r4d_fuse_test calls libr4d's `replaces` hooks: the chains a fused row publishes, which is
+    # what r4d_selftest and rad-kbench's fusion oracle declare and run (abi/rad_abi.h, RadFuseFn).
+    # It also asks the row's `opd_shape` hook (r4d_shapes.cpp) for its operands, as rad-kbench draws
+    # them, and holds the answers to what the kernel's own checks require.
+    if(n STREQUAL r4d_fuse_test)
+      target_sources(${n} PRIVATE ${CMAKE_SOURCE_DIR}/libr4d/r4d_fuse.cpp
+                                  ${CMAKE_SOURCE_DIR}/libr4d/r4d_shapes.cpp)
+    endif()
   elseif(n IN_LIST RAD_TESTS_WITH_PACK)
     add_executable(${n} ${t} ${CMAKE_SOURCE_DIR}/arch/minimaxh3/rad_ref2va_pack.cpp)
     target_link_libraries(${n} PRIVATE rad_json)
@@ -270,6 +284,11 @@ foreach(t ${RAD_TESTS})
   endif()
   if(n IN_LIST RAD_TESTS_WITH_LEGACY)
     target_link_libraries(${n} PRIVATE rad_legacy_toolparse)
+  endif()
+  # The test records rad_link_hold calls through the linker's wrap, so it needs no strong symbol
+  # beside dispatch.cpp.o.
+  if(n IN_LIST RAD_TESTS_WRAP_LINK_HOLD)
+    target_link_options(${n} PRIVATE -Wl,--wrap=rad_link_hold)
   endif()
   target_compile_definitions(${n} PRIVATE RAD_CHAT_FIXTURES="${RAD_CHAT_FIXTURES}"
                                           RAD_MEDIA_FIXTURES="${RAD_MEDIA_FIXTURES}"
@@ -316,6 +335,9 @@ foreach(t ${RAD_TESTS})
            "rad_perf_entry(${n} [==[${t}]==] [==[${CMAKE_BINARY_DIR}/tests/${n}]==])\n")
   endif()
 endforeach()
+
+# kernel_override_test's libraries: a kernel library and overrides of it (rad_add_kernel_override).
+add_subdirectory(override)
 
 # ================================================================== perf_ cases
 #
@@ -396,7 +418,7 @@ if(TARGET hyv4flash_calib_test)
     RAD_CALIB_ST2GRAM="${CMAKE_SOURCE_DIR}/tools/calib_st2gram.py")
 endif()
 foreach(t engine_e2e_test convert_test clef_decision_test laya_decision_test spark25_convert_test
-          hyv4flash_convert_test)
+          hyv4flash_convert_test kernel_reload_e2e_test)
   if(TARGET ${t})
     target_compile_definitions(${t} PRIVATE
       RAD_E2E_SERVER="$<TARGET_FILE:radiance>" RAD_E2E_CONVERT="$<TARGET_FILE:rad-convert>"
@@ -411,6 +433,9 @@ foreach(t engine_e2e_test convert_test clef_decision_test laya_decision_test spa
       target_compile_definitions(${t} PRIVATE
         RAD_CLEF_GOLDEN="${CMAKE_CURRENT_SOURCE_DIR}/data/golden/clef_tiny.json")
       add_dependencies(${t} radiance rad-convert libref libquant clef_bf16)
+    elseif(t STREQUAL "kernel_reload_e2e_test")
+      # The model a tiny qwen35 selects and libref; tests/override adds its own libraries.
+      add_dependencies(${t} radiance libref qwen35_bf16)
     elseif(t STREQUAL "laya_decision_test")
       # The tiny Laya's golden (tests/mklayagolden.py) and the plugin a Laya container selects.
       target_compile_definitions(${t} PRIVATE
@@ -431,6 +456,9 @@ if(TARGET clef_decision_test)
 endif()
 if(TARGET laya_decision_test)
   set_tests_properties(laya_decision_test PROPERTIES LABELS "e2e" TIMEOUT 300)
+endif()
+if(TARGET kernel_reload_e2e_test)
+  set_tests_properties(kernel_reload_e2e_test PROPERTIES LABELS "e2e" TIMEOUT 300)
 endif()
 
 # abi_layout_test compares the ABI's struct layouts with a C translation unit's: abi_c_test.c
@@ -597,8 +625,9 @@ set_tests_properties(isa_tools PROPERTIES TIMEOUT ${RAD_TEST_TIMEOUT})
 # recurrence, the MXFP4 expert GEMM's forms, the MLA matrix row's pairings and its sink, the KV
 # resolve, the buffer-keyed device blocks, LiLiCorr's candidate correlator, Muse Glimmer's
 # vision-tower taps, GLM's MoE decode fusions and its gather's quantising forms (r4d_moe.hip: the
-# publish entry points themselves, so the launcher's choice of wave form and its refusals run too)
-# and GLM's DSA scoring split by query rows, whose kernels a card-less build otherwise never runs.
+# publish entry points themselves, so the launcher's choice of wave form and its refusals run too),
+# GLM's DSA scoring split by query rows and the row top-k (row_topk, cast_row_topk: both launch
+# forms and the arrival counters), whose kernels a card-less build otherwise never runs.
 # emu/hip/hip_runtime.h supplies the HIP names, each GPU thread is a fiber, and
 # __syncthreads and cross-lane ops are barriers (one not reached uniformly is reported as a
 # deadlock). Checked against ports of libref's ref_attn_paged and ref_qsa_select, the host
@@ -626,17 +655,23 @@ set(R4D_EMU_HIP ${R4D_DIR}/r4d_attn_paged_window.hip ${R4D_DIR}/r4d_pair_argmax_
                 ${R4D_DIR}/r4d_vit_muse.hip ${R4D_DIR}/r4d_moe.hip)
 list(APPEND R4D_EMU_HIP ${R4D_DIR}/r4d_attn_kv_sink_h256.hip)
 list(APPEND R4D_EMU_HIP ${R4D_DIR}/r4d_ihc_bf16.hip ${R4D_DIR}/r4d_engram_bf16.hip
-                        ${R4D_DIR}/r4d_mla_kv_bf16.hip ${R4D_DIR}/r4d_dfly.hip)
+                        ${R4D_DIR}/r4d_mla_kv_bf16.hip ${R4D_DIR}/r4d_dfly.hip
+                        ${R4D_DIR}/r4d_idx_pool_gated_f32.hip ${R4D_DIR}/r4d_qsa_work_bf16.hip
+                        ${R4D_DIR}/r4d_qsa_tail_store_bf16.hip
+                        ${R4D_DIR}/r4d_qsa_work_pool_tail_bf16.hip
+                        ${R4D_DIR}/r4d_model_bf16.hip ${R4D_DIR}/r4d_rowtopk_bf16.hip
+                        ${R4D_DIR}/r4d_idx_score_bf16.hip)
 set(R4D_EMU_TESTS attn pick norm escale qsa lora f32 mhc kda mla moefuse kvres
                   dsa lili vit)
-list(APPEND R4D_EMU_TESTS attn_kv_sink hy4 mla_sink mla_kv)
+list(APPEND R4D_EMU_TESTS attn_kv_sink hy4 mla_sink mla_kv idxpool qsafront row topk)
 set(R4D_EMU_BUILT OFF)
 if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$")
   # No fiber switch for this ISA.
 elseif(CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND NOT RAD_ASAN AND NOT RAD_TSAN)
   set_source_files_properties(${R4D_EMU_HIP} PROPERTIES LANGUAGE CXX COMPILE_OPTIONS "-x;c++")
   add_library(r4d_emu_kernels OBJECT ${R4D_EMU_HIP} ${R4D_EMU}/ref_host.cpp
-                                     ${R4D_EMU}/emu/emu.cpp ${R4D_EMU}/emu/tune_defaults.cpp)
+                                     ${R4D_EMU}/emu/emu.cpp ${R4D_EMU}/emu/tune_defaults.cpp
+                                     ${R4D_EMU}/model_stubs.cpp)
   target_include_directories(r4d_emu_kernels PUBLIC ${R4D_EMU}/emu ${R4D_EMU} ${R4D_DIR})
   target_link_libraries(r4d_emu_kernels PUBLIC rad_abi)
   # As in libr4d: the joins must match the unfused chain bit for bit, so no FMA contraction.
@@ -665,7 +700,7 @@ else()
               -I${CMAKE_SOURCE_DIR}/abi -I${R4D_DIR})
     set(objs "")
     foreach(src ${R4D_EMU_HIP} ${R4D_EMU}/ref_host.cpp ${R4D_EMU}/emu/emu.cpp
-                ${R4D_EMU}/emu/tune_defaults.cpp
+                ${R4D_EMU}/emu/tune_defaults.cpp ${R4D_EMU}/model_stubs.cpp
                 ${R4D_EMU}/test_attn.cpp ${R4D_EMU}/test_pick.cpp ${R4D_EMU}/test_norm.cpp
                 ${R4D_EMU}/test_escale.cpp ${R4D_EMU}/test_qsa.cpp ${R4D_EMU}/test_lora.cpp
                 ${R4D_EMU}/test_f32.cpp ${R4D_EMU}/test_mhc.cpp
@@ -674,7 +709,8 @@ else()
                 ${R4D_EMU}/test_dsa.cpp ${R4D_EMU}/test_lili.cpp
                 ${R4D_EMU}/test_vit.cpp ${R4D_EMU}/test_attn_kv_sink.cpp
                 ${R4D_EMU}/test_hy4.cpp ${R4D_EMU}/test_mla_sink.cpp
-                ${R4D_EMU}/test_mla_kv.cpp)
+                ${R4D_EMU}/test_mla_kv.cpp ${R4D_EMU}/test_idxpool.cpp
+                ${R4D_EMU}/test_qsafront.cpp ${R4D_EMU}/test_row.cpp ${R4D_EMU}/test_topk.cpp)
       get_filename_component(stem ${src} NAME_WE)
       set(lang "")
       if(src MATCHES "\\.hip$")
@@ -711,7 +747,8 @@ else()
   endif()
 endif()
 if(R4D_EMU_BUILT)
-  foreach(t pick norm escale qsa lora f32 mhc kda mla moefuse kvres dsa lili vit hy4 mla_sink mla_kv)
+  foreach(t pick norm escale qsa lora f32 mhc kda mla moefuse kvres dsa lili vit hy4 mla_sink
+            mla_kv idxpool qsafront row topk)
     add_test(NAME r4d_emu_${t} COMMAND ${CMAKE_BINARY_DIR}/tests/r4d_emu_${t})
   endforeach()
   # Hy4-flash's non-absorbed prefill (attn_kv_sink_h256): about 4 s.
@@ -731,8 +768,22 @@ if(R4D_EMU_BUILT)
   # load one -- expand bit for bit, shrink to its bound. kda_update is held to libref's within
   # rounding, and that test needs it.
   # r4d_emu_mla_kv: the kv_b projections on WMMA against libref, their law and the fused gate.
+  # r4d_emu_idxpool: the compressed indexer's gated pool against libref, byte for byte, with the
+  # dead-page early-out's fixtures.
   set_tests_properties(r4d_emu_mla_kv PROPERTIES LABELS "r4d_emu" TIMEOUT ${RAD_TEST_TIMEOUT})
-  set_tests_properties(r4d_emu_lora r4d_emu_kda r4d_emu_hy4 r4d_emu_mla_kv PROPERTIES
+  set_tests_properties(r4d_emu_idxpool PROPERTIES LABELS "r4d_emu" TIMEOUT ${RAD_TEST_TIMEOUT})
+  # r4d_emu_qsafront: the fused key side against the three ops it replaces (qsa_work ->
+  # idx_pool_gated -> qsa_tail_store), byte for byte, with the tail's alias bound on both sides of
+  # its edge. No libref: the three ops are the oracle.
+  set_tests_properties(r4d_emu_qsafront PROPERTIES LABELS "r4d_emu" TIMEOUT ${RAD_TEST_TIMEOUT})
+  # r4d_emu_row: mla_row_norm_rope_store's fused norm / rope / kv_store against the chain the three
+  # ops make, byte for byte, over plain and imrope rotary, both gain dtypes, padding slots, a
+  # chained call and a rotary wider than a block.
+  set_tests_properties(r4d_emu_row PROPERTIES LABELS "r4d_emu" TIMEOUT ${RAD_TEST_TIMEOUT})
+  # r4d_emu_topk: row_topk's one- and two-launch forms and cast_row_topk against the cast then
+  # row_topk, byte for byte, and the cast's rounding over every f32 pattern.
+  set_tests_properties(r4d_emu_topk PROPERTIES LABELS "r4d_emu" TIMEOUT ${RAD_TEST_TIMEOUT})
+  set_tests_properties(r4d_emu_lora r4d_emu_kda r4d_emu_hy4 r4d_emu_mla_kv r4d_emu_idxpool PROPERTIES
                        ENVIRONMENT "RADIANCE_HOME=${CMAKE_BINARY_DIR}/radiance_home")
   # A seeded random sweep, mostly prefill shapes on the WMMA kernel, which the emulator runs at
   # about 2 s a case: `slow`. `r4d_emu_attn sweep 200` is a longer run by hand, a superset of it.
@@ -939,6 +990,11 @@ if(RAD_PYTHON3)
   add_test(NAME dspark_qos_regression_test
            COMMAND ${RAD_PYTHON3} ${CMAKE_CURRENT_SOURCE_DIR}/dspark_qos_regression_test.py)
   set_tests_properties(dspark_qos_regression_test PROPERTIES LABELS "unit;fast" TIMEOUT ${RAD_TEST_TIMEOUT})
+  # scripts/backlog/{probe,agg,attr,layer}.py over a made-up run: a stamped long-context run holds phases
+  # with no window of their own, and the readers must read the waves rather than die on them (T-03).
+  add_test(NAME backlog_stamps_test COMMAND ${RAD_PYTHON3} ${CMAKE_CURRENT_SOURCE_DIR}/backlog_stamps_test.py)
+  set_tests_properties(backlog_stamps_test PROPERTIES LABELS "unit;fast" SKIP_RETURN_CODE 77
+                       TIMEOUT ${RAD_TEST_TIMEOUT})
 endif()
 
 # ================================================================== the shipped plugins, out of tree
