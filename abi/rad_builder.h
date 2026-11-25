@@ -291,6 +291,17 @@ typedef struct RadBuildCtx {
      * max_tok rows. 0, the zero-initialised default, keeps the interval-tall passes. A plugin
      * without such a pass ignores it. */
     int      span_pass_step;
+
+    /* ---- appended in ABI 44 (a chunk planned as layer-sliced sub-steps) */
+    /* The number of trunk layers, from the first, whose persistent state a pass can carry across
+     * a step boundary and pick up again at layer L: every state the layers [0, L) write is either
+     * declared as replicated persistent (the KV cache, an attention sink, a tap, a calibration
+     * table) or fully rewritten by the trunk of each pass. The core sets it to the whole trunk only
+     * when --chunk-slices asks for slicing and the plugin reports it can serve a layer range
+     * (RadArchProbe::slice_layers_ok), which is the same report the scheduler plans a chunk by. 0,
+     * the zero-initialised default, says the plugin declares no such set, so no chunk is sliced
+     * for it. */
+    int32_t  layer_slices;
 } RadBuildCtx;
 
 /* The most instances (engine ranks) one process holds at once; every slot is below it. */
@@ -317,10 +328,22 @@ static inline int rad_build_slot(const RadBuildCtx* c) { return c->slot_base + c
  * steered exactly when its `scales` entry is nonzero, so a plugin asks that and cannot disagree
  * with the loader. */
 typedef struct RadControlVector {
-    const float* dir;        /* device, [n_layers, n_embd] f32, unit rows */
+    const float* dir;        /* device, [n_layers, rank, n_embd] f32, unit rows */
     const float* scales;     /* host,    [n_layers]     f32, |d_l| * user scale; 0 = not steered */
     int64_t      n_embd;
     int64_t      n_layers;
+    /* Directions per layer. `dir` holds layer l's direction k at ((l*rank)+k)*n_embd. 1 is the
+     * single-direction package every 2.2 release wrote; 0 is treated as 1 so a package built
+     * against the older struct steers exactly as it did. Trailing and zero-defaulted. */
+    int64_t      rank;
+    /* 1: `dir` is per-stream: `rank` still counts the rows of a layer, and they form rank / hc
+     * GROUPS of one direction per hyper-connection stream ([n_layers, rank/hc, hc, n_embd]), so
+     * stream s of group k is at ((l*rank) + k*hc + s)*n_embd and a kernel must project stream s
+     * against its own vector. 0:
+     * one direction per group, applied to every stream (the pre-45 behaviour). The four streams of
+     * this architecture carry the refusal signal differently (cosines 0.1-0.6), which is why the
+     * published refusal vector is per-stream. Trailing and zero-defaulted. */
+    int64_t      per_stream;
 } RadControlVector;
 
 /* ================================================================== weights */
@@ -1746,6 +1769,14 @@ typedef struct RadArchProbe {
      * rather than ending the chunk there and running the rows past it as a step of their own.
      * Zero keeps that step. */
     int32_t ckpt_snap_ok;
+
+    /* ---- appended in ABI 44 (a chunk planned as layer-sliced sub-steps) */
+    /* Nonzero when the plugin honours RadBatch::layer_lo/hi: it runs a step's trunk over that
+     * range only, and starts at layer_lo from the state the previous sub-step left (the replicated
+     * persistent state declared as RadBuildCtx::layer_slices, plus its transient buffers keyed by
+     * a pass's position in the chunk). Zero, the zero-initialised default, keeps every step whole:
+     * a plugin that runs a whole trunk whatever the range says must keep it zero. */
+    int32_t slice_layers_ok;
 } RadArchProbe;
 
 int rad_arch_probe(const RadModelMeta* meta, RadArchProbe* out);

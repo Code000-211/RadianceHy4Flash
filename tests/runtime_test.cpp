@@ -2540,6 +2540,27 @@ static uint64_t test_prefill_geometry_key(RadCtx* c, const RadBatch* b, const in
     return rad_prefill_grid_key((int)b->max_q_len, bq, splits, kv_heads, (int)b->n_seq, threads);
 }
 
+/* A layer-sliced pass (S-02) resumes the chunk from the plugin's persistent state, which the batch
+ * does not carry: its launch cannot be replayed from the key, so it never gets one. */
+TEST(a_layer_sliced_pass_is_never_recorded) {
+    Fixture f;
+    f.add_buffer("x", RAD_BF16, 64, 4, 0);
+    rad_op op = loose_op(f);
+    attach_host_row(f, op, k_host_read, "sliced_prefill");
+    CHECK_OK(f.start());
+
+    RadBatch b{};
+    b.phase = RAD_PHASE_PREFILL;
+    b.n_tok = 128; b.n_seq = 1; b.max_q_len = 128;
+    CHECK(f.ctx.pass_key(&b) != 0);           /* the whole trunk: recordable */
+    b.layer_lo = 0; b.layer_hi = 4;
+    CHECK_EQ(f.ctx.pass_key(&b), (uint64_t)0);
+    b.layer_lo = 4; b.layer_hi = 8;
+    CHECK_EQ(f.ctx.pass_key(&b), (uint64_t)0);
+    b.layer_lo = 0; b.layer_hi = 0;
+    CHECK(f.ctx.pass_key(&b) != 0);           /* and the whole trunk keys again */
+}
+
 TEST(legacy_prefill_keying_only_fails_closed_for_dynamic_split_rows) {
     {
         Fixture f;

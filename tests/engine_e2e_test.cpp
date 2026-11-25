@@ -954,6 +954,31 @@ TEST(an_attention_row_split_no_plugin_serves_is_refused_at_startup) {
     CHECK(named);
 }
 
+/* B-03: the bring-up logs one line per phase with its own duration and the seconds since the
+ * engine's start. A KL record is the cheapest mode that starts the engine all the way through
+ * the settle and the ready line. */
+TEST(the_startup_log_times_each_bringup_phase) {
+    World& w = world();
+    REQUIRE(w.ok);
+    tiny::TempDir d("e2e_phases");
+    const Ran r = radiance(w.qwen35, { "--kld-record", d / "rec", "--kld-corpus", w.corpus_probe },
+                           {}, 120);
+    if (r.status != 0)
+        fprintf(stderr, "    child exited %d:\n%s\n", r.status, tail(r.log).c_str());
+    REQUIRE_EQ(r.status, 0);
+    const std::vector<std::string> want = { "startup: declare in", "startup: plan in",
+                                            "startup: weights in", "startup: kv in",
+                                            "startup: settle in", "startup: ready in" };
+    size_t at = 0;
+    for (const std::string& line : want) {
+        const size_t p = r.log.find(line, at);
+        CHECK(p != std::string::npos);
+        if (p != std::string::npos) at = p;
+    }
+    /* The arena levels line is nested inside declare, so it is not in the ordered list. */
+    CHECK(has(r.log, "startup: arena levels in"));
+}
+
 /* --draft-coupling's answers before any request: a value other than off/on is refused by the flag
  * parse, and a model whose drafter has no per-round draw to couple is refused at bringup. The same
  * model with the flag off is the control: it starts, so the refusals are the flag's and not the

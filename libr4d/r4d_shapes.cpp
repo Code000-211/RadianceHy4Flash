@@ -884,7 +884,10 @@ extern "C" int r4d_shape_mla_attn_paged_sink(const RadParam* p, int n_p, int ope
                                 opd_idx(1, 0, 0, ctx),
                                 opd_idx(2, 0, M + 1, -1, (uint32_t)RAD_OPD_F_IDX_CU),
                                 opd((uint32_t)RAD_F32, h),
-                                opd((uint32_t)RAD_BF16, M, h, L) };
+                                opd((uint32_t)RAD_BF16, M, h, L),
+                                /* the folded rotary's positions (optional): this geometry is the
+                                 * one without them, so q_rope arrives rotated */
+                                opd_none() };
     R4D_PICK(list);
 }
 /* mla_attn_sel_sink: mla_attn's per-row tables with the rotary query and the sinks. */
@@ -900,7 +903,8 @@ extern "C" int r4d_shape_mla_attn_sel_sink(const RadParam* p, int n_p, int opera
                                 opd_idx(M, B, pages),
                                 opd_idx(M, 0, 0, B * bs),
                                 opd((uint32_t)RAD_F32, h),
-                                opd((uint32_t)RAD_BF16, M, h, L) };
+                                opd((uint32_t)RAD_BF16, M, h, L),
+                                opd_none() };             /* the folded rotary's positions */
     R4D_PICK(list);
 }
 extern "C" int r4d_shape_dsa_score(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
@@ -1600,7 +1604,7 @@ extern "C" int r4d_shape_ar_rmsnorm_had_quant_i8g(const RadParam* p, int n_p, in
 
 extern "C" int r4d_shape_gemm_nt_f32(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const int64_t M = pi(p, n_p, "M"), N = pi(p, n_p, "N"), K = pi(p, n_p, "K");
-    const RadOpdDesc l[] = { opd((uint32_t)RAD_BF16, M, K), opd((uint32_t)RAD_F32, N, K),
+    const RadOpdDesc l[] = { opd((uint32_t)RAD_BF16, M, K), opd(pi(p, n_p, "weight_bf16", 0) ? RAD_BF16 : RAD_F32, N, K),
                              opd((uint32_t)RAD_F32, M, N) };
     R4D_PICK(l);
 }
@@ -1914,6 +1918,33 @@ extern "C" int r4d_shape_moe_gather_inv(const RadParam* p, int n_p, int operand,
     return r4d_shape_moe_gather(p, n_p, operand, out);
 }
 
+/* moe_gather_inv writing the sum's rotated int8 codes as well (K-19): its `y` is still the row it
+ * sums, and the shared arm's two slots hold the codes' pair -- the codes one int8 a column, and
+ * their scales one f32 a `group`-wide block (`group`: 128, or 256 for an IQ8R trunk). The linear
+ * that reads the sum reads them in place of its own quantiser's output, so they are the same
+ * [M, n] and [M, n/group] a quantiser op declares. */
+extern "C" int r4d_shape_moe_gather_inv_i8g(const RadParam* p, int n_p, int operand,
+                                            RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M"), n = pi(p, n_p, "n");
+    const int64_t k = pi(p, n_p, "top_k"), g = pi(p, n_p, "group");
+    if (M <= 0 || n <= 0 || k <= 0 || g <= 0 || n % g != 0) return RAD_E_UNSUPPORTED;
+    /* The entry point's band (r4d_rad_moe_gather_inv_i8g, r4d_moe.hip): the codes need a whole
+     * 256-column wave live, the sixteen-slot form needs top_k = 16, and the scale is written once a
+     * `group`-wide block, which is 128 or 256 wide. */
+    if (n % 256 != 0 || k != 16 || (g != 128 && g != 256)) return RAD_E_UNSUPPORTED;
+    const uint32_t D = dt_act(p, n_p, "dtype");
+    const RadOpdDesc l[] = {
+        opd(D, M * k, n),
+        opd(D, M, k),
+        /* Distinct, as in the plain form: the table holds distinct rows of `y_expert`. */
+        opd_idx(M * k, 0, M * k, -1, (uint32_t)RAD_OPD_F_IDX_UNIQUE),
+        opd((uint32_t)RAD_I8, M, n),
+        opd((uint32_t)RAD_F32, M, n / g),
+        opd(D, M, n),
+    };
+    R4D_PICK(l);
+}
+
 /* row_topk -- exact per-row top-R of a wide bf16 matrix (shim in r4d_rowtopk_bf16.hip). R is at
  * most 32, stage 2's PT. */
 extern "C" int r4d_shape_row_topk(const RadParam* p, int n_p, int operand,
@@ -2211,6 +2242,52 @@ extern "C" int r4d_shape_qsa_tail_store(const RadParam* p, int n_p, int operand,
                                         * synthesised case tests the scan, not the copy */
         opd(D, s, 1, g, n),            /* the tail state: [slots, heads, ring, n], heads 1 */
         opd_idx(s, 1, s),              /* the state row; one column, values inside the pool */
+    };
+    R4D_PICK(l);
+}
+
+/* K-24's fused key side: qsa_work's operands and the pool's, joined where the gather meets the
+ * arithmetic. `state` is the tail the gather reads and the store writes; `page`, `bpos` and `nc`
+ * are the work list's, sized by `work` as qsa_work sizes them. */
+extern "C" int r4d_shape_qsa_work_pool_tail(const RadParam* p, int n_p, int operand,
+                                            RadOpdDesc* out) {
+
+    const int64_t M = pi(p, n_p, "M");
+    const int64_t n = pi(p, n_p, "n");
+    const int64_t r = pi(p, n_p, "ratio", 4);
+    const int64_t g = pi(p, n_p, "ring", r);
+    const int64_t s = pi(p, n_p, "seqs", 1);
+    const int64_t W = pi(p, n_p, "work", 1);
+    if (n <= 0 || r <= 0 || g < r || s <= 0 || W <= 0) return RAD_E_UNSUPPORTED;
+    const uint32_t D = dt_act(p, n_p, "dtype");
+    /* The kernel tells its two position forms apart by `mode` (r4d_qsa_work_pool_tail_bf16.hip):
+     * under M-RoPE `bpos` carries the group's three components (`qsa_work`'s [work, 3]) and the
+     * rotary plane is an operand, while under gptj each work item has one position and the step has
+     * no plane. Describing the gptj form under imrope would hand the kernel a shape it refuses.
+     */
+    const char* mode = rad_param_gets(p, n_p, "mode", "gptj");
+    const bool im = !std::strcmp(mode, "imrope") || !std::strcmp(mode, "imrope_gptj");
+    const RadOpdDesc l[] = {
+        opd(D, M, n),                  /* k */
+        /* Positions and cu_seqlens drawn as runs (`RAD_OPD_F_IDX_CU`, 0 .. M), which is the one
+         * batch a drawn case can make legal here: the work list's bounds come off the positions
+         * (`lo`, `hi`, and the `k` row a block reads is `t0 + first - p0`), so a token at a
+         * position the step does not hold sends the gather past `k`'s rows -- measured on gfx1201
+         * as a GPU memory fault in rad-kbench's draw of a uniform one. */
+        opd_idx(M, 1, M, -1, RAD_OPD_F_IDX_CU),
+        opd_idx(s + 1, 1, M + 1, -1, RAD_OPD_F_IDX_CU),
+        opd(D, s, 1, g, n),            /* the tail state, [slots, heads, ring, n] */
+        opd_idx(s, 1, s),              /* the state row, one column */
+        opd_idx(s, W, W),              /* the block-key block table */
+        opd((uint32_t)RAD_F32, n, n),  /* wv */
+        opd((uint32_t)RAD_F32, n, n),  /* wg */
+        opd((uint32_t)RAD_F32, r, n),  /* ape */
+        opd((uint32_t)RAD_F32, n),     /* gain: one row, as the kernel reads it */
+        im ? opd_idx(3, M, M) : opd_none(),   /* rope: the step's three planes, or none */
+        opd((uint32_t)RAD_I32, W),     /* page */
+        im ? opd_idx(W, 3, M) : opd_idx(W, 0, M),   /* bpos: [work, 3] under M-RoPE */
+        opd((uint32_t)RAD_I32, s),     /* nc */
+        opd(D, W, 1, r, n / r),        /* cache: the pool's page, at most `work` of them */
     };
     R4D_PICK(l);
 }

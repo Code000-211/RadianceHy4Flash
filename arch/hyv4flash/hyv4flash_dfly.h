@@ -15,10 +15,15 @@
  *   z     = final_norm(x)
  *   chain k = 0..depth-1:  zc = z[k+1] + down(silu(gate(c)) * up(c)),  c = [hnorm(z[k+1]) |
  *     enorm(embed(prev))], prev the bonus then each proposal; proposal k = argmax(lm_head(zc))
- *     (the trunk's head, row_topk over the bf16-rounded logits, ties to the lower id)
+ *     (the trunk's head, row_topk over the bf16-rounded logits, ties to the lower id; one
+ *     cast_row_topk where a library serves it, else cast then row_topk)
+ *
+ * Under load the core may stage the short block instead (D-06: kShortBlock = 4 rows, so 3
+ * proposals and 3 chain rounds; --draft-short-from). The draft is causal, so that pass is the
+ * full pass's first rows.
  *
  * What the trunk step leaves for it (only while the drafter is served): final_hidden (PERSIST,
- * every row), and for each distinct Lidx a snapshot of the indexer's selection by trunk row
+ * every possible anchor row), and for each distinct Lidx a snapshot of the indexer's selection by trunk row
  * (`dfly.sel_snap.<l>`, `dfly.nsel_snap.<l>`, nsel 0 for a row that attended densely), taken right
  * after qsa_select and before a streamed group's kv_resolve rewrites it into ring slots.
  *
@@ -63,6 +68,12 @@ namespace hyv4flash {
 struct Dfly {
     /* ---------------------------------------------------------------- configuration */
     int64_t layers = 0, depth = 0, block = 0, ff = 0, window = 0, topk = 0;
+    /* D-06: the short block the core stages under load (rad_drafter_short_block, --draft-short-from):
+     * kShortBlock rows, the anchor and kShortBlock - 1 masks, declared when the drafter's own block
+     * is longer (depth 4 and 5). The draft is causal (dfly_sel gives a row the keys up to its own
+     * position), so the short pass is the full pass's first rows; 0 when there is none. */
+    static constexpr int64_t kShortBlock = 4;
+    int64_t block_lo = 0;
     int32_t mask = -1;
     std::vector<int> kv, idx;       /* per draft layer: Lkv[i], Lidx[i] */
     std::vector<int> idx_set;       /* the distinct Lidx */
@@ -100,9 +111,11 @@ struct Dfly {
         layers = s.dfly_layers;
         want = layers > 0 && ctx->max_spec > 0;
         served = false;
+        block_lo = 0;
         if (!want) return;
         depth = ctx->max_spec;
         block = depth + 1;
+        block_lo = block > kShortBlock ? kShortBlock : 0;
         mask = (int32_t)rad_meta_geti(m, "dfly_mask_token_id", -1);
         window = rad_meta_geti(m, "dfly_context_local_window", 0);
         topk = rad_meta_geti(m, "dfly_target_index_topk", -1);
@@ -128,7 +141,12 @@ struct Dfly {
         char buf[256];
         why.clear();
         auto no = [&](const char* fmt, auto... a) {
-            if (why.empty()) {
+            if (!why.empty()) return;
+            /* A message with no arguments is taken as written: giving it to std::snprintf would
+             * read any % in it as a conversion with nothing behind it. */
+            if constexpr (sizeof...(a) == 0) {
+                why = fmt;
+            } else {
                 /* Every caller passes a literal; a variadic lambda cannot say so to the compiler. */
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wformat-security"
@@ -158,6 +176,11 @@ struct Dfly {
         if (s.world > 1 && s.sparse.heads % s.world)
             no("the draft's %lld attention heads do not split evenly over %d ranks",
                (long long)s.sparse.heads, s.world);
+        /* The correction's gate and up hold this rank's rows and its down this rank's columns, so
+         * the chain's width splits over the same ranks. */
+        if (s.world > 1 && s.n_embd % s.world)
+            no("the draft's %lld-wide correction does not split evenly over %d ranks",
+               (long long)s.n_embd, s.world);
         if (s.world > 1 && b && (!rad_op_declared(b, "all_gather") ||
                                  !rad_op_declared(b, "row_topk_merge")))
             no("tensor parallelism (%d ranks) needs all_gather and row_topk_merge for the draft "
@@ -191,53 +214,91 @@ struct Dfly {
     }
 
     /* ---------------------------------------------------------------- the trunk's snapshots */
+    /* P-09: the snapshot layers' selections live in two layer-major planes, so a single-span
+     * step of a group that does not stream lets `qsa_select` write its layer's window directly
+     * (no post-copy), and a non-selecting step clears every layer's counts with one fill.
+     * Layer li's window starts at row `Snap::base` and is `g.max_tok` rows tall. */
     struct Snap {
         int layer = -1;
-        rad_buf sel = 0, nsel = 0, ids = 0;   /* ids: taps only, the selection as group ids */
-        rad_op op_sel = 0, op_nsel = 0, op_zero = 0, op_ids = 0;
+        int li = 0;             /* the plane's layer slot (declare order) */
+        int64_t base = 0;       /* the plane row this layer's window starts at */
+        int64_t width = 0;
     };
     std::vector<Snap> snap;
+    rad_buf snap_sel = 0, snap_nsel = 0;      /* [L*T, G] i32 + [L*T] i32, PERSIST */
+    rad_buf snap_ids = 0;                     /* taps only, the selection as group ids */
+    rad_op op_sel = 0, op_nsel = 0, op_zero = 0, op_ids = 0;   /* shared by the layers */
+    int64_t snap_t = 0;                       /* the plane's rows a layer (g.max_tok) */
     const Snap* snap_of(int l) const {
         for (const Snap& sn : snap)
             if (sn.layer == l) return &sn;
         return nullptr;
     }
-    /* Declared right after layer l's indexer (its qsa_select writes `ix.selected`). */
+    /* P-09: the window a snapshot layer's `qsa_select` writes when the step is single-span and
+     * the group does not stream (the caller holds both step facts). */
+    SelOut snap_out(int l) const {
+        const Snap* sn = snap_of(l);
+        return SelOut{ snap_sel, snap_nsel, sn->base };
+    }
+    /* Declared right after layer l's indexer (its `qsa_select` may write the plane's window). */
     int declare_snap(RadBuilder* b, Names& nm, const Shape& s, const Geom& g, int l,
                      const IndexWire& iw) {
         if (!snaps(l)) return RAD_OK;
         const int64_t T = g.max_tok, G = s.ix_group_topk;
+        if (snap.empty()) {
+            snap_t = T;
+            const int64_t L = (int64_t)idx_set.size(), P = L * T;
+            snap_sel = decl_b(b, nm.f("dfly.sel_snap"), RAD_I32, { P, G }, RAD_BUF_PERSIST);
+            snap_nsel = decl_b(b, nm.f("dfly.nsel_snap"), RAD_I32, { P }, RAD_BUF_PERSIST);
+            if (!snap_sel || !snap_nsel) return RAD_E_INVAL;
+            op_sel = decl_copy(b, T, G, RAD_I32, iw.sel, snap_sel);
+            op_nsel = decl_copy(b, T, 1, RAD_I32, iw.nsel, snap_nsel);
+            op_zero = mk(b, "fill", { RAD_RANGE("M", 1, P), RAD_INT("n", 1), RAD_STR("dtype", "i32") },
+                         {}, {}, { snap_nsel });
+            HY4_NEED(op_sel && op_nsel, "cast (i32)");
+            HY4_NEED(op_zero, "fill (i32)");
+            if (taps_on() && iw.sel_ids) {
+                snap_ids = decl_b(b, nm.f("dfly.sel_snap_ids"), RAD_I32, { P, G }, RAD_BUF_PERSIST);
+                if (!snap_ids) return RAD_E_INVAL;
+                op_ids = decl_copy(b, T, G, RAD_I32, iw.sel_ids, snap_ids);
+                HY4_NEED(op_ids, "cast (i32)");
+            }
+        }
         Snap sn;
         sn.layer = l;
-        sn.sel = decl_b(b, nm.f("dfly.sel_snap.%d", l), RAD_I32, { T, G }, RAD_BUF_PERSIST);
-        sn.nsel = decl_b(b, nm.f("dfly.nsel_snap.%d", l), RAD_I32, { T }, RAD_BUF_PERSIST);
-        if (!sn.sel || !sn.nsel) return RAD_E_INVAL;
-        sn.op_sel = decl_copy(b, T, G, RAD_I32, iw.sel, sn.sel);
-        sn.op_nsel = decl_copy(b, T, 1, RAD_I32, iw.nsel, sn.nsel);
-        sn.op_zero = mk(b, "fill", { RAD_RANGE("M", 1, T), RAD_INT("n", 1), RAD_STR("dtype", "i32") },
-                        {}, {}, { sn.nsel });
-        HY4_NEED(sn.op_sel && sn.op_nsel, "cast (i32)");
-        HY4_NEED(sn.op_zero, "fill (i32)");
-        if (taps_on() && iw.sel_ids) {
-            sn.ids = decl_b(b, nm.f("dfly.sel_snap_ids.%d", l), RAD_I32, { T, G }, RAD_BUF_PERSIST);
-            if (!sn.ids) return RAD_E_INVAL;
-            sn.op_ids = decl_copy(b, T, G, RAD_I32, iw.sel_ids, sn.ids);
-            HY4_NEED(sn.op_ids, "cast (i32)");
-        }
+        sn.li = (int)snap.size();
+        sn.base = sn.li * T;
+        sn.width = G;
         snap.push_back(sn);
         return RAD_OK;
     }
     /* Issued after layer l's Indexer::step, before its attention (whose kv_resolve may rewrite
-     * `ix.selected` in place). */
-    void snap_step(RadCtx* c, int l, const IndexWire& iw, int64_t T, bool select) const {
+     * `ix.selected` in place). `direct`: the step's `qsa_select` wrote the plane's window
+     * itself, so a selecting layer copies only the tap's group ids (P-09). */
+    void snap_step(RadCtx* c, int l, const IndexWire& iw, bool select, QueryRows rows,
+                   bool direct) const {
         const Snap* sn = snap_of(l);
-        if (!sn || T <= 0) return;
+        if (!sn || !rows.n) return;
         if (select) {
-            RAD_ISSUE_N(c, sn->op_sel, T, brows(iw.sel, T), brows(sn->sel, T));
-            RAD_ISSUE_N(c, sn->op_nsel, T, brows(iw.nsel, T), brows(sn->nsel, T));
-            if (sn->op_ids) RAD_ISSUE_N(c, sn->op_ids, T, brows(iw.sel_ids, T), brows(sn->ids, T));
-        } else if (!break_nsel_keep) {
-            RAD_ISSUE_N(c, sn->op_zero, T, brows(sn->nsel, T));
+            if (direct && !op_ids) return;
+            rows.spans([&](int64_t orig, int64_t compact, int64_t n) {
+                if (!direct) {
+                    RAD_ISSUE_N(c, op_sel, n, brow_slice(iw.sel, compact, n, sn->width),
+                                brow_slice(snap_sel, sn->base + orig, n, sn->width));
+                    RAD_ISSUE_N(c, op_nsel, n, brow_slice(iw.nsel, compact, n, 1),
+                                brow_slice(snap_nsel, sn->base + orig, n, 1));
+                }
+                /* the tap's group ids (`op_tap_select`) always land on the wire */
+                if (op_ids)
+                    RAD_ISSUE_N(c, op_ids, n, brow_slice(iw.sel_ids, compact, n, sn->width),
+                                brow_slice(snap_ids, sn->base + orig, n, sn->width));
+            });
+        } else if (!break_nsel_keep && sn == &snap.front()) {
+            /* One fill clears every layer's counts (P-09). The rows outside this step's spans
+             * ride along: a row the step did not query cannot be an anchor of the draft pass
+             * that follows it, so no reader sees a difference from the per-span clear. */
+            RAD_ISSUE_N(c, op_zero, (int64_t)snap.size() * snap_t,
+                        brows(snap_nsel, (int64_t)snap.size() * snap_t));
         }
     }
 
@@ -291,8 +352,9 @@ struct Dfly {
     struct Step {
         rad_buf rowk = 0;
         rad_op op_rowk = 0, op_zk = 0, op_pe = 0, op_hn = 0, op_en = 0,
-               op_silu = 0, op_add = 0, op_head = 0, op_lcast = 0, op_topk = 0,
+               op_silu = 0, op_add = 0, op_head = 0, op_lcast = 0, op_topk = 0, op_ctopk = 0,
                op_tok = 0, op_prev = 0, op_gcp = 0, op_ucp = 0;
+        rad_op op_rowk_lo = 0;   /* rowk at the short block's stride (rounds < block_lo - 1) */
         /* --draft-coupling: the sampled proposal (and, sabotaged, the shortlist's ids replaced
          * first) */
         rad_op op_couple = 0, op_csab = 0;
@@ -301,7 +363,7 @@ struct Dfly {
     };
     Shape s{};
     Geom g{};
-    int64_t Md = 0, W = 0, R = 8, E = 0, H = 0, L = 0, RO = 0, N = 0, VD = 0, Q = 0, F = 0;
+    int64_t Md = 0, W = 0, R = 8, E = 0, Ew = 0, H = 0, L = 0, RO = 0, N = 0, VD = 0, Q = 0, F = 0;
     rad_kvgroup kvg = 0;
     rad_weight token = 0, head = 0, fusion = 0, f_enorm = 0, f_hnorm = 0, f_gate = 0, c_hnorm = 0,
                c_enorm = 0, c_gate = 0, c_up = 0, c_down = 0, out_norm = 0;
@@ -316,7 +378,7 @@ struct Dfly {
     /* --draft-coupling: the planes the engine binds by name (one draw a drafting row, one state a
      * (chain step, row)) */
     rad_buf couple_draws = 0, couple_state = 0;
-    rad_op op_ar_o = 0, op_ar_y = 0;   /* TP: the layers' two reductions; 0 at one rank */
+    rad_op op_ar_o = 0, op_ar_y = 0, op_ar_c = 0;   /* TP: the layers' two reductions and the chain's; 0 at one rank */
     rad_buf ident = 0;   /* taps: [max_seqs, P] the identity table */
     int64_t ident_w = 0;
     struct ChainCodes { int64_t k = 0, g8 = 0; rad_buf q8 = 0, s8 = 0; };
@@ -324,6 +386,7 @@ struct Dfly {
     Proj p_fuse, c_g, c_u, c_d;   /* the fusion and the correction's three linears */
     rad_op op_embed = 0, op_xcopy = 0, op_row0 = 0, op_ea = 0, op_th = 0, op_fen = 0, op_fhn = 0,
            op_fgate = 0, op_fadd = 0, op_scatter = 0, op_final = 0, op_sabotage = 0;
+    rad_op op_row0_lo = 0;   /* row0 at the short block's stride */
     rad_op op_ident = 0;
     std::vector<Layer> lay;
     std::vector<Step> steps;
@@ -359,6 +422,7 @@ struct Dfly {
         s = shape;
         g = geom;
         E = s.n_embd;
+        Ew = E / s.world;
         const AttnGeom& a = s.sparse_r;   /* this rank's heads */
         H = a.heads;
         F = ff / s.world;                 /* this rank's MLP width (drafter() checked it divides) */
@@ -466,11 +530,12 @@ struct Dfly {
         ccat = bf("chain_in", { S, 2 * E });
         /* gate and up each into a buffer of its own, then copied into the halves silu_mul reads: a GEMM
          * output as a column half of one [S, 2E] buffer is strided once two sequences draft, and
-         * libr4d's GEMMs refuse a strided output (the copies are exact, so the bytes are unchanged). */
-        cg = bf("chain_gate", { S, E });
-        cup = bf("chain_up", { S, E });
-        cgu = bf("chain_gate_up", { S, 2 * E });
-        cff = bf("chain_act", { S, E });
+         * libr4d's GEMMs refuse a strided output (the copies are exact, so the bytes are unchanged).
+         * At TP each holds this rank's width: the gate's and the up's rows and the down's input. */
+        cg = bf("chain_gate", { S, Ew });
+        cup = bf("chain_up", { S, Ew });
+        cgu = bf("chain_gate_up", { S, 2 * Ew });
+        cff = bf("chain_act", { S, Ew });
         cd = bf("chain_delta", { S, E });
         zc = bf("corrected", { S, E });
         logits = decl_b(b, nm.f("dfly.logits"), RAD_F32, { S, Vr });
@@ -575,9 +640,9 @@ struct Dfly {
             const rad_op h = rad_decl_op(b, "gather_rows", ps, 3, nullptr, 0);
             return ix ? rw(b, h, { src, ix }, { out }) : rw(b, h, { src }, { out });
         };
-        auto iota = [&](int64_t start, rad_buf out) {
+        auto iota = [&](int64_t start, rad_buf out, int64_t stride) {
             return mk(b, "iota",
-                      { RAD_RANGE("M", 1, S), RAD_INT("start", start), RAD_INT("step", block) },
+                      { RAD_RANGE("M", 1, S), RAD_INT("start", start), RAD_INT("step", stride) },
                       {}, {}, { out });
         };
 
@@ -591,7 +656,8 @@ struct Dfly {
         HY4_NEED(op_xcopy, "cast");
         RAD_ARCH_TRY(t_embed.declare(b, nm, Md, "dfly.embed", -1, RAD_BF16, E, emb));
         /* B: the fusion into each anchor row. */
-        op_row0 = iota(0, row0);
+        op_row0 = iota(0, row0, block);
+        if (block_lo) op_row0_lo = iota(0, row0, block_lo);
         op_ea = gather(S, emb, row0, ea);
         op_th = gather(S, final_hidden, 0, th);
         op_fen = decl_rmsnorm(b, S, E, s.eps, f_enorm, ea, cat);
@@ -605,6 +671,7 @@ struct Dfly {
                         { RAD_RANGE("M", 1, S), RAD_INT("n", E), RAD_STR("dtype", "bf16") }, {},
                         { ea, row0, x }, { x });
         HY4_NEED(op_row0, "iota");
+        HY4_NEED(!block_lo || op_row0_lo, "iota");
         HY4_NEED(op_ea && op_th, "gather_rows");
         HY4_NEED(op_fen && op_fhn, "rmsnorm");
         HY4_NEED(p_fuse.ok() && op_fgate && op_fadd, "gemm_nt / mul_weight / add");
@@ -619,20 +686,21 @@ struct Dfly {
             RAD_ARCH_TRY(rc);
             op_ar_y = decl_all_reduce(b, g, E, y, &rc);
             RAD_ARCH_TRY(rc);
+            op_ar_c = decl_all_reduce(b, g, E, cd, &rc);
+            RAD_ARCH_TRY(rc);
         }
         /* C, D: the layers, each with its table. */
         const double scale = 1.0 / std::sqrt((double)Q);
         const int64_t half = (L + RO) / 2;
         for (int64_t i = 0; i < layers; ++i) {
             Layer& d = lay[(size_t)i];
-            const Snap* sn = snap_of(d.ixl);
-            if (!sn) return RAD_E_INVAL;
+            if (!snap_of(d.ixl)) return RAD_E_INVAL;   /* the draft layer's trunk selection */
             const int li = (int)i;
             d.op_tab = mk(b, "dfly_sel",
                           { RAD_RANGE("M", 1, Md), RAD_INT("blocks_in", s.ix_group_topk),
                             RAD_INT("blocks", W), RAD_INT("ratio", s.ix_pool),
                             RAD_INT("seqs", S) },
-                          {}, { sn->sel, sn->nsel }, { d.tab, d.len, d.cnt });
+                          {}, { snap_sel, snap_nsel }, { d.tab, d.len, d.cnt });
             HY4_NEED(d.op_tab, "dfly_sel");
             d.op_attn_norm = decl_rmsnorm(b, Md, E, s.eps, d.attn_norm, x, xn);
             RAD_ARCH_TRY(d.t_in.declare(b, nm, Md, "dfly.attn_in_norm", li, RAD_BF16, E, xn));
@@ -837,7 +905,7 @@ struct Dfly {
             HY4_NEED(d.op_gmul && d.op_add1 && d.op_add2 && d.op_silu, "gate_mul / add / silu_mul");
             /* Taps: the table as group indices (dfly_sel again over the group-id snapshot and an
              * identity table, the indexer tap's trick) and its lengths. */
-            if (taps_on() && sn->ids) {
+            if (taps_on() && snap_ids) {
                 if (!ident) {
                     ident_w = iw.blocks;
                     ident = decl_b(b, nm.f("dfly.identity"), RAD_I32, { S, ident_w }, RAD_BUF_PERSIST);
@@ -856,7 +924,7 @@ struct Dfly {
                                   { RAD_RANGE("M", 1, Md), RAD_INT("blocks_in", s.ix_group_topk),
                                     RAD_INT("blocks", W), RAD_INT("ratio", s.ix_pool),
                                     RAD_INT("seqs", S) },
-                                  {}, { sn->ids, sn->nsel, ident }, { d.tap_tab, tl });
+                                  {}, { snap_ids, snap_nsel, ident }, { d.tap_tab, tl });
                 HY4_NEED(d.op_tap_tab, "dfly_sel");
             }
         }
@@ -867,16 +935,19 @@ struct Dfly {
 
         /* F: the chain, one step a proposal. */
         steps.assign((size_t)depth, Step{});
-        /* The correction's linears once, their ops issued by every step. */
-        RAD_ARCH_TRY(linear(c_g, "dfly.correct_gate", gtop, S, E, 2 * E, c_gate, ccat, cg, RAD_SHARD_NONE, {}, true));
-        RAD_ARCH_TRY(linear(c_u, "dfly.correct_up", gtop, S, E, 2 * E, c_up, ccat, cup, RAD_SHARD_NONE, {}, true));
-        RAD_ARCH_TRY(linear(c_d, "dfly.correct_down", gtop, S, E, E, c_down, cff, cd, RAD_SHARD_NONE, {}, true));
+        /* The correction's linears once, their ops issued by every step: gate and up by rows, down
+         * by columns, so each rank reads 1/world of each and the down's partial sum is reduced
+         * exactly once a step before the residual. */
+        RAD_ARCH_TRY(linear(c_g, "dfly.correct_gate", gtop, S, Ew, 2 * E, c_gate, ccat, cg, RAD_SHARD_ROW, {}, true));
+        RAD_ARCH_TRY(linear(c_u, "dfly.correct_up", gtop, S, Ew, 2 * E, c_up, ccat, cup, RAD_SHARD_ROW, {}, true));
+        RAD_ARCH_TRY(linear(c_d, "dfly.correct_down", gtop, S, E, Ew, c_down, cff, cd, RAD_SHARD_COL, {}, true));
         for (int64_t k = 0; k < depth; ++k) {
             Step& st = steps[(size_t)k];
             const int ki = (int)k;
             st.rowk = i32(nm.f("rowk.%lld", (long long)k), { S });
             if (!st.rowk) return RAD_E_INVAL;
-            st.op_rowk = iota(k + 1, st.rowk);
+            st.op_rowk = iota(k + 1, st.rowk, block);
+            if (block_lo && k < block_lo - 1) st.op_rowk_lo = iota(k + 1, st.rowk, block_lo);
             st.op_zk = gather(S, z, st.rowk, zk);
             if (k == 0)
                 st.op_pe = gather(S, emb, row0, pe);
@@ -887,9 +958,9 @@ struct Dfly {
                               { token }, { prev }, { pe });
             st.op_hn = decl_rmsnorm(b, S, E, s.eps, c_hnorm, zk, ccat);
             st.op_en = decl_rmsnorm(b, S, E, s.eps, c_enorm, pe, ccat);
-            st.op_gcp = decl_copy(b, S, E, RAD_BF16, cg, cgu);
-            st.op_ucp = decl_copy(b, S, E, RAD_BF16, cup, cgu);
-            st.op_silu = mk(b, "silu_mul", { RAD_RANGE("M", 1, S), RAD_INT("n", E), RAD_STR("dtype", "bf16") },
+            st.op_gcp = decl_copy(b, S, Ew, RAD_BF16, cg, cgu);
+            st.op_ucp = decl_copy(b, S, Ew, RAD_BF16, cup, cgu);
+            st.op_silu = mk(b, "silu_mul", { RAD_RANGE("M", 1, S), RAD_INT("n", Ew), RAD_STR("dtype", "bf16") },
                             {}, { cgu }, { cff });
             st.op_add = add(S, zk, cd, zc);
             RAD_ARCH_TRY(st.t_corr.declare(b, nm, S, "dfly.corrected", ki, RAD_BF16, E, zc));
@@ -898,23 +969,43 @@ struct Dfly {
                               RAD_STR("dtype", "bf16") },
                             { head }, { zc }, { logits });
             RAD_ARCH_TRY(st.t_logits.declare(b, nm, S, "dfly.logits", ki, RAD_F32, Vr, logits));
-            st.op_lcast = mk(b, "cast",
-                             { RAD_RANGE("M", 1, S), RAD_INT("n", Vr), RAD_STR("from", "f32"),
-                               RAD_STR("to", "bf16") },
-                             {}, { logits }, { lbf });
             /* Sharded, row_topk ranks this rank's columns, reports global ids and writes the pair
              * plane; the merge below overwrites cidx / cval with the global top-R. Whole, no
-             * `vocab_off` (an optional parameter present at 0 is another declaration). */
-            if (s.world > 1)
-                st.op_topk = mk(b, "row_topk",
-                                { RAD_RANGE("M", 1, S), RAD_INT("N", Vr), RAD_INT("R", R),
-                                  RAD_INT("vocab_off", g.vocab_off), RAD_STR("dtype", "bf16") },
-                                {}, { lbf }, { cidx, cval, pairs });
-            else
-                st.op_topk = mk(b, "row_topk",
-                                { RAD_RANGE("M", 1, S), RAD_INT("N", Vr), RAD_INT("R", R),
-                                  RAD_STR("dtype", "bf16") },
-                                {}, { lbf }, { cidx, cval });
+             * `vocab_off` (an optional parameter present at 0 is another declaration).
+             *
+             * cast_row_topk is that cast and row_topk in one op: it reads the f32 logits and
+             * rounds each as the cast does, so its outputs are the pair's bytes without the
+             * cast's launch or the bf16 plane. Taken where a library serves it; the pair
+             * otherwise. */
+            if (rad_op_declared(b, "cast_row_topk")) {
+                if (s.world > 1)
+                    st.op_ctopk = mk(b, "cast_row_topk",
+                                     { RAD_RANGE("M", 1, S), RAD_INT("N", Vr), RAD_INT("R", R),
+                                       RAD_INT("vocab_off", g.vocab_off), RAD_STR("dtype", "f32") },
+                                     {}, { logits }, { cidx, cval, pairs });
+                else
+                    st.op_ctopk = mk(b, "cast_row_topk",
+                                     { RAD_RANGE("M", 1, S), RAD_INT("N", Vr), RAD_INT("R", R),
+                                       RAD_STR("dtype", "f32") },
+                                     {}, { logits }, { cidx, cval });
+                if (st.op_ctopk && !rad_op_resolved(b, st.op_ctopk)) st.op_ctopk = 0;
+            }
+            if (!st.op_ctopk) {
+                st.op_lcast = mk(b, "cast",
+                                 { RAD_RANGE("M", 1, S), RAD_INT("n", Vr), RAD_STR("from", "f32"),
+                                   RAD_STR("to", "bf16") },
+                                 {}, { logits }, { lbf });
+                if (s.world > 1)
+                    st.op_topk = mk(b, "row_topk",
+                                    { RAD_RANGE("M", 1, S), RAD_INT("N", Vr), RAD_INT("R", R),
+                                      RAD_INT("vocab_off", g.vocab_off), RAD_STR("dtype", "bf16") },
+                                    {}, { lbf }, { cidx, cval, pairs });
+                else
+                    st.op_topk = mk(b, "row_topk",
+                                    { RAD_RANGE("M", 1, S), RAD_INT("N", Vr), RAD_INT("R", R),
+                                      RAD_STR("dtype", "bf16") },
+                                    {}, { lbf }, { cidx, cval });
+            }
             if (s.world > 1) {
                 /* Row-interleaved, so a row's pairs from every rank are adjacent, as
                  * row_topk_merge reads them. A pair of ops a step (each step's buffers live
@@ -959,13 +1050,14 @@ struct Dfly {
             st.op_tok = decl_copy(b, S, 1, RAD_I32, cidx, tokens);
             st.op_prev = decl_copy(b, S, 1, RAD_I32, cidx, prev);
             HY4_NEED(st.op_rowk, "iota");
+            HY4_NEED(!(block_lo && k < block_lo - 1) || st.op_rowk_lo, "iota");
             HY4_NEED(st.op_zk && st.op_pe, "gather_rows / embed_lookup");
             HY4_NEED(st.op_hn && st.op_en, "rmsnorm");
             HY4_NEED(c_g.ok() && c_u.ok() && c_d.ok() && st.op_add && st.op_silu,
                      "gemm_nt / silu_mul / add");
             HY4_NEED(st.op_head, "logits_gemm");
-            HY4_NEED(st.op_lcast && st.op_tok && st.op_prev && st.op_gcp && st.op_ucp, "cast");
-            HY4_NEED(st.op_topk, "row_topk (bf16)");
+            HY4_NEED(st.op_tok && st.op_prev && st.op_gcp && st.op_ucp, "cast");
+            HY4_NEED(st.op_ctopk || (st.op_lcast && st.op_topk), "cast and row_topk (bf16)");
         }
         if (sabotage && !coupled) {
             op_sabotage = mk(b, "fill",
@@ -1003,6 +1095,8 @@ struct Dfly {
         dd.window = 1;
         dd.block = block;
         RAD_ARCH_TRY(rad_declare_drafter(b, &dd));
+        /* D-06: the short block, which the core stages per step under load (--draft-short-from). */
+        if (block_lo) RAD_ARCH_TRY(rad_drafter_short_block(b, block_lo));
         return RAD_OK;
     }
 
@@ -1026,9 +1120,13 @@ struct Dfly {
     /* The query pass (draft_pass 1). */
     void query(RadCtx* c, const RadBatch* batch) const {
         const int64_t n = batch->n_seq, M = batch->n_tok;
-        if (!served || n <= 0 || M != n * block || M > Md || !batch->anchor_rows) {
-            rad_step_fail(c, "hyv4flash: the DFly2 query pass needs block rows a sequence and the "
-                             "anchor rows (RadBatch::anchor_rows)");
+        /* The drafter's block or, under load, its short one (D-06): as many rounds as proposals. */
+        const int64_t blk = block_lo > 0 && n > 0 && M == n * block_lo ? block_lo : block;
+        const int64_t rounds = depth - (block - blk);
+        if (!served || n <= 0 || M != n * blk || M > Md || !batch->anchor_rows) {
+            rad_step_fail(c, "hyv4flash: the DFly2 query pass needs the drafter's block (or its "
+                             "short block) of rows a sequence and the anchor rows "
+                             "(RadBatch::anchor_rows)");
             return;
         }
         const auto* kb = kv_batch(batch, kvg);
@@ -1051,7 +1149,7 @@ struct Dfly {
         t_embed.step(c, brows(emb, M), M);
         RAD_ISSUE_N(c, op_xcopy, M, brows(emb, M), brows(x, M));
         /* B */
-        RAD_ISSUE_N(c, op_row0, n, brows(row0, n));
+        RAD_ISSUE_N(c, blk == block ? op_row0 : op_row0_lo, n, brows(row0, n));
         RAD_ISSUE_N(c, op_ea, n, brows(emb, M), brows(row0, n), brows(ea, n));
         RAD_ISSUE_N(c, op_th, n, RAD_B(final_hidden), src, brows(th, n));
         RAD_ISSUE_N(c, op_fen, n, brows(ea, n), RAD_W(f_enorm), bcol(cat, 0, E, n));
@@ -1066,7 +1164,8 @@ struct Dfly {
         const int64_t half = (L + RO) / 2;
         for (const Layer& d : lay) {
             const Snap* sn = snap_of(d.ixl);
-            RAD_ISSUE_N(c, d.op_tab, M, RAD_B(sn->sel), RAD_B(sn->nsel), src, bt, pos, cu,
+            RAD_ISSUE_N(c, d.op_tab, M, brow_slice(snap_sel, sn->base, snap_t, sn->width),
+                        brow_slice(snap_nsel, sn->base, snap_t, 1), src, bt, pos, cu,
                         brows(d.tab, M), brows(d.len, M), brows(d.cnt, M));
             /* D-01: a fused producer writes the codes its reader's own quantiser would write, so
              * the reader is issued with codes_ready and that quantiser is skipped. kv_a and the
@@ -1074,7 +1173,8 @@ struct Dfly {
             const bool kva_codes = d.op_atn && d.p_kva.lin.q8 == d.p_qa.lin.q8;
             const bool gate_codes = d.op_atn && d.p_gate.lin.q8 == d.p_qa.lin.q8;
             if (d.op_tap_tab) {
-                RAD_ISSUE_N(c, d.op_tap_tab, M, RAD_B(sn->ids), RAD_B(sn->nsel), src,
+                RAD_ISSUE_N(c, d.op_tap_tab, M, brow_slice(snap_ids, sn->base, snap_t, sn->width),
+                            brow_slice(snap_nsel, sn->base, snap_t, 1), src,
                             bcol_at(ident, 0, ident_w, 0, ident_w, n), pos, cu,
                             brows(d.tap_tab, M), brows(d.t_len.buf, M), RAD_NONE);
             }
@@ -1191,9 +1291,9 @@ struct Dfly {
         RAD_ISSUE_N(c, op_final, M, brows(x, M), RAD_W(out_norm), brows(z, M));
         t_final.step(c, brows(z, M), M);
         /* F */
-        for (int64_t k = 0; k < depth; ++k) {
+        for (int64_t k = 0; k < rounds; ++k) {
             const Step& st = steps[(size_t)k];
-            RAD_ISSUE_N(c, st.op_rowk, n, brows(st.rowk, n));
+            RAD_ISSUE_N(c, blk == block ? st.op_rowk : st.op_rowk_lo, n, brows(st.rowk, n));
             RAD_ISSUE_N(c, st.op_zk, n, brows(z, M), brows(st.rowk, n), brows(zk, n));
             if (k == 0)
                 RAD_ISSUE_N(c, st.op_pe, n, brows(emb, M), brows(row0, n), brows(pe, n));
@@ -1203,23 +1303,26 @@ struct Dfly {
             RAD_ISSUE_N(c, st.op_en, n, brows(pe, n), RAD_W(c_enorm), bcol(ccat, E, E, n));
             run(c, c_g, ccat, cg, n);
             run(c, c_u, ccat, cup, n);
-            RAD_ISSUE_N(c, st.op_gcp, n, brows(cg, n), bcol(cgu, 0, E, n));
-            RAD_ISSUE_N(c, st.op_ucp, n, brows(cup, n), bcol(cgu, E, E, n));
+            RAD_ISSUE_N(c, st.op_gcp, n, brows(cg, n), bcol(cgu, 0, Ew, n));
+            RAD_ISSUE_N(c, st.op_ucp, n, brows(cup, n), bcol(cgu, Ew, Ew, n));
             RAD_ISSUE_N(c, st.op_silu, n, brows(cgu, n), brows(cff, n));
             run(c, c_d, cff, cd, n);
+            issue_all_reduce(c, op_ar_c, cd, n, E);
             RAD_ISSUE_N(c, st.op_add, n, brows(zk, n), brows(cd, n), brows(zc, n));
             st.t_corr.step(c, brows(zc, n), n);
             RAD_ISSUE_N(c, st.op_head, n, brows(zc, n), RAD_W(head), brows(logits, n));
             st.t_logits.step(c, brows(logits, n), n);
-            RAD_ISSUE_N(c, st.op_lcast, n, brows(logits, n), brows(lbf, n));
+            if (!st.op_ctopk) RAD_ISSUE_N(c, st.op_lcast, n, brows(logits, n), brows(lbf, n));
+            /* cast_row_topk reads the f32 logits where row_topk reads their bf16 copy */
+            const rad_op topk = st.op_ctopk ? st.op_ctopk : st.op_topk;
+            const rad_buf tin = st.op_ctopk ? logits : lbf;
             if (st.op_merge) {
-                RAD_ISSUE_N(c, st.op_topk, n, brows(lbf, n), brows(cidx, n), brows(cval, n),
+                RAD_ISSUE_N(c, topk, n, brows(tin, n), brows(cidx, n), brows(cval, n),
                             brows(pairs, n));
                 RAD_ISSUE(c, st.op_gather, RAD_B(pairs), RAD_B(gath));
                 RAD_ISSUE_N(c, st.op_merge, n, brows(gath, n), brows(cidx, n), brows(cval, n));
             } else {
-                RAD_ISSUE_N(c, st.op_topk, n, brows(lbf, n), brows(cidx, n), brows(cval, n),
-                            RAD_NONE);
+                RAD_ISSUE_N(c, topk, n, brows(tin, n), brows(cidx, n), brows(cval, n), RAD_NONE);
             }
             st.t_idx.step(c, brows(cidx, n), n);
             st.t_val.step(c, brows(cval, n), n);

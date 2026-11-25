@@ -148,7 +148,7 @@ private:
     /* Steps by shape, and decode rows that ran unspeculated. Counters, so two scrapes give the
      * rate over a window rather than an average dominated by startup. */
     Counter c_steps_prefill_, c_steps_mixed_, c_steps_decode_, c_rows_unspec_, c_steps_ahead_;
-    Counter c_prefill_capped_, c_steps_held_;
+    Counter c_prefill_capped_, c_steps_held_, c_steps_sliced_, c_substeps_;
     Counter c_mixed_step_target_steps_, c_mixed_step_target_misses_;
     Gauge   g_mixed_step_target_cap_;
     /* Seconds inside a step, all shapes and decode-only. Wall clock over a step count is not a

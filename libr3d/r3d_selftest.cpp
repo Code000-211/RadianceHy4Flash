@@ -2984,6 +2984,107 @@ static void check_moe_numerics() {
 #endif
 }
 
+/* gemm_nt_f32 by value: each tile form its rule picks (N <= 8; M <= 16 or a narrow N under 64
+ * rows; a wide N under 64 rows; 64 rows and more), K with and without a tail past the steps in
+ * flight, and the router's own 1 x 512 x 3072. Rows are pitched and the output keeps a filled
+ * pitch, so an overrun or a missed tail shows. The f32 weight is compared byte for byte with the
+ * arithmetic every form keeps, written out on the host (lane l folds k = l, l+32, ... with fmaf,
+ * then the xor butterfly over 16, 8, 4, 2, 1, the header of r3d_gemm_nt_f32.hip); then the same
+ * weight stored as bf16 (`weight_bf16`) must give the f32 weight's bytes, since the kernel widens
+ * it exactly. The weight's values are bf16 values, so both runs read the same numbers. */
+static void check_f32_numerics() {
+    std::printf("== gemm_nt_f32, f32 and stored bf16 weights, by value\n");
+#ifndef RAD_HAVE_HIP
+    skip("built without HIP: gemm_nt_f32 is not run");
+#else
+    int ndev = 0;
+    if (hipGetDeviceCount(&ndev) != hipSuccess || ndev == 0) {
+        skip("no device visible");
+        return;
+    }
+    using namespace moenum;
+    auto launch = (Launch)dlsym(g_h, "r3d_rad_gemm_nt_f32");
+    if (!launch) {
+        fail("r3d_rad_gemm_nt_f32 is missing");
+        return;
+    }
+    struct Shape { long long M, N, K; };
+    const Shape shapes[] = { { 3, 4, 129 },    { 1, 512, 3072 }, { 16, 288, 512 },
+                             { 33, 32, 1040 }, { 40, 288, 1040 }, { 70, 36, 129 },
+                             { 130, 288, 4096 } };
+    for (const Shape& sh : shapes) {
+        const long long M = sh.M, N = sh.N, K = sh.K, xp = K + 5, yp = N + 3;
+        std::vector<uint16_t> x(M * xp), wb(N * K);
+        std::vector<float> w(N * K);
+        uint32_t st = 0xF32Bu + (uint32_t)(M * 7 + N * 3 + K);
+        auto rnd = [&]() {
+            st = st * 1664525u + 1013904223u;
+            return ((st >> 8) & 0xffffu) / 65536.0f - 0.5f;
+        };
+        for (auto& v : x) v = rad_f32_to_bf16(rnd());
+        for (long long i = 0; i < N * K; ++i) {
+            wb[i] = rad_f32_to_bf16(rnd() * 0.25f);
+            w[i] = rad_bf16_to_f32(wb[i]);
+        }
+        /* The arithmetic on the host, into a copy of the filled output. */
+        const std::vector<float> fill(M * yp, -7.25f);
+        std::vector<float> want = fill;
+        for (long long r = 0; r < M; ++r)
+            for (long long c = 0; c < N; ++c) {
+                float lane[32];
+                for (int l = 0; l < 32; ++l) {
+                    float sum = 0;
+                    for (long long j = l; j < K; j += 32)
+                        sum = std::fmaf(rad_bf16_to_f32(x[r * xp + j]), w[c * K + j], sum);
+                    lane[l] = sum;
+                }
+                for (int mask = 16; mask; mask >>= 1) {
+                    float next[32];
+                    for (int l = 0; l < 32; ++l) next[l] = lane[l] + lane[l ^ mask];
+                    std::memcpy(lane, next, sizeof lane);
+                }
+                want[r * yp + c] = lane[0];
+            }
+        Dev dv;
+        void* dx = dv.put(x.data(), x.size() * 2);
+        void* dy = dv.put(fill.data(), fill.size() * 4);
+        void* dwf = dv.put(w.data(), w.size() * 4);
+        void* dwb = dv.put(wb.data(), wb.size() * 2);
+        if (!dx || !dy || !dwf || !dwb) {
+            fail("gemm_nt_f32 at M=%lld N=%lld K=%lld: allocation failed", M, N, K);
+            continue;
+        }
+        std::vector<float> got_f32;
+        for (int bf16 = 0; bf16 < 2; ++bf16) {
+            RadTensor t[3] = { dense(dx, RAD_BF16, M, K), dense(bf16 ? dwb : dwf,
+                               bf16 ? RAD_BF16 : RAD_F32, N, K), dense(dy, RAD_F32, M, N) };
+            t[0].stride[0] = xp;
+            t[2].stride[0] = yp;
+            const RadParam p[] = { pi("M", M), pi("N", N), pi("K", K), ps("dtype", "bf16"),
+                                   pi("weight_bf16", bf16) };
+            RadArgs a{ t, 3, p, (int)(sizeof(p) / sizeof(p[0])), nullptr, 0, nullptr, 0, 1 };
+            int rc = hipMemcpy(dy, fill.data(), fill.size() * 4, hipMemcpyHostToDevice) == hipSuccess
+                ? launch(&a, nullptr) : RAD_E_DEVICE;
+            std::vector<float> y(M * yp);
+            if (rc == RAD_OK && (hipDeviceSynchronize() != hipSuccess ||
+                                 hipMemcpy(y.data(), dy, y.size() * 4, hipMemcpyDeviceToHost) != hipSuccess))
+                rc = RAD_E_DEVICE;
+            const char* what = bf16 ? "stored bf16 vs widened f32"
+                                    : "f32: byte-identical to the host arithmetic";
+            const bool same = rc == RAD_OK &&
+                !std::memcmp(y.data(), bf16 ? got_f32.data() : want.data(), y.size() * 4);
+            if (same) ok("gemm_nt_f32 %s at M=%lld N=%lld K=%lld", what, M, N, K);
+            else if (rc != RAD_OK) fail("gemm_nt_f32 %s at M=%lld N=%lld K=%lld: rc %d", what, M, N, K, rc);
+            else fail("gemm_nt_f32 %s at M=%lld N=%lld K=%lld: bytes differ", what, M, N, K);
+            if (!bf16) {
+                if (!same) break;
+                got_f32 = y;
+            }
+        }
+    }
+#endif
+}
+
 int main(int argc, char** argv) {
     /* Unbuffered stdout, so when a row dies the last line printed is the last thing that worked,
      * even when output goes to a file or pipe. */
@@ -3020,6 +3121,7 @@ int main(int argc, char** argv) {
         check_band_reach();
         check_shapes();
         check_moe_numerics();
+        check_f32_numerics();
 
         const int n = rows();
         int passed = 0, failed = 0;

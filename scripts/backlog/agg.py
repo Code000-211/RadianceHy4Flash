@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
-"""agg.py stamps.csv probe.json [--top N]: per probe phase and per kind of pass (tape length): passes, wall, busy union,
+"""agg.py stamps.csv probe.json [--top N] [--match RE]: per probe phase and per kind of pass (tape length): passes, wall, busy union,
 per-kernel exclusive time (end - max(start, previous end on its queue)), grouped into categories; and the card's idle
-time between consecutive stamped passes is not visible (1 pass in N) -- compare wall with the probe's ms/step."""
+time between consecutive stamped passes is not visible (1 pass in N) -- compare wall with the probe's ms/step.
+--match prints only the kernels whose name matches RE, with their total on a line of its own: the read of one named
+term per step (T-03's `qsa_select` and `idx_score` at 60K, K-43's score plane) without the whole table.
+A phase with no stamped window -- a composite one (longctx, idle, long8) or a gap probe (stallN) -- is named and
+skipped; its waves are in the JSON as phases of their own, and those are what the stamped numbers come from."""
 import csv, json, sys, collections, subprocess, re, statistics
 import demangle
 FILT = demangle.path()  # c++filt locally, the ROCm SDK's llvm-cxxfilt on iks
@@ -9,6 +13,7 @@ if not FILT: sys.exit("agg.py: no c++filt or llvm-cxxfilt, neither on PATH nor n
 rows = list(csv.DictReader(open(sys.argv[1])))
 R = json.load(open(sys.argv[2]))
 TOP = int(sys.argv[sys.argv.index("--top") + 1]) if "--top" in sys.argv else 40
+MATCH = re.compile(sys.argv[sys.argv.index("--match") + 1]) if "--match" in sys.argv else None
 for r in rows:
     for k in ("pass", "seq", "start_ns", "end_ns", "records", "ordered", "chained", "queue"): r[k] = int(r[k] or 0)
 rows = [r for r in rows if r["start_ns"] and r["end_ns"]]
@@ -50,7 +55,12 @@ passes = collections.defaultdict(list)
 for r in rows: passes[r["pass"]].append(r)
 out = {}
 for p in R["phases"]:
-    a, b = p["mono_ns"]
+    w = p.get("mono_ns")
+    if not w or not w[1] or "decode_steps" not in p:
+        print(f"\n==== phase {p.get('name', '(composite)')}: no stamped window, skipped"
+              f"{'; its waves are their own phases in the JSON' if any(v.get('mono_ns') for v in p.values() if isinstance(v, dict)) else ''}")
+        continue
+    a, b = w
     ps = [v for v in passes.values() if a <= min(x["start_ns"] for x in v) and max(x["end_ns"] for x in v) <= b]
     kinds = collections.Counter(v[0]["records"] for v in ps)
     print(f"\n==== phase {p['name']}: clients {p['clients']}, gen {p['gen']}, decode steps {p['decode_steps']:.0f}, tok/step {p['tok_per_step']:.2f}, "
@@ -75,7 +85,13 @@ for p in R["phases"]:
         for k, g in agg.items(): c = cs[cat(k)]; c[0] += g[0] / n; c[1] += g[1] / n
         for c, g in sorted(cs.items(), key=lambda x: -x[1][1]):
             print(f"    [{c:46s}] {g[0]:7.1f} launches {g[1]:8.0f} us {100*g[1]/tot:5.1f}%")
-        for k, g in sorted(agg.items(), key=lambda x: -x[1][1])[:TOP]:
+        shown = [kv for kv in sorted(agg.items(), key=lambda x: -x[1][1]) if MATCH.search(kv[0])] if MATCH \
+            else sorted(agg.items(), key=lambda x: -x[1][1])[:TOP]
+        if MATCH:
+            ln = sum(g[0] for _, g in shown) / n; us = sum(g[1] for _, g in shown) / n
+            print(f"    terms /{MATCH.pattern}/: {len(shown)} kernels, {ln:.1f} launches {us:.1f} us a step "
+                  f"({100 * us / tot:.1f}% of the exclusive sum)")
+        for k, g in shown:
             print(f"      {k:46s} {g[0]/n:7.1f} x {g[1]/g[0]:8.1f} us = {g[1]/n:8.0f} us {100*g[1]/n/tot:5.1f}%   ({cat(k)})")
         out[f"{p['name']}/{rec}"] = {"n": n, "wall": statistics.median(walls), "busy": statistics.median(busy), "cats": {c: g for c, g in cs.items()}, "k": {k: [g[0] / n, g[1] / n] for k, g in agg.items()}}
 json.dump(out, open(sys.argv[1].replace(".csv", ".agg.json"), "w"), indent=1)

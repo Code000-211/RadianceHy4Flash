@@ -192,6 +192,10 @@ struct Module {
     hsa_executable_t exec[kMaxDevices] = {};
     bool        loaded[kMaxDevices] = {};
     std::string load_err[kMaxDevices];
+    /* Bytes of code object loaded on each device -- the `im.size` module_load took -- so the VRAM
+     * budget can say what share of the card's `already held` is device code (M-14). 0 where the
+     * module never loaded there, including where the load failed. */
+    int64_t     loaded_bytes[kMaxDevices] = {};
 };
 
 struct Func {
@@ -508,6 +512,9 @@ bool module_load(Module* m, int ord, const ModuleImage& im, std::string* why) {
         m->load_err[ord] = "the code object did not load on " + d.isa;
     } else {
         m->exec[ord] = ex;
+        /* What the card now holds for this module, whole: the code object loads as one piece at
+         * the kernel's first launch, forms of it this model never runs and all. */
+        m->loaded_bytes[ord] = (int64_t)im.size;
     }
     if (!m->load_err[ord].empty()) { *why = m->load_err[ord]; return false; }
     return true;
@@ -782,6 +789,26 @@ uint64_t read_progress() {
 /* The DMA lanes' part of the dump, set once a lane opens. */
 void (*g_dump_lanes)() = nullptr;
 
+/* A queue's chain accounting for the stall report (issue #251, after krisf's dump in PR #252). A
+ * chained kernel behind another waits in its prologue for the queue's completion counter, so a
+ * queue that is idle while a wait stands is one whose counter is short of what a slot or a flush
+ * needs: a block that never counted. The line gives the blocks issued, the counter as the host
+ * reads it now and the largest value it has read (the read can lag the card, see chain_flush, so a
+ * short read alone proves nothing while the queue still runs), what the slot at the read index
+ * needs before it is rewritten, the flush outstanding if there is one, and what decides whether
+ * the next chained packet keeps its barrier bit. Read without the queue's lock, as the rest of
+ * the report is: the thread that holds it may be the one that is stuck. */
+std::string chain_line(Stream* s, uint64_t rd) {
+    const uint64_t ctr = s->chain_ctr ? *reinterpret_cast<volatile uint64_t*>(s->chain_ctr) : 0;
+    const uint64_t need = s->slot_need.empty() ? 0 : s->slot_need[rd & s->mask];
+    return fmt("chain: issued %" PRIu64 ", counter reads %" PRIu64 " (largest read %" PRIu64
+               "), the slot at the read index needs %" PRIu64 ", flush %s for %" PRIu64
+               "; gates %d, last packet %s, plain in flight %d, collective in flight %d",
+               s->chain_issued, ctr, s->chain_seen, need, s->flush_out ? "out" : "none",
+               s->flush_target, s->gates.load(std::memory_order_relaxed),
+               s->prev_chained ? "chained" : "plain", (int)s->plain_inflight, (int)s->peer_inflight);
+}
+
 void dump_queues(const char* where) {
     std::lock_guard<std::mutex> lk(G().streams_mu);
     RAD_ERR("device: %s has seen no queue advance for %u s; the queues:", where, kStallMs / 1000);
@@ -811,6 +838,7 @@ void dump_queues(const char* where) {
         }
         RAD_ERR("  device %d queue %p: written %" PRIu64 ", read %" PRIu64 " -> %s", s->ord,
                 (void*)s->q, wr, rd, what.c_str());
+        RAD_ERR("    %s", chain_line(s, rd).c_str());
     }
     if (g_dump_lanes) g_dump_lanes();
 }
@@ -4887,6 +4915,31 @@ int a_code_runs(size_t from, size_t to, int device, char* why, int cap) {
     return 1;
 }
 
+/* What the card holds in device code: the code objects loaded on it, and the modules they came
+ * from. A module loads whole at its first kernel, so the total is what a build carrying forms this
+ * model never launches costs the card -- the share of `already held` M-14 sets out to measure, and
+ * the number a deployment listing only the forms it uses (R4D_MOEIQR_FORMS is one) gives back. */
+int a_code_resident(int device, int64_t* bytes, int* modules) {
+    if (device < 0 || (size_t)device >= G().dev.size()) return RAD_E_INVAL;
+    std::vector<Module*> ms;
+    {
+        Registry& r = reg();
+        std::lock_guard<std::mutex> lk(r.mu);
+        ms = r.order;
+    }
+    int64_t total = 0;
+    int     n = 0;
+    for (Module* m : ms) {
+        std::lock_guard<std::mutex> lk(m->mu);
+        if (m->loaded_bytes[device] <= 0) continue;
+        total += m->loaded_bytes[device];
+        ++n;
+    }
+    if (bytes) *bytes = total;
+    if (modules) *modules = n;
+    return RAD_OK;
+}
+
 DeviceBackend g_aql;
 
 }  // namespace
@@ -4929,6 +4982,17 @@ void chain_read_lag(void* stream, uint64_t lag) {
 
 uint64_t chain_flushes() { return g_chain_flushes.load(std::memory_order_relaxed); }
 
+int chain_state(void* stream, uint64_t* issued, uint64_t* counted, std::string* line) {
+    Stream* s = ours(stream);
+    if (!s || !issued || !counted) return RAD_E_INVAL;
+    s->lock();
+    *issued = s->chain_issued;
+    *counted = s->chain_ctr ? *reinterpret_cast<volatile uint64_t*>(s->chain_ctr) : 0;
+    if (line) *line = chain_line(s, hsa_queue_load_read_index_scacquire(s->q));
+    s->unlock();
+    return RAD_OK;
+}
+
 int chain_marks(void* stream, unsigned* seen, unsigned n) {
     if (!ours(stream) || !seen) return RAD_E_INVAL;
     for (unsigned i = 0; i < n; ++i)
@@ -4938,6 +5002,10 @@ int chain_marks(void* stream, unsigned* seen, unsigned n) {
 }  // namespace aql
 
 size_t aql_code_registered(void) { return a_code_mark(); }
+
+int aql_code_resident(int device, int64_t* bytes, int* modules) {
+    return a_code_resident(device, bytes, modules);
+}
 
 const DeviceBackend* aql_backend_if_present(void) {
     static const DeviceBackend* b = []() -> const DeviceBackend* {
@@ -5024,6 +5092,7 @@ const DeviceBackend* aql_backend_if_present(void) {
         g_aql.tape_record = a_tape_record;
         g_aql.code_mark = a_code_mark;
         g_aql.code_runs = a_code_runs;
+        g_aql.code_resident = a_code_resident;
         g_aql.tape_set_overlap = a_tape_set_overlap;
         g_aql.tape_destroy = a_tape_destroy;
         g_aql.stream_gate = a_stream_gate;
@@ -5252,6 +5321,7 @@ int chain_marks(void*, unsigned*, unsigned) { return RAD_E_UNSUPPORTED; }
 int chain_asks(void*, const void*, void*, uint64_t, unsigned*, unsigned) { return RAD_E_UNSUPPORTED; }
 void chain_read_lag(void*, uint64_t) {}
 uint64_t chain_flushes() { return 0; }
+int chain_state(void*, uint64_t*, uint64_t*, std::string*) { return RAD_E_UNSUPPORTED; }
 }  // namespace aql
 }  // namespace rad
 

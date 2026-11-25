@@ -12,13 +12,15 @@
  *
  * The vector shipped in data/vectors/ is a refusal-direction projection for Qwen3.8-Flash-Next:
  * with it on, the model declines far fewer requests. It is loaded only with --control-vector, and
- * each request can name its own choice.
+ * each request can name its own choice. The same directory carries the Hy4-flash package, whose
+ * rows are grouped per hyper-connection stream (controlvector.per_stream, rank = 4 * groups).
  *
  * A file is refused unless
  *
  *   - `general.architecture` is `controlvector`,
  *   - `controlvector.model_hint`, when present, is this model's architecture id,
- *   - every tensor is `direction.<l>`, F32, one dimension, exactly the model's `n_embd`, and
+ *   - every tensor is `direction.<l>`, F32, `[n_embd]` or `[n_embd, k]` with the same `k` on
+ *     every layer and 1 <= k <= kControlVectorMaxRank, exactly the model's `n_embd` wide, and
  *     1 <= l < the model's layer count,
  *   - the layer range lies inside the model and every layer in it has a direction.
  */
@@ -30,15 +32,24 @@
 
 namespace rad {
 
+/* The most directions per layer any architecture declares hooks for. The loader refuses a file
+ * that carries more, so "loaded" and "steered" cannot disagree. */
+constexpr int64_t kControlVectorMaxRank = RAD_CONTROL_VECTOR_MAX_RANK;
+
 /* What a loaded vector keeps on the host, before it is uploaded per rank. `dir` is
- * [n_layers * n_embd] f32, unit rows, row 0 unused (the format has no direction for layer 0);
- * `scales[l]` is |d_l| * user scale, or 0 where the layer is outside the loaded range. */
+ * [n_layers * rank * n_embd] f32, unit rows, layer 0 unused (the format has no direction for
+ * layer 0); layer l's direction k is at ((l*rank)+k)*n_embd. `scales[l]` is |d_l| * user scale
+ * for a rank-1 file (the file's own magnitude is the strength), or the package scale for a rank-k
+ * basis (which removes each component whole), or 0 where the layer is outside the loaded range;
+ * one strength is shared by the layer's `rank` rows. */
 struct ControlVector {
     std::vector<float> dir;
     std::vector<float> scales;
     int64_t n_embd = 0;
     int64_t n_layers = 0;
-    int64_t n_dirs = 0;               /* directions the file carried (47 for the published one) */
+    int64_t n_dirs = 0;               /* direction tensors the file carried (one per layer) */
+    int64_t rank = 1;                 /* direction groups per layer */
+    int64_t per_stream = 0;           /* 1: each group holds one direction per hc stream */
     int     first = -1, last = -1;    /* inclusive layer range */
     float   user_scale = 1.0f;
     std::string path;
@@ -71,7 +82,8 @@ int control_vector_discover(const std::string& model_path, const std::string& ar
                             const std::string& radiance_home, std::string* found,
                             std::string* tried);
 
-/* Build the ABI view for one rank. `dir_device` is that rank's [n_layers, n_embd] f32 copy. */
+/* Build the ABI view for one rank. `dir_device` is that rank's [n_layers, rank, n_embd] f32
+ * copy (the whole table; the stream is replicated, so every rank holds all of it). */
 RadControlVector control_vector_view(const ControlVector& cv, const float* dir_device);
 
 /* Upload the host table to a fresh device buffer on rank `rank`, or null on failure. The caller

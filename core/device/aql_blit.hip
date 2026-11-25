@@ -105,33 +105,38 @@ __global__ __launch_bounds__(kThreads) void aql_copy1(const unsigned char* __res
         dst[i] = src[i];
 }
 
+/* The strided 16-byte copy runs over a flattened grid: piece i of the space is the piece
+ * (r = i / w16, c = i % w16) of the image and the grid strides over all w16 * height pieces. The
+ * row-blocked form this replaces put a row in each gridDim.y step and a row's pieces across a
+ * 256-thread block: the cast's 128-byte rows are 8 pieces, so 8 of every block's lanes worked and
+ * a one-row image took a whole block (the indexer's rows: 32768 such blocks). Every piece is
+ * still read and written exactly once with the same value, so the destination is byte-identical. */
 __global__ __launch_bounds__(kThreads) void aql_copy2d16(const u32x4* __restrict__ src,
                                                          u32x4* __restrict__ dst, uint64_t spitch16,
                                                          uint64_t dpitch16, uint64_t w16,
                                                          uint64_t height) {
-    const uint64_t cstride = (uint64_t)gridDim.x * kThreads;
-    for (uint64_t r = blockIdx.y; r < height; r += gridDim.y) {
-        const u32x4* s = src + r * spitch16;
-        u32x4* d = dst + r * dpitch16;
-        for (uint64_t c = (uint64_t)blockIdx.x * kThreads + threadIdx.x; c < w16; c += cstride)
-            d[c] = s[c];
+    const uint64_t total = w16 * height;
+    const uint64_t stride = (uint64_t)gridDim.x * kThreads;
+    for (uint64_t i = (uint64_t)blockIdx.x * kThreads + threadIdx.x; i < total; i += stride) {
+        const uint64_t r = i / w16, c = i - r * w16;
+        dst[r * dpitch16 + c] = src[r * spitch16 + c];
     }
 }
 
 /* aql_copy2d16 as a chained form (chain_kernel.h), launched where launches chain: the pass's
  * card-side strided copies (a cast into a column slice, a state kept aside and put back) then cost
- * no barrier on either side. Every block counts once; the row loops have no early return. */
+ * no barrier on either side. Every block counts once; the copy loop has no early return, so a
+ * block that lands past the end still counts. */
 __global__ __launch_bounds__(kThreads) void r4dchain_copy2d16(const u32x4* __restrict__ src,
                                                               u32x4* __restrict__ dst,
                                                               uint64_t spitch16, uint64_t dpitch16,
                                                               uint64_t w16, uint64_t height) {
     rad_chain_wait();
-    const uint64_t cstride = (uint64_t)gridDim.x * kThreads;
-    for (uint64_t r = blockIdx.y; r < height; r += gridDim.y) {
-        const u32x4* s = src + r * spitch16;
-        u32x4* d = dst + r * dpitch16;
-        for (uint64_t c = (uint64_t)blockIdx.x * kThreads + threadIdx.x; c < w16; c += cstride)
-            d[c] = s[c];
+    const uint64_t total = w16 * height;
+    const uint64_t stride = (uint64_t)gridDim.x * kThreads;
+    for (uint64_t i = (uint64_t)blockIdx.x * kThreads + threadIdx.x; i < total; i += stride) {
+        const uint64_t r = i / w16, c = i - r * w16;
+        dst[r * dpitch16 + c] = src[r * spitch16 + c];
     }
     rad_chain_done();
 }
@@ -261,18 +266,18 @@ extern "C" int rad_aql_blit_copy2d(void* dst, uint64_t dpitch, const void* src, 
                                    uint64_t width, uint64_t height, void* stream) {
     if (width == 0 || height == 0) return 0;
     const hipStream_t s = (hipStream_t)stream;
-    const unsigned by = (unsigned)(height < 65535 ? height : 65535);
     if (aligned16((uint64_t)(uintptr_t)dst | (uint64_t)(uintptr_t)src | dpitch | spitch | width)) {
+        /* One dimension over every 16-byte piece, capped as every other grid here is. */
         const uint64_t w16 = width / 16;
+        const dim3 g(blocks_for(w16 * height, kThreads));
         if (rad_dev_chain_enabled())
-            hipLaunchKernelGGL(r4dchain_copy2d16, dim3(blocks_for(w16, kThreads), by),
-                               dim3(kThreads), 0, s, (const u32x4*)src, (u32x4*)dst, spitch / 16,
-                               dpitch / 16, w16, height);
+            hipLaunchKernelGGL(r4dchain_copy2d16, g, dim3(kThreads), 0, s, (const u32x4*)src,
+                               (u32x4*)dst, spitch / 16, dpitch / 16, w16, height);
         else
-            hipLaunchKernelGGL(aql_copy2d16, dim3(blocks_for(w16, kThreads), by), dim3(kThreads),
-                               0, s, (const u32x4*)src, (u32x4*)dst, spitch / 16, dpitch / 16, w16,
-                               height);
+            hipLaunchKernelGGL(aql_copy2d16, g, dim3(kThreads), 0, s, (const u32x4*)src,
+                               (u32x4*)dst, spitch / 16, dpitch / 16, w16, height);
     } else {
+        const unsigned by = (unsigned)(height < 65535 ? height : 65535);
         if (rad_dev_chain_enabled())
             hipLaunchKernelGGL(r4dchain_copy2d1, dim3(blocks_for(width, kThreads), by),
                                dim3(kThreads), 0, s, (const unsigned char*)src,

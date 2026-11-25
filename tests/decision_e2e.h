@@ -59,7 +59,11 @@ struct Server {
     bool start(const std::string& model, const std::vector<std::string>& args) {
         std::vector<std::string> a = { "--host", "127.0.0.1", "--port", "0" };
         a.insert(a.end(), args.begin(), args.end());
-        if (!child.start(engine_argv(model, a), engine_env())) return false;
+        return start_child(engine_argv(model, a), engine_env());
+    }
+    /* A command line and environment of the caller's, which binds a free loopback port itself. */
+    bool start_child(const std::vector<std::string>& argv, const std::vector<std::string>& env) {
+        if (!child.start(argv, env)) return false;
         drain = std::thread([this] {
             char buf[4096];
             for (;;) {
