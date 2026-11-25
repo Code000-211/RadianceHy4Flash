@@ -212,8 +212,15 @@ endif()
 # License 1.0 (data/vectors/LICENSE.qwen-community-1.0.txt, NOTICE); radiance's Apache-2.0 grant
 # covers the code that reads them, never the file. It ships loaded only when the deployment asks
 # (--control-vector), and the request default is off, because what it removes is a safety behaviour.
+# The Hy4-flash package is derived here rather than downloaded: the published recipe run on the
+# taps of the quant this host serves, so it is the direction this model actually computes
+# (data/vectors/hyv4flash-control-vector.json records the sample counts, the groups and the
+# measurements). Same rule as the Qwen file -- shipped, never loaded unless the deployment asks,
+# request default off -- and because it is derived from Hy4-flash's weights it stays under that
+# model's licence, not radiance's Apache-2.0.
 file(MAKE_DIRECTORY ${RAD_PLUGIN_OUT}/vectors)
-foreach(rrad_vector qwen4exp-control-vector.gguf qwen4exp-control-vector.json)
+foreach(rrad_vector qwen4exp-control-vector.gguf qwen4exp-control-vector.json
+                     hyv4flash-control-vector.gguf hyv4flash-control-vector.json)
   configure_file(${CMAKE_CURRENT_SOURCE_DIR}/data/vectors/${rrad_vector}
                  ${RAD_PLUGIN_OUT}/vectors/${rrad_vector} COPYONLY)
   install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/data/vectors/${rrad_vector}

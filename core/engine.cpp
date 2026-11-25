@@ -816,6 +816,17 @@ Engine::~Engine() {
                  (unsigned long long)r->ctx.route_dropped());
         RAD_INFO("%s", r->mover.report().c_str());
     }
+    /* The device code each card ended up holding (M-14): the plan's receipt reads it before the
+     * first kernel has launched, when only the few modules the bring-up ran are loaded; this is
+     * the figure after serving, every module the run launched, each loaded whole. */
+    for (auto& r : ranks_) {
+        int64_t cb = 0;
+        int cm = 0;
+        if (dev_code_resident(r->device, &cb, &cm) != RAD_OK || cb <= 0) continue;
+        LogRank lr(r->index);
+        RAD_INFO("device code resident at exit: %s in %d code module(s), each loaded whole",
+                 humanb(cb).c_str(), cm);
+    }
     /* Drain the transfer streams before the contexts. Ctx::shutdown drains the compute streams
      * and frees the arena, but the mover's stream also copies into the arena (the prefill
      * stager's ring, lent slab slots) and would otherwise drain only later, with the mover. A fill

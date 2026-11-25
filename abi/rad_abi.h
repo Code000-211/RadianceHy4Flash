@@ -19,7 +19,11 @@ extern "C" {
  * version is refused at load with both versions printed. Each also exports the layout's fingerprint
  * (rad_abi_layout.h), so two layouts given one number are refused as well. A new optional export
  * (e.g. rad_plugin_reference) is not a change of shape: a plugin without it gets the default. */
-#define RAD_ABI_VERSION 44u
+#define RAD_ABI_VERSION 45u
+/* The most control-vector directions per layer an architecture declares hooks for. The
+ * loader refuses a file carrying more, so "loaded" and "steered" cannot disagree. It lives
+ * in the ABI because a plugin sees only abi/ headers, never core/. */
+#define RAD_CONTROL_VECTOR_MAX_RANK 8
 
 /* ================================================================== plugin identity */
 /* One value per plugin, not flags (QUANT is 3). RAD_PLUGIN_QUANT is a quantiser plugin:

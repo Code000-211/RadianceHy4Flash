@@ -81,7 +81,11 @@ scripts/backlog/lane.sh --env iks-A               # what a lane exports: port, m
   `RAD_IDLE_WAIT_S` s, a decode-only request that makes the experts ask for VRAM back, the same prefix again
   (the resume) and a cold prefill of the same size, with `/stats` and `/sessions` read at each step: the
   host tier's `prefix-cache-mib` check, X-01) and `long8` (the item's multi-session case: eight
-  conversations of `RAD_LONG8_CHARS` characters at once, then the same idle, demand and return passes).
+  conversations of `RAD_LONG8_CHARS` characters at once, then the same idle, demand and return passes), and
+  `lctxN` (`N` conversations of `RAD_LCTX_CHARS` characters — the default 190,000 is the 58,903-token
+  conversation of §1.3 — filled by a one-token wave and then decoded for `RAD_LCTX_NTOK` tokens: the long-context
+  decode stamps at one and four decoders, `lctx1` and `lctx4`, whose two waves land in the JSON as their own
+  phases).
   `greedy` is the merge bar's first clause: three prompts and a 5.7K arrival at temperature 0 with
   `ignore_eos` off, each as `gen` / `chars` / `sha256` of the text itself, so two arms' JSON compare byte for
   byte (S-01b).
@@ -95,11 +99,15 @@ scripts/backlog/lane.sh --env iks-A               # what a lane exports: port, m
 - **`bench.py <port> <tag> <out-dir>`** the served benchmark (decode, prefill, cold/warm, `--reps`, `--temp`), and
   **`prompts.py`** holds the prompts and the code corpus both tools send: they are read from the tree the tools sit
   in (`RAD_SRC` overrides), never from a copy on the measuring host, so a lane's prompt is the same text everywhere.
-- **`layer.py <stamps.csv> <probe.json> <phase> <rec> [<li>]`**, **`agg.py <stamps.csv> <probe.json> [--top N]`**,
+- **`layer.py <stamps.csv> <probe.json> <phase> <rec> [<li>]`**, **`agg.py <stamps.csv> <probe.json> [--top N] [--match RE]`**,
   **`attr.py <stamps.csv> <probe.json> [--top N]`**: the per-layer and per-op tables from a run's stamps. They are
   plain CPU tools over those two files (run them as `python3 scripts/backlog/agg.py …`; they are 644 in the tree),
   so they run wherever the files are: on the lane, or here over a file copied back from iks with `scp
-  iks:moebius-gpu/<name>/src/runs/<lane>/<tag>/<tag>.stamps.csv .`. They need a demangler, and iks has no
+  iks:moebius-gpu/<name>/src/runs/<lane>/<tag>/<tag>.stamps.csv .`. They read the phases that carry a stamped
+  window; a composite phase (`longctx`, `idle`, `long8`) and a gap probe (`stallN`) carry none, so they are named
+  and skipped, and the waves the composite ran are what the tables come from. `agg.py --match RE` prints only the
+  kernels of that name and their sum per step — the read of one term, e.g. `--match 'qsa_select|idx_score'` for
+  K-25's two terms at long context. They need a demangler, and iks has no
   `c++filt`: `demangle.py` takes `c++filt` or `llvm-cxxfilt` from `PATH`, else the `llvm-cxxfilt` next to the
   compiler the tree was built with (`build/CMakeCache.txt`), which is where the ROCm SDK keeps it. The iks trees'
   `runs/` are not kept between calls (the tree is unpacked fresh each call), so copy back what a card needs.

@@ -7,6 +7,7 @@
 #include "../arch/hyv4flash/hyv4flash.cpp"
 
 #include <cstdlib>
+#include <memory>
 
 using namespace rad_fake;
 
@@ -2883,7 +2884,9 @@ TEST(an_engine_step_with_dfly2_is_lint_clean_and_the_query_pass_touches_no_trunk
         CHECK_EQ(std::count(q.begin(), q.end(), std::string("dfly_sel")), 1);
         CHECK_EQ(std::count(q.begin(), q.end(), std::string("mla_attn_sel_sink")), 1);
         CHECK_EQ(std::count(q.begin(), q.end(), std::string("logits_gemm")), depth);
-        CHECK_EQ(std::count(q.begin(), q.end(), std::string("row_topk")), depth);
+        /* the f32 logits' top-k in one op where a library serves it (D-04) */
+        CHECK_EQ(std::count(q.begin(), q.end(), std::string("cast_row_topk")), depth);
+        CHECK_EQ(std::count(q.begin(), q.end(), std::string("row_topk")), 0);
         const auto& df = d.df();
         size_t store = SIZE_MAX, attn = SIZE_MAX;
         for (size_t i = 0; i < ps[2]->issues.size(); ++i) {
@@ -2897,6 +2900,66 @@ TEST(an_engine_step_with_dfly2_is_lint_clean_and_the_query_pass_touches_no_trunk
         int snap = 0;
         for (const auto& is : ps[0]->issues) snap += is.op == df.snap[0].op_sel;
         CHECK_EQ(snap, 1);
+    }
+}
+
+/* D-04: each chain round's top-k reads the f32 logits through cast_row_topk, which rounds them as
+ * `cast` does (the same bytes, one op); without a library that declares it, or with one that
+ * refuses it, the round keeps the pair, `cast` into logits_bf16 then row_topk. Whole and sharded. */
+void no_cast_topk(RadBuilder* b) { bf16_encs(b); b->undeclared.insert("cast_row_topk"); }
+void refused_cast_topk(RadBuilder* b) { bf16_encs(b); b->refuse.insert("cast_row_topk"); }
+TEST(dfly2_takes_cast_row_topk_where_served_and_the_cast_pair_otherwise) {
+    const int depth = 5;
+    for (int world : { 1, 2 }) for (int form = 0; form < 3; ++form) {
+        DeclDfly d(depth, dfly_meta(), world, 0,
+                   form == 0 ? bf16_encs : form == 1 ? no_cast_topk : refused_cast_topk);
+        REQUIRE_EQ(d.rc, RAD_OK);
+        RadBuilder& b = d.b;
+        const auto& df = d.df();
+        const bool fused = form == 0;
+        for (const auto& S : df.steps) {
+            CHECK_EQ(S.op_ctopk != 0, fused);
+            CHECK_EQ(S.op_lcast != 0, !fused);
+            CHECK_EQ(S.op_topk != 0, !fused);
+            const RecOp* o = b.op_of(fused ? S.op_ctopk : S.op_topk);
+            REQUIRE(o);
+            CHECK_EQ(pstr(o, "dtype"), std::string(fused ? "f32" : "bf16"));
+            CHECK_EQ(pint(o, "N"), 320 / world);
+            REQUIRE_EQ(o->reads.size(), (size_t)1);
+            CHECK_EQ(b.bufs[o->reads[0] - 1].name.find(fused ? "dfly.logits" : "logits_bf16") !=
+                         std::string::npos, true);
+            CHECK_EQ(o->writes.size(), (size_t)(world > 1 ? 3 : 2));
+            if (world > 1) CHECK_EQ(pint(o, "vocab_off"), 0);
+        }
+        if (world > 1) continue;   /* the passes below are the whole-vocabulary engine's */
+        auto trunk = kit(b, std::vector<int>(2, depth + 1), {});
+        trunk->b.positions_h = trunk->pos.data();
+        auto ctxp = context_pass(b, *trunk);
+        Query qp(b, 2, depth + 1, depth);
+        auto ps = run_passes(b, hyv4flash::step, { trunk.get(), ctxp.get(), qp.k.get() });
+        for (const auto& c : ps) {
+            if (!c->step_fail.empty()) fprintf(stderr, "%s\n", c->step_fail.c_str());
+            CHECK(c->step_fail.empty());
+        }
+        CHECK_LINT(b, ps[0].get(), ps[1].get(), ps[2].get());
+        const auto q = issued_ops(b, *ps[2]);
+        auto count = [&](const char* op) { return (int64_t)std::count(q.begin(), q.end(), std::string(op)); };
+        CHECK_EQ(count("cast_row_topk"), fused ? depth : 0);
+        CHECK_EQ(count("row_topk"), fused ? 0 : depth);
+        CHECK_EQ(count("cast") >= (fused ? 0 : depth), true);
+        /* each round: the head, then (the cast and) the top-k */
+        for (const auto& S : df.steps) {
+            size_t at_head = SIZE_MAX, at_cast = SIZE_MAX, at_top = SIZE_MAX;
+            const auto& is = ps[2]->issues;
+            for (size_t i = 0; i < is.size(); ++i) {
+                if (is[i].op == S.op_head && at_head == SIZE_MAX) at_head = i;
+                if (S.op_lcast && is[i].op == S.op_lcast && at_cast == SIZE_MAX) at_cast = i;
+                if (is[i].op == (fused ? S.op_ctopk : S.op_topk) && at_top == SIZE_MAX) at_top = i;
+            }
+            REQUIRE(at_head != SIZE_MAX && at_top != SIZE_MAX);
+            CHECK(at_head < at_top);
+            if (!fused) { REQUIRE(at_cast != SIZE_MAX); CHECK(at_head < at_cast && at_cast < at_top); }
+        }
     }
 }
 
@@ -2947,7 +3010,7 @@ TEST(dfly2_serves_a_short_block_of_four_rows) {
                     return (int64_t)std::count(q.begin(), q.end(), std::string(op));
                 };
                 CHECK_EQ(count("logits_gemm"), rounds);
-                CHECK_EQ(count("row_topk"), rounds);
+                CHECK_EQ(count("cast_row_topk"), rounds);
                 CHECK_EQ(count("mtp_couple_propose"), coupled ? rounds : 0);
                 /* each anchor and each round's row found at this block's stride */
                 int row0 = 0, row0_lo = 0, rowk = 0, rowk_lo = 0;
@@ -3036,7 +3099,7 @@ TEST(dfly2_coupled_draws_each_chain_step_from_its_shortlist_law) {
                 const auto& S = df.steps[(size_t)k];
                 size_t at_top = SIZE_MAX, at_c = SIZE_MAX, at_tok = SIZE_MAX, at_merge = SIZE_MAX;
                 for (size_t i = 0; i < is.size(); ++i) {
-                    if (is[i].op == S.op_topk) at_top = i;
+                    if (is[i].op == (S.op_ctopk ? S.op_ctopk : S.op_topk)) at_top = i;
                     if (is[i].op == S.op_merge && S.op_merge) at_merge = i;
                     if (is[i].op == S.op_couple) at_c = i;
                     if (is[i].op == S.op_tok) at_tok = i;
@@ -3361,7 +3424,7 @@ TEST(dfly2_at_tp_splits_heads_and_width_and_merges_the_vocabulary_shards) {
                 CHECK_EQ(pint(b.op_of(L.p_gu.op), "N"), 2 * ff / world);
                 CHECK_EQ(pint(b.op_of(L.p_down.op), "K"), ff / world);
                 CHECK_EQ(pint(b.op_of(df.steps[0].op_head), "n_vocab"), 320 / world);
-                CHECK_EQ(pint(b.op_of(df.steps[0].op_topk), "vocab_off"), 320 / world * rank);
+                CHECK_EQ(pint(b.op_of(df.steps[0].op_ctopk), "vocab_off"), 320 / world * rank);
                 /* The correction's three linears are this rank's width too, and its down's partial
                  * sum is reduced exactly before the residual and the proposal law read it. */
                 CHECK_EQ(pint(b.op_of(df.c_g.op), "N"), df.E / world);
@@ -3410,7 +3473,7 @@ TEST(dfly2_at_tp_splits_heads_and_width_and_merges_the_vocabulary_shards) {
                         add = add || op == st.op_add;
                     }
                     if (op == df.c_d.op || op == df.op_ar_c || add) chain.push_back(i);
-                    if (op == df.steps[0].op_topk) ++tk;
+                    if (op == df.steps[0].op_ctopk) ++tk;
                     if (op == L.p_out.op) i_out = i;
                     if (op == df.op_ar_o) i_ar = i;
                     if (op == L.op_post || (op == L.op_add1 && i_post == SIZE_MAX)) i_post = std::min(i_post, i);
@@ -3516,6 +3579,60 @@ TEST(the_four_rank_junction_twin_takes_the_launch_bound_heights) {
     REQUIRE_EQ(off.rc, RAD_OK);
     CHECK_EQ(count_op(off.b, "ar_rmsnorm_ihc_junction"), 0);
     CHECK(count_op(off.b, "all_reduce") > 0);
+}
+
+/* A per-stream control vector: rank counts the rows of a layer, rank / hc of them are groups of
+ * one direction per stream, and each group is one chained hc_project with vsep = n_embd on every
+ * steered layer. Without a vector the graph carries no projection and no switch buffer at all, so
+ * a deployment that does not ask for one runs the graph it ran before. */
+TEST(a_per_stream_control_vector_declares_one_projection_per_group) {
+    const int64_t E = 128, hc = 2, groups = 2, rank = groups * hc, layers = 3;
+    std::vector<float> dir((size_t) (layers * rank * E), 0.0f);
+    float scales[3] = { 0.0f, 1.0f, 1.0f };
+    RadControlVector cv{ dir.data(), scales, E, layers, rank, 1 };
+
+    auto declared = [&](const RadControlVector* v, int* rc) {
+        MetaKV mk = mini_meta();
+        auto b = std::make_unique<RadBuilder>();
+        bf16_encs(b.get());
+        RadBuildCtx ctx = build_ctx();
+        ctx.cvec = v;
+        G3Env g3env;
+        stderr_of([&] { *rc = hyv4flash::declare(b.get(), mk.meta(), &ctx); });
+        return b;
+    };
+    int rc = 0;
+    auto b = declared(&cv, &rc);
+    REQUIRE_EQ(rc, RAD_OK);
+    CHECK_EQ(count_op(*b, "hc_project"), (int) ((layers - 1) * groups));
+    for (const RecOp& o : b->ops) {
+        if (o.op != "hc_project") continue;
+        bool vsep = false;
+        for (const RecParam& p : o.p)
+            if (p.key == "vsep") { vsep = true; CHECK_EQ(p.ival, (long long) E); }
+        CHECK(vsep);
+    }
+
+    /* The shared single direction: one projection a layer, vsep 0. */
+    RadControlVector one{ dir.data(), scales, E, layers, 1, 0 };
+    auto b1 = declared(&one, &rc);
+    REQUIRE_EQ(rc, RAD_OK);
+    CHECK_EQ(count_op(*b1, "hc_project"), (int) (layers - 1));
+    for (const RecOp& o : b1->ops)
+        if (o.op == "hc_project")
+            for (const RecParam& p : o.p)
+                if (p.key == "vsep") CHECK_EQ(p.ival, 0LL);
+
+    /* Rows that do not split into the model's streams are refused, not misread. */
+    RadControlVector odd{ dir.data(), scales, E, layers, 3, 1 };
+    auto b2 = declared(&odd, &rc);
+    CHECK(rc != RAD_OK);
+
+    /* No vector: no projection and no switch. */
+    auto b0 = declared(nullptr, &rc);
+    REQUIRE_EQ(rc, RAD_OK);
+    CHECK_EQ(count_op(*b0, "hc_project"), 0);
+    for (const RecBuf& x : b0->bufs) CHECK(x.name.find("projection_on") == std::string::npos);
 }
 
 RAD_TEST_MAIN()

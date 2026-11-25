@@ -5104,6 +5104,25 @@ static void hy4_cases(std::vector<Hand>& hs) {
         hs.push_back(std::move(h));
     }
 
+    /* ---- hc_project: the control vector, one shared direction and a per-stream table -------- */
+    for (const bool per_stream : { false, true }) {
+        for (const uint32_t dt : { (uint32_t)RAD_F32, (uint32_t)RAD_BF16 }) {
+            /* Row 1's switch is 0: it must come back as it went in. */
+            const int64_t M = 3, n = 37, hc = 4;
+            Hand h(per_stream ? (dt == RAD_F32 ? "a per-stream table, f32 streams"
+                                               : "a per-stream table, bf16 streams")
+                              : (dt == RAD_F32 ? "one shared direction, f32 streams"
+                                               : "one shared direction, bf16 streams"),
+                   "hc_project", dt == RAD_F32 ? 1e-5 : 6e-3);
+            h.dense(dt, { M, hc * n }, hfill(451), true)
+             .dense(RAD_F32, { per_stream ? hc : 1, n }, hfill(452, 0.2f))
+             .dense(RAD_I32, { M }, [](int64_t i) { return i == 1 ? 0.0f : 1.0f; })
+             .pi("M", M).pi("n", n).pi("hc", hc).pi("vsep", per_stream ? n : 0).pf("scale", 1.0)
+             .ps("dtype", dt == RAD_F32 ? "f32" : "bf16");
+            hs.push_back(std::move(h));
+        }
+    }
+
     /* ---- gate_mul: saturated gates -------------------------------------------------------- */
     {
         const int64_t M = 3, n = 37;
