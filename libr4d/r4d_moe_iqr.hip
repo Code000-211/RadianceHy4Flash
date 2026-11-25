@@ -928,7 +928,10 @@ int moe_iqr_launch(const RadArgs* a, RadStream stream, int ncls, bool gated = fa
      * run is cut in two for the map (moe_iqr_packmap_kernel). The fused form's [13] / [9] is its
      * codes' scale instead. */
     const RadTensor* QS     = gated ? r4d_opt(a, ncls == 4 ? 13 : 9) : nullptr;
-    const RadTensor* split  = gated ? nullptr : r4d_opt(a, ncls == 4 ? 13 : 9);
+    /* A checkpoint inside the step: the gated row takes it one place later, after `q` and `s`,
+     * and needs no code of its own for it -- a split moves rows between runs, and the rotation and
+     * the scale are a row's own. */
+    const RadTensor* split  = r4d_opt(a, gated ? (ncls == 4 ? 14 : 10) : (ncls == 4 ? 13 : 9));
     if (!Aq || !As || !sorted || !off || !Y || (gated && !QS)) return R4D_NO(RAD_E_INVAL);
     if (!Aq->data || !As->data || !sorted->data || !off->data || !Y->data ||
         (gated && !QS->data))

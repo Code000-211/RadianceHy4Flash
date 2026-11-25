@@ -1298,6 +1298,7 @@ static const RadOperandSpec oMoeGemmQGated[] = {
     { "w_odd_scale",   RAD_OPD_WTAB, 0 },
     { "q",             RAD_OPD_OUT,  0 },
     { "s",             RAD_OPD_OUT,  0 },
+    { "split",         RAD_OPD_IN,   1 },
 };
 /* As above over four classes by expert number mod 4. */
 static const RadParamSpec pMoeGemmQGatedMod4[] = {
@@ -1320,6 +1321,7 @@ static const RadOperandSpec oMoeGemmQGatedMod4[] = {
     { "w_3_scale",     RAD_OPD_WTAB, 0 },
     { "q",             RAD_OPD_OUT,  0 },
     { "s",             RAD_OPD_OUT,  0 },
+    { "split",         RAD_OPD_IN,   1 },
 };
 static const RadParamSpec pMoeGather[] = {
     P_INT("M"), P_INT("n"), P_INT("top_k"), P_STR("dtype"),
