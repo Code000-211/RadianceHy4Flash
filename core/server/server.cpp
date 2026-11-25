@@ -1235,7 +1235,6 @@ HttpResponse Server::streaming_completion(const HttpRequest& req, OaiRequest& r)
     r.t_received_ns = req.t_received_ns;
     auto st = std::make_shared<StreamState>();
     st->r = r;
-    st->peer_closed = req.closed;
 
     ApiError err;
     const int64_t t_submit0 = prep_now_ns();
@@ -1282,10 +1281,6 @@ HttpResponse Server::streaming_completion(const HttpRequest& req, OaiRequest& r)
                 }
             }
             return true;
-        }
-
-        if (st->peer_closed && st->peer_closed()) {
-            return false;
         }
 
         /* The model is leaving (end_streams, retire). The stream ends here whether or not the
@@ -1454,8 +1449,10 @@ HttpResponse Server::streaming_completion(const HttpRequest& req, OaiRequest& r)
         }
 
         if (!progress && out.empty()) {
-            /* Nothing to send: sleep on the first live sink. The wait is bounded so the
-             * peer-closed check above runs a few times a second. */
+            /* Nothing to send: sleep on the first live sink. The wait is bounded so the transport's
+             * own peer check, which runs before every chunk the loop above writes, comes round a
+             * few times a second: the vendored httplib polls the socket there, and a write that
+             * fails on a closed one ends the response and cancels its generations (on_close). */
             for (auto& g : st->gens) if (!g.closed) { g.sink->wait(); break; }
         }
         return true;
