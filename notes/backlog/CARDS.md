@@ -52,11 +52,21 @@ scripts/backlog/lane.sh --env iks-A               # what a lane exports: port, m
 - **The local lane serves `<tree>/build/bin/radiance`**, so that tree is built once. Here the build needs ROCm's
   clang++ as the host compiler: the host's GCC 13 rejects the compound literals in `abi/rad_runtime.h`, and a
   whole-tree build stops on the narrowing errors in `tests/museglimmer_test.cpp`, which the lane does not use.
+  Device code is compiled with **radiance's own HIP compiler**, the one the Dockerfile builds and ships:
+  ROCm 10.1's clang over the libLLVM rebuilt with `docker/llvm-vopd-pairing.patch`, installed on this host as
+  `/opt/rocm-repeatable`. Stock clang 24 pairs VOPD non-repeatably (two compiles of the same code can differ in
+  `.text` and speed), so CMake turns VOPD off on it (`rad_hip_repeatable`, 1.4-3.5 % on the fp8 prefill tiles);
+  the patched one keeps VOPD on and repeatable. Build exactly as the image does:
   ```sh
   cmake -S . -B build -G Ninja -DCMAKE_CXX_COMPILER=/opt/rocm/llvm/bin/clang++ \
+        -DCMAKE_HIP_COMPILER=/opt/rocm-repeatable/lib/llvm/bin/clang++ -DCMAKE_HIP_COMPILER_ROCM_ROOT=/opt/rocm \
+        -DCMAKE_HIP_FLAGS=--rocm-path=/opt/rocm -DRAD_HIP_VOPD_REPEATABLE=ON \
         -DRAD_WITH_HIP=ON -DRAD_GPU_TARGETS=gfx1201
   cmake --build build --target radiance -j 32
   ```
+  Check a configured tree with `grep -E 'CMAKE_HIP_COMPILER:|RAD_HIP_VOPD_REPEATABLE' build/CMakeCache.txt`. Both
+  arms of an A/B are built the same way; numbers from a tree built with the stock compiler (VOPD off) are not
+  comparable with this one's.
 - **`run.sh <tag> <cfg.yaml> <phases> [ENV=VAL ...] [-- radiance args]`** one server in the lane, `probe.py`
   against it, then it is stopped. Everything lands in `runs/<lane>/<tag>/`: the lane's rendered config
   (`<cfg>.yaml` with the lane's port, model, host pool and `ngram-placement`), `server.log`, `run.out`, `<tag>.json`.
