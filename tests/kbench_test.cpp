@@ -140,6 +140,10 @@ TEST(a_copy_is_judged_exactly) {
     for (const char* op : { "gather_rows", "scatter_rows", "embed_lookup", "kv_store",
                             "row_topk", "pair_argmax", "all_gather" })
         CHECK_EQ(kb::tolerance_for(op, geom({ { "dtype", "bf16" } }), "y").rel_l2, 0.0);
+    /* cast_row_topk (D-04) is the cast then row_topk, byte for byte: exact too, not the cast's
+     * 1e-6, which its name would match as a prefix. */
+    CHECK_EQ(kb::tolerance_for("cast_row_topk", geom({ { "dtype", "f32" } }), "val").rel_l2, 0.0);
+    CHECK_EQ(kb::tolerance_for("cast", geom({ { "dtype", "f32" } }), "y").rel_l2, 1e-6);
 }
 
 /* Every float output of every op the checked-in fixtures record resolves to a row chosen for it,

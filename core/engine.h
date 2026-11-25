@@ -160,6 +160,12 @@ public:
      * (every stream drained), and returns its result; for mapping changes under a serving engine.
      * RAD_E_STATE when the engine stops first. From any thread but the step loop's. */
     int  run_quiet(const std::function<int()>& fn);
+    /* A reload of rebuilt kernel hooks (Registry::reload_prepare, docs/PLUGIN.md §14), with the
+     * engine quiet: inside run_quiet, or on a parked engine from the fleet's thread. hooks_check
+     * asks every rank whether it can take them (Ctx::hooks_check); hooks_refresh, once they are
+     * committed, makes every rank's issue plans and recorded passes over (Ctx::hooks_refresh). */
+    int  hooks_check(const HookReload& r, std::string* why) const;
+    void hooks_refresh();
     /* The engine's owner id for the device layer (engine_owner): every thread it starts files its
      * allocations under it. */
     int  owner() const { return owner_; }

@@ -180,6 +180,9 @@ struct RadCtx {
     int             world = 1;
     std::vector<RecIssue> issues;
     std::vector<int>      routed_layers;
+    /* Each report's RadRouting::expert_count: the buffer it points into (fake_buf_of; 0 for a
+     * pointer that is no buffer's) and the byte offset into it. */
+    std::vector<std::pair<rad_buf, int64_t>> routed_counts;
     std::string           step_fail;
     int                   lane = 0;     /* where the next issue goes */
     std::vector<RecJoin>  joins;
@@ -603,11 +606,6 @@ extern "C" int             rad_ctx_wgp_count(RadCtx*) { return 32; }
 /* The context itself, so a copy issued on the step's stream is recorded in it (rad_memcpy_async). */
 extern "C" RadStream       rad_stream(RadCtx* c)     { return (RadStream)c; }
 extern "C" int             rad_stream_sync(RadStream s) { (void)s; return RAD_OK; }
-extern "C" int rad_route_report(RadCtx* c, int layer, const RadRouting* r) {
-    (void)r;
-    c->routed_layers.push_back(layer);
-    return RAD_OK;
-}
 extern "C" int rad_route_table(RadBuilder* b, rad_buf table) {
     if (!b || table == 0) return RAD_E_INVAL;
     b->route_table = table;
@@ -647,6 +645,17 @@ static rad_buf fake_buf_of(const void* p, size_t n_bufs) {
     if ((u & ~(kFakeBufTag - 1)) != kFakeBufTag) return 0;
     const uintptr_t h = (u & (kFakeBufTag - 1)) >> kFakePtrShift;
     return h >= 1 && h <= n_bufs ? (rad_buf)h : 0;
+}
+extern "C" int rad_route_report(RadCtx* c, int layer, const RadRouting* r) {
+    c->routed_layers.push_back(layer);
+    rad_buf h = 0;
+    int64_t off = 0;
+    if (r && r->expert_count && c->b) {
+        h = fake_buf_of(r->expert_count, c->b->bufs.size());
+        if (h) off = (int64_t)((uintptr_t)r->expert_count - (uintptr_t)rad_buf_ptr(c, h));
+    }
+    c->routed_counts.push_back({ h, off });
+    return RAD_OK;
 }
 /* Pinned host memory a plugin fills itself (qwen4exp_fp8's piece bounds, the calibration tap's
  * staging), as host memory; nothing else is handed out. */
