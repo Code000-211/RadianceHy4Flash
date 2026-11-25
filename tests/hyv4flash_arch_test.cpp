@@ -2812,13 +2812,16 @@ TEST(dfly2_is_a_block_drafter_of_block_depth_plus_one_with_window_1) {
         CHECK_EQ(d.b.drafter_short, depth >= 4 ? (int64_t)4 : (int64_t)0);
         CHECK(dd.proposal != 0);
         CHECK(!d.b.drafter_shared && d.b.drafter_parents == 0);
-        /* No KV group of its own; the snapshots and the proposal persist. */
+        /* No KV group of its own; the snapshots and the proposal persist. P-09: the selections
+         * live in two layer-major planes named without the layer. With the drafter served,
+         * final_hidden persists too: the query pass reads anchor rows of an earlier trunk step. */
         for (const auto& g : d.b.kv_groups) CHECK(g.name.find("dfly") == std::string::npos);
-        for (const char* n : { "dfly.sel_snap.2", "dfly.nsel_snap.2", "dfly.tokens" }) {
+        for (const char* n : { "dfly.sel_snap", "dfly.nsel_snap", "dfly.tokens" }) {
             const RecBuf* bb = find_b(d.b, n);
             REQUIRE(bb != nullptr);
             CHECK_EQ(bb->d.kind, (int)RAD_BUF_PERSIST);
         }
+        CHECK_EQ(find_b(d.b, "final_hidden")->d.kind, (int)RAD_BUF_PERSIST);
         /* The served weights are read every step; nothing is renamed or fused anew. */
         const RecWeight* qb = find_w(d.b, "dfly.blk.0.attn_q_b.weight");
         REQUIRE(qb != nullptr);
@@ -2839,6 +2842,9 @@ TEST(dfly2_is_a_block_drafter_of_block_depth_plus_one_with_window_1) {
     CHECK_EQ(qb->d.access, (int)RAD_ACCESS_RARE);
     CHECK(d.err.find("DFly2 is declared and not served") != std::string::npos);
     CHECK_EQ(count_op(d.b, "dfly_sel"), 0);
+    /* P-09: with no drafter nothing reads final_hidden across steps: it is a step plane. */
+    CHECK(find_b(d.b, "dfly.sel_snap") == nullptr);
+    CHECK_EQ(find_b(d.b, "final_hidden")->d.kind, (int)RAD_BUF_TRANSIENT);
 }
 
 /* --draft-suffix beside DFly2 (WP13.8b): with the drafter in the container the probe says its
@@ -2895,11 +2901,17 @@ TEST(an_engine_step_with_dfly2_is_lint_clean_and_the_query_pass_touches_no_trunk
         }
         REQUIRE(store != SIZE_MAX && attn != SIZE_MAX);
         CHECK(store < attn);
-        /* The trunk step (contexts 40+ pass mini's dense limit of 16) snapshots its selection. */
-        const auto t = issued_ops(b, *ps[0]);
-        int snap = 0;
-        for (const auto& is : ps[0]->issues) snap += is.op == df.snap[0].op_sel;
-        CHECK_EQ(snap, 1);
+        /* The trunk step (contexts 40+ pass mini's dense limit of 16) writes its selection
+         * straight into the snapshot plane (P-09): no copy launch, the selection's own op. */
+        const auto& m = *hyv4flash::models[0];
+        const rad_op ix_sel = m.layers[df.snap[0].layer].ix.op_select;
+        int snap = 0, sels = 0;
+        for (const auto& is : ps[0]->issues) {
+            snap += is.op == df.op_sel;
+            sels += is.op == ix_sel;
+        }
+        CHECK_EQ(snap, 0);
+        CHECK_EQ(sels, 1);
     }
 }
 
@@ -3226,9 +3238,10 @@ TEST(dfly2_reads_quantised_linears_as_the_trunk_does) {
     }
 }
 
-/* §3.2: a dense trunk step clears the snapshot's counts (nsel 0: the row attended densely) instead
- * of copying, and a selecting one copies after qsa_select and before the layer's attention. */
-TEST(the_trunk_snapshots_its_selection_after_qsa_select_and_clears_it_on_a_dense_step) {
+/* §3.2 / P-09: a dense trunk step clears the snapshot's counts with the one fill over the
+ * plane, and a selecting single-span step writes the selection into the plane itself: the
+ * attention reads it from the layer's window, and no copy launch runs in between. */
+TEST(the_trunk_writes_its_selection_into_the_snapshot_and_clears_it_on_a_dense_step) {
     DeclDfly d;
     REQUIRE_EQ(d.rc, RAD_OK);
     const auto& m = *hyv4flash::models[0];
@@ -3242,22 +3255,109 @@ TEST(the_trunk_snapshots_its_selection_after_qsa_select_and_clears_it_on_a_dense
         CHECK(c.step_fail.empty());
         CHECK_LINT(d.b, &c);
         size_t sel = SIZE_MAX, cp = SIZE_MAX, zero = SIZE_MAX, attn = SIZE_MAX;
+        int cps = 0, zeros = 0;
         for (size_t i = 0; i < c.issues.size(); ++i) {
             const rad_op op = c.issues[i].op;
-            if (op == m.layers[2].ix.op_select) sel = i;
-            if (op == sn.op_sel) cp = i;
-            if (op == sn.op_zero) zero = i;
-            if (op == m.layers[2].attn.op_sel || op == m.layers[2].attn.op_paged) attn = i;
+            if (op == m.layers[2].ix.op_select && sel == SIZE_MAX) sel = i;
+            if (op == m.df.op_sel) { cp = i; ++cps; }
+            if (op == m.df.op_zero) { zero = i; ++zeros; }
+            if ((op == m.layers[2].attn.op_sel || op == m.layers[2].attn.op_paged) &&
+                attn == SIZE_MAX)
+                attn = i;
         }
         REQUIRE(attn != SIZE_MAX);
+        /* The copy is never issued on a step that writes in place, and the fill runs once a
+         * step for the whole plane, never once a layer. */
+        CHECK_EQ(cps, 0);
         if (dense) {
             CHECK(zero != SIZE_MAX && zero < attn);
-            CHECK_EQ(cp, SIZE_MAX);
+            CHECK_EQ(zeros, 1);
+            CHECK_EQ(sel, SIZE_MAX);
         } else {
-            CHECK(sel != SIZE_MAX && cp != SIZE_MAX && sel < cp && cp < attn);
+            CHECK(sel != SIZE_MAX && sel < attn);
             CHECK_EQ(zero, SIZE_MAX);
+            /* qsa_select wrote the plane's window for this layer, and the attention reads the
+             * selection from there. */
+            CHECK_EQ((rad_buf)c.issues[sel].opd[5].handle, m.df.snap_sel);
+            CHECK_EQ((rad_buf)c.issues[sel].opd[6].handle, m.df.snap_nsel);
+            CHECK_EQ(c.issues[sel].opd[5].offset, sn.base * m.s.ix_group_topk);
+            CHECK_EQ(c.issues[sel].opd[6].offset, sn.base);
+            CHECK_EQ((rad_buf)c.issues[attn].opd[3].handle, m.df.snap_sel);
+            CHECK_EQ(c.issues[attn].opd[3].offset, sn.base * m.s.ix_group_topk);
         }
     }
+}
+
+/* P-09: with taps on, the in-place step still refreshes the tap's group ids in the snapshot (the
+ * drafter's tap table reads them): only the ids are copied, the selection itself is not. */
+TEST(the_in_place_snapshot_step_still_copies_the_tap_group_ids) {
+    setenv("RADIANCE_HY4_TAPS", "1", 1);
+    {
+        DeclDfly d;
+        REQUIRE_EQ(d.rc, RAD_OK);
+        const auto& m = *hyv4flash::models[0];
+        const auto& sn = m.df.snap[0];
+        REQUIRE(m.df.op_ids != 0);
+        auto k = kit(d.b, { 1 }, {});
+        k->b.positions_h = k->pos.data();
+        RadCtx c{ .b = &d.b, .batch = &k->b };
+        hyv4flash::step(&c, &k->b);
+        CHECK(c.step_fail.empty());
+        CHECK_LINT(d.b, &c);
+        size_t tap = SIZE_MAX, ids = SIZE_MAX;
+        int cps = 0;
+        for (size_t i = 0; i < c.issues.size(); ++i) {
+            const rad_op op = c.issues[i].op;
+            if (op == m.layers[2].ix.op_tap_select && tap == SIZE_MAX) tap = i;
+            if (op == m.df.op_sel) ++cps;
+            if (op == m.df.op_ids && ids == SIZE_MAX) ids = i;
+        }
+        REQUIRE(tap != SIZE_MAX && ids != SIZE_MAX);
+        CHECK(tap < ids);
+        CHECK_EQ(cps, 0);
+        CHECK_EQ((rad_buf)c.issues[ids].opd[1].handle, m.df.snap_ids);
+        CHECK_EQ(c.issues[ids].opd[1].offset, sn.base * m.s.ix_group_topk);
+    }
+    unsetenv("RADIANCE_HY4_TAPS");
+}
+
+/* P-09: a streamed group keeps the copy: its kv_resolve rewrites the wire selection in place,
+ * so the snapshot is still taken between the selection and the attention — now at the layer's
+ * window in the plane, and the attention keeps reading the wire. */
+TEST(a_streamed_sparse_group_keeps_the_snapshot_copy_at_the_layer_window) {
+    DeclDfly d;
+    REQUIRE_EQ(d.rc, RAD_OK);
+    const auto& m = *hyv4flash::models[0];
+    const auto& sn = m.df.snap[0];
+    const int64_t blocks = 64, slots = 16, bbytes = 320;
+    std::vector<uint8_t> host((size_t)(blocks * bbytes * 3));
+    std::vector<int32_t> res((size_t)(blocks * 3)), slot_block((size_t)(slots * 3)),
+        slot_state((size_t)(slots * 6)), ctl(16);
+    RadKVStream st{};
+    st.host = host.data(); st.res = res.data(); st.slot_block = slot_block.data();
+    st.slot_state = slot_state.data(); st.ctl = ctl.data(); st.block_bytes = bbytes;
+    st.host_layer_stride = bbytes * blocks; st.slots = slots; st.host_bytes = (int64_t)host.size();
+    auto k = kit(d.b, { 1 }, {});
+    k->b.positions_h = k->pos.data();
+    k->kv[(size_t)m.kv_sparse - 1].stream = &st;
+    RadCtx c{ .b = &d.b, .batch = &k->b };
+    hyv4flash::step(&c, &k->b);
+    if (!c.step_fail.empty()) fprintf(stderr, "%s\n", c.step_fail.c_str());
+    CHECK(c.step_fail.empty());
+    CHECK_LINT(d.b, &c);
+    size_t sel = SIZE_MAX, cp = SIZE_MAX, attn = SIZE_MAX;
+    for (size_t i = 0; i < c.issues.size(); ++i) {
+        const rad_op op = c.issues[i].op;
+        if (op == m.layers[2].ix.op_select && sel == SIZE_MAX) sel = i;
+        if (op == m.df.op_sel) cp = i;
+        if (op == m.layers[2].attn.op_sel && attn == SIZE_MAX) attn = i;
+    }
+    REQUIRE(sel != SIZE_MAX && cp != SIZE_MAX && attn != SIZE_MAX);
+    CHECK(sel < cp && cp < attn);
+    CHECK_EQ((rad_buf)c.issues[cp].opd[0].handle, m.iw.sel);        /* src: the wire */
+    CHECK_EQ((rad_buf)c.issues[cp].opd[1].handle, m.df.snap_sel);   /* dst: the layer's window */
+    CHECK_EQ(c.issues[cp].opd[1].offset, sn.base * m.s.ix_group_topk);
+    CHECK_EQ((rad_buf)c.issues[attn].opd[3].handle, m.iw.sel);      /* the attention: the wire */
 }
 
 /* Under streaming (WP14) the query pass resolves its table between the draft rows' store and the

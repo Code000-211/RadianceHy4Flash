@@ -720,7 +720,11 @@ static int buffers(RadBuilder* b, Model& m) {
     m.tr.xn = bf("block_in", { T, E });
     m.tr.y = bf("block_out", { T, E });
     m.x0 = bf("embed", { T, E });
-    m.final_hidden = decl_b(b, nm.f("final_hidden"), RAD_BF16, { T, E }, RAD_BUF_PERSIST);
+    /* P-09: the drafter's query pass reads this plane's anchor rows written by an earlier trunk
+     * step, so it persists only when the drafter is served; without a drafter every reader
+     * (head, taps, unpack, calibration) reads it inside its own step. */
+    m.final_hidden = decl_b(b, nm.f("final_hidden"), RAD_BF16, { T, E },
+                            m.df.served ? RAD_BUF_PERSIST : RAD_BUF_TRANSIENT);
     m.logit_input = bf("logit_input", { g.max_logit_rows, E });
     m.logits = decl_b(b, nm.f("logits"), RAD_F32, { g.max_logit_rows, g.n_vocab });
     if (!m.tr.h || !m.tr.x || !m.tr.post || !m.tr.xn || !m.tr.y || !m.x0 || !m.final_hidden ||
@@ -1191,10 +1195,12 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                      { RAD_RANGE("M", 1, g.max_logit_rows), RAD_INT("n", E),
                        RAD_STR("dtype", "bf16") },
                      {}, { m.final_hidden }, { m.logit_input });
+    /* P-08: the direct head reads `final_hidden` in place of the gather; the declared read keeps
+     * it live at this op now that a step-lifetime plane may be transient (P-09). */
     m.op_head = mk(b, "logits_gemm",
                    { RAD_RANGE("M", 1, g.max_logit_rows), RAD_INT("n_vocab", g.n_vocab),
                      RAD_INT("n_embd", E), RAD_STR("dtype", "bf16") },
-                   { m.head }, { m.logit_input }, { m.logits });
+                   { m.head }, { m.logit_input, m.final_hidden }, { m.logits });
     HY4_NEED(m.op_norm && m.op_gather && m.op_head, "rmsnorm / gather_rows / logits_gemm");
     RAD_ARCH_TRY(m.calib.output(b, g, s, m.final_hidden));
 
@@ -1450,16 +1456,28 @@ static void step(RadCtx* c, const RadBatch* batch) {
         /* A pass on a streamed group's ring attends through the selection at every context
          * (hyv4flash_attn.h); every sparse layer of a pass agrees, the view being the pass's. */
         if (!l.sliding && !lp.select && l.attn.ring_bound(c, batch)) lp.select = true;
-        if (!l.sliding && !l.ix.step(c, batch, lp, queries, rows)) return;
+        /* P-09: on a snapshot layer of a single-span step whose group does not stream (the only
+         * other writer of the selection is the streamed group's kv_resolve, rewriting `sel` in
+         * place), `qsa_select` writes the selection snapshot's window and the attention reads it
+         * from there: the post-copy has nothing left to do. A compact tail pass (multiple spans)
+         * and a streamed group keep the copy. */
+        const auto* kb0 = l.sliding ? nullptr : kv_batch(batch, l.attn.kv);
+        const bool direct = !l.sliding && lp.select && !rows.ids && !(kb0 && kb0->stream) &&
+                            m.df.snaps((int)i);
+        SelOut so{};
+        if (direct) so = m.df.snap_out((int)i);
+        if (!l.sliding && !l.ix.step(c, batch, lp, queries, rows, direct ? &so : nullptr)) return;
         if (!rows.n) {
             const auto* kb = kv_batch(batch, l.attn.kv);
             if (!l.j_mid && kb && kb->stream) kv_stage_next(c, l.attn.kv, l.attn.layer);
             return;
         }
-        if (!l.sliding) m.df.snap_step(c, (int)i, m.iw, lp.select, rows);
+        if (!l.sliding) m.df.snap_step(c, (int)i, m.iw, lp.select, rows, direct);
         const bool jm = (bool)l.j_mid;
         const bool je = (bool)l.j_end;
-        l.attn.core(c, batch, lp, m.iw.sel, m.iw.len, m.iw.nsel, jm, queries, rows);
+        l.attn.core(c, batch, lp, direct ? so.sel : m.iw.sel, m.iw.len,
+                    direct ? so.nsel : m.iw.nsel, jm, queries, rows,
+                    direct ? so.first : 0, direct ? so.first : 0);
         if (rows.ids)
             rows.spans([&](int64_t src, int64_t dst, int64_t n) {
                 move_rows(c, m.pack_h, m.tr.h, s.hc * E, src, dst, n);
