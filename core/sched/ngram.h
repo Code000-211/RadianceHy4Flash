@@ -71,6 +71,12 @@ public:
      * `n` tokens, or -1. Visible for tests; propose() calls it after indexing. */
     int64_t find_suffix(const TokenSeq& seq, int n) const;
 
+    /* The index describes its tokens, not its request: a copy built over a prompt serves another
+     * request whose sequence starts with the same tokens (Scheduler's suffix stash). */
+    void set_owner(uint64_t owner) { owner_ = owner; }
+    /* Every entry as (end, n), sorted: the index's contents whatever its table's shape. Tests. */
+    std::vector<uint64_t> contents() const;
+
     int64_t indexed() const { return filled_; }   /* n-grams ending before this are in */
     int64_t entries() const { return entries_; }
     size_t  bytes() const { return tab_.capacity() * sizeof(uint32_t); }

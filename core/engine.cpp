@@ -1427,6 +1427,7 @@ int Engine::step_loop() {
                 continue;
             }
             expire_tick(rad_mono_ns());
+            pcache_tick(rad_mono_ns());
             loan_tick(/*idle=*/true);
             xflex_tick(/*busy=*/false);
             /* A request (or a cancel, a park, a quiet call) wakes the wait at once; otherwise it
@@ -2920,6 +2921,9 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
         b->restore_fn = [this, b](const Request& req, bool whole_only) -> RestoreResult {
             const uint64_t t0 = rad_mono_ns();
             PrefixCache& pc = ranks_[0]->prefix;
+            /* --prefix-cache-dir: what the chain holds only on disk is read into host memory
+             * first, so the restore below promotes it like any host entry. */
+            pcache_page_in(req);
             /* Room is made before anything is planned (PCBinding::restore_plan): a chain the free
              * list cannot hold would otherwise come back only as far as it reaches. One block
              * table serves every rank, so what rank 0's cache gives up is room on every rank. */
@@ -3072,6 +3076,10 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
     loop_status_.store(RAD_OK, std::memory_order_release);
     done_.reserve((size_t)cfg_.max_seqs);
 
+    ranks_[0]->prefix.set_lrfu_half_life((double)cfg_.prefix_cache_lrfu_half_life_s);
+    RAD_TRY(pcache_open());
+    gsuffix_open();
+
     rank_threads_.clear();
     for (int i = 0; i < cfg_.tp; ++i)
         rank_threads_.emplace_back([this, i] {
@@ -3111,6 +3119,9 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
     if (stepper.joinable()) stepper.join();
     for (auto& t : rank_threads_) if (t.joinable()) t.join();
     rank_threads_.clear();
+    /* --prefix-cache-dir: the cache goes to disk now that nothing runs. */
+    pcache_flush(/*final=*/true);
+    gsuffix_save(/*final=*/true);
     xstats_close();
     if (rtrace_) rtrace_->close();
     /* A step-loop error takes precedence over the transport's status. */

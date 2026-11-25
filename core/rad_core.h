@@ -1070,6 +1070,23 @@ struct Config {
     /* Seconds an unused conversation is kept in any tier (VRAM, host memory, its snapshots). 0
      * keeps everything until the memory is needed. */
     int64_t prefix_cache_ttl = 3600;
+    /* --prefix-cache-dir: keep the cache across restarts (core/mem/pcstore.h). Written on a clean
+     * stop and, every --prefix-cache-flush-s seconds the server is idle with something new, read
+     * back lazily at the next start. Empty is off. Needs the host tier (--prefix-cache-mib). */
+    std::string prefix_cache_dir;
+    /* The store's size in MiB; 0 is the host tier plus the snapshot store. */
+    int64_t prefix_cache_dir_mib = 0;
+    /* Seconds between idle flushes; 0 writes only at a clean stop. */
+    int64_t prefix_cache_flush_s = 600;
+    /* What the store may write in an hour of idle flushes, MiB (a token bucket holding one hour);
+     * 0 unbounded. The write at a clean stop is not held to it, but counts against it. */
+    int64_t prefix_cache_dir_write_mib_per_hour = 4096;
+    /* The LRFU half-life entries, snapshots and suffix responses are scored with, seconds. */
+    int64_t prefix_cache_lrfu_half_life_s = 6 * 3600;
+    /* Admission (core/mem/pcstore.h PcPolicy): a new item goes to disk when reused, on a
+     * conversation of at least this many tokens, or at a clean stop when used within active_s. */
+    int64_t prefix_cache_dir_long_tokens = 32768;
+    int64_t prefix_cache_dir_active_s = 3600;
 
     /* The cache always lends; there is no flag. It keeps the blocks in use plus a derived buffer
      * and lends the rest to the expert plane at addresses it already owns (core/mem/kv.h). The
@@ -1170,6 +1187,11 @@ struct Config {
     int         draft_suffix_min_match = 6;
     int         draft_suffix_max = 7;
     float       draft_suffix_min_score = 0.3f;
+    /* --draft-suffix-global-mib N (core/sched/gsuffix.h): also propose from a cache of earlier
+     * responses across requests, up to N MiB, and verify whichever chain expects more accepted
+     * tokens. Default 256 (with --draft-suffix on); 0 is off. Kept across restarts in
+     * --prefix-cache-dir when that is set, under its own key (the vocabulary). */
+    int64_t     draft_suffix_global_mib = 256;
     /* The head's own rounds when --draft-suffix raised `n_spec` (the verify window) past them; 0 =
      * `n_spec` (set by the engine, not a flag). */
     int         n_spec_head = 0;
