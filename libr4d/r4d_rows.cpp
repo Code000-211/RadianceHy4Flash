@@ -9957,7 +9957,7 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cMoeGemmIqr), NOTUNE,
   nullptr, nullptr, r4d_rad_moe_gemm_iqr_gated, r4d_rad_moe_gemm_iqr_gated_scratch,
-  r4d_rad_layout_moe_iqr_gated, r4d_rad_relayout_moe_iqr_gated, nullptr,
+  r4d_rad_layout_moe_iqr_gated, r4d_rad_relayout_moe_iqr_gated, r4d_shape_moe_gemm_q_gated,
   r4d_rad_unrelayout_moe_iqr_gated, r4d_fuse_moe_gemm_q_gated },
 
 { "moe_gemm_iqr_gated_mod4", "moe_gemm_q_gated_mod4", "moe",
@@ -9968,7 +9968,8 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cMoeGemmIqr), NOTUNE,
   nullptr, nullptr, r4d_rad_moe_gemm_iqr_gated_mod4, r4d_rad_moe_gemm_iqr_gated_scratch,
-  r4d_rad_layout_moe_iqr_gated_mod4, r4d_rad_relayout_moe_iqr_gated_mod4, nullptr,
+  r4d_rad_layout_moe_iqr_gated_mod4, r4d_rad_relayout_moe_iqr_gated_mod4,
+  r4d_shape_moe_gemm_q_gated_mod4,
   r4d_rad_unrelayout_moe_iqr_gated_mod4, r4d_fuse_moe_gemm_q_gated_mod4 },
 
 { "moe_gemm_w4a8i8", "moe_gemm_q", "moe",

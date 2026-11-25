@@ -1086,6 +1086,9 @@ int r4d_shape_moe_scatter    (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_moe_gemm_q     (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_moe_gemm_q_mod4(const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_moe_gemm_i8     (const RadParam*, int, int operand, RadOpdDesc*);
+/* The gated form writes the codes in place of the pair's plane; `parts` the gate's copy. */
+int r4d_shape_moe_gemm_q_gated      (const RadParam*, int, int operand, RadOpdDesc*);
+int r4d_shape_moe_gemm_q_gated_mod4 (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_moe_gemm_i8_mod4(const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_moe_gather     (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_scale_rows     (const RadParam*, int, int operand, RadOpdDesc*);
