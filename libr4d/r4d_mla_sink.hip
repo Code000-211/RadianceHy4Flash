@@ -68,11 +68,6 @@ constexpr int D = 512, RD = 64, W = D + RD, PART = D + 4;
 /* Row pitch of a staged token in LDS: 576 + 8, so consecutive rows do not share a bank pattern. */
 constexpr int kPitch = W + 8;
 constexpr int kPieces = 16 * W / 8; /* 16-byte pieces of a 16-token chunk */
-/* The value tile (`vt`): a chunk's 16 tokens a column, so a column is 32 bytes and the value
- * product's fragment -- a lane's tokens 4(lane>>4)+0..3 and +8..11 of one column -- is the two
- * 8-byte groups `frag` reads. 16.4 KiB next to the key tile (perf.md 3.4.2). */
-constexpr int kVToks = 16;
-constexpr int kColPiece = D / 8; /* 16-byte column pieces of the latent in a token's row */
 /* Super-chunks: 64 tokens with a window, 128 at window 0 and in the selection form. A lone
  * workgroup takes about 1.8 us a 16-token chunk (gfx1201), so a decode row's time is the chunks of
  * one super-chunk; more of them cost the partials' write and merge. The merge holds kMaxSplits. */
@@ -164,28 +159,6 @@ __device__ __forceinline__ float sink_inv(float m, float d, float sink) {
     return c / fmaf(d, c, expf(sink - top));
 }
 
-/* One column piece of the value tile, from the eight key pieces a staging thread holds: piece i is
- * token tok0 + i's columns [col0, col0 + 8). The transposition is one v_perm_b32 a dword, because a
- * column's tokens 2k and 2k+1 are the two halves of their dwords: perm(a, b, sel) takes its low 16
- * bits from b and its high from a, so {token 2k+1, token 2k} of a column is one perm of the two.
- * Four perms a column, eight columns: 32 a staging thread, against the eight scalar u16 reads the
- * value fragment costs a lane a chunk otherwise. */
-__device__ __forceinline__ void sink_vt_piece(uint16_t* vt, int col0, int tok0, const uint4* r) {
-    constexpr unsigned kSelLo = 0x05040100u, kSelHi = 0x07060302u; /* u16 0 / u16 1 of a dword */
-    const uint32_t* const d = (const uint32_t*)r; /* constant indices only: keeps the pieces in VGPRs */
-#pragma unroll
-    for (int w = 0; w < 4; ++w)
-#pragma unroll
-        for (int j = 0; j < 2; ++j) {
-            const unsigned sel = j ? kSelHi : kSelLo;
-            const uint4 c = make_uint4(__builtin_amdgcn_perm(d[4 * 1 + w], d[4 * 0 + w], sel),
-                                       __builtin_amdgcn_perm(d[4 * 3 + w], d[4 * 2 + w], sel),
-                                       __builtin_amdgcn_perm(d[4 * 5 + w], d[4 * 4 + w], sel),
-                                       __builtin_amdgcn_perm(d[4 * 7 + w], d[4 * 6 + w], sel));
-            *(uint4*)(vt + (col0 + 2 * w + j) * kVToks + tok0) = c;
-        }
-}
-
 /* FUSED: the fused form (m.fused), its own instance so its accumulator's registers do not touch
  * the other forms' schedule. */
 template <int HG, bool WIDE, bool SEL, bool FUSED>
@@ -194,25 +167,11 @@ __device__ __forceinline__ void mla_sink_rows_body(
     const int* cu, const int* len, const float* sinks, uint16_t* out, float* scratch, SinkMeta m) {
     constexpr int NT = HG * 128, LOADS = (kPieces + NT - 1) / NT;
     static_assert(LOADS <= 32, "staged mask bits");
-    /* The column-major value tile (perf.md 3.4.2): 16.4 KiB next to the key tile. HG 4's key tile
-     * and partials are 53.5 KiB, so only HG 1 and 2 carry it (57.9 / 62.0 KiB, two workgroups a WGP
-     * -- single-buffering the key tile, K-41, gives HG 4 the room). Its staging unit is one column
-     * piece of eight tokens, so a workgroup must hold the latent's 128 units. */
-    constexpr bool VT = HG <= 2;
-    constexpr int kLatUnits = kColPiece * (kVToks / 8); /* 128: a column piece of a token half */
-    constexpr int kRope = (RD / 8) * kVToks;            /* 128 rope columns, no value product */
-    static_assert(kLatUnits * 8 + kRope == kPieces, "the staging covers a chunk's pieces once");
-    static_assert(!VT || NT >= kLatUnits, "the latent's staging units fit a workgroup");
     __shared__ __align__(16) uint16_t keys[2][16 * kPitch];
-    __shared__ __align__(16) uint16_t vt[VT ? D * kVToks : 1];
     __shared__ __align__(32) float partial[HG * 4][32 * 8];
     __shared__ int visible[2][16];
     __shared__ long rows_at[2][16];
     __shared__ int span_pages[kSpanPages];
-    static_assert(!VT || sizeof(keys) + sizeof(vt) + sizeof(partial) + sizeof(visible) +
-                              sizeof(rows_at) + sizeof(span_pages) <=
-                          64 * 1024,
-                  "the value tile fits a workgroup's LDS");
     const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5, quarter = wave & 3,
               group = wave >> 2, r = blockIdx.x, split = blockIdx.z;
     const int head = blockIdx.y * 16 * HG + group * 16 + (lane & 15);
@@ -310,75 +269,31 @@ __device__ __forceinline__ void mla_sink_rows_body(
                    ? (long)page * m.kp + (long)(token & (m.bs - 1)) * m.kt
                    : -1;
     };
-    uint4 staged[VT ? 9 : LOADS];
+    uint4 staged[LOADS];
     unsigned staged_ok = 0;
-    /* A latent staging thread owns column piece tid % 64 of the chunk's token half tid / 64. */
-    const int lat = VT && tid < kLatUnits ? tid : -1, cp = lat & (kColPiece - 1),
-              half = lat / kColPiece;
-    /* The rope pieces ride after the latent's eight: one a thread (HG 1), or the threads the
-     * latent's 128 leave over (HG 2). */
-    const int rope = VT ? (NT > kLatUnits ? tid - kLatUnits : tid) : -1;
-    auto load_piece = [&](uint4& dst, long row, int piece) {
-        const bool ok = row >= 0;
-        const long at = ok ? row + piece * 8 : 0;
-        if constexpr (WIDE) {
-            dst = *(const uint4*)(kv + at);
-            if (!ok) dst = make_uint4(0, 0, 0, 0);
-        } else {
-            uint32_t w[4];
-#pragma unroll
-            for (int i = 0; i < 4; ++i)
-                w[i] = ok ? (uint32_t)kv[at + 2 * i] | (uint32_t)kv[at + 2 * i + 1] << 16 : 0u;
-            dst = make_uint4(w[0], w[1], w[2], w[3]);
-        }
-    };
     auto fetch = [&](int slot) {
-        if constexpr (VT) {
-            if (lat >= 0) {
-#pragma unroll
-                for (int i = 0; i < 8; ++i) {
-                    const long row = rows_at[slot][8 * half + i];
-                    load_piece(staged[i], row, cp);
-                    staged_ok = row >= 0 ? staged_ok | 1u << i : staged_ok & ~(1u << i);
-                }
-            }
-            if (rope >= 0 && rope < kRope) {
-                const long row = rows_at[slot][rope / 8];
-                load_piece(staged[8], row, kColPiece + (rope & 7));
-            }
-        } else {
 #pragma unroll
         for (int j = 0; j < LOADS; ++j) {
             const int flat = tid + j * NT;
             if (LOADS * NT > kPieces && flat >= kPieces) continue;
             const int piece = flat % (W / 8);
             const long row = rows_at[slot][flat / (W / 8)];
-            load_piece(staged[j], row, piece);
-            staged_ok = row >= 0 ? staged_ok | 1u << j : staged_ok & ~(1u << j);
-        }
+            const bool ok = row >= 0;
+            const long at = ok ? row + piece * 8 : 0;
+            if constexpr (WIDE) {
+                staged[j] = *(const uint4*)(kv + at);
+                if (!ok) staged[j] = make_uint4(0, 0, 0, 0);
+            } else {
+                uint32_t w[4];
+#pragma unroll
+                for (int i = 0; i < 4; ++i)
+                    w[i] = ok ? (uint32_t)kv[at + 2 * i] | (uint32_t)kv[at + 2 * i + 1] << 16 : 0u;
+                staged[j] = make_uint4(w[0], w[1], w[2], w[3]);
+            }
+            staged_ok = ok ? staged_ok | 1u << j : staged_ok & ~(1u << j);
         }
     };
     auto stash = [&](int b) {
-        if constexpr (VT) {
-            if (lat >= 0) {
-#pragma unroll
-                for (int i = 0; i < 8; ++i) {
-                    const int token = 8 * half + i;
-                    *(uint4*)(keys[b] + token * kPitch + cp * 8) = staged[i];
-                }
-                sink_vt_piece(vt, cp * 8, 8 * half, staged);
-                /* The row-major key tile's first piece names the token's visibility: one thread a
-                 * half, both halves of the chunk covered. */
-                if (!cp)
-#pragma unroll
-                    for (int i = 0; i < 8; ++i)
-                        visible[b][8 * half + i] = (int)(staged_ok >> i & 1u);
-            }
-            if (rope >= 0 && rope < kRope) {
-                const int token = rope / 8;
-                *(uint4*)(keys[b] + token * kPitch + (kColPiece + (rope & 7)) * 8) = staged[8];
-            }
-        } else {
 #pragma unroll
         for (int j = 0; j < LOADS; ++j) {
             const int flat = tid + j * NT;
@@ -386,7 +301,6 @@ __device__ __forceinline__ void mla_sink_rows_body(
             const int token = flat / (W / 8), piece = flat % (W / 8);
             *(uint4*)(keys[b] + token * kPitch + piece * 8) = staged[j];
             if (!piece) visible[b][token] = (int)(staged_ok >> j & 1u);
-        }
         }
     };
     v8f value[8];
@@ -522,18 +436,12 @@ __device__ __forceinline__ void mla_sink_rows_body(
         pl.w[3] = low ? lx1 : plo[3];
 #pragma unroll
         for (int mt = 0; mt < 8; ++mt) {
-            const auto v = VT ? frag(vt, kVToks, quarter * 128 + mt * 16, 0, lane)
-                              : fragT(tile, kPitch, quarter * 128 + mt * 16, 0, lane);
+            const auto v = fragT(tile, kPitch, quarter * 128 + mt * 16, 0, lane);
             value[mt] *= alpha;
             value[mt] = mma(v, ph.f, value[mt]);
             value[mt] = mma(v, pl.f, value[mt]);
         }
-        if (more) {
-            /* The value tile is single-buffered, so the next chunk's stash waits for every wave's
-             * value product; the key tile is double-buffered and needs no barrier here. */
-            if constexpr (VT) __syncthreads();
-            stash(buf ^ 1);
-        }
+        if (more) stash(buf ^ 1);
         if (tid < 16) rows_at[buf][tid] = ahead;
         __syncthreads();
         buf ^= 1;
