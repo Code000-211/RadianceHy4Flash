@@ -414,6 +414,13 @@ struct DeviceBackend {
      * packet. Null on a backend that keeps none. */
     void    (*stream_counts)(int device, int* open, int* idle);
     int     (*stream_trim)(int device, int keep);
+
+    /* ---- the device code the card holds: the total size of the code objects loaded on card
+     * `device`, and how many modules they came from. A module loads whole at its first kernel
+     * (module_load in aql.cpp), so this is what a build carrying forms the model never launches
+     * costs the card -- the part of the budget's `already held` a deployment could give back.
+     * RAD_E_UNSUPPORTED on a backend that loads no device code. (M-14) */
+    int (*code_resident)(int device, int64_t* bytes, int* modules);
 };
 
 
@@ -442,6 +449,11 @@ int     dev_vram_used(int device, int64_t* out);
  * every plugin runs (1). */
 size_t  dev_code_mark();
 int     dev_code_runs(size_t from, size_t to, int device, std::string* why);
+
+/* The current backend's DeviceBackend::code_resident: the bytes of device code resident on
+ * `device` and the modules they came from. Where the backend cannot say, *bytes and *modules keep
+ * whatever the caller put there and the answer is RAD_E_UNSUPPORTED. */
+int     dev_code_resident(int device, int64_t* bytes, int* modules);
 
 /* The current backend's DeviceBackend::integrated. */
 bool    dev_integrated(int device);
@@ -850,6 +862,9 @@ int64_t aql_pageable_bytes(void);
  * build's exported symbols and see every dlopen'ed plugin's device code, card or not. Serves as
  * the host backend's code_mark in a HIP build. */
 size_t  aql_code_registered(void);
+/* The same for DeviceBackend::code_resident: the code objects the AQL backend has loaded, for the
+ * host backend running beside HIP, whose device code is the AQL one's. */
+int     aql_code_resident(int device, int64_t* bytes, int* modules);
 #endif
 
 /* ------------------------------------------------------------------ the error slot */

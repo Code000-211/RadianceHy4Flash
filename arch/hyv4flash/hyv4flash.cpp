@@ -57,6 +57,7 @@
 #include "hyv4flash_calib.h"
 #include "hyv4flash_vision.h"
 #include "hyv4flash_dfly.h"
+#include <arch/rad_block_hc.h>   // HcProject; hyv4flash_common.h imports rad::arch
 
 #include "chat.h"
 
@@ -134,6 +135,14 @@ inline bool& pipe_said() {
     return said;
 }
 
+/* Rows the control-vector derivation tap holds. Every collection prompt is under this many
+ * tokens (the chat template included), and the probe reads the same count back. */
+constexpr int64_t kCvecTapRows = 192;
+/* Most directions per layer the plugin will declare. The package's rank is bounded here so the
+ * chained projection count is a compile-time array; a larger file steers its first kMaxCvecRank
+ * directions and says so. */
+constexpr int64_t kMaxCvecRank = RAD_CONTROL_VECTOR_MAX_RANK;
+
 struct Layer {
     bool sliding = false;
     int engram = -1;      /* index into Model::engrams, -1 for none */
@@ -148,6 +157,13 @@ struct Layer {
     /* The iHC junctions (WP16.2): attention -> feed-forward, and the feed-forward -> the next
      * layer's attention (or the head; tail 0 when an Engram opens the next layer). */
     Junction j_mid{}, j_end{};
+    /* Control-vector projections of the wide stream, after this layer's final write. Up to
+     * kMaxCvecRank chained directions; inert when no vector is loaded, this layer is outside its
+     * range, or no row asked for it. */
+    HcProject proj[kMaxCvecRank]{};
+    /* The same stream a projection would read, for deriving a vector offline
+     * (RADIANCE_HY4_TAPS=1 + RADIANCE_DUMP_BUF=dbg.cvec.<l>:<rows>). Off, not declared. */
+    Tap t_cvec{};
 };
 
 struct Model {
@@ -181,6 +197,8 @@ struct Model {
      * zeros (RadBatch::mm_rows), and the embedding here is replicated, so the rows are summed
      * over the ranks (exactly: one non-zero term) before they replace the lookup's. */
     rad_buf mm_rows = 0;
+    rad_buf proj_on = 0;   /* [T] int32: 1 = project this row this step */
+    int64_t proj_rank = 1; /* direction GROUPS per layer declared from ctx->cvec (clamped) */
     rad_op op_mm_scatter = 0, op_mm_copy = 0, op_mm_reduce = 0;
     rad_buf tail_meta = 0;
     rad_op pack_h = 0, pack_post = 0, unpack_hidden = 0;
@@ -732,7 +750,8 @@ static int buffers(RadBuilder* b, Model& m) {
     return RAD_OK;
 }
 
-static int trunk_layer(RadBuilder* b, Model& m, int l, MoeFP8::Src* msrc) {
+static int trunk_layer(RadBuilder* b, Model& m, int l, MoeFP8::Src* msrc,
+                       const RadControlVector* cvec) {
     Names& nm = m.nm;
     const Shape& s = m.s;
     const Geom& g = m.g;
@@ -870,6 +889,19 @@ static int trunk_layer(RadBuilder* b, Model& m, int l, MoeFP8::Src* msrc) {
             RAD_ARCH_TRY(lay.j_end.declare(b, s, g, T, m.tr, lay.ffn.junction_a(),
                                            lay.ffn.junction_b(), lay.ffn.post_gain, nullptr, 0, 0,
                                            lay.ffn.op_join, lay.ffn.op_ar, nullptr));
+    /* The projection reads the streams after this layer's final write, so it is declared after
+     * j_end / hc_ffn.declare_post and before the next reader, t_resid. */
+    for (int64_t k = 0; k < m.proj_rank; ++k)
+        RAD_ARCH_TRY(lay.proj[k].declare(b, nm.f("blk.%lld.proj.%lld", (long long) l, (long long) k),
+                                         g, l, cvec, m.proj_on, m.tr.h, s.hc, k));
+    /* The stream the projection reads, for deriving a vector from real prompts. Gated by
+     * RADIANCE_HY4_CVEC_TAPS, not RADIANCE_HY4_TAPS: the full tap set costs a ~12.4 GiB arena. */
+    /* Gate the declare itself, not Tap::declare's `force`: `force` is checked only when taps are
+     * off, so passing cvec_taps_on() there declared the cvec buffer under plain
+     * RADIANCE_HY4_TAPS=1 as well, adding ~225 MB to an arena that already does not fit. */
+    if (cvec_taps_on())
+        RAD_ARCH_TRY(lay.t_cvec.declare(b, nm, kCvecTapRows, "cvec", l, RAD_BF16, s.hc * E,
+                                        m.tr.h, true));
     RAD_ARCH_TRY(lay.t_resid.declare(b, nm, T, "resid", l, RAD_BF16, s.hc * E, m.tr.h));
     RAD_ARCH_TRY(m.calib.layer(b, g, s, l, m.tr.xn, lay.attn, !lay.sliding, lay.ffn,
                                lay.engram >= 0 ? &m.engrams[(size_t)lay.engram] : nullptr));
@@ -1047,6 +1079,28 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     const bool vit = vit_weights && !why_not;
     s.mrope = vit;
     RAD_ARCH_TRY(buffers(b, m));
+    m.proj_on = HcProject::declare_mask(b, nm.f("projection_on"), g, ctx->cvec);
+    /* Directions per layer, clamped to the array the Layer holds. */
+    if (ctx->cvec && ctx->cvec->dir) {
+        m.proj_rank = ctx->cvec->rank > 0 ? ctx->cvec->rank : 1;
+        /* A per-stream package carries one direction per stream inside each group, so the number
+         * of chained projections is the group count, not the row count. */
+        if (ctx->cvec->per_stream) {
+            if (m.proj_rank % s.hc != 0) {
+                fprintf(stderr, "radiance: a per-stream control vector of %lld rows a layer does "
+                                "not split into this model's %lld streams\n",
+                        (long long) m.proj_rank, (long long) s.hc);
+                return RAD_E_INVAL;
+            }
+            m.proj_rank /= s.hc;
+        }
+        if (m.proj_rank > kMaxCvecRank) {
+            fprintf(stderr, "radiance: control vector declares %lld directions per layer; "
+                            "steering the first %lld\n",
+                    (long long) m.proj_rank, (long long) kMaxCvecRank);
+            m.proj_rank = kMaxCvecRank;
+        }
+    }
     const int64_t T = g.max_tok, E = s.n_embd;
     m.embed = mk(b, "embed_lookup",
                  { RAD_RANGE("M", 1, T), RAD_INT("n_embd", E), RAD_INT("n_vocab", s.n_vocab),
@@ -1099,7 +1153,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
      * levels by declaring it again at smaller steps -- a floor in the declare dropped them. The
      * step adds its own half, and a library that serves no narrow reduction clears this below. */
     m.pipe_on = pipe_env_on() && g.world > 1 && !taps_on() && calib_dir() == nullptr;
-    for (int l = 0; l < (int)s.n_layer; ++l) RAD_ARCH_TRY(trunk_layer(b, m, l, &msrc[(size_t)l]));
+    for (int l = 0; l < (int)s.n_layer; ++l)
+        RAD_ARCH_TRY(trunk_layer(b, m, l, &msrc[(size_t)l], ctx->cvec));
 
     /* The head: the streams' collapse, the final norm, the lm_head over the sampled rows. */
     RAD_ARCH_TRY(m.hc_head.declare(b, nm, s, T, nm.f("hc_head"), "model.hc_head.hc_head_fn",
@@ -1459,6 +1514,8 @@ static void step(RadCtx* c, const RadBatch* batch) {
             pipe_join(c);
             pipe_issue(c, [&] { l.j_end.step(c, n0, n1, pipe_lane()); });
             pipe_join(c);
+            for (int64_t k = 0; k < m.proj_rank; ++k) l.proj[k].step(c, batch, 0, rows.n);
+            l.t_cvec.step(c, brows(m.tr.h, rows.n), rows.n);
             entered = je && l.j_end.tail;
             continue;
         }
@@ -1469,6 +1526,8 @@ static void step(RadCtx* c, const RadBatch* batch) {
         }
         m.calib.after_ffn(c, (int)i, rows.n);
         if (!je) l.hc_ffn.post_add(c, m.tr.y, m.tr.post, m.tr.h, rows.n);
+        for (int64_t k = 0; k < m.proj_rank; ++k) l.proj[k].step(c, batch, 0, rows.n);
+        l.t_cvec.step(c, brows(m.tr.h, rows.n), rows.n);
         l.t_resid.step(c, brows(m.tr.h, rows.n), rows.n);
         entered = je && l.j_end.tail;
     }
@@ -1528,6 +1587,8 @@ static int probe(const RadModelMeta* meta, RadArchProbe* out) {
      * request keeps m = 1. S-02b declares the set and reports 1 here when the trunk can stop
      * between two layers (no taps, no calibration window). */
     out->slice_layers_ok = 0;
+    /* The gated streams are projected after every block's write (HcProject). */
+    out->control_vector_ok = 1;
     /* declare() honours RadBuildCtx::shape_probe (probe_model above): the core sizes the arena's
      * levels, lends their tops to the expert slab and arms the prefill stager. */
     {   /* RADIANCE_HY4_SHAPE_PROBE=0: no sizing declares (an A/B switch, hy4-perf). */
