@@ -4050,7 +4050,12 @@ maximum is taken (libref shifts by the maximum of the scores and the sink).
   differ from the key width; `out` has the value's. libr4d's `attn_kv_sink_h256` serves keys and
   values of 256, bf16, any window and up to 65535 heads (bf16 Q.K, f16 P.V, the sink added to the
   denominator at the store); a sequence with `n_s < m_s` cannot be refused on the device and
-  gets zero rows.
+  gets zero rows. It is the kernel's `bq` axis, not a parameter of the op (the core appends the
+  tuned choice to the launch): the query rows a workgroup takes, 64 (8 waves) or 128 (16, the
+  default), `RAD_E_SHAPE` at anything else. A narrower one reads fewer keys it must mask at a
+  sliding window, at the cost of more workgroups, so it moves a row's key tile grid inside this
+  op's prefill bound rather than keeping it byte-equal; `rad-tune` measures both at the model's
+  shapes and picks per window.
 - **`mla_kv_split`** reorders the `kv_b` GEMM output `[N, heads*(k_dim+v_dim)]` and the rotated key
   part `[N, rope_dim]` into `k [N, heads, k_dim + rope_dim]` (the rope part the same for every head)
   and `v [N, heads, v_dim]`. A copy, converted to the outputs' dtype.

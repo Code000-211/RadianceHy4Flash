@@ -6787,6 +6787,24 @@ static const RadConstraint cNemotronRope64[] = { C_IN("dtype", "bf16"), C_GE("M"
 static const RadConstraint cNemotronRope128[] = { C_IN("dtype", "bf16"), C_GE("M", 1), C_LE("M", 2147483647), C_EQ("head_dim",128) };
 static const RadConstraint cNemotronAttn64[] = { C_IN("dtype", "bf16"), C_GE("M", 1), C_LE("M", 2147483647), C_EQ("head_dim",64), C_EQ("causal",0) };
 static const RadConstraint cNemotronAttn128[] = { C_IN("dtype", "bf16"), C_GE("M", 1), C_LE("M", 2147483647), C_EQ("head_dim",128), C_EQ("causal",0) };
+
+/* attn_kv_sink_h256's only axis: the query rows a workgroup (128: 16 waves, 512 threads; 64: 8
+ * waves, 256). A workgroup reads window + bq - 1 keys, of which each of its rows sees `window`, so
+ * at window 512 the share read and masked falls from 20 % to 11 % with 64 rows; the narrower
+ * workgroup moves a row's key tile grid with it, so the axis trades a little arithmetic for time
+ * rather than time alone. Both points stay inside this op's prefill bound against libref, which is
+ * why the axis is legal (perf.md §1, E4); tests/r4d_emu/test_attn_kv_sink.cpp runs both and the two
+ * against each other. The default is the 128-row tile: on one lane (iks, one R9700 at the 210 W cap,
+ * gfx1201, `--perfkvsink 20` in both orders) 64 rows is 4.4-8.8 % faster at window 512 (8.0 % at
+ * 64 heads M 1024, 4.4 % at M 2048) and 2.7-5.3 % slower where every row's mask is the same (window
+ * 0, the dense layers; the one M 512 point there is inside the lane's spread), while the 128-row
+ * point is the pre-change kernel to within the lane's 2 % spread; so the tuner picks it per shape
+ * and the dense path keeps 128. `notes/backlog/closed/K-56b.md` carries the rows and the commands. */
+static const int64_t kAkvSinkBq[] = { 64, 128 };
+static const RadTunable tAttnKvSink[] = {
+  { "bq", kAkvSinkBq, NELEM(kAkvSinkBq), 128, "query rows a workgroup: 128 (16 waves) or 64 (8 waves)" },
+};
+
 static const RadKernelInfo kKernels[] = {
 { "gemm_bf16_pixtral_patch", "gemm_nt", "gemm", "RGB 14x14 patch projection with ordered f32 dots",
   "K=588, M<=INT_MAX, N<=INT_MAX, pitched bf16 rows", "bf16",
@@ -8257,12 +8275,12 @@ R4D_WINSINK_ROW(128, 16, i8kv, i8, cWinH128G16I8, "int8 (an f16 scale of K and o
 
 /* attn_kv_sink: Hy4-flash's non-absorbed prefill over kv_b-expanded keys and values
  * (r4d_attn_kv_sink_h256.hip). head_dim 256 for keys and values alike, any window, any heads up to
- * the grid's 65535. */
+ * the grid's 65535. `bq` is its only axis (tAttnKvSink above). */
 { "attn_kv_sink_h256", "attn_kv_sink", "attn",
   "dense causal WMMA attention over separate key and value rows, a window and a sink a head",
-  "head_dim=256 (keys and values), heads<=65535, any window, ragged cu_q/cu_k, 128 query rows a workgroup",
+  "head_dim=256 (keys and values), heads<=65535, any window, ragged cu_q/cu_k, bq 64 or 128 query rows a workgroup",
   "bf16 q/k/v/out (16-byte aligned rows), f32 sinks; bf16 Q.K, f16 P.V, f32 softmax",
-  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cAttnKvSink), NOTUNE,
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cAttnKvSink), ROW(tAttnKvSink), nullptr,
   nullptr, nullptr, r4d_rad_attn_kv_sink_h256, nullptr, nullptr, nullptr,
   r4d_shape_attn_kv_sink },
 
