@@ -226,9 +226,10 @@ TEST(the_mini_graph_declares_every_layer_kind) {
     CHECK_EQ(count_op(b, "mla_kv_split"), 3);
     CHECK_EQ(count_op(b, "gate_mul"), 3);
     CHECK_EQ(count_op(b, "kv_store"), 3);
-    CHECK_EQ(count_op(b, "qsa_work"), 2);
-    CHECK_EQ(count_op(b, "idx_pool_gated"), 2);
-    CHECK_EQ(count_op(b, "qsa_tail_store"), 2);
+    CHECK_EQ(count_op(b, "qsa_work_pool_tail"), 2);     /* K-24: the key side, fused */
+    CHECK_EQ(count_op(b, "qsa_work"), 0);
+    CHECK_EQ(count_op(b, "idx_pool_gated"), 0);
+    CHECK_EQ(count_op(b, "qsa_tail_store"), 2);         /* the long chunks' rows */
     CHECK_EQ(count_op(b, "idx_score"), 2);
     CHECK_EQ(count_op(b, "qsa_select"), 2);
     CHECK_EQ(count_op(b, "engram_ids"), 2);             /* the decode and the prefill layout */
@@ -473,7 +474,7 @@ TEST(last_layer_keeps_cache_writers_at_chunk_height_and_queries_at_output_height
         CHECK_EQ(height(last.attn.q_a.op_q), 12);
         CHECK_EQ(height(last.attn.kv_a.op), 12);
         CHECK_EQ(height(last.ix.key.op), 12);
-        CHECK_EQ(height(last.ix.op_work), 12);
+        CHECK_EQ(height(last.ix.op_front), 12);
         CHECK_EQ(height(last.ix.op_tail), 12);
         CHECK_EQ(height(last.attn.q_a.op), outputs);
         CHECK_EQ(height(last.ix.op_select), outputs);
@@ -481,6 +482,112 @@ TEST(last_layer_keeps_cache_writers_at_chunk_height_and_queries_at_output_height
         CHECK_EQ(height(last.attn.out.op), outputs);
         CHECK_EQ(height(hyv4flash::models[0]->op_head), outputs);
     }
+}
+
+/* K-24: the key side is one op where the three were. `qsa_work_pool_tail` publishes the work list
+ * (`page`, `bpos`, `nc`) and pools it in one launch, so a step whose chunks cannot outgrow the ring
+ * needs no `qsa_tail_store` either: the kernel stores a chunk's own rows when
+ * `rows <= ring - ratio + 1`, and `T - S + 1` bounds the longest chunk of a step of T tokens over
+ * S sequences. Above that bound the store stays, after every gather of the step. */
+TEST(k24_the_key_side_is_one_op_and_its_tail_store_only_past_the_ring) {
+    RadBuilder b;
+    bf16_encs(&b);
+    auto mk = mini_meta();
+    auto ctx = build_ctx();
+    REQUIRE_EQ(hyv4flash::declare(&b, mk.meta(), &ctx), RAD_OK);
+    const auto& last = hyv4flash::models[0]->layers.back();
+    REQUIRE(last.ix.op_front != 0);          /* the exact form fuses */
+    REQUIRE_EQ(last.ix.op_work, (rad_op)0);
+    REQUIRE_EQ(last.ix.op_pool, (rad_op)0);
+    auto has = [](const RecIssue* i, rad_buf buf) {
+        for (const RadOperand& o : i->opd)
+            if (o.kind == (uint8_t)RAD_OPK_BUF && o.handle == buf) return true;
+        return false;
+    };
+    struct Case { int64_t q, tail; };
+    for (const Case cs : { Case{ 1, 0 }, Case{ 2, 1 }, Case{ 12, 1 } }) {
+        auto k = kit(b, {}, { (int)cs.q });
+        RadCtx c{ .b = &b, .batch = &k->b };
+        hyv4flash::step(&c, &k->b);
+        CHECK(c.step_fail.empty());
+        CHECK_LINT(b, &c);
+        /* the three ops the item fuses are never issued while the fused one is */
+        CHECK(issue_of(b, c, "qsa_work") == nullptr);
+        CHECK(issue_of(b, c, "idx_pool_gated") == nullptr);
+        const RecIssue* f = issue_of(b, c, "qsa_work_pool_tail");
+        REQUIRE(f != nullptr);
+        CHECK_EQ(f->n, cs.q);
+        CHECK(has(f, last.ix.w.page));                 /* the work list travels with the pool */
+        CHECK(has(f, last.ix.w.bpos));
+        CHECK(has(f, last.ix.w.nc));
+        CHECK(has(f, last.ix.w.tk));                   /* the keys it reads come from the step */
+        CHECK_EQ(issue_of(b, c, "qsa_tail_store") != nullptr, cs.tail != 0);
+    }
+}
+
+/* K-24, the other side of the same switch: the fused key side is one library's row, not a property
+ * of the model, so a library that does not carry it (libref, libavx, a libr4d older than the
+ * kernel) must still get a hyv4flash that declares -- and it declares the three ops, which are the
+ * reference path (docs/OPS.md). The fused op is asked for only where one serves it
+ * (rad_op_declared), which is why hyv4flash_convert_test declares on the host backend at all. */
+TEST(k24_a_library_without_the_fused_key_side_keeps_the_three_ops) {
+    RadBuilder b;
+    bf16_encs(&b);
+    b.undeclared.insert("qsa_work_pool_tail");
+    auto mk = mini_meta();
+    auto ctx = build_ctx();
+    REQUIRE_EQ(hyv4flash::declare(&b, mk.meta(), &ctx), RAD_OK);
+    const auto& last = hyv4flash::models[0]->layers.back();
+    CHECK_EQ(last.ix.op_front, (rad_op)0);
+    REQUIRE(last.ix.op_work != 0);
+    REQUIRE(last.ix.op_pool != 0);
+    REQUIRE(last.ix.op_tail != 0);
+    auto k = kit(b, {}, { 1 });
+    RadCtx c{ .b = &b, .batch = &k->b };
+    hyv4flash::step(&c, &k->b);
+    CHECK(c.step_fail.empty());
+    CHECK_LINT(b, &c);
+    CHECK_EQ(issue_of(b, c, "qsa_work_pool_tail"), nullptr);
+    const RecIssue* w = issue_of(b, c, "qsa_work");
+    const RecIssue* p = issue_of(b, c, "idx_pool_gated");
+    REQUIRE(w != nullptr);
+    REQUIRE(p != nullptr);
+    /* the pool is issued over the work list qsa_work filled in, which is what the fused op does in
+     * shared memory instead */
+    CHECK(w->opd[7].handle == p->opd[0].handle);
+    CHECK(p->opd[5].handle == w->opd[9].handle);   /* its positions are qsa_work's bpos */
+    CHECK(p->opd[6].handle == w->opd[8].handle);   /* and its page, qsa_work's page */
+    /* and the tail's rows are copied beside them, as before K-24 */
+    CHECK(issue_of(b, c, "qsa_tail_store") != nullptr);
+}
+
+/* And the third case between them: a library that *declares* the fused key side -- libr4d does --
+ * need not serve every geometry of it. Its kernel is compiled for the indexer the model has (n
+ * 128, the row's constraint), where the conversion tests build 16-wide ones, so `mk` returns a
+ * null handle there; that is the three-op path's cue, not a missing library, and declaring it is
+ * not an error (`rad_op_resolved`, abi/rad_builder.h). A `HY4_NEED` on that handle would fail
+ * every narrow declare instead. */
+TEST(k24_a_declared_but_unserved_fused_key_side_still_declares) {
+    RadBuilder b;
+    bf16_encs(&b);
+    b.refuse.insert("qsa_work_pool_tail");
+    auto mk = mini_meta();
+    auto ctx = build_ctx();
+    REQUIRE_EQ(hyv4flash::declare(&b, mk.meta(), &ctx), RAD_OK);
+    const auto& last = hyv4flash::models[0]->layers.back();
+    CHECK_EQ(last.ix.op_front, (rad_op)0);
+    REQUIRE(last.ix.op_work != 0);
+    REQUIRE(last.ix.op_pool != 0);
+    REQUIRE(last.ix.op_tail != 0);
+    auto k = kit(b, {}, { 1 });
+    RadCtx c{ .b = &b, .batch = &k->b };
+    hyv4flash::step(&c, &k->b);
+    CHECK(c.step_fail.empty());
+    CHECK_LINT(b, &c);
+    CHECK_EQ(issue_of(b, c, "qsa_work_pool_tail"), nullptr);
+    CHECK(issue_of(b, c, "qsa_work") != nullptr);
+    CHECK(issue_of(b, c, "idx_pool_gated") != nullptr);
+    CHECK(issue_of(b, c, "qsa_tail_store") != nullptr);
 }
 
 TEST(compact_dense_prefill_keeps_full_keys_and_restores_gather_indices) {
@@ -1044,7 +1151,8 @@ TEST(the_quantised_indexers_swap_the_key_cache_and_the_score_for_the_dsa_forms) 
         REQUIRE_EQ(rc, RAD_OK);
         CHECK_EQ(count_op(b, "idx_pool_gated_fp8"), m == 1 ? 2 : 0);
         CHECK_EQ(count_op(b, "idx_pool_gated_i8"), i8 ? 2 : 0);
-        CHECK_EQ(count_op(b, "idx_pool_gated"), q ? 0 : 2);
+        CHECK_EQ(count_op(b, "idx_pool_gated"), 0);
+        CHECK_EQ(count_op(b, "qsa_work_pool_tail"), q ? 0 : 2);   /* K-24: exact only */
         CHECK_EQ(count_op(b, "dsa_query"), m == 1 ? 2 : 0);
         CHECK_EQ(count_op(b, "dsa_query_i8"), i8 ? 2 : 0);
         CHECK_EQ(count_op(b, "dsa_score"), q ? 2 : 0);
@@ -1121,7 +1229,7 @@ TEST(the_tower_and_the_three_component_positions) {
             CHECK_EQ(pstr(&o, "mode"), std::string("imrope_gptj"));
             CHECK_EQ(pstr(&o, "sections"), std::string("2 1 1"));
         }
-    CHECK_EQ(pstr(find_op(b, "idx_pool_gated"), "mode"), std::string("imrope_gptj"));
+    CHECK_EQ(pstr(find_op(b, "qsa_work_pool_tail"), "mode"), std::string("imrope_gptj"));
     const RecBuf* bp = find_b(b, "ix.bpos");
     REQUIRE(bp != nullptr);
     CHECK_EQ(bp->d.rank, 2u);
@@ -2793,9 +2901,10 @@ struct Query {
         k->b.positions_h = k->pos.data();
     }
 };
-const char* kTrunkOnly[] = { "qsa_work", "qsa_tail_store", "idx_pool_gated", "idx_score",
-                             "qsa_select", "engram_ids", "ihc_pre", "ihc_post", "idx_pool_gated_fp8",
-                             "dsa_score", "attn_kv_sink", "mla_attn_paged_sink" };
+const char* kTrunkOnly[] = { "qsa_work", "qsa_work_pool_tail", "qsa_tail_store", "idx_pool_gated",
+                             "idx_score", "qsa_select", "engram_ids", "ihc_pre", "ihc_post",
+                             "idx_pool_gated_fp8", "dsa_score", "attn_kv_sink",
+                             "mla_attn_paged_sink" };
 }  // namespace
 
 /* kernels/dfly2.md §3.1: a block drafter of block depth + 1 (the anchor predicts nothing), no cache
