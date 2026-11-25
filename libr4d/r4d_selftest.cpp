@@ -152,6 +152,7 @@ struct Plugin {
     void (*pin_hc_dec)(int) = nullptr;
     long long (*hc_rcp_check)(unsigned, unsigned, long long*) = nullptr;
     void (*pin_qsel)(int) = nullptr;
+    void (*pin_isc)(int) = nullptr;
     void (*pin_mla)(int) = nullptr;
     void (*pin_usel)(int, int) = nullptr;
     int (*usel_geom)(int, int*) = nullptr;
@@ -229,6 +230,7 @@ static bool load(Plugin* pl, const char* path) {
     okall &= sym(pl->h, "r4d_hc_read_pin_decode", &pl->pin_hc_dec);
     okall &= sym(pl->h, "r4d_hc_rcp_check", &pl->hc_rcp_check);
     okall &= sym(pl->h, "r4d_qsa_select_pin_form", &pl->pin_qsel);
+    okall &= sym(pl->h, "r4d_idx_score_pin_form", &pl->pin_isc);
     okall &= sym(pl->h, "r4d_mla_matrix_pin_form", &pl->pin_mla);
     okall &= sym(pl->h, "r4d_attn_usel_gqa12_pin", &pl->pin_usel);
     okall &= sym(pl->h, "r4d_attn_usel_gqa12_geom", &pl->usel_geom);
@@ -19276,13 +19278,18 @@ static void idx_perf(const Plugin& pl, int64_t ctx, int64_t M, int iters) {
     };
     RadTensor sc = T(d_sc, RAD_F32, { M, nb });
     sc.shape[1] = live + 1;
-    const double t_exact =
-        run("idx_score_bf16",
+    auto exact = [&](int form) {
+        if (pl.pin_isc) pl.pin_isc(form);
+        const double t = run("idx_score_bf16",
             { T(d_qb, RAD_BF16, { M, H, n }), T(d_gb, RAD_BF16, { M, H }),
               T(d_kb, RAD_BF16, { pages, 1, 4, n / 4 }), T(d_bt, RAD_I32, { 1, nb }),
               T(d_cu, RAD_I32, { 2 }), T(d_nc, RAD_I32, { 1 }), sc },
             { PI("M", M), PI("n", n), PI("heads", H), PI("blocks", nb), PI("seqs", 1),
               PS("dtype", "bf16") });
+        if (pl.pin_isc) pl.pin_isc(0);
+        return t;
+    };
+    const double t_exact = exact(0), t_row = exact(1), t_tile = exact(2);
     auto quant = [&](const char* qrow, const char* srow, uint32_t qt, const char* dt) {
         const double tq = run(qrow, { T(d_qb, RAD_BF16, { M * H, n }), T(d_qc, qt, { M * H, n }),
                                       T(d_qq, RAD_F32, { M * H, 1 }) },
@@ -19306,7 +19313,8 @@ static void idx_perf(const Plugin& pl, int64_t ctx, int64_t M, int iters) {
               T(d_su, RAD_I32, { M }) },
             { PI("M", M), PI("blocks", nb), PI("topk", topk), PI("ratio", ratio), PI("seqs", 1),
               PI("signed", 1), PI("own", 1) });
-    std::printf("  exact  idx_score                      %9.2f us\n", t_exact);
+    std::printf("  exact  idx_score                      %9.2f us (per-row %.2f, row-tiled %.2f)\n",
+                t_exact, t_row, t_tile);
     std::printf("  fp8    dsa_query %8.2f + dsa_score %9.2f = %9.2f us\n", f8.first, f8.second,
                 f8.first + f8.second);
     std::printf("  int8   dsa_query %8.2f + dsa_score %9.2f = %9.2f us\n", i8.first, i8.second,
@@ -29455,6 +29463,21 @@ static void idx_score_run(const Plugin& pl, const char* what, const std::vector<
            what, (long long)nfin, worst, (long long)inf_bad).c_str(),
        inf_bad == 0 && nbad == 0 && nfin > 0);
 
+    /* The per-row and the row-tiled form, each pinned, give the launcher's bytes. */
+    bool same = pl.pin_isc != nullptr;
+    for (int f = 1; same && f <= 2; ++f) {
+        std::vector<float> o2((size_t)(M * SC), 5.0f);
+        st_memcpy(d_o, o2.data(), o2.size() * 4, hipMemcpyHostToDevice);
+        a.t = ts.data();
+        pl.pin_isc(f);
+        rc = r->launch(&a, nullptr);
+        pl.pin_isc(0);
+        st_stream_sync(nullptr);
+        st_memcpy(o2.data(), d_o, o2.size() * 4, hipMemcpyDeviceToHost);
+        same = rc == RAD_OK && std::memcmp(o2.data(), dev.data(), dev.size() * 4) == 0;
+    }
+    ok(fmt("%s: the per-row and row-tiled forms give the same bytes", what).c_str(), same);
+
     if (!extra) return;
     /* Every row alone (M 1, its own sequence's table) gives the full launch's bytes; and a second
      * launch gives the same bytes. */
@@ -29507,6 +29530,11 @@ static void idx_score_run(const Plugin& pl, const char* what, const std::vector<
 static void idx_score_case(const Plugin& pl) {
     idx_score_run(pl, "idx_score against libref's idx_score", { 5, 1, 70 }, 700, 640, 2000,
                   { 600, 130, 700 }, true);
+    /* Past the row-tiled rule (256 rows): tiles that cross sequences, a one-row sequence between
+     * prefill chunks, one with no live group, M not a multiple of 16, and columns past the table
+     * (`bt` 600 wide, the scores 690). */
+    idx_score_run(pl, "idx_score row-tiled against libref's idx_score", { 1, 260, 1, 3, 37 }, 600,
+                  690, 2000, { 12, 600, 0, 130, 700 }, false);
     /* The 1 M-token geometry (262144 groups a row, ratio 4). */
     idx_score_run(pl, "idx_score at 262144 groups against libref's idx_score", { 2 }, 262144, 262144,
                   262145, { 262144 }, false);

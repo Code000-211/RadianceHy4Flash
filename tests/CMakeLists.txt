@@ -636,7 +636,8 @@ set(R4D_EMU_HIP ${R4D_DIR}/r4d_attn_paged_window.hip ${R4D_DIR}/r4d_pair_argmax_
 list(APPEND R4D_EMU_HIP ${R4D_DIR}/r4d_attn_kv_sink_h256.hip)
 list(APPEND R4D_EMU_HIP ${R4D_DIR}/r4d_ihc_bf16.hip ${R4D_DIR}/r4d_engram_bf16.hip
                         ${R4D_DIR}/r4d_mla_kv_bf16.hip ${R4D_DIR}/r4d_dfly.hip
-                        ${R4D_DIR}/r4d_model_bf16.hip ${R4D_DIR}/r4d_rowtopk_bf16.hip)
+                        ${R4D_DIR}/r4d_model_bf16.hip ${R4D_DIR}/r4d_rowtopk_bf16.hip
+                        ${R4D_DIR}/r4d_idx_score_bf16.hip)
 set(R4D_EMU_TESTS attn pick norm escale qsa lora f32 mhc kda mla moefuse kvres
                   dsa lili vit)
 list(APPEND R4D_EMU_TESTS attn_kv_sink hy4 mla_sink mla_kv row topk)
