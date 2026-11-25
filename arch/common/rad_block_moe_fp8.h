@@ -220,6 +220,12 @@ struct MoeFP8 {
          * this block's Geom is the experts'). 0 means n_embd. With it the router reads
          * Wire::route. The sigmoid router only. */
         int64_t router_k = 0;
+        /* Read the router's projection weight as it is stored, bf16, rather than widened to f32 at
+         * load (GlmRouter::Config::weight_bf16; the projection widens it exactly in the kernel, so
+         * the logits are the f32 path's). It takes effect only when the weight's stored encoding
+         * is bf16, or unknown (a builder with no model behind it); a checkpoint that stores the
+         * router in f32 keeps the f32 weight and kernel path. The sigmoid router only. */
+        bool router_weight_bf16 = false;
         /* The caller reduces the block's delta across ranks, because it applies more linear work
          * to it first (Nemotron-H's latent up-projection); no all-reduce is declared. */
         int     no_reduce = 0;
@@ -335,6 +341,11 @@ struct MoeFP8 {
         ActFP8  sff{};         /* [max_tok, n_ff_shared] */
         rad_buf sout    = 0;   /* [max_tok, n_embd]           bf16 */
         rad_buf sgate   = 0;   /* [max_tok, 1]                bf16 */
+        /* The routed sum's rotated int8 codes and scales, and their scale group (0: off). With them
+         * the gather writes the sum's codes in the launch that sums it (moe_gather_inv_i8g, K-19)
+         * and the linear reading the sum declares no quantiser of its own (`q8`, `s8` and `g8` are
+         * what it reads; `x` is `h`'s). */
+        ActFP8  sum{};
     };
 
     /* Checkpoint names. `experts` is a prefix ("....mlp.experts") from which per-expert names are
@@ -398,8 +409,9 @@ struct MoeFP8 {
     LinearFP8    sh_gate_up{}, sh_down{};
     rad_op op_router = 0, op_topk = 0, op_scatter = 0;
     /* `op_scatter` is moe_scatter_inv and `op_gather` moe_gather_inv: the sort writes `w.inv` and
-     * the gather reads it (Wire::inv). */
-    bool   scatter_inv = false, gather_inv = false;
+     * the gather reads it (Wire::inv). `gather_q8`: `op_gather` is moe_gather_inv_i8g, which also
+     * writes the sum's rotated int8 codes into `w.sum` (K-19). */
+    bool   scatter_inv = false, gather_inv = false, gather_q8 = false;
     /* `router_topk_scatter`, if it resolves: topk and scatter in one launch. The pair is declared
      * either way, since the fused form is bounded by the sort's single workgroup and a prefill
      * chunk exceeds it. */
@@ -530,7 +542,13 @@ struct MoeFP8 {
     int  declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
                  const Wire& wire, const Src& src, bool fold = false, bool add_out = true,
                  int ar_in = kArNone, bool ar_out_ = false);
-    void step(RadCtx* c, const RadBatch* batch) const;
+    /* `side`: an independent chain's ops, issued behind this block's ordered launches (SideOps,
+     * rad_arch.h), for a caller whose shared expert is its own (Config::n_ff_shared 0). The pass
+     * asks for stage k where it issues its own shared arm's stage k (pass()): 0 behind the routed
+     * gate_up (behind the router where `sh_first` would put it), 1 behind the routed quantiser,
+     * 2 behind the routed down (in front of it on an `sh_dn_first` step). A step of more than one
+     * pass asks nothing; the caller issues whatever is left once the block returns. */
+    void step(RadCtx* c, const RadBatch* batch, const SideOps* side = nullptr) const;
     /* A checkpoint inside the step (RadBatch::ckpt_cut): its token on the card, for the routed
      * GEMMs' `split` operand, while step() issues a step that is one pass; null otherwise. Each
      * expert's rows before the checkpoint are then a run of their own, as a step ending there
@@ -538,10 +556,11 @@ struct MoeFP8 {
     mutable const int32_t* split_tok = nullptr;
     /* The block over the first `T` rows of its buffers, for passes that need fewer rows than the
      * batch (the MTP head's history pass reads its output only at drafting rows). */
-    void step_rows(RadCtx* c, int64_t T) const;
+    void step_rows(RadCtx* c, int64_t T, const SideOps* side = nullptr) const;
     /* One pass of at most `c.rows` tokens. `own_ar` false: the caller issues the pass's
-     * all-reduce itself (issue_ar), as GdnFP8::step describes. */
-    void pass(RadCtx* c, int64_t T, int64_t r0, int64_t rows, bool own_ar = true) const;
+     * all-reduce itself (issue_ar), as GdnFP8::step describes. `side`: as step(). */
+    void pass(RadCtx* c, int64_t T, int64_t r0, int64_t rows, bool own_ar = true,
+              const SideOps* side = nullptr) const;
     /* The heat engine's handoff, after a step's last pass (step() says what it reports). */
     void route_report(RadCtx* c) const;
     bool issues_ar(int64_t T, int64_t rows) const {
@@ -903,6 +922,7 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
         rc.experts = c.n_expert_all;
         rc.top_k = c.top_k;
         rc.rows = c.rows;
+        rc.weight_bf16 = c.router_weight_bf16;
         rc.norm = c.norm_topk;
         rc.route_scale = c.route_scale;
         rc.groups = c.n_group;
@@ -1550,6 +1570,25 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
     const bool separate_fp32_combine = shared && c.shared_fp32_combine &&
                                        (g.world > 1 || !c.shared_ungated);
     gfold = shared && !separate_fp32_combine;
+    /* K-19: the gather wave also writes the sum's rotated int8 codes when the linear that reads the
+     * sum takes them (`w.sum.q8`, which ActFP8 leaves 0 until a model declares it). Only the
+     * slot-table form has it, only without the shared arm, and only where the gather writes the sum
+     * itself -- with a separate f32 combine the plane it writes is `w.moe`, an arm's partial, not
+     * the latent `h.x` the codes would have to describe. */
+    if (w.sum.q8 && w.sum.s8 && scatter_inv && !gfold && !separate_fp32_combine) {
+        rad_buf grd[3] = { w.edn, w.ew, w.inv };
+        rad_buf gwr[3] = { w.sum.q8, w.sum.s8, w.h.x };
+        op_gather = RAD_OP(b, "moe_gather_inv_i8g",
+                           RAD_PARAMS(RAD_RANGE("M", 1, c.rows), RAD_INT("n", g.n_embd),
+                                      RAD_INT("top_k", c.top_k), RAD_STR("dtype", g.dtype),
+                                      RAD_INT("group", w.sum.g8)),
+                           RAD_NOWEIGHTS);
+        if (op_gather) {
+            gather_inv = gather_q8 = true;
+            rad_op_reads (b, op_gather, grd, 3);
+            rad_op_writes(b, op_gather, gwr, 3);
+        }
+    }
     for (int form = scatter_inv ? 0 : 1; form < 2 && !op_gather; ++form) {
         rad_buf grd[5] = { w.edn, w.ew, form ? w.sorted : w.inv, w.sout, w.sgate };
         rad_buf gwr[1] = { separate_fp32_combine ? w.moe : w.h.x };
@@ -1620,8 +1659,7 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
         /* An IQR gate_up between the rotated int8 trunk's fed pairs folds SwiGLU and the rotating
          * quantiser into its epilogue, to 16 rows: one launch a layer less than the pair, which
          * stays declared for longer steps, other encodings and a clamped product. */
-        if (sh_limit <= 0 && sh_gate_up.iqr && w.h.q8_fed && w.h.q8_rot && w.sff.q8_fed &&
-            w.sff.q8_rot)
+        if (sh_limit <= 0 && gated_fold_iqr_ok(sh_gate_up, w.h, w.sff, true))
             op_sh_gated = decl_gated_fold_iqr(
                 b, c.rows, sh_gate_up.N, sh_gate_up.K, sh_gate_up.w, sh_gate_up.ws,
                 { w.h.q8, w.h.s8 },
@@ -1844,7 +1882,8 @@ inline void MoeFP8::shared_up(RadCtx* c_, int64_t T, int64_t r0, int64_t rows,
  *
  * The expert buffers are addressed from zero, not `r0`: they are a pass tall and `sorted_tok` is
  * pass-relative. Only step-tall operands (residual stream, normed input) carry the offset. */
-inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool own_ar) const {
+inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool own_ar,
+                         const SideOps* side) const {
     /* `ne` is this rank's expert count, `ne_all` the model's: logits and top-k are model-wide,
      * everything after the scatter is this rank's slice. */
     const int64_t ne = c.n_expert, ne_all = c.n_expert_all, k = c.top_k;
@@ -1937,12 +1976,15 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
      * in turn. Flash-Next's 16- and 32-row verify passes on two R9700: 22.1 -> 21.9 ms and
      * 31.6 -> 30.95 ms. Below, the arm fits inside the routed GEMM's time and stays beside it. */
     const bool sh_first = shared && gu_trellis && rows * k >= kSharedFirstRows;
+    /* A caller's shared arm (`side`) takes the same three places as this block's own. */
+    const bool side_first = side && gu_trellis && rows * k >= kSharedFirstRows;
     /* The routed GEMMs' `split` (split_tok), on a pass that is the whole step. */
     const bool split_on = split_tok && r0 == 0 && rows == T;
     const RadOperand sp = split_on ? praw(split_tok, RAD_I32, 1) : RAD_NONE;
     if (sh_first)
         shared_up(c_, T, r0, rows,
                   (rfused && router_fused_gate) || (sfused && sigmoid_scatter_gate));
+    if (side_first) side->at(0);
     /* Apply the previous layer's prefetch prediction: substitute the copied experts into the
      * tables. */
     (void)rad_expert_prefetch_step(c_, layer);
@@ -1976,8 +2018,10 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
     if (shared && !sh_first)
         shared_up(c_, T, r0, rows,
                   (rfused && router_fused_gate) || (sfused && sigmoid_scatter_gate));
+    if (side && !side_first) side->at(0);
     gq_exp.step(c_, w.egu, rows * k, 0, rows * k);
     if (shared && !(op_sh_gated && rows <= sh_gated_rows)) gq_sh.step(c_, w.sgu, T, r0, rows);
+    if (side) side->at(1);
     /* The shared arm's down projection in front of the routed down GEMM on a step of
      * [sh_down_first_lo, sh_down_first_hi] rows. Behind it (below) the two still run together,
      * but the card launches the arm only once every block of the routed GEMM is on it; at a
@@ -1991,6 +2035,8 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
      * coupling, chain 1 / 2 / 3 (two / three / four rows): -0.28% / -0.21% / -0.25% a step. */
     const bool sh_dn_first = shared && T >= sh_down_first_lo && T <= sh_down_first_hi;
     if (sh_dn_first) sh_down.step(c_, w.sff, w.sout, T, r0, rows);
+    const bool side_dn_first = side && T >= sh_down_first_lo && T <= sh_down_first_hi;
+    if (side_dn_first) side->at(2);
     if (c.expert_bf16)
         RAD_ISSUE_N(c_, op_dn, rows, brows(w.eff.x, rows * k), RAD_WTAB(w_dn[0], ne),
                     brows(w.sorted, rows * k), brows(w.eoff, ne + 1), brows(w.edn, rows * k));
@@ -2031,6 +2077,7 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
                     brows(w.sorted, rows * k), poff, brows(w.edn, rows * k));
     }
     if (shared && !sh_dn_first) sh_down.step(c_, w.sff, w.sout, T, r0, rows);
+    if (side && !side_dn_first) side->at(2);
     /* The calibration tap reads the GEMMs' operands and writes nothing they touch, so it does not
      * change the model's output. */
     if (op_gram_gu && !calib_done) {
@@ -2083,8 +2130,10 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
     if (op_combine || !gather_taken(g, T, gather_out_rows, gather_out_rows6))
         RAD_ISSUE_N(c_, op_gather, rows, brows(w.edn, rows * k), brow_slice(w.ew, r0, rows, k),
                     brows(gather_inv ? w.inv : w.sorted, rows * k),
-                    gfold ? brow_slice(w.sout, r0, rows, g.n_embd) : RAD_NONE,
-                    gfold ? brow_slice(w.sgate, r0, rows, 1) : RAD_NONE,
+                    gather_q8 ? brow_slice(w.sum.q8, r0, rows, g.n_embd)
+                              : (gfold ? brow_slice(w.sout, r0, rows, g.n_embd) : RAD_NONE),
+                    gather_q8 ? brow_slice(w.sum.s8, r0, rows, g.n_embd / w.sum.g8)
+                              : (gfold ? brow_slice(w.sgate, r0, rows, 1) : RAD_NONE),
                     brow_slice(op_combine ? w.moe : w.h.x, r0, rows, g.n_embd));
     if (op_moe_ar)
         RAD_ISSUE_N(c_, op_moe_ar, rows * g.n_embd,
@@ -2150,13 +2199,14 @@ inline void MoeFP8::calib_experts_pass(RadCtx* c_, int64_t slots) const {
     calib_dne.add(staging);
 }
 
-inline void MoeFP8::step(RadCtx* c_, const RadBatch* batch) const {
+inline void MoeFP8::step(RadCtx* c_, const RadBatch* batch, const SideOps* side) const {
     const int64_t T = batch->n_tok, ck = batch->ckpt_cut;
     const bool cut = ck > 0 && ck < T && batch->ckpt_cu;
     if (cut && T > c.rows) {
         /* A checkpoint inside a step wider than a pass: the passes start again at the checkpoint
          * (as HyperConn::read_pieces does), so the rows before it are passed as a chunk ending
-         * there passes them, and the rows after it as the next chunk would. */
+         * there passes them, and the rows after it as the next chunk would. More than one pass:
+         * `side` is asked nothing (step()). */
         for (int64_t a = 0; a < T; a = ck > a ? ck : T) {
             const int64_t b = ck > a ? ck : T;
             for (int64_t r0 = a; r0 < b; r0 += c.rows)
@@ -2168,14 +2218,16 @@ inline void MoeFP8::step(RadCtx* c_, const RadBatch* batch) const {
     /* One pass over the whole step: `split` gives the rows before the checkpoint runs of their
      * own (split_tok). */
     split_tok = cut ? batch->ckpt_cu + 1 : nullptr;
-    step_rows(c_, T);
+    step_rows(c_, T, side);
     split_tok = nullptr;
 }
 
-inline void MoeFP8::step_rows(RadCtx* c_, int64_t T) const {
+inline void MoeFP8::step_rows(RadCtx* c_, int64_t T, const SideOps* side) const {
+    /* `side` only where the step is one pass (step()). */
+    const SideOps* one = T <= c.rows ? side : nullptr;
     for (int64_t r0 = 0; r0 < T; r0 += c.rows) {
         const int64_t n = (T - r0 < c.rows) ? (T - r0) : c.rows;
-        pass(c_, T, r0, n);
+        pass(c_, T, r0, n, true, one);
     }
     route_report(c_);
 }

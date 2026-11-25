@@ -49,6 +49,7 @@
 #include "r4d_fp8_wmma.h"
 #include "r4d_fp8_lm.h"
 #include "r4d_chain.h"
+#include "r4d_keyed.h"
 #include "r4d_iqr.h"
 #include <hip/hip_bf16.h>
 #include <cstdint>
@@ -122,82 +123,20 @@ __device__ __forceinline__ unsigned long long tk_round(unsigned long long* t) {
   return m;
 }
 
-// The body; the plain kernel and its chained form (r4d_chain.h) wrap it below. A wave past the
-// chunks returns early; there is no barrier in it.
-template <int PT>
-__device__ __forceinline__ void r4d_rowtopk_stage1_body(
-    const unsigned short* __restrict__ Y, unsigned long long* __restrict__ P,
-    int N, int RC, int NCH, int CH) {
-  // WPB independent waves per block, each on its own chunk, sharing nothing. Grouping them only
-  // matters because 32-thread blocks exhaust the CU's workgroup slots before its wave slots.
-  const int m = blockIdx.y;
-  const int c = blockIdx.x * R4D_TOPK_WPB + (int)(threadIdx.x >> 5);
-  if (c >= NCH) return;
-  const int lane = threadIdx.x & 31;
-  const int c0 = c * CH;
-  int c1 = c0 + CH;
-  if (c1 > N) c1 = N;
+// One element of the row as stage 1 ranks it. A bf16 plane is read as is. An f32 plane (the
+// cast_row_topk op: a head's f32 logits) is rounded here exactly as `cast` f32 -> bf16 rounds it
+// (r4d_encoder_bf16.hip's narrow_bf16_kernel calls this same f32_to_bf16, NaN included), so the
+// keys, and so every selection and every reported value, are those of the bf16 plane the cast
+// would have written. The cast's launch and its plane are what this saves.
+__device__ __forceinline__ unsigned short tk_bf(unsigned short v) { return v; }
+__device__ __forceinline__ unsigned short tk_bf(float v) { return f32_to_bf16(v); }
 
-  unsigned long long t[PT];
-#pragma unroll
-  for (int q = 0; q < PT; q++) t[q] = 0ull;
-
-  const unsigned short* row = Y + (size_t)m * N;
-  // Eight bf16 per lane per load, so the wave moves 512 contiguous bytes per issue. UNROLL loads
-  // are issued before the first is consumed, since the insert chain would otherwise put a memory
-  // latency between consecutive loads.
-  const int v0 = c0 >> 3, v1 = c1 >> 3;
-  const int step = R4D_TOPK_WAVE * R4D_TOPK_UNROLL;
-  int v = v0 + lane;
-  for (; v + step - R4D_TOPK_WAVE < v1; v += step) {
-    u4v_tk p[R4D_TOPK_UNROLL];
-#pragma unroll
-    for (int u = 0; u < R4D_TOPK_UNROLL; u++)
-      p[u] = *(r4d_tk_gv4)(row + (size_t)(v + u * R4D_TOPK_WAVE) * 8);
-#pragma unroll
-    for (int u = 0; u < R4D_TOPK_UNROLL; u++) {
-      const unsigned base = (unsigned)((v + u * R4D_TOPK_WAVE) * 8);
-#pragma unroll
-      for (int e = 0; e < 4; e++) {
-        tk_insert<PT>(t, tk_key((unsigned short)(p[u][e] & 0xFFFFu), base + 2 * e));
-        tk_insert<PT>(t, tk_key((unsigned short)(p[u][e] >> 16), base + 2 * e + 1));
-      }
-    }
-  }
-  for (; v < v1; v += R4D_TOPK_WAVE) {
-    const u4v_tk p = *(r4d_tk_gv4)(row + (size_t)v * 8);
-    const unsigned base = (unsigned)(v * 8);
-#pragma unroll
-    for (int e = 0; e < 4; e++) {
-      tk_insert<PT>(t, tk_key((unsigned short)(p[e] & 0xFFFFu), base + 2 * e));
-      tk_insert<PT>(t, tk_key((unsigned short)(p[e] >> 16), base + 2 * e + 1));
-    }
-  }
-  for (int i = (v1 << 3) + lane; i < c1; i += R4D_TOPK_WAVE) {
-    tk_insert<PT>(t, tk_key(row[i], (unsigned)i));
-  }
-
-  unsigned long long* out = P + ((size_t)m * NCH + c) * RC;
-  for (int r = 0; r < RC; r++) {
-    const unsigned long long w = tk_round<PT>(t);
-    if (lane == 0) out[r] = w;
-  }
-}
-template <int PT>
-__global__ __launch_bounds__(R4D_TOPK_WAVE * R4D_TOPK_WPB) void r4d_rowtopk_stage1_kernel(
-    const unsigned short* __restrict__ Y, unsigned long long* __restrict__ P,
-    int N, int RC, int NCH, int CH) {
-    r4d_rowtopk_stage1_body<PT>(Y, P, N, RC, NCH, CH);
-}
-template <int PT>
-__global__ __launch_bounds__(R4D_TOPK_WAVE * R4D_TOPK_WPB) void r4dchain_rowtopk_stage1(
-    const unsigned short* __restrict__ Y, unsigned long long* __restrict__ P,
-    int N, int RC, int NCH, int CH) {
-    r4d_chain_wait_vec();
-    r4d_rowtopk_stage1_body<PT>(Y, P, N, RC, NCH, CH);
-    r4d_chain_done();
-}
-
+// The R winners of row m over its n stage-1 survivors at P, written by one wave (`lane` 0..31).
+// Stage 2's kernel runs it with a wave per row; the fused stage 1 runs it in the row's last wave
+// to finish (see r4d_rowtopk_stage1_body). PT is a lane's list, at least R (see the header): 32
+// serves every R, and a launch for R <= 8 or R <= 16 takes the shorter list, whose insert and whose
+// round's shift are that much shorter. The output is the same for any PT >= R.
+//
 // `off` is the first global column this rank's plane stands for, and `OP` the optional (id, value)
 // pair plane an all-gather moves: eight bytes an entry, an int32 id in the first float slot, the
 // layout core/sample/sampler.h holds as buf_pairs_. Both are inert at off = 0 with OP null, which
@@ -206,17 +145,10 @@ __global__ __launch_bounds__(R4D_TOPK_WAVE * R4D_TOPK_WPB) void r4dchain_rowtopk
 // An empty slot is not token `off`. A chunk that ran out of candidates leaves a zero key; OI gets
 // column 0 for it, without the offset, so a pad cannot look like this rank's first real token. The
 // pair plane writes -1, the sentinel the merge drops (not -INFINITY, a valid masked logit).
-// The body; the plain kernel and its chained form (r4d_chain.h) wrap it below. PT is a lane's
-// list, at least R (see the header): 32 serves every R, and a launch for R <= 8 or R <= 16 takes
-// the shorter list, whose insert and whose round's shift are that much shorter. The output is the
-// same for any PT >= R.
 template <int PT>
-__device__ __forceinline__ void r4d_rowtopk_stage2_body(
+__device__ __forceinline__ void r4d_rowtopk_stage2_row(
     const unsigned long long* __restrict__ P, float* __restrict__ OV, int* __restrict__ OI,
-    float* __restrict__ OP, int off, int R, int n) {
-  const int m = blockIdx.x;
-  const int lane = threadIdx.x;
-
+    float* __restrict__ OP, int off, int R, int n, int m, int lane) {
   unsigned long long t[PT];
 #pragma unroll
   for (int q = 0; q < PT; q++) t[q] = 0ull;
@@ -253,18 +185,179 @@ __device__ __forceinline__ void r4d_rowtopk_stage2_body(
     }
   }
 }
+
+// Where the fused form's stage 2 writes: the outputs and the row's arrival counters.
+struct R4dTopkOut {
+  float* OV;
+  int* OI;
+  float* OP;
+  unsigned* ctr;     // one a row, zero at entry and left zero (rowtopk_ctr)
+  int off, R;
+};
+
+// The body; the plain kernels and their chained forms (r4d_chain.h) wrap it below. A wave past the
+// chunks returns early; there is no barrier in it. XT is the plane's element: unsigned short
+// (bf16) or float (rounded to bf16 as it is read, tk_bf).
+//
+// PT2 > 0 is the fused form: stage 2 runs in the row's last wave to finish instead of a launch of
+// its own. Each wave publishes its RC candidates (fence, then one arrival on the row's counter);
+// the wave that takes the last ticket resets the counter for the next launch and runs stage 2 over
+// the row's NCH * RC candidates, exactly as stage 2's kernel would (the same function on the same
+// keys), so the outputs are the two-launch form's bytes. The waves of a row are spread over blocks
+// that share nothing, so the arrival is a wave's, not a block's: no barrier is added.
+template <int PT, class XT, int PT2>
+__device__ __forceinline__ void r4d_rowtopk_stage1_body(
+    const XT* __restrict__ Y, unsigned long long* __restrict__ P,
+    int N, int RC, int NCH, int CH, const R4dTopkOut& o) {
+  // WPB independent waves per block, each on its own chunk, sharing nothing. Grouping them only
+  // matters because 32-thread blocks exhaust the CU's workgroup slots before its wave slots.
+  const int m = blockIdx.y;
+  const int c = blockIdx.x * R4D_TOPK_WPB + (int)(threadIdx.x >> 5);
+  if (c >= NCH) return;
+  const int lane = threadIdx.x & 31;
+  const int c0 = c * CH;
+  int c1 = c0 + CH;
+  if (c1 > N) c1 = N;
+
+  unsigned long long t[PT];
+#pragma unroll
+  for (int q = 0; q < PT; q++) t[q] = 0ull;
+
+  const XT* row = Y + (size_t)m * N;
+  // A lane takes every 32nd group of eight columns, whatever the element: eight bf16 are one
+  // 16-byte load, eight f32 two. The slices, and so what a lane's list of PT can hold, are the
+  // same for both planes. The wave moves 512 (1024) contiguous bytes per issue. U groups are
+  // loaded before the first is consumed, since the insert chain would otherwise put a memory
+  // latency between consecutive loads: UNROLL for bf16, half that for f32, so a lane has the same
+  // UNROLL 16-byte loads in flight either way (and an f32 instance keeps its bf16 twin's waves a
+  // SIMD; at PT 2 a full UNROLL of f32 groups costs four). How many groups a pass takes does not
+  // change which lane reads a group, so not what a lane's list holds.
+  constexpr int NV = (int)sizeof(XT) / 2;   // 16-byte loads a group of eight
+  constexpr int U = R4D_TOPK_UNROLL / NV;
+  const int v0 = c0 >> 3, v1 = c1 >> 3;
+  const int step = R4D_TOPK_WAVE * U;
+  int v = v0 + lane;
+  for (; v + step - R4D_TOPK_WAVE < v1; v += step) {
+    u4v_tk p[U][NV];
+#pragma unroll
+    for (int u = 0; u < U; u++)
+#pragma unroll
+      for (int h = 0; h < NV; h++)
+        p[u][h] = *(r4d_tk_gv4)(row + (size_t)(v + u * R4D_TOPK_WAVE) * 8 + h * (8 / NV));
+#pragma unroll
+    for (int u = 0; u < U; u++) {
+      const unsigned base = (unsigned)((v + u * R4D_TOPK_WAVE) * 8);
+      if constexpr (NV == 1) {
+#pragma unroll
+        for (int e = 0; e < 4; e++) {
+          tk_insert<PT>(t, tk_key((unsigned short)(p[u][0][e] & 0xFFFFu), base + 2 * e));
+          tk_insert<PT>(t, tk_key((unsigned short)(p[u][0][e] >> 16), base + 2 * e + 1));
+        }
+      } else {
+#pragma unroll
+        for (int e = 0; e < 8; e++)
+          tk_insert<PT>(t, tk_key(tk_bf(__uint_as_float(p[u][e >> 2][e & 3])), base + e));
+      }
+    }
+  }
+  for (; v < v1; v += R4D_TOPK_WAVE) {
+    u4v_tk p[NV];
+#pragma unroll
+    for (int h = 0; h < NV; h++) p[h] = *(r4d_tk_gv4)(row + (size_t)v * 8 + h * (8 / NV));
+    const unsigned base = (unsigned)(v * 8);
+    if constexpr (NV == 1) {
+#pragma unroll
+      for (int e = 0; e < 4; e++) {
+        tk_insert<PT>(t, tk_key((unsigned short)(p[0][e] & 0xFFFFu), base + 2 * e));
+        tk_insert<PT>(t, tk_key((unsigned short)(p[0][e] >> 16), base + 2 * e + 1));
+      }
+    } else {
+#pragma unroll
+      for (int e = 0; e < 8; e++)
+        tk_insert<PT>(t, tk_key(tk_bf(__uint_as_float(p[e >> 2][e & 3])), base + e));
+    }
+  }
+  for (int i = (v1 << 3) + lane; i < c1; i += R4D_TOPK_WAVE) {
+    tk_insert<PT>(t, tk_key(tk_bf(row[i]), (unsigned)i));
+  }
+
+  unsigned long long* out = P + ((size_t)m * NCH + c) * RC;
+  for (int r = 0; r < RC; r++) {
+    const unsigned long long w = tk_round<PT>(t);
+    if (lane == 0) out[r] = w;
+  }
+
+  if constexpr (PT2 > 0) {
+    // Lane 0 wrote this wave's candidates; they are visible device-wide before its arrival.
+    __threadfence();
+    unsigned tk = 0;
+    if (lane == 0)
+      tk = __hip_atomic_fetch_add(&o.ctr[m], 1u, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT);
+    tk = (unsigned)__builtin_amdgcn_readfirstlane((int)tk);
+    if (tk + 1u != (unsigned)NCH) return;
+    if (lane == 0) o.ctr[m] = 0u;              // zero for the next launch (launches never overlap)
+    __threadfence();                           // acquire the row's other waves' candidates
+    r4d_rowtopk_stage2_row<PT2>(P, o.OV, o.OI, o.OP, o.off, o.R, NCH * RC, m, lane);
+  }
+}
+template <int PT>
+__global__ __launch_bounds__(R4D_TOPK_WAVE * R4D_TOPK_WPB) void r4d_rowtopk_stage1_kernel(
+    const unsigned short* __restrict__ Y, unsigned long long* __restrict__ P,
+    int N, int RC, int NCH, int CH) {
+    r4d_rowtopk_stage1_body<PT, unsigned short, 0>(Y, P, N, RC, NCH, CH, R4dTopkOut{});
+}
+template <int PT>
+__global__ __launch_bounds__(R4D_TOPK_WAVE * R4D_TOPK_WPB) void r4dchain_rowtopk_stage1(
+    const unsigned short* __restrict__ Y, unsigned long long* __restrict__ P,
+    int N, int RC, int NCH, int CH) {
+    r4d_chain_wait_vec();
+    r4d_rowtopk_stage1_body<PT, unsigned short, 0>(Y, P, N, RC, NCH, CH, R4dTopkOut{});
+    r4d_chain_done();
+}
+// Stage 1 over an f32 plane, for the two-launch path (R > 16, or no counter block).
+template <int PT>
+__global__ __launch_bounds__(R4D_TOPK_WAVE * R4D_TOPK_WPB) void r4d_rowtopk_f32_stage1_kernel(
+    const float* __restrict__ Y, unsigned long long* __restrict__ P,
+    int N, int RC, int NCH, int CH) {
+    r4d_rowtopk_stage1_body<PT, float, 0>(Y, P, N, RC, NCH, CH, R4dTopkOut{});
+}
+template <int PT>
+__global__ __launch_bounds__(R4D_TOPK_WAVE * R4D_TOPK_WPB) void r4dchain_rowtopk_f32_stage1(
+    const float* __restrict__ Y, unsigned long long* __restrict__ P,
+    int N, int RC, int NCH, int CH) {
+    r4d_chain_wait_vec();
+    r4d_rowtopk_stage1_body<PT, float, 0>(Y, P, N, RC, NCH, CH, R4dTopkOut{});
+    r4d_chain_done();
+}
+// The fused form: both stages in one launch (PT2 8 or 16, see rowtopk_sharded_emit).
+template <int PT, int PT2, class XT>
+__global__ __launch_bounds__(R4D_TOPK_WAVE * R4D_TOPK_WPB) void r4d_rowtopk_fused_kernel(
+    const XT* __restrict__ Y, unsigned long long* __restrict__ P,
+    int N, int RC, int NCH, int CH, R4dTopkOut o) {
+    r4d_rowtopk_stage1_body<PT, XT, PT2>(Y, P, N, RC, NCH, CH, o);
+}
+template <int PT, int PT2, class XT>
+__global__ __launch_bounds__(R4D_TOPK_WAVE * R4D_TOPK_WPB) void r4dchain_rowtopk_fused(
+    const XT* __restrict__ Y, unsigned long long* __restrict__ P,
+    int N, int RC, int NCH, int CH, R4dTopkOut o) {
+    r4d_chain_wait_vec();
+    r4d_rowtopk_stage1_body<PT, XT, PT2>(Y, P, N, RC, NCH, CH, o);
+    r4d_chain_done();
+}
+
+// The plain kernel and its chained form (r4d_chain.h), a wave per row.
 template <int PT>
 __global__ __launch_bounds__(R4D_TOPK_WAVE) void r4d_rowtopk_stage2_kernel(
     const unsigned long long* __restrict__ P, float* __restrict__ OV, int* __restrict__ OI,
     float* __restrict__ OP, int off, int R, int n) {
-    r4d_rowtopk_stage2_body<PT>(P, OV, OI, OP, off, R, n);
+    r4d_rowtopk_stage2_row<PT>(P, OV, OI, OP, off, R, n, (int)blockIdx.x, (int)threadIdx.x);
 }
 template <int PT>
 __global__ __launch_bounds__(R4D_TOPK_WAVE) void r4dchain_rowtopk_stage2(
     const unsigned long long* __restrict__ P, float* __restrict__ OV, int* __restrict__ OI,
     float* __restrict__ OP, int off, int R, int n) {
     r4d_chain_wait_vec();
-    r4d_rowtopk_stage2_body<PT>(P, OV, OI, OP, off, R, n);
+    r4d_rowtopk_stage2_row<PT>(P, OV, OI, OP, off, R, n, (int)blockIdx.x, (int)threadIdx.x);
     r4d_chain_done();
 }
 
@@ -281,31 +374,68 @@ int r4d_rowtopk_bf16_chunks(int N, int NCH) {
   return (N + CH - 1) / CH;
 }
 
+// The fused form's arrival counters, one a row (see r4d_rowtopk_stage1_body). A block per (stream,
+// output values) (r4d_keyed.h): launches that share one write the same output on one stream, so
+// they are ordered and never overlap, and each leaves every counter zero. Taller launches, or no
+// block, take the two-launch path, which writes the same bytes.
+constexpr int kTopkMaxCtr = 8192;
+static unsigned* rowtopk_ctr(RadStream stream, long outv) {
+  return r4d::keyed_block(r4d::Keyed::RowTopk, (const void*)stream, (const void*)outv,
+                          (size_t)kTopkMaxCtr * sizeof(unsigned));
+}
+
 // The top-R over one rank's slice of a wider plane: `off` is the slice's first global column, and
 // `outp` (optional, 0 for none) is the M*R (int32 id, float value) pair plane an all-gather moves
-// so ranks can agree on a global top-R without gathering the plane.
-static int rowtopk_bf16_sharded_emit(long y, long partial, long outv, long outi, long outp,
-                                     int M, int N, int R, int RC, int NCH, int PT1, int off,
-                                     RadStream stream, bool chain = false) {
+// so ranks can agree on a global top-R without gathering the plane. `f32` reads an f32 plane and
+// ranks it rounded to bf16 (cast_row_topk).
+//
+// At R <= 16 stage 2 runs in stage 1's launch (the fused form, one launch); its list of 8 or 16
+// keys fits beside stage 1's without costing stage 1 a wave a SIMD. R > 16 (a list of 32, ~140
+// VGPRs) keeps its own launch.
+static int rowtopk_sharded_emit(long y, long partial, long outv, long outi, long outp,
+                                int M, int N, int R, int RC, int NCH, int PT1, int off,
+                                RadStream stream, bool chain, bool f32) {
   int emit_rc = RAD_OK;
   // R <= PT2 is what makes stage 2 exact for any candidates; a real limit, so checked, not
   // clamped.
   if (M < 1 || N < 1 || N % 8 || R < 1 || R > R4D_TOPK_PT2 || RC < 1 ||
       RC > PT1 * R4D_TOPK_WAVE || NCH < 1)
     return R4D_NO(RAD_E_SHAPE);
+  if (PT1 != 2 && PT1 != 4 && PT1 != 8 && PT1 != 16) return R4D_NO(RAD_E_INVAL);
   const int CH  = rowtopk_chunk_width(N, NCH);
   const int nch = (N + CH - 1) / CH;
-#define R4D_TK_S1(PT) emit_rc = R4D_EMIT(stream, (chain ? r4dchain_rowtopk_stage1<PT>           \
-                                                       : r4d_rowtopk_stage1_kernel<PT>),         \
-                        dim3((nch + R4D_TOPK_WPB - 1) / R4D_TOPK_WPB, M),                        \
-                        dim3(R4D_TOPK_WAVE * R4D_TOPK_WPB), 0,                                   \
-                        (const unsigned short*)y, (unsigned long long*)partial, N, RC, nch, CH)
+  const dim3 g1((nch + R4D_TOPK_WPB - 1) / R4D_TOPK_WPB, M), b1(R4D_TOPK_WAVE * R4D_TOPK_WPB);
+
+  unsigned* const ctr = (R <= 16 && M <= kTopkMaxCtr) ? rowtopk_ctr(stream, outv) : nullptr;
+  if (ctr) {
+    const R4dTopkOut o{ (float*)outv, (int*)outi, (float*)outp, ctr, off, R };
+#define R4D_TK_F(PT, PT2, XT) R4D_EMIT(stream, (chain ? r4dchain_rowtopk_fused<PT, PT2, XT>       \
+                                                     : r4d_rowtopk_fused_kernel<PT, PT2, XT>),     \
+                                       g1, b1, 0, (const XT*)y, (unsigned long long*)partial, N,   \
+                                       RC, nch, CH, o)
+#define R4D_TK_F2(PT, XT) (R <= 8 ? R4D_TK_F(PT, 8, XT) : R4D_TK_F(PT, 16, XT))
+#define R4D_TK_FX(PT) (f32 ? R4D_TK_F2(PT, float) : R4D_TK_F2(PT, unsigned short))
+    switch (PT1) {
+      case 2: return R4D_TK_FX(2);
+      case 4: return R4D_TK_FX(4);
+      case 8: return R4D_TK_FX(8);
+      default: return R4D_TK_FX(16);
+    }
+#undef R4D_TK_FX
+#undef R4D_TK_F2
+#undef R4D_TK_F
+  }
+
+#define R4D_TK_S1(PT) emit_rc = f32                                                              \
+    ? R4D_EMIT(stream, (chain ? r4dchain_rowtopk_f32_stage1<PT> : r4d_rowtopk_f32_stage1_kernel<PT>),\
+               g1, b1, 0, (const float*)y, (unsigned long long*)partial, N, RC, nch, CH)        \
+    : R4D_EMIT(stream, (chain ? r4dchain_rowtopk_stage1<PT> : r4d_rowtopk_stage1_kernel<PT>),   \
+               g1, b1, 0, (const unsigned short*)y, (unsigned long long*)partial, N, RC, nch, CH)
   switch (PT1) {
     case 2: R4D_TK_S1(2); break;
     case 4: R4D_TK_S1(4); break;
     case 8: R4D_TK_S1(8); break;
-    case 16: R4D_TK_S1(16); break;
-    default: return R4D_NO(RAD_E_INVAL);
+    default: R4D_TK_S1(16); break;
   }
 #undef R4D_TK_S1
   if (emit_rc != RAD_OK) return emit_rc;
@@ -631,13 +761,17 @@ extern "C" int64_t r4d_rad_rowtopk_scratch(const RadArgs* a) {
     return (int64_t)M * nch * RC * (int64_t)sizeof(unsigned long long);
 }
 
-extern "C" int r4d_rad_rowtopk(const RadArgs* a, RadStream stream) {
+/* row_topk over a bf16 plane, and cast_row_topk over an f32 one: the same op on the plane `cast`
+ * f32 -> bf16 would write, rounded as the plane is read (tk_bf), so the cast's launch and its
+ * plane go. */
+static int rad_rowtopk(const RadArgs* a, RadStream stream, bool f32) {
     const RadTensor *x, *idx, *val;
     long long M, N, R;
     int RC, NCH, PT1;
     int rc = topk_params(a, &x, &idx, &val, &M, &N, &R, &RC, &NCH, &PT1);
     if (rc != RAD_OK) return rc;
     if (!x || !idx || !val) return R4D_NO(RAD_E_INVAL);
+    if (f32 && x->dtype != RAD_F32) return R4D_NO(RAD_E_DTYPE);
     if (!r4d_contig(idx) || !r4d_contig(val)) return R4D_NO(RAD_E_STRIDE);
 
     const int nch = r4d_rowtopk_bf16_chunks((int)N, NCH);
@@ -657,9 +791,15 @@ extern "C" int r4d_rad_rowtopk(const RadArgs* a, RadStream stream) {
 
     /* The chained forms at decode heights, where the row resolved with `chain`. */
     const bool ch = r4d_geti_or(a, "chain", 0) != 0 && M <= 64;
-    return rowtopk_bf16_sharded_emit(r4d_addr(x), (long)(uintptr_t)a->scratch, r4d_addr(val),
-                                     r4d_addr(idx), pairs ? r4d_addr(pairs) : 0,
-                                     (int)M, (int)N, (int)R, RC, NCH, PT1, (int)off, stream, ch);
+    return rowtopk_sharded_emit(r4d_addr(x), (long)(uintptr_t)a->scratch, r4d_addr(val),
+                                r4d_addr(idx), pairs ? r4d_addr(pairs) : 0,
+                                (int)M, (int)N, (int)R, RC, NCH, PT1, (int)off, stream, ch, f32);
+}
+extern "C" int r4d_rad_rowtopk(const RadArgs* a, RadStream stream) {
+    return rad_rowtopk(a, stream, false);
+}
+extern "C" int r4d_rad_cast_rowtopk(const RadArgs* a, RadStream stream) {
+    return rad_rowtopk(a, stream, true);
 }
 
 /* ------------------------------------------------------------------ row_topk_merge

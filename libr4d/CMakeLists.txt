@@ -191,6 +191,8 @@ set(R4D_UNITS
   "r4d_qsa_tail_store_bf16|"
   "r4d_qsa_work_bf16|"
   "r4d_idx_pool_gated_f32|"
+  # K-24: the key side in one op (work list + pool + the tail rows no gather of its own can reach).
+  "r4d_qsa_work_pool_tail_bf16|"
   "r4d_idx_score_bf16|"
   "r4d_sample_chain_f32|"
   "r4d_model_bf16|"
@@ -286,3 +288,50 @@ install(TARGETS r4d_selftest RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 # C++17: at C++20 clang tightens the address-space check on
 # __builtin_amdgcn_global_load_tr_b128_v8i16 in r4d_common.h. Kernel cost figures are for C++17.
 set_target_properties(libr4d PROPERTIES HIP_STANDARD 17 HIP_STANDARD_REQUIRED ON)
+
+# One kernel at a time (docs/PLUGIN.md §14). -DR4D_OVERRIDE_UNITS="r4d_gemm_iqr[;...]" adds the
+# target `libr4d_override`: the named units of R4D_UNITS and nothing else, compiled as they are for
+# libr4d, into <build>/override_home/kernels/libr4d.so. That file serves every row of the libr4d it
+# is built over with libr4d's own hooks, except the hooks the named units define. Put its home
+# ahead of the build's on the search path and it shadows libr4d:
+#
+#   cmake -B build -DR4D_OVERRIDE_UNITS=r4d_gemm_iqr
+#   cmake --build build --target libr4d_override
+#   RADIANCE_HOME=build/override_home:build/radiance_home build/bin/radiance --config ...
+#
+# The libr4d it is built over is this tree's, or with -DR4D_OVERRIDE_BASE=<path to a libr4d.so> one
+# built elsewhere from the same sources but for the named units -- a tree that only works on one
+# kernel then never compiles the other units. A change to the row table, a layout or a header that
+# other units include is not a unit's change: rebuild libr4d for those.
+set(R4D_OVERRIDE_UNITS "" CACHE STRING
+    "units of libr4d (as in R4D_UNITS, ';'-separated) to build as an override of libr4d")
+set(R4D_OVERRIDE_BASE "" CACHE FILEPATH
+    "the libr4d.so the override is built over; empty for this tree's")
+if(R4D_OVERRIDE_UNITS)
+  set(R4D_UNIT_NAMES "")
+  foreach(u ${R4D_UNITS})
+    string(REGEX REPLACE "\\|.*$" "" unit "${u}")
+    list(APPEND R4D_UNIT_NAMES ${unit})
+  endforeach()
+  set(R4D_OVERRIDE_SRC "")
+  foreach(unit ${R4D_OVERRIDE_UNITS})
+    string(REGEX REPLACE "\\.hip$" "" unit "${unit}")
+    if(NOT unit IN_LIST R4D_UNIT_NAMES)
+      message(FATAL_ERROR "R4D_OVERRIDE_UNITS names '${unit}', which is not a unit of libr4d "
+                          "(R4D_UNITS in libr4d/CMakeLists.txt).")
+    endif()
+    list(APPEND R4D_OVERRIDE_SRC "${CMAKE_CURRENT_SOURCE_DIR}/${unit}.hip")
+  endforeach()
+  set(R4D_OVERRIDE_OVER libr4d)
+  if(R4D_OVERRIDE_BASE)
+    set(R4D_OVERRIDE_OVER "${R4D_OVERRIDE_BASE}")
+  endif()
+  # The units' own flags (-mcumode, the compilation unit IDs) are source-file properties of this
+  # directory, set above, so they hold here as well.
+  rad_add_kernel_override(libr4d_override BASE ${R4D_OVERRIDE_OVER}
+    HIP_SOURCES ${R4D_OVERRIDE_SRC}
+    GPU_TARGETS ${R4D_GPU_TARGETS}
+    INCLUDES    ${CMAKE_CURRENT_SOURCE_DIR}
+    CUID_NAME   libr4d)
+  set_target_properties(libr4d_override PROPERTIES HIP_STANDARD 17 HIP_STANDARD_REQUIRED ON)
+endif()

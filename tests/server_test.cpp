@@ -145,6 +145,38 @@ TEST(oai_seeds_sampling_from_the_deployment_default) {
     CHECK_NEAR(r3.sp.top_p, 0.95f, 1e-6);
 }
 
+TEST(oai_times_the_request_prep_phases) {
+    Fixture f;
+    OaiRequest c;
+    ApiError e;
+    CHECK_OK(parse_chat_request(R"({"messages":[{"role":"user","content":"hi"}]})",
+                                f.odeps(), f.limits(), &c, &e));
+    CHECK(c.prep_parse_ns >= 0);
+    CHECK(c.prep_render_ns >= 0);
+    CHECK(c.prep_encode_ns >= 0);
+    CHECK(c.prep_grammar_ns >= 0);
+    CHECK_EQ(c.prep_submit_ns, -1);        /* only serve() sets it, at submit */
+
+    OaiRequest p;
+    CHECK_OK(parse_completion_request(R"({"prompt":"ab"})", f.odeps(), f.limits(), &p, &e));
+    CHECK(p.prep_parse_ns >= 0);
+    CHECK_EQ(p.prep_render_ns, -1);        /* a completion renders no template */
+    CHECK(p.prep_encode_ns >= 0);
+    CHECK(p.prep_grammar_ns >= 0);
+    CHECK_EQ(p.prep_submit_ns, -1);
+
+    /* The log fragment: ms where timed, '-' where the path has no such phase. */
+    const std::string line = format_prep_phases(p);
+    CHECK(line.find(" render=-") != std::string::npos);
+    CHECK(line.find(" submit=-") != std::string::npos);
+    CHECK(line.find(" parse=") != std::string::npos && line.find(" parse=-") == std::string::npos);
+    OaiRequest fixed;
+    fixed.prep_parse_ns = 1500000;
+    fixed.prep_submit_ns = 0;
+    CHECK(format_prep_phases(fixed) ==
+          " parse=1.50ms render=- encode=- grammar=- submit=0.00ms");
+}
+
 TEST(oai_parses_a_completion_prompt_in_every_shape) {
     Fixture f;
     OaiLimits lim = f.limits();
@@ -2297,8 +2329,6 @@ TEST(a_dropped_stream_cancels_at_the_scheduler) {
     q.method = "POST";
     q.path = "/v1/chat/completions";
     q.body = R"({"messages":[{"role":"user","content":"hi"}],"stream":true})";
-    std::atomic<bool> gone{false};
-    q.closed = [&gone] { return gone.load(); };
 
     HttpResponse r = f.srv->router().dispatch(q);
     CHECK_EQ(r.status, 200);
@@ -2309,11 +2339,10 @@ TEST(a_dropped_stream_cancels_at_the_scheduler) {
     CHECK(!f.sched.saw_cancel());
     CHECK_EQ(f.srv->in_flight(), 1LL);
 
-    /* The peer goes away. The transport notices on its next pull and tears the provider down. */
-    gone.store(true);
-    std::string c;
-    bool more = r.next(c);
-    CHECK(!more);
+    /* The peer goes away. The transport notices -- its own peer check runs before every chunk it
+     * writes, and the write to a closed socket fails there -- and reports it as on_close. The
+     * provider above does not probe the socket itself, so this is where the drop reaches the
+     * server. */
     r.on_close(false);
 
     CHECK(f.sched.saw_cancel());
@@ -3212,6 +3241,53 @@ TEST(the_sink_is_a_single_producer_ring_that_fails_loudly_on_overflow) {
     t.finish(Finish::Stop);
     t.finish(Finish::Cancelled);
     CHECK_EQ((int)t.finish_reason(), (int)Finish::Stop);
+}
+
+/* A producer that pushes under a lock its consumer takes (the scheduler's step lock) hands the
+ * wake to the caller instead of issuing it: the token is in the ring throughout, the consumer is
+ * woken by wake() and by nothing else, and a step's pushes to one stream owe that one wake
+ * between them. */
+TEST(the_sink_hands_its_wake_to_a_producer_that_has_a_lock_to_release) {
+    Sink s(64);
+    std::atomic<bool> woke{false};
+    std::thread consumer([&] { woke.store(s.wait(5000), std::memory_order_release); });
+    for (int i = 0; i < 500 && !s.consumer_asleep(); ++i)
+        std::this_thread::sleep_for(std::chrono::microseconds(200));
+    CHECK(s.consumer_asleep());
+
+    bool owed = false;
+    CHECK(s.push(11, nullptr, -1, &owed));
+    CHECK(owed);
+    /* The same step's second token to the same stream owes nothing: the one wake serves both. */
+    bool again = false;
+    CHECK(s.push(12, nullptr, -1, &again));
+    CHECK(!again);
+    /* Deferred means nothing woke the consumer: it is still asleep with the tokens in the ring. */
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    CHECK(!woke.load(std::memory_order_acquire));
+
+    /* And the wake the producer issues once it has let go returns the consumer well before the
+     * five seconds it would otherwise sleep. */
+    const auto t0 = std::chrono::steady_clock::now();
+    s.wake();
+    consumer.join();
+    const double ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    CHECK(woke.load(std::memory_order_acquire));
+    CHECK(ms < 1000.0);
+
+    /* A push to a consumer that is awake owes it nothing. */
+    bool awake = false;
+    CHECK(s.push(13, nullptr, -1, &awake));
+    CHECK(!awake);
+
+    SinkToken buf[8];
+    CHECK_EQ((long long)s.read(buf, 8), 3LL);
+    CHECK_EQ(buf[0].token, 11);
+    CHECK_EQ(buf[1].token, 12);
+    CHECK_EQ(buf[2].token, 13);
+    /* And the sink is quiescent again: the flag the destructor waits on is clear. */
+    s.finish(Finish::Stop);
 }
 
 /* ================================================================== the admin surface */

@@ -688,6 +688,53 @@ TEST(resident_queue_scratch_is_charged_with_the_hardware_queues) {
     CHECK_EQ(want1 - want0, 160LL << 20);
 }
 
+/* What of "already held" is device code: the code objects resident on the card, each one loaded
+ * whole from its module at its kernel's first launch. M-14 measures it, because libr4d carries the
+ * integer-expert forms a given quantization never launches and each of them still loads whole. It
+ * is a report line and not a term: the bytes are already inside what `free` excludes, so naming
+ * them must not move the split. */
+TEST(the_receipt_says_what_of_the_held_memory_is_device_code) {
+    Config c = small_config();
+    c.vram_weights_mib = 0;
+    c.vram_kv_mib      = 0;
+    c.gpu_headroom_mib = 96;
+    VramFacts f{};
+    f.capacity   = 32LL << 30;
+    f.free       = f.capacity - (512LL << 20);
+    f.arena      = 144LL << 20;
+    f.staging    = 98LL << 20;
+    f.statics    = 2LL << 30;
+    f.experts    = 200LL << 30;
+    f.kv_ceiling = 100LL << 30;
+    VramBudget none;
+    CHECK_OK(vram_budget_resolve(c, { f }, &none));
+    CHECK_EQ(none.code_bytes, 0ll);
+    CHECK(none.report.find("of which code") == std::string::npos);   /* a backend with nothing to say */
+
+    /* Cards that have loaded code say so, and the worst rank's figure is the one printed, as with
+     * every fold here. */
+    Config c1 = small_config();
+    c1.vram_weights_mib = 0;
+    c1.vram_kv_mib      = 0;
+    c1.gpu_headroom_mib = 96;
+    VramFacts a = f, b = f;
+    a.code_bytes   = (40LL << 20) + 100 * 1024;
+    a.code_modules = 61;
+    b.code_bytes   = (110LL << 20) + 600 * 1024;   /* what libr4d's 121 gfx1201 modules weigh */
+    b.code_modules = 121;
+    VramBudget got;
+    CHECK_OK(vram_budget_resolve(c1, { a, b }, &got));
+    CHECK_EQ(got.code_bytes, b.code_bytes);
+    CHECK_EQ(got.code_modules, 121);
+    CHECK(got.report.find("of which code") != std::string::npos);
+    CHECK(got.report.find("121 code module(s) resident") != std::string::npos);
+
+    /* Measuring changes nothing: the same split as the card that could not say. */
+    CHECK_EQ(got.claimable, none.claimable);
+    CHECK_EQ(got.kv, none.kv);
+    CHECK_EQ(got.experts, none.experts);
+}
+
 TEST(the_smallest_card_binds_and_a_short_one_refuses_by_name) {
     Config c = small_config();
     c.vram_weights_mib = 0;
@@ -2226,6 +2273,51 @@ TEST(prefix_cache_hits_the_shared_prefix_only) {
     CHECK_EQ(f.pc.lookup(p1, {}).n_attn_tokens, 48);
 }
 
+/* A request's chain, kept between calls (SchedReq::chain): the lookup that admits it and the
+ * publish that hands its blocks back walk the same prompt blocks, and a request that waits asks
+ * again on every scheduling round. Only blocks the kept chain does not cover are hashed. */
+TEST(a_kept_chain_hashes_only_the_blocks_past_what_it_covers) {
+    Fixture f;
+    CHECK_OK(f.build(/*with_linear=*/false));
+    auto prompt = tok_run(10, 1024);                     /* 64 blocks */
+    publish(f, 1, prompt, 1024);
+    CHECK_EQ(f.pc.stats().chain_blocks, 64ll);
+
+    /* Nobody kept the publish's chain: a lookup hashes the prompt's blocks again. */
+    const CacheHit cold = f.pc.lookup(prompt, {});
+    CHECK_EQ(f.pc.stats().chain_blocks, 128ll);
+
+    /* Handed a chain, a lookup hashes the prompt's blocks into it once; handed the same chain
+     * again, it hashes none, and the hit is the cold lookup's. */
+    PrefixChain chain;
+    const CacheHit first = f.pc.lookup(prompt, {}, nullptr, nullptr, 0, &chain);
+    CHECK_EQ(f.pc.stats().chain_blocks, 192ll);
+    const CacheHit kept = f.pc.lookup(prompt, {}, nullptr, nullptr, 0, &chain);
+    CHECK_EQ(f.pc.stats().chain_blocks, 192ll);
+    CHECK_EQ(kept.n_attn_tokens, cold.n_attn_tokens);
+    CHECK_EQ(kept.n_attn_tokens, first.n_attn_tokens);
+    CHECK_EQ(kept.n_linear_tokens, cold.n_linear_tokens);
+    CHECK_EQ(kept.branch_at, cold.branch_at);
+    CHECK(chain.hs == chain_of(prompt));
+
+    /* A publish goes on from there: the prompt's blocks are held, and only the two whole blocks
+     * of the reply are hashed. */
+    auto text = prompt;
+    for (int i = 0; i < 40; ++i) text.push_back(700 + i);        /* 1064 tokens, 66 blocks */
+    CHECK_OK(f.kv.add_sequence(2));
+    CHECK_OK(f.kv.ensure(2, (int64_t)text.size()));
+    std::vector<std::vector<int32_t>> bt;
+    for (int32_t g : f.pc.cached_groups()) bt.push_back(f.kv.block_table(2, g));
+    CHECK_OK(f.pc.insert(2, text, {}, bt, (int64_t)text.size(), "", -1, &chain));
+    CHECK_EQ(f.pc.stats().chain_blocks, 194ll);
+    CHECK(chain.hs == chain_of(text));
+
+    /* What it published under the kept chain is what a cold walk of the reply finds: its 66 whole
+     * blocks, which leave the last 8 tokens to compute from. */
+    CHECK_EQ(f.pc.lookup(text, {}).n_attn_tokens, 1056);
+    CHECK_EQ(f.pc.stats().chain_blocks, 260ll);
+}
+
 /* Where a hit ends at a head two cached prompts already left differently (CacheHit::branch_at):
  * the same instructions in front of different texts. One cached prompt past it is not enough, the
  * next prompt could be the same conversation going on; a prompt that follows one of them further, or
@@ -3726,6 +3818,37 @@ struct Lender {
     int64_t bs() const { return kv.plan(G_FULL)->block_size; }
 };
 
+/* A cache with a sliding window beside a full group, the shape M-11 lends from: the window's pool
+ * is one window per sequence slot, so with fewer sequences live the top of its carve is unused.
+ * 512 tokens of window at a 16-token block are 32 blocks a slot, and one step (256 tokens) is 16
+ * more: four slots (max_seqs) and one step are 212 blocks. */
+enum : int32_t { W_FULL = 1, W_WIN = 2 };
+
+static std::vector<KVGroupInfo> windowed_groups() {
+    std::vector<KVGroupInfo> g;
+    g.push_back(null_group());
+    g.push_back(paged_group("latent", RAD_KV_FULL, 2, 16, { 0, 1 }));
+    g.push_back(paged_group("latent_sliding", RAD_KV_WINDOW, 2, 16, { 0, 1 }, /*window=*/512));
+    return g;
+}
+
+struct WindowLender {
+    Pools     pools;
+    KVManager kv;
+    Config    cfg = small_config();
+
+    int build() {
+        cfg.vram_kv_mib      = 64;
+        cfg.max_tok          = 256;
+        cfg.max_seqs         = 4;
+        cfg.checkpoint_slots = 0;
+        int s = configure_pools(pools, cfg);
+        if (s < 0) return s;
+        return kv.configure(windowed_groups(), cfg, pools.kv());
+    }
+    int64_t bs(int32_t g) const { return kv.plan(g)->block_size; }
+};
+
 TEST(a_new_cache_lends_nothing_and_hands_out_its_whole_carve) {
     Lender e;
     CHECK_OK(e.build());
@@ -3766,6 +3889,61 @@ TEST(an_idle_cache_lends_all_but_its_buffer) {
     CHECK_OK(e.kv.set_loan(0));
     CHECK_EQ(e.kv.live_blocks(G_FULL), all);
     CHECK_EQ(e.kv.free_blocks(G_FULL), all - 1);
+}
+
+/* spare_tokens() is one number, so a reader cannot tell a pool packed to its top from one whose
+ * free blocks sit under a held one: both lend nothing there. These name the pieces -- where the
+ * loan stops, what the pool holds under it and what the buffer keeps -- so a measurement can.
+ * The gap `held_top - held` is what a compaction that moved the held blocks down would recover. */
+TEST(the_spare_a_loan_reaches_is_reported_piece_by_piece) {
+    Lender e;
+    CHECK_OK(e.build());
+    const int64_t all = e.kv.total_blocks(G_FULL);
+    const int64_t bs  = e.bs();
+
+    /* Idle: nothing held, so the loan reaches all but the buffer. */
+    const KVManager::SpareSplit idle = e.kv.spare_split();
+    CHECK_EQ(idle.group, (int32_t)G_FULL);
+    CHECK_EQ(idle.block_tokens, bs);
+    CHECK_EQ(idle.block_bytes, e.kv.plan(G_FULL)->bytes_per_block);
+    CHECK_EQ(idle.n_blocks, all);
+    CHECK_EQ(idle.held, 0);
+    CHECK_EQ(idle.held_top, 0);
+    CHECK(idle.buffer_blocks > 0);          /* the chunk floor, kept so a request needs no recall */
+    CHECK_EQ(idle.live, all);
+    CHECK_EQ(idle.spare_tokens, (all - idle.buffer_blocks) * bs);
+    CHECK_EQ(idle.loan_tokens, 0);
+
+    /* Hold the low half: the mark is just past the highest held block (rounded up to a bucket of
+     * the held histogram), and the spare is everything above it less the buffer. */
+    std::vector<int32_t> got;
+    for (int64_t i = 0; i < all / 2; ++i) {
+        int32_t b = -1;
+        CHECK_OK(e.kv.reserve_block(G_FULL, &b));
+        got.push_back(b);
+    }
+    const KVManager::SpareSplit half = e.kv.spare_split();
+    CHECK_EQ(half.held, (int64_t)got.size());
+    CHECK(half.held_top >= half.held);
+    CHECK_EQ(half.held_top, e.kv.held_top_blocks(G_FULL));
+    CHECK_EQ(half.spare_tokens, (all - half.held_top - half.buffer_blocks) * bs);
+
+    /* A block released under the top is a hole: unheld, and still unlendable, because the loan
+     * may not reach past the block above it. The split says so where one number cannot. */
+    e.kv.release_block(G_FULL, got[0]);
+    const KVManager::SpareSplit hole = e.kv.spare_split();
+    CHECK_EQ(hole.held, half.held - 1);
+    CHECK_EQ(hole.held_top, half.held_top);
+    CHECK(hole.held_top - hole.held > 0);
+    CHECK_EQ(hole.spare_tokens, half.spare_tokens);
+    CHECK_EQ(e.kv.spare_tokens(), half.spare_tokens);
+
+    /* The loan the arbiter set is reported beside it, so /stats can read both marks at once. */
+    CHECK_OK(e.kv.set_loan(hole.spare_tokens));
+    const KVManager::SpareSplit lent = e.kv.spare_split();
+    CHECK_EQ(lent.loan_tokens, hole.spare_tokens);
+    CHECK_EQ(lent.live, all - hole.spare_tokens / bs);
+    CHECK_EQ(e.kv.live_blocks(G_FULL), lent.live);
 }
 
 TEST(a_block_something_holds_is_never_lent) {
@@ -3840,17 +4018,17 @@ TEST(admission_reports_only_recoverable_external_capacity_as_a_fleet_wait) {
     CHECK(!waiting);                              /* no future grant can exceed the full carve */
     e.kv.set_flex_room(tokens);
     bool deny = true;
-    e.kv.set_fleet_reclaim([&](int64_t, bool* pending) {
+    e.kv.set_fleet_reclaim([&](int32_t, int64_t, bool* pending) {
         if (deny) { if (pending) *pending = true; return (int)RAD_E_FULL; }
         return (int)RAD_OK;
     });
     CHECK_EQ(e.kv.ensure(1, tokens, -1, &waiting), RAD_E_FULL);
     CHECK(waiting);                               /* allowance was optimistic; actual grant denied */
-    e.kv.set_fleet_reclaim([](int64_t, bool*) { return (int)RAD_E_NOMEM; });
+    e.kv.set_fleet_reclaim([](int32_t, int64_t, bool*) { return (int)RAD_E_NOMEM; });
     CHECK_EQ(e.kv.ensure(1, tokens, -1, &waiting), RAD_E_NOMEM);
     CHECK(!waiting);                              /* a backing failure is an operational error */
     deny = false;
-    e.kv.set_fleet_reclaim([&](int64_t, bool*) { return (int)RAD_OK; });
+    e.kv.set_fleet_reclaim([&](int32_t, int64_t, bool*) { return (int)RAD_OK; });
     CHECK_OK(e.kv.ensure(1, tokens, -1, &waiting));
     CHECK(!waiting);
 }
@@ -3865,7 +4043,7 @@ TEST(a_request_past_the_mark_takes_the_loan_back) {
 
     int calls = 0;
     int64_t asked = -1;
-    e.kv.set_reclaim([&](int64_t t) { ++calls; asked = t; return (int)RAD_OK; });
+    e.kv.set_reclaim([&](int32_t, int64_t t) { ++calls; asked = t; return (int)RAD_OK; });
 
     /* Longer than the cache keeps, well within its carve. */
     const int64_t tokens = (idle + all) / 2 * e.bs();
@@ -3895,7 +4073,7 @@ TEST(a_recall_the_slab_cannot_make_refuses_the_request) {
     CHECK_OK(e.kv.set_loan(e.kv.spare_tokens()));
     const int64_t idle = e.kv.live_blocks(G_FULL);
     const int64_t loan = e.kv.loan_tokens();
-    e.kv.set_reclaim([](int64_t) { return (int)RAD_E_DEVICE; });
+    e.kv.set_reclaim([](int32_t, int64_t) { return (int)RAD_E_DEVICE; });
 
     CHECK_OK(e.kv.add_sequence(1));
     CHECK(e.kv.ensure(1, (idle + all) / 2 * e.bs()) < 0);
@@ -3944,6 +4122,141 @@ TEST(a_follower_takes_the_leaders_mark) {
     CHECK_OK(lead.kv.set_loan(0));
     CHECK_OK(fol.kv.follow(lead.kv));
     CHECK_EQ(fol.kv.live_blocks(G_FULL), fol.kv.total_blocks(G_FULL));
+}
+
+/* ================================================================== the window loan (M-11)
+ *
+ * A sliding-window group's pool holds one window per sequence slot, so the slots no sequence
+ * occupies are VRAM nothing can reach: it is carved for a maximum number of sequences that a
+ * decode run at one to four sequences never reaches. It lends those blocks on a loan of its own,
+ * because the number the FULL groups lend on is a token axis that runs out across the whole carve
+ * while the window's spare is sized by slots, and one number cannot mark both.
+ */
+
+TEST(a_window_group_lends_the_slots_no_sequence_occupies) {
+    WindowLender e;
+    CHECK_OK(e.build());
+    const int64_t all = e.kv.total_blocks(W_WIN);
+    const int64_t bs = e.bs(W_WIN);
+    CHECK(all > 0);
+    CHECK(e.kv.win_lendable(W_WIN));
+    CHECK(!e.kv.lendable(W_WIN));     /* its own loan, not the FULL groups' */
+    CHECK(!e.kv.win_lendable(W_FULL));
+
+    /* Idle, it lends every slot but the buffer it keeps for a step. */
+    const int64_t spare = e.kv.spare_window_tokens();
+    CHECK(spare > 0);
+    CHECK_EQ(spare % bs, 0ll);
+    CHECK_OK(e.kv.set_window_loan(spare));
+    CHECK_EQ(e.kv.window_loan_tokens(), spare);
+    const int64_t live = e.kv.live_blocks(W_WIN);
+    CHECK(live > 0);
+    CHECK(live < all);
+    CHECK_EQ(all - live, spare / bs);
+    CHECK_EQ(e.kv.free_blocks(W_WIN), live);
+
+    /* Two numbers: the FULL arbiter moving its loan does not move the window's mark. */
+    CHECK_OK(e.kv.set_loan(e.kv.spare_tokens()));
+    CHECK_EQ(e.kv.live_blocks(W_WIN), live);
+    CHECK_OK(e.kv.set_loan(0));
+    CHECK_EQ(e.kv.live_blocks(W_WIN), live);
+    /* And the window's moving does not move a FULL group. */
+    const int64_t full_live = e.kv.live_blocks(W_FULL);
+    CHECK_OK(e.kv.set_window_loan(0));
+    CHECK_EQ(e.kv.live_blocks(W_FULL), full_live);
+    CHECK_EQ(e.kv.live_blocks(W_WIN), all);
+}
+
+/* A restore reserves a named block id; one above the window's mark is a block the slab is holding.
+ * The same refusal as for a FULL group, or the restore writes over weights in use. */
+TEST(a_named_window_block_above_the_mark_is_refused) {
+    WindowLender e;
+    CHECK_OK(e.build());
+    CHECK_OK(e.kv.set_window_loan(e.kv.spare_window_tokens()));
+    const int64_t live = e.kv.live_blocks(W_WIN);
+    CHECK(live < e.kv.total_blocks(W_WIN));
+    CHECK_EQ(e.kv.reserve_specific_block(W_WIN, (int32_t)live), RAD_E_STATE);
+    CHECK_OK(e.kv.reserve_specific_block(W_WIN, (int32_t)live - 1));
+}
+
+/* A window block a sequence holds is never lent, and the spare the cache reports stays below the
+ * highest held block even when a sequence's window is only partly full. */
+TEST(a_window_block_a_sequence_holds_is_never_lent) {
+    WindowLender e;
+    CHECK_OK(e.build());
+    const int64_t all = e.kv.total_blocks(W_WIN);
+    const int64_t bs = e.bs(W_WIN);
+    CHECK_OK(e.kv.add_sequence(1));
+    CHECK_OK(e.kv.ensure(1, 40 * bs));     /* a window and a part: the table fills to its cap */
+    const int64_t held = e.kv.held_top_blocks(W_WIN);
+    CHECK(held > 0);
+
+    const int64_t spare = e.kv.spare_window_tokens();
+    CHECK(spare > 0);
+    CHECK(spare < all * bs);
+    CHECK(all - spare / bs >= held);
+    CHECK_OK(e.kv.set_window_loan(spare));
+    CHECK(e.kv.live_blocks(W_WIN) >= held);
+
+    /* Pushing the mark down onto a held block is refused, and moves nothing. */
+    const int64_t before = e.kv.live_blocks(W_WIN);
+    CHECK_EQ(e.kv.set_window_loan((all - held + 1) * bs), RAD_E_STATE);
+    CHECK_EQ(e.kv.live_blocks(W_WIN), before);
+    CHECK_EQ(e.kv.window_loan_tokens(), spare);
+}
+
+/* A request needing a block the window lent asks for it back through the hook, and takes its own
+ * loan back: the FULL groups' mark and loan answer for nothing. */
+TEST(a_window_request_past_the_mark_takes_its_own_loan_back) {
+    WindowLender e;
+    CHECK_OK(e.build());
+    const int64_t bs = e.bs(W_WIN);
+    const int64_t win_spare = e.kv.spare_window_tokens();
+    CHECK_OK(e.kv.set_window_loan(win_spare));
+    const int64_t full_live = e.kv.live_blocks(W_FULL);
+    const int64_t win_live = e.kv.live_blocks(W_WIN);
+
+    int calls = 0;
+    int32_t group = -1;
+    int64_t asked = -1;
+    e.kv.set_reclaim([&](int32_t g, int64_t t) { ++calls; group = g; asked = t; return (int)RAD_OK; });
+
+    /* A sequence whose window is past what the cache kept asks for it back: one recall, on the
+     * window group, for its own loan. */
+    CHECK_OK(e.kv.add_sequence(1));
+    CHECK_OK(e.kv.ensure(1, 40 * bs));
+    CHECK_EQ(calls, 1);
+    CHECK_EQ(group, W_WIN);
+    CHECK(asked >= 0 && asked < win_spare);
+    CHECK_EQ(e.kv.window_loan_tokens(), asked);
+    CHECK(e.kv.live_blocks(W_WIN) > win_live);
+    CHECK_EQ(e.kv.block_table(1, W_WIN).size(), (size_t)(40));
+
+    /* The FULL group answered for nothing: its own loan is where it was, and this cache lends no
+     * FULL group at all. */
+    CHECK_EQ(e.kv.loan_tokens(), 0ll);
+    CHECK_EQ(e.kv.live_blocks(W_FULL), full_live);
+
+    /* With the sequence's window held, the spare is smaller again, and lending it is one tick's
+     * work: the mark the recall left is what the cache now reports. */
+    const int64_t spent = e.kv.spare_window_tokens();
+    CHECK(spent < win_spare);
+    CHECK_OK(e.kv.set_window_loan(spent));
+    CHECK_EQ(e.kv.live_blocks(W_WIN) >= e.kv.held_top_blocks(W_WIN), true);
+}
+
+/* A follower takes the leader's window mark in both directions, as it does the FULL groups'. */
+TEST(a_follower_takes_the_leaders_window_mark) {
+    WindowLender lead, fol;
+    CHECK_OK(lead.build());
+    CHECK_OK(fol.build());
+    CHECK_OK(lead.kv.set_window_loan(lead.kv.spare_window_tokens()));
+    CHECK_OK(fol.kv.follow(lead.kv));
+    CHECK_EQ(fol.kv.window_loan_tokens(), lead.kv.window_loan_tokens());
+    CHECK_EQ(fol.kv.live_blocks(W_WIN), lead.kv.live_blocks(W_WIN));
+    CHECK_OK(lead.kv.set_window_loan(0));
+    CHECK_OK(fol.kv.follow(lead.kv));
+    CHECK_EQ(fol.kv.live_blocks(W_WIN), fol.kv.total_blocks(W_WIN));
 }
 
 /* ================================================================== the snapshot store */
@@ -5492,7 +5805,7 @@ TEST(a_restore_reserves_its_whole_chain_against_one_recall) {
     CHECK_OK(e.kv.set_loan(e.kv.spare_tokens()));
     const int64_t idle = e.kv.live_blocks(G_FULL);
     int calls = 0;
-    e.kv.set_reclaim([&](int64_t) { ++calls; return (int)RAD_OK; });
+    e.kv.set_reclaim([&](int32_t, int64_t) { ++calls; return (int)RAD_OK; });
 
     const int64_t want = (idle + all) / 2;
     std::vector<int32_t> got;
@@ -6425,7 +6738,7 @@ struct KVRun {
         if (s < 0) return s;
         s = kv.configure(every_kind_groups(), cfg, pools.kv());
         if (s < 0) return s;
-        kv.set_reclaim([](int64_t) { return (int)RAD_OK; });
+        kv.set_reclaim([](int32_t, int64_t) { return (int)RAD_OK; });
         return RAD_OK;
     }
     uint64_t pick() { return live[(size_t)r.below(live.size())]; }
@@ -6743,6 +7056,27 @@ struct KVRun {
                 ++seen[t > 0 ? "loan" : "loan back"];
             }
             if (t == spare && rc != RAD_OK) { fail("the spare figure could not be lent"); return; }
+
+            /* The window groups lend on a loan of their own (M-11), with the same contract. */
+            const int64_t w_spare = kv.spare_window_tokens();
+            const uint64_t whow = r.below(4);
+            const int64_t w = whow == 0 ? 0 : whow == 1 ? (int64_t)r.below(2000) : w_spare;
+            what = fmt("set_window_loan %lld (spare %lld)", (long long)w, (long long)w_spare);
+            const int64_t wloan0 = kv.window_loan_tokens(), wlive0 = kv.live_blocks(HG_WIN);
+            const int wrc = kv.set_window_loan(w);
+            if (wrc == RAD_E_STATE) {
+                if (kv.window_loan_tokens() != wloan0 || kv.live_blocks(HG_WIN) != wlive0) {
+                    fail("a refused window loan moved the mark"); return;
+                }
+                ++seen["window loan refused"];
+            } else if (wrc != RAD_OK) {
+                fail(fmt("set_window_loan returned %s", rad_strerror(wrc))); return;
+            } else {
+                ++seen[w > 0 ? "window loan" : "window loan back"];
+            }
+            if (w == w_spare && wrc != RAD_OK) {
+                fail("the window spare figure could not be lent"); return;
+            }
         }
     }
 };
@@ -6762,7 +7096,8 @@ TEST(kv_invariants_hold_over_random_interleavings_of_every_mutation) {
     for (const char* k : { "ensure", "ensure refused", "rollback", "fork", "fork refused", "adopt",
                            "free", "preempt", "make_room", "preempted for room", "trim_window",
                            "window slid", "copy-on-write", "reserve", "reserve specific", "release",
-                           "loan", "loan back", "loan refused" }) {
+                           "loan", "loan back", "loan refused", "window loan", "window loan back",
+                           "window loan refused" }) {
         if (run.seen[k] <= 0) fprintf(stderr, "    no '%s' in the run\n", k);
         CHECK(run.seen[k] > 0);
     }
@@ -6772,6 +7107,7 @@ TEST(kv_invariants_hold_over_random_interleavings_of_every_mutation) {
     for (const auto& h : run.held) run.kv.release_block(h.first, h.second);
     run.held.clear();
     CHECK_OK(run.kv.set_loan(0));
+    CHECK_OK(run.kv.set_window_loan(0));
     for (int32_t g : { (int32_t)HG_FULL, (int32_t)HG_WIN })
         CHECK_EQ(run.kv.free_blocks(g), run.kv.total_blocks(g));
     for (int32_t g : { (int32_t)HG_LIN, (int32_t)HG_CONV })

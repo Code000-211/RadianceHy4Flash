@@ -281,6 +281,54 @@ TEST(a_slot_wait_ends_when_the_hosts_read_of_the_chain_counter_lags_for_good) {
     rad_dev_chain_infer(0);
 }
 
+/* A chained kernel that ran without counting leaves its queue's completion counter short for good,
+ * and the next wait behind it never ends: the queues stand idle and nothing in a stall report said
+ * why (issue #251). The report now carries each queue's chain accounting (aql.cpp, chain_line),
+ * and this is that accounting over a ring lap and a half of chained launches, with the packets
+ * unacquired and acquired: every launch's block is issued once, the counter never runs ahead of
+ * what was issued, the launches all ran (each stored where its own slot said, laps included), and
+ * the line says so. With chaining off a launch is issued no blocks at all. */
+TEST(the_stall_report_gives_a_queues_chain_accounting) {
+    if (std::strcmp(rad::device_backend_name(), "aql") != 0) SKIP("launches chain on the AQL backend only");
+    const unsigned n = 4096 + 2048 + 517;
+    Stream st;
+    DevBuf<unsigned> seen((int64_t)n * sizeof(unsigned), RAD_MEM_DEVICE);
+    REQUIRE(!!seen);
+    std::vector<unsigned> got(n);
+    for (int fenced = 0; fenced < 2; ++fenced) {
+        rad_dev_chain_infer(fenced ? 1 : 2);
+        CHECK_OK(rad_memset_async(seen, 0, (int64_t)n * sizeof(unsigned), st.s));
+        CHECK_OK(rad_stream_sync(st.s));
+        uint64_t i0 = 0, c0 = 0, i1 = 0, c1 = 0;
+        std::string line;
+        REQUIRE_EQ(rad::aql::chain_state(st.s, &i0, &c0, nullptr), RAD_OK);
+        CHECK(c0 <= i0);
+        CHECK_OK(rad::aql::chain_marks(st.s, seen, n));
+        CHECK_OK(rad_stream_sync(st.s));
+        REQUIRE_EQ(rad::aql::chain_state(st.s, &i1, &c1, &line), RAD_OK);
+        CHECK_EQ(i1 - i0, (uint64_t)n);   /* one block a launch */
+        CHECK(c1 <= i1);                  /* the host's read may lag the card, never lead it */
+        CHECK(line.find("chain: issued " + std::to_string(i1) + ", counter reads " + std::to_string(c1)) == 0);
+        CHECK(line.find("last packet") != std::string::npos);
+        CHECK_OK(rad_memcpy_async(got.data(), seen, (int64_t)n * sizeof(unsigned), st.s));
+        CHECK_OK(rad_stream_sync(st.s));
+        unsigned wrong = 0;
+        for (unsigned i = 0; i < n; ++i) wrong += got[i] != i + 1u;
+        CHECK_EQ(wrong, 0u);
+    }
+    /* Chaining off: the same launches run plain and the accounting does not move. */
+    rad_dev_chain_infer(0);
+    uint64_t i0 = 0, c0 = 0, i1 = 0, c1 = 0;
+    CHECK_OK(rad_stream_sync(st.s));
+    REQUIRE_EQ(rad::aql::chain_state(st.s, &i0, &c0, nullptr), RAD_OK);
+    CHECK_OK(rad::aql::chain_marks(st.s, seen, 64));
+    CHECK_OK(rad_stream_sync(st.s));
+    REQUIRE_EQ(rad::aql::chain_state(st.s, &i1, &c1, nullptr), RAD_OK);
+    CHECK_EQ(i1, i0);
+    CHECK_EQ(rad::aql::chain_state(nullptr, &i1, &c1, nullptr), RAD_E_INVAL);
+    CHECK_EQ(rad::aql::chain_state(st.s, nullptr, &c1, nullptr), RAD_E_INVAL);
+}
+
 /* The host writes a launch's arguments and chain record into VRAM through the BAR, and the card's
  * host data path keeps such a write until it is flushed (aql.cpp, host_writes_out). A launch the
  * card starts within a microsecond or two of its doorbell otherwise reads the slot as it was. What
@@ -2582,6 +2630,53 @@ TEST(granules_remapped_at_random_never_share_a_page) {
     rad_dev_free(stage, RAD_MEM_HOST_PINNED);
     rad_dev_free(back, RAD_MEM_HOST_PINNED);
     rad_stream_destroy(s);
+}
+
+/* The code objects a card holds -- DeviceBackend::code_resident -- is the line the VRAM receipt
+ * prints beside `already held` (M-14): every module loaded there, each whole from its code object.
+ * The AQL backend counts what module_load took; a backend that loads no device code refuses rather
+ * than answering zero, so the receipt leaves the line out instead of claiming a card holds none. */
+TEST(the_resident_device_code_query_answers_for_whichever_backend_is_running) {
+    int64_t bytes = -1;
+    int     modules = -1;
+    const int s = rad::dev_code_resident(0, &bytes, &modules);
+    if (s == RAD_OK) {
+        CHECK(bytes >= 0);
+        CHECK(modules >= 0);
+        if (bytes > 0) CHECK(modules > 0);      /* bytes came from somewhere */
+    } else {
+        CHECK_EQ(s, RAD_E_UNSUPPORTED);
+        CHECK_EQ(bytes, -1);                    /* nothing written where there is no answer */
+        CHECK_EQ(modules, -1);
+    }
+}
+
+/* The count is only worth printing if it is not zero where code did load: launch the backend's own
+ * module-loaded kernel (chain_probe), then the card must report bytes and modules, and a second
+ * read must not move (nothing loaded in between). */
+TEST(a_card_that_has_launched_a_kernel_reports_the_device_code_it_holds) {
+    if (std::strcmp(rad::device_backend_name(), "aql") != 0) SKIP("device code loads on the AQL backend only");
+    Stream st;
+    DevBuf<unsigned> x(64 * sizeof(unsigned), RAD_MEM_DEVICE);
+    DevBuf<unsigned> seen(4 * 8 * sizeof(unsigned), RAD_MEM_DEVICE);
+    REQUIRE(x && seen);
+    CHECK_OK(rad_memset_async(x, 0, 64 * sizeof(unsigned), st.s));
+    CHECK_OK(rad_memset_async(seen, 0, 4 * 8 * sizeof(unsigned), st.s));
+    CHECK_OK(rad_stream_sync(st.s));
+    void* gate = nullptr;
+    REQUIRE_EQ(rad_stream_gate(st.s, &gate), RAD_OK);
+    CHECK_OK(rad::aql::chain_probe(st.s, x, seen, 4, 8));
+    CHECK_OK(rad_gate_open(gate));
+    CHECK_OK(rad_stream_sync(st.s));
+    int64_t bytes = 0, bytes2 = 0;
+    int modules = 0, modules2 = 0;
+    CHECK_OK(rad::dev_code_resident(0, &bytes, &modules));
+    CHECK(bytes > 0);
+    CHECK(modules > 0);
+    CHECK_OK(rad::dev_code_resident(0, &bytes2, &modules2));
+    CHECK_EQ(bytes2, bytes);
+    CHECK_EQ(modules2, modules);
+    CHECK_EQ(rad::dev_code_resident(-1, &bytes, &modules), RAD_E_INVAL);
 }
 
 RAD_TEST_MAIN_HOST_KARGS()

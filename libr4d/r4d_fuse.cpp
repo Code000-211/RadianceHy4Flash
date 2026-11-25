@@ -510,6 +510,49 @@ extern "C" int r4d_fuse_gemm_nt_q_gated_iqr(const RadParam* p, int n_p, uint64_t
 }
 
 /* ==========================================================================================
+ * gemm_nt_q_dual at i8a8h -- two IQR weights of one activation's codes read in one launch (K-02's
+ * q_nope and q_rope). (row: gemm_iqr_dual, M == 1; kernel: libr4d/r4d_gemm_iqr.hip, whose dual
+ * GEMV puts the two launches' blocks in one grid at one eight-wave block size, each part doing what
+ * it does in a launch of its own, so each writes its own launch's bytes.)
+ *
+ * Operands: [0] a  [1] a_scale  [2] b  [3] b_scale  [4] y  [5] b2  [6] b2_scale  [7] y2
+ *
+ * The chain of the two `gemm_nt_q` rows it replaces: the first of the pair over `a`, then the
+ * second, over the same `a` and scales and with its own N (`N2`).
+ */
+extern "C" int r4d_fuse_gemm_nt_q_dual_iqr(const RadParam* p, int n_p, uint64_t present, int step,
+                                          RadFuseStep* out) {
+    (void)present;
+    if (!out) return RAD_E_INVAL;
+    const int64_t M = pi(p, n_p, "M"), N = pi(p, n_p, "N"), N2 = pi(p, n_p, "N2"),
+                  K = pi(p, n_p, "K");
+    const char* dt = r4d_pgets(p, n_p, "dtype");
+    if (M <= 0 || N <= 0 || N2 <= 0 || K <= 0) return RAD_E_UNSUPPORTED;
+    if (pi(p, n_p, "group", R4D_FP8_BLOCK) != R4D_FP8_BLOCK) return RAD_E_UNSUPPORTED;
+    if (!dt || (std::strcmp(dt, "i8a8") && std::strcmp(dt, "i8a8h"))) return RAD_E_UNSUPPORTED;
+
+    switch (step) {
+    case 0: {
+        Step s(out, "gemm_nt_q");
+        s.mirror(p, n_p, "M").mirror(p, n_p, "N").mirror(p, n_p, "K")
+         .mirror(p, n_p, "group").mirror(p, n_p, "dtype");
+        /* a, a_scale, b, b_scale, y, a_sum, b_ref */
+        return s.wire({ 0, 1, 2, 3, 4, RAD_FUSE_NONE, RAD_FUSE_NONE });
+    }
+    case 1: {
+        Step s(out, "gemm_nt_q");
+        /* the second weight's own N is the pair's N2 */
+        s.mirror(p, n_p, "M").pint("N", N2).mirror(p, n_p, "K")
+         .mirror(p, n_p, "group").mirror(p, n_p, "dtype");
+        /* the second weight reads the same a and a_scale */
+        return s.wire({ 0, 1, 5, 6, 7, RAD_FUSE_NONE, RAD_FUSE_NONE });
+    }
+    default:
+        return RAD_E_NOTFOUND;
+    }
+}
+
+/* ==========================================================================================
  * gdn_conv_recurrent_update -- the decode convolution folded into the recurrent update's prologue.
  * (row: gdn_conv_recurrent_update_k128_v128_bf16; kernel: libr4d/
  * r4d_gdn_recurrent_update_k128_v128_bf16_fp32state.hip, r4d_gdn_recurrent_update_kernel under CV)
@@ -686,6 +729,72 @@ extern "C" int r4d_fuse_mla_expand_gate(const RadParam* p, int n_p, uint64_t pre
         s.mirror(p, n_p, "M").pint("n", heads * vd).mirror(p, n_p, "dtype");
         /* a = the expansion, g, y */
         return s.wire({ RAD_FUSE_TMP(0), 2, 3 });
+    }
+    default:
+        return RAD_E_NOTFOUND;
+    }
+}
+
+/* ==========================================================================================
+ * qsa_work_pool_tail -- qsa_work, idx_pool_gated over its stage, then qsa_tail_store (K-24).
+ * (row: qsa_work_pool_tail_bf16; kernel: libr4d/r4d_qsa_work_pool_tail_bf16.hip)
+ *
+ * Operands: [0] k  [1] pos  [2] cu  [3] state  [4] sidx  [5] bt  [6] wv  [7] wg  [8] ape
+ *           [9] gain  [10] rope?  [11] page  [12] bpos  [13] nc  [14] cache?
+ *
+ * One temporary, `stage`: the kernel gathers the block's `ratio` raw keys, its destination page and
+ * its first-token position into shared memory instead of the global buffer `qsa_work` writes, and
+ * the pool reads them back from there with the same arithmetic (libr4d/r4d_idx_pool_body.h). The
+ * pool is the same op reading `qsa_work`'s `bpos` as its `pos` and writing `cache` with no `out`,
+ * which is how arch/hyv4flash/hyv4flash_indexer.h issues the unfused pair; a geometry without
+ * `cache` has no chain, because this op has no `out` to hand the pooled key to.
+ *
+ * The tail store is exact only while the kernel stores it: this kernel writes a sequence's rows
+ * when its chunk holds at most `ring - ratio + 1` tokens, and leaves a longer chunk to the caller's
+ * qsa_tail_store. A hook cannot see the per-sequence row counts (they are data, not parameters),
+ * so the chain is claimed only for the geometries where the bound holds whatever the split is:
+ * every chunk of `M` tokens split over `seqs` >= 1 sequences is at most `M` rows, so
+ * `M <= ring - ratio + 1` is sufficient and `M` alone decides it. A geometry past it has no chain
+ * at all, not a chain of two steps, so the hook declines from the first step and the caller's
+ * report says so, rather than memcmp'ing a chain the kernel did not do.
+ */
+extern "C" int r4d_fuse_qsa_work_pool_tail(const RadParam* p, int n_p, uint64_t present, int step,
+                                           RadFuseStep* out) {
+    if (!out) return RAD_E_INVAL;
+    const int64_t M = pi(p, n_p, "M"), r = pi(p, n_p, "ratio", 4),
+                  g = pi(p, n_p, "ring", r);
+    /* `work` is the pool's row count here as in qsa_work: the launch is as wide as `page`, and the
+     * operand description sizes `page` from the same default. */
+    const int64_t W = pi(p, n_p, "work", 1);
+    if (M <= 0 || r <= 0 || g < r || W <= 0) return RAD_E_UNSUPPORTED;
+    if (!RAD_FUSE_HAS(present, 14)) return RAD_E_UNSUPPORTED;   /* no cache, no pool output */
+    if (M > g - r + 1) return RAD_E_UNSUPPORTED;               /* see above: the kernel left it */
+    switch (step) {
+    case 0: {
+        Step s(out, "qsa_work");
+        s.mirror(p, n_p, "M").mirror(p, n_p, "n").mirror(p, n_p, "ratio")
+         .mirror(p, n_p, "ring").mirror(p, n_p, "seqs");
+        if (rad_param_find(p, n_p, "work")) s.mirror(p, n_p, "work");
+        else s.pint("work", W);
+        s.mirror(p, n_p, "dtype");
+        /* k, pos, cu, state, sidx, bt, rope, stage = the temporary, page, bpos, nc */
+        return s.wire({ 0, 1, 2, 3, 4, 5, opt_opd(present, 10), RAD_FUSE_TMP(0), 11, 12, 13 });
+    }
+    case 1: {
+        Step s(out, "idx_pool_gated");
+        /* One row a block, which is the page width, not the step's token count. */
+        s.pint("M", W).mirror(p, n_p, "n").mirror(p, n_p, "ratio")
+         .mirror(p, n_p, "rotary_dim").mirror(p, n_p, "eps").mirror(p, n_p, "theta")
+         .mirror(p, n_p, "mode").mirror_opt(p, n_p, "sections")
+         .mirror_opt(p, n_p, "block_size").mirror(p, n_p, "dtype");
+        /* k = the stage, wv, wg, ape, gain, pos = bpos, page, cache, out = none */
+        return s.wire({ RAD_FUSE_TMP(0), 6, 7, 8, 9, 12, 11, 14, RAD_FUSE_NONE });
+    }
+    case 2: {
+        Step s(out, "qsa_tail_store");
+        s.mirror(p, n_p, "M").mirror(p, n_p, "n").mirror(p, n_p, "ratio")
+         .mirror(p, n_p, "ring").mirror(p, n_p, "seqs").mirror(p, n_p, "dtype");
+        return s.wire({ 0, 1, 2, 3, 4 });              /* k, pos, cu, state, sidx */
     }
     default:
         return RAD_E_NOTFOUND;

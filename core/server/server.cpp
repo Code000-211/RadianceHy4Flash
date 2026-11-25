@@ -961,7 +961,11 @@ void Server::record(const OaiRequest& r, const std::vector<Generation>& gens, Fi
                              r.n, r.max_tokens, to_reason(overall));
 
     /* The request log's closing line: this request's share of what /metrics aggregates (finish,
-     * cached prompt, reasoning tokens when known, TTFT, decode rate, total time). */
+     * cached prompt, reasoning tokens when known, TTFT, decode rate, total time), then its prep
+     * phase times (parse / render / encode / grammar / submit) in ms; '-' where the path has no
+     * such phase (a completion renders no template; embeddings, rerank and the other paths print
+     * what their parser set, else '-'). Additive: no existing field is renamed,
+     * reordered or dropped. */
     const TimingsOut t = timings_of(gens, r.t_received_ns);
     const UsageOut u = usage_of(r, gens);
     const double rate = (decode > 0.0 && n_gen > 1) ? (double)(n_gen - 1) / decode : -1.0;
@@ -972,10 +976,10 @@ void Server::record(const OaiRequest& r, const std::vector<Generation>& gens, Fi
     char rate_s[32] = "";
     if (rate > 0) std::snprintf(rate_s, sizeof rate_s, " %.1f tok/s", rate);
     RAD_LOG_AT(quiet ? Log::Debug : Log::Info,
-               "req %s done%s finish=%s prompt=%lld (cache %lld) gen=%lld%s %s%s %.2fs",
+               "req %s done%s finish=%s prompt=%lld (cache %lld) gen=%lld%s %s%s %.2fs%s",
                r.id.c_str(), from_peer(r.peer).c_str(), finish_reason_oai(overall),
                (long long)n_prompt, (long long)(t.valid ? t.cache_n : 0), (long long)n_gen,
-               reason, ttft_s, rate_s, e2e);
+               reason, ttft_s, rate_s, e2e, format_prep_phases(r).c_str());
 }
 
 /* ------------------------------------------------------------------ non-streaming */
@@ -984,11 +988,13 @@ HttpResponse Server::blocking_completion(const HttpRequest& req, OaiRequest& r) 
     r.t_received_ns = req.t_received_ns;
     std::vector<Generation> gens;
     ApiError err;
+    const int64_t t_submit0 = prep_now_ns();
     if (submit_all(r, &gens, &err) < 0) {
         retire(gens);
         release(r.n_choices());
         return error_response(err, req.peer, r.shape);
     }
+    r.prep_submit_ns = prep_now_ns() - t_submit0;
 
     for (;;) {
         pump(gens, r);
@@ -1229,14 +1235,15 @@ HttpResponse Server::streaming_completion(const HttpRequest& req, OaiRequest& r)
     r.t_received_ns = req.t_received_ns;
     auto st = std::make_shared<StreamState>();
     st->r = r;
-    st->peer_closed = req.closed;
 
     ApiError err;
+    const int64_t t_submit0 = prep_now_ns();
     if (submit_all(st->r, &st->gens, &err) < 0) {
         retire(st->gens);
         release(r.n_choices());
         return error_response(err, req.peer, r.shape);
     }
+    st->r.prep_submit_ns = prep_now_ns() - t_submit0;
     if (st->r.endpoint == Endpoint::Chat)
         for (auto& g : st->gens)
             g.delta.reset(
@@ -1274,10 +1281,6 @@ HttpResponse Server::streaming_completion(const HttpRequest& req, OaiRequest& r)
                 }
             }
             return true;
-        }
-
-        if (st->peer_closed && st->peer_closed()) {
-            return false;
         }
 
         /* The model is leaving (end_streams, retire). The stream ends here whether or not the
@@ -1446,8 +1449,10 @@ HttpResponse Server::streaming_completion(const HttpRequest& req, OaiRequest& r)
         }
 
         if (!progress && out.empty()) {
-            /* Nothing to send: sleep on the first live sink. The wait is bounded so the
-             * peer-closed check above runs a few times a second. */
+            /* Nothing to send: sleep on the first live sink. The wait is bounded so the transport's
+             * own peer check, which runs before every chunk the loop above writes, comes round a
+             * few times a second: the vendored httplib polls the socket there, and a write that
+             * fails on a closed one ends the response and cancels its generations (on_close). */
             for (auto& g : st->gens) if (!g.closed) { g.sink->wait(); break; }
         }
         return true;

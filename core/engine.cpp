@@ -760,6 +760,16 @@ void Engine::quiet_service() {
     quiet_cv_.notify_all();
 }
 
+int Engine::hooks_check(const HookReload& r, std::string* why) const {
+    for (const auto& rk : ranks_)
+        if (const int st = rk->ctx.hooks_check(r, why); st < 0) return st;
+    return RAD_OK;
+}
+
+void Engine::hooks_refresh() {
+    for (auto& rk : ranks_) rk->ctx.hooks_refresh();
+}
+
 int32_t* Engine::Readback::reserve(int64_t count) {
     if (count <= n) return p;
     if (p) rad_dev_free(p, RAD_MEM_HOST_PINNED);
@@ -805,6 +815,17 @@ Engine::~Engine() {
                  (unsigned long long)r->heat_credited, (unsigned long long)r->heat_idle,
                  (unsigned long long)r->ctx.route_dropped());
         RAD_INFO("%s", r->mover.report().c_str());
+    }
+    /* The device code each card ended up holding (M-14): the plan's receipt reads it before the
+     * first kernel has launched, when only the few modules the bring-up ran are loaded; this is
+     * the figure after serving, every module the run launched, each loaded whole. */
+    for (auto& r : ranks_) {
+        int64_t cb = 0;
+        int cm = 0;
+        if (dev_code_resident(r->device, &cb, &cm) != RAD_OK || cb <= 0) continue;
+        LogRank lr(r->index);
+        RAD_INFO("device code resident at exit: %s in %d code module(s), each loaded whole",
+                 humanb(cb).c_str(), cm);
     }
     /* Drain the transfer streams before the contexts. Ctx::shutdown drains the compute streams
      * and frees the arena, but the mover's stream also copies into the arena (the prefill
@@ -1508,6 +1529,10 @@ int Engine::step_loop() {
                                 b->phase == RAD_PHASE_DECODE  ? "decode"  : "MIXED",
                                 (long long)b->n_seq, (long long)b->n_tok);
             if (issued) s += " ahead";
+            /* A chunk group's sub-step (S-02): which layers of the trunk this pass runs. */
+            if (plan.slice_m > 0)
+                s += fmt(" layers=%d-%d slice=%d/%d", (int)plan.layer_lo, (int)plan.layer_hi,
+                         (int)plan.slice_j + 1, (int)plan.slice_m);
             for (int i = 0; i < b->n_seq && i < 8; ++i) {
                 s += fmt("  [%d] slot=%d q=%d ctx=%d", i, plan.e[(size_t)i].slot,
                          plan.e[(size_t)i].n_tokens, plan.e[(size_t)i].ctx_len);
@@ -2384,7 +2409,13 @@ int Engine::collect_step(const RadBatch* b, StepOut& so) {
  *
  * The budget divides the card once at startup, so an unused KV block is VRAM no expert can use.
  * The cache therefore lends what it does not hold at addresses it already owns: no allocation,
- * mapping or driver call. There is exactly one lender, so the same memory is never in two pools.
+ * mapping or driver call. The same memory is never in two pools.
+ *
+ * There are two lenders, and each is arbitrated here in the same three steps: the FULL paged
+ * groups share the KV loan, and the sliding-window groups lend the slots no sequence occupies
+ * through a loan of their own (kv.h "the loan", M-11). Their marks are separate because one
+ * number cannot serve both -- a window pool holds one window per sequence slot, so its spare is
+ * sized by slots and would be the min against the FULL groups' token axis.
  *
  * The order is the safety argument:
  *
@@ -2415,8 +2446,28 @@ void Engine::loan_tick(bool idle) {
     const int64_t chunk = std::max<int64_t>(cfg_.max_tok, 1);
     int64_t offer = cur;
     if (spare < cur || spare >= cur + chunk) offer = spare;
-    int64_t held = 0;
-    for (auto& r : ranks_) held = std::max(held, r->mover.loan_held(Mover::kLendKV));
+    const int64_t held = [&] {
+        int64_t h = 0;
+        for (auto& r : ranks_) h = std::max(h, r->mover.loan_held(Mover::kLendKV));
+        return h;
+    }();
+
+    /* The window loan, the same three steps. Its ceiling is what the slab carved for it: a window
+     * pool is small, so the slot budget may be spent by the KV cache's own lend before the
+     * window's carve, and a loan the slab has no slot for would mark blocks lent that nothing
+     * uses. It grows in whole windows, since the slack a window pool has comes and goes a sequence
+     * at a time. */
+    const int64_t w_cur   = lead.kv.window_loan_tokens();
+    const int64_t w_spare = lead.kv.spare_window_tokens();
+    const int64_t w_step  = lead.kv.window_loan_step();
+    int64_t w_held = 0, w_ceiling = 0;
+    for (auto& r : ranks_) {
+        w_held = std::max(w_held, r->mover.loan_held(Mover::kLendKvWindow));
+        w_ceiling = std::max(w_ceiling, r->mover.loan_ceiling(Mover::kLendKvWindow));
+    }
+    int64_t w_offer = w_cur;
+    if (w_spare < w_cur || w_spare >= w_cur + w_step) w_offer = w_spare;
+    w_offer = std::min(w_offer, w_ceiling);
 
     /* The cache moves first when the loan grows, the slabs first when it shrinks, so no block is
      * ever both a cache block and a slab slot. */
@@ -2426,10 +2477,17 @@ void Engine::loan_tick(bool idle) {
         lending_ = false;
         return;
     }
+    if (lead.kv.set_window_loan(std::max(w_offer, w_held)) < 0) {
+        RAD_ERR("kv window loan: the cache refused a loan of %lld tokens it said it could spare; "
+                "lending stops", (long long)std::max(w_offer, w_held));
+        lending_ = false;
+        return;
+    }
     for (size_t i = 1; i < ranks_.size(); ++i) (void)ranks_[i]->kv.follow(lead.kv);
     for (auto& r : ranks_) {
         if (rad_dev_set(r->device) < 0) continue;
         (void)r->mover.set_loan(Mover::kLendKV, offer);
+        (void)r->mover.set_loan(Mover::kLendKvWindow, w_offer);
         if (idle) {
             const int st = r->mover.idle_tick(&r->heat);
             if (st < 0) RAD_WARN("rank %d: filling the lent slots while idle: %s", r->index,
@@ -2464,6 +2522,9 @@ int Engine::arena_step(const RadBatch* b, bool ahead) {
      * for it (`plan_next_`). Either way the question is whether that plan leaves a chunk, which is
      * nothing to stage when the hold follows it. */
     const bool more = b->phase != RAD_PHASE_DECODE && sched_.prefill_continues(ahead);
+    /* Inside a chunk group the next pass starts at its slice's first layer (S-02); 0 everywhere
+     * else, a whole trunk. */
+    const int32_t first_layer = more ? sched_.next_prefill_first_layer(ahead) : 0;
     for (auto& r : ranks_) {
         const int64_t allow = r->arena_lent[(size_t)level];
         if (r->mover.loan(Mover::kLendArena) > allow ||
@@ -2488,7 +2549,7 @@ int Engine::arena_step(const RadBatch* b, bool ahead) {
          * top that no level's buffers use. At the shared level the ring is memory the full plan
          * computes in, and a copy still going there when such a step starts would race it; a
          * pass's own copies are behind its own ops, which wait for them. */
-        r->stager.set_next_prefill(more && level == 0);
+        r->stager.set_next_prefill(more && level == 0, first_layer);
     }
     if (ranks_.size() > 1) (void)rad_dev_set(ranks_[0]->device);
     return RAD_OK;
