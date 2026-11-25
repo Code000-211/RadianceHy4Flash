@@ -682,6 +682,11 @@ int r4d_rad_gemm_iqr_dual(const RadArgs*, RadStream);
 int r4d_rad_moe_gemm_iqr(const RadArgs*, RadStream);
 int r4d_rad_moe_gemm_iqr_mod4(const RadArgs*, RadStream);
 int64_t r4d_rad_moe_gemm_iqr_scratch(const RadArgs*);
+/* The same projection with the clamped SwiGLU and the rotated int8 quantisation fused into its
+ * epilogue (K-53): `q`/`s` where the pair writes and reads a bf16 plane. */
+int r4d_rad_moe_gemm_iqr_gated(const RadArgs*, RadStream);
+int r4d_rad_moe_gemm_iqr_gated_mod4(const RadArgs*, RadStream);
+int64_t r4d_rad_moe_gemm_iqr_gated_scratch(const RadArgs*);
 int r4d_rad_quant_act_i8g(const RadArgs*, RadStream);
 int r4d_rad_had_quant_act_i8g(const RadArgs*, RadStream);
 int r4d_rad_had_quant_act_fp8(const RadArgs*, RadStream);
@@ -738,6 +743,8 @@ R4D_HOOKS(iqr_logits)
 R4D_HOOKS(iqr_vocab)
 R4D_HOOKS(moe_iqr)
 R4D_HOOKS(moe_iqr_mod4)
+R4D_HOOKS(moe_iqr_gated)
+R4D_HOOKS(moe_iqr_gated_mod4)
 R4D_HOOKS(fp8_logits)
 R4D_HOOKS(i8_logits)
 R4D_HOOKS(hc_e4m3)
@@ -1140,6 +1147,10 @@ int r4d_fuse_gemm_nt_q_gated     (const RadParam*, int, uint64_t, int, RadFuseSt
 int r4d_fuse_gemm_nt_q_gated_mx  (const RadParam*, int, uint64_t, int, RadFuseStep*);
 int r4d_fuse_gemm_nt_q_gated_iqr (const RadParam*, int, uint64_t, int, RadFuseStep*);
 int r4d_fuse_gemm_nt_q_dual_iqr (const RadParam*, int, uint64_t, int, RadFuseStep*);
+/* moe_gemm_q_gated (K-53): the routed gate_up GEMM, its clamped SwiGLU and its rotated int8
+ * quantiser against `moe_gemm_q` then `swiglu_clamped_had_quant_i8g` over the [rows, N] plane. */
+int r4d_fuse_moe_gemm_q_gated      (const RadParam*, int, uint64_t, int, RadFuseStep*);
+int r4d_fuse_moe_gemm_q_gated_mod4 (const RadParam*, int, uint64_t, int, RadFuseStep*);
 int r4d_fuse_gdn_conv_recurrent_update(const RadParam*, int, uint64_t, int, RadFuseStep*);
 int r4d_fuse_qk_norm_rope_gate_kv_store(const RadParam*, int, uint64_t, int, RadFuseStep*);
 int r4d_fuse_qkv_norm_rope_kv_store(const RadParam*, int, uint64_t, int, RadFuseStep*);

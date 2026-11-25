@@ -553,6 +553,69 @@ extern "C" int r4d_fuse_gemm_nt_q_dual_iqr(const RadParam* p, int n_p, uint64_t 
 }
 
 /* ==========================================================================================
+ * moe_gemm_q_gated -- the routed gate_up GEMM with the clamped SwiGLU and the rotated int8
+ * quantisation in its epilogue (K-53). (rows: moe_gemm_iqr_gated and _mod4; kernel:
+ * libr4d/r4d_moe_iqr.hip, whose block owns one 128-column group of the gate part and the group's
+ * matching up columns and rotates and quantises the product before the run ends, so `q`/`s` are
+ * the codes the pair's second launch writes over the bf16 plane.)
+ *
+ * Operands: [0] a  [1] a_scale  [2] w  [3] w_scale  [4] sorted_tok  [5] expert_offset
+ *           [6] w_1  [7] w_1_scale  [8..11] w_2/w_3 and their scales (_mod4 only)  [q] [s]
+ *
+ * The chain it replaces: `moe_gemm_q` (`_mod4` for the four-class row), whose `y` is the [rows, N]
+ * bf16 plane the routed GEMM writes, then `swiglu_clamped_had_quant_i8g` over that plane -- one
+ * launch a layer fewer, and 100 MB a layer of plane never written or read.
+ */
+static int moe_gemm_q_gated_chain(const RadParam* p, int n_p, int step, RadFuseStep* out,
+                                  const char* gemm, int n_q, int q_idx, int s_idx) {
+    const int64_t M = pi(p, n_p, "M"), N = pi(p, n_p, "N"), K = pi(p, n_p, "K"),
+                  top_k = pi(p, n_p, "top_k"), parts = pi(p, n_p, "parts", 1);
+    const char* dt = r4d_pgets(p, n_p, "dtype");
+    if (M <= 0 || N <= 0 || K <= 0 || top_k <= 0 || parts != 2 || (N / parts) % 128)
+        return RAD_E_UNSUPPORTED;
+    if (pi(p, n_p, "group", 128) != 128) return RAD_E_UNSUPPORTED;
+    if (!dt || std::strcmp(dt, "i8a8h")) return RAD_E_UNSUPPORTED;
+
+    switch (step) {
+    case 0: {
+        /* The plane is the same whichever grid writes it: `parts` and the class widths pick blocks
+         * and padding, not values, and this row serves one width for every class. */
+        Step s(out, gemm);
+        s.mirror(p, n_p, "M").mirror(p, n_p, "N").mirror(p, n_p, "K")
+         .mirror(p, n_p, "n_expert").mirror(p, n_p, "top_k").mirror(p, n_p, "group")
+         .mirror(p, n_p, "a_order").mirror(p, n_p, "dtype").mirror_opt(p, n_p, "a_group");
+        /* a, a_scale, w, w_scale, sorted_tok, expert_offset, then a (weight, scale) a class -> y */
+        if (n_q == 2) return s.wire({ 0, 1, 2, 3, 4, 5, 6, 7, RAD_FUSE_TMP(0) });
+        return s.wire({ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, RAD_FUSE_TMP(0) });
+    }
+    case 1: {
+        Step s(out, "swiglu_clamped_had_quant_i8g");
+        /* the plane the GEMM wrote: a sorted row a row, the gate part then the up part */
+        s.pint("M", M * top_k).pint("n", N / parts).mirror_opt(p, n_p, "limit")
+         .pint("group", 128).pstr("dtype", "bf16");
+        /* the plane, then the quantiser's codes, scale and (absent) bf16 product */
+        return s.wire({ RAD_FUSE_TMP(0), q_idx, s_idx, RAD_FUSE_NONE });
+    }
+    default:
+        return RAD_E_NOTFOUND;
+    }
+}
+
+extern "C" int r4d_fuse_moe_gemm_q_gated(const RadParam* p, int n_p, uint64_t present, int step,
+                                         RadFuseStep* out) {
+    (void)present;
+    if (!out) return RAD_E_INVAL;
+    return moe_gemm_q_gated_chain(p, n_p, step, out, "moe_gemm_q", 2, 8, 9);
+}
+
+extern "C" int r4d_fuse_moe_gemm_q_gated_mod4(const RadParam* p, int n_p, uint64_t present,
+                                              int step, RadFuseStep* out) {
+    (void)present;
+    if (!out) return RAD_E_INVAL;
+    return moe_gemm_q_gated_chain(p, n_p, step, out, "moe_gemm_q_mod4", 4, 12, 13);
+}
+
+/* ==========================================================================================
  * gdn_conv_recurrent_update -- the decode convolution folded into the recurrent update's prologue.
  * (row: gdn_conv_recurrent_update_k128_v128_bf16; kernel: libr4d/
  * r4d_gdn_recurrent_update_k128_v128_bf16_fp32state.hip, r4d_gdn_recurrent_update_kernel under CV)
