@@ -37,21 +37,14 @@
  * a light layer's copy finishes early and the engine idles, and a heavy layer's copy delays every
  * layer after it. The ring packs each layer at its own size, so copies run ahead through light
  * layers and heavy ones start early. A layer staged beyond the next one takes at most half the
- * ring, so the next layer always has the room two buffers would give it. A layer heavier than
- * that half goes in two parts: what half the ring holds is staged ahead like any other, the rest
- * at the layer's own first op, when the layers before it have retired and the place after its
- * first part reaches the rest of the ring. The ring keeps that rest free until then (`Place::left`)
- * rather than letting the layers after it take it. Only what still does not fit is read across the
- * link in place, and that is the layer's coldest units, not its first ones by pool slot
- * (Mover::stage_units).
+ * ring, so the next layer always has the room two buffers would give it.
  *
  * ---- order and safety --------------------------------------------------------------------------
  *
  *   the pass's first op     stage the first routed layer the pass issues, and the ones after it
  *                           as far as the pace and the ring allow
- *   a layer's first op      publish the host addresses of earlier layers again, stage the rest of
- *                           a layer staged in two parts, wait on all its copies, stage further
- *                           layers into the freed room
+ *   a layer's first op      wait on its copies; publish the host addresses of earlier layers
+ *                           again; stage further layers into the freed room
  *   a layer's last op       record "free" behind it on the op's stream
  *   the pass's end          the same for anything still staged; and, when the next step continues
  *                           a prompt, stage the first layers of its trunk pass
@@ -169,12 +162,6 @@ private:
          * only at the next layer's first op. */
         bool     read = false;
         bool     retired = false;              /* its units are published at their pool slots */
-        /* Room the units of `li` this place did not take will need. A layer heavier than half the
-         * ring is staged in two parts: the rest is due at the layer's own first op, and the ring
-         * keeps this much free for it until then -- its first part is in the ring already, so at
-         * that op the room past it is the whole ring less this. Zero once the layer is whole or
-         * gives up the rest to `stage_overflow` (M-04). */
-        int64_t  left = 0;
         std::vector<int32_t> staged;
     };
     /* More places than a two-share ring can hold at the smallest per-layer share; a full table
@@ -223,18 +210,11 @@ private:
     enum { kStaged, kNone, kLater };
     int  stage_ahead(int32_t cur, bool* resync);
     int  stage_layer(int32_t li, bool now, RadEvent gate, int* got);
-    /* Stage the rest of a layer staged ahead in two parts, at its own first op. */
-    int  top_up(int32_t li);
     void withdraw_early();
-    int  take(int64_t want, bool partial, int64_t reserve, int32_t* out);
+    int  take(int64_t want, bool partial, int32_t* out);
     int  recycle_front();
     int  rebase(RadStream s);
     void retire(Place& p);
-    /* The units of layer `li` its places do not hold, and the room they will need (M-04). */
-    int64_t pending_need(int32_t li);
-    /* The room the ring keeps free for the layers staged ahead in two parts. */
-    int64_t reserve() const;
-    std::vector<int32_t> held_, units_;  /* pending_need's scratch, so a layer allocates nothing */
 };
 
 /* ---- the file stager: routed layers read from the container -------------------------------------

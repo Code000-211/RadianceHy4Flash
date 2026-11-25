@@ -163,7 +163,6 @@ int PrefillStager::recycle_front() {
     if (p.free_rec) RAD_TRY(rad_event_wait(mover_->transfer_stream(), p.free));
     p.li = -1;
     p.free_rec = p.read = p.retired = false;
-    p.left = 0;
     ring_order_.pop_front();
     spare_.push_back(i);
     return RAD_OK;
@@ -189,14 +188,13 @@ int PrefillStager::rebase(RadStream s) {
 
 /* A place of `want` bytes at the head of the ring or, with `partial`, all the room the head can
  * reach when `want` does not fit. The head may only overwrite retired places: it stays within one
- * ring of the oldest place still published. `reserve` is the room the layers staged ahead in two
- * parts still need, which the ring keeps for them (M-04). *out is -1 when nothing fits. */
-int PrefillStager::take(int64_t want, bool partial, int64_t reserve, int32_t* out) {
+ * ring of the oldest place still published. *out is -1 when nothing fits. */
+int PrefillStager::take(int64_t want, bool partial, int32_t* out) {
     *out = -1;
     int64_t limit = head_ + ring_;
     for (int32_t i : ring_order_)
         if (!place_[i].retired) { limit = place_[i].beg + ring_; break; }
-    int64_t len = std::min(want, limit - head_ - reserve);
+    int64_t len = std::min(want, limit - head_);
     if (len < want && !partial) return RAD_OK;
     if (len < RAD_ALIGN_UNIT) return RAD_OK;
     const int64_t end = head_ + len;
@@ -216,60 +214,22 @@ int PrefillStager::take(int64_t want, bool partial, int64_t reserve, int32_t* ou
     return RAD_OK;
 }
 
-/* The units of layer `li` its places do not hold yet, and the room they will need. A layer staged
- * ahead in two parts has this much room kept for it until its own first op stages it (M-04). */
-int64_t PrefillStager::pending_need(int32_t li) {
-    const Layer& L = layers_[(size_t)li];
-    held_.clear();
-    for (int32_t i : ring_order_) {
-        const Place& p = place_[i];
-        if (!p.retired && p.li == li) held_.insert(held_.end(), p.staged.begin(), p.staged.end());
-    }
-    units_.clear();
-    for (int32_t u : L.units)
-        if (std::find(held_.begin(), held_.end(), u) == held_.end()) units_.push_back(u);
-    return units_.empty() ? 0 : mover_->stage_need(units_, nullptr);
-}
-
-int64_t PrefillStager::reserve() const {
-    int64_t n = 0;
-    for (int32_t i : ring_order_)
-        if (!place_[i].retired) n += place_[i].left;
-    return n;
-}
-
 /* Stage one layer into the ring, behind `gate` when not null. The layer the run reaches next
- * (`now`) takes whatever room there is up to its need; any other goes within half the ring, so the
- * next layer always has at least half the ring. A layer heavier than that half is staged in two
- * parts: half the ring now, the rest at its own first op (top_up). *got is kStaged, kNone when
- * nothing of the layer is pooled or the ring holds all of it, or kLater when the ring has no room
- * yet. */
+ * (`now`) takes whatever room there is up to its need; any other goes only whole and within half
+ * the ring, so the next layer always has at least half the ring. *got is kStaged, kNone when
+ * nothing of the layer is pooled, or kLater when the ring has no room yet. */
 int PrefillStager::stage_layer(int32_t li, bool now, RadEvent gate, int* got) {
     *got = kLater;
     const Layer& L = layers_[(size_t)li];
-    /* A first part staged this layer ahead; the rest is this call's to stage. */
-    bool first = true;
-    for (int32_t i : ring_order_) {
-        const Place& p = place_[i];
-        if (!p.retired && p.li == li) { first = false; break; }
-    }
-    /* What the ring does not hold yet: a first part staged ahead leaves the rest to stage here. */
-    const std::vector<int32_t>* units = &L.units;
-    if (!first) { pending_need(li); units = &units_; }
     int64_t unit = 0;
-    const int64_t need = mover_->stage_need(*units, &unit);
+    const int64_t need = mover_->stage_need(L.units, &unit);
     if (need <= 0) { *got = kNone; return RAD_OK; }
-    /* Half the ring is the share of a layer the run is not at yet, aligned so the place is a whole
-     * number of units. */
-    const int64_t half = ring_ / 2 - (ring_ / 2) % RAD_ALIGN_UNIT;
-    int64_t want = need;
-    if (!now) want = std::min(need, half);
-    const bool partial = now || want < need;
+    if (!now && need > ring_ / 2) return RAD_OK;
     /* A place that wraps past the region's end is two stretches, and the first may end with less
      * room than a unit, so it asks for one unit extra. */
-    if (head_ % ring_ + want > ring_) want += unit;
+    const int64_t want = head_ % ring_ + need > ring_ ? need + unit : need;
     int32_t i = -1;
-    RAD_TRY(take(want, partial, now ? 0 : reserve(), &i));
+    RAD_TRY(take(want, now, &i));
     if (i < 0) return RAD_OK;
     Place& p = place_[i];
     p.li = li;
@@ -278,11 +238,7 @@ int PrefillStager::stage_layer(int32_t li, bool now, RadEvent gate, int* got) {
     const int64_t off = p.beg % ring_, len = p.end - p.beg;
     Mover::StageSpan sp[2] = { { base_ + off, std::min(len, ring_ - off) },
                                { base_, len - std::min(len, ring_ - off) } };
-    Mover::StagePart part;
-    part.first = first;
-    part.last  = now;
-    RAD_TRY(mover_->stage_units(*units, sp, sp[1].cap > 0 ? 2 : 1, nullptr, p.done, &p.staged,
-                                &part));
+    RAD_TRY(mover_->stage_units(L.units, sp, sp[1].cap > 0 ? 2 : 1, nullptr, p.done, &p.staged));
     if (p.staged.empty()) {
         p.li = -1;
         spare_.push_back(i);
@@ -291,29 +247,7 @@ int PrefillStager::stage_layer(int32_t li, bool now, RadEvent gate, int* got) {
     }
     head_ = p.end;
     ring_order_.push_back(i);
-    /* What the place did not hold stays the layer's room in the ring, to be staged at its own
-     * first op; once it is, whatever is still over is read in place and counted as overflow. */
-    p.left = (now || part.left <= 0) ? 0 : pending_need(li);
     *got = kStaged;
-    return RAD_OK;
-}
-
-/* Stage the rest of a layer staged ahead in two parts, into the room its predecessors' retirement
- * has just freed. What still does not fit is read across the link in place. */
-int PrefillStager::top_up(int32_t li) {
-    bool due = false;
-    for (int32_t i : ring_order_) {
-        const Place& p = place_[i];
-        if (!p.retired && p.li == li && p.left > 0) { due = true; break; }
-    }
-    if (!due) return RAD_OK;
-    int got = kLater;
-    RAD_TRY(stage_layer(li, /*now=*/true, nullptr, &got));
-    /* One attempt at the layer's own op: what the ring did not take is read across the link, so
-     * the room kept for it goes back to the ring. */
-    if (got != kLater)
-        for (int32_t i : ring_order_)
-            if (place_[i].li == li) place_[i].left = 0;
     return RAD_OK;
 }
 
@@ -369,19 +303,17 @@ int PrefillStager::before_op(rad_op h, RadStream s, bool* resync) {
     /* The run's arrival at this layer paces the copies kLead layers on. */
     RAD_TRY(rad_event_record(gate_[li % kGates], s));
     gate_li_[li % kGates] = li;
-    /* Earlier layers are done: every pass of rows issued their last op and recorded `free`, and
-     * layers do not interleave. They are retired here, not at their last op, which may repeat for
-     * another pass of rows; before this layer's staging, so that the room they held is its own. */
-    for (int32_t i : ring_order_) {
-        Place& p = place_[i];
-        if (!p.retired && p.li < li && p.read) retire(p);
-    }
-    /* A layer heavier than half the ring was staged ahead in two parts; the rest goes now. */
-    RAD_TRY(top_up(li));
     /* This layer's copies were published when issued; this one wait orders its ops behind them. */
     for (int32_t i : ring_order_) {
         Place& p = place_[i];
         if (!p.retired && p.li == li) RAD_TRY(rad_event_wait(s, p.done));
+    }
+    /* Earlier layers are done: every pass of rows issued their last op and recorded `free`, and
+     * layers do not interleave. They are retired here, not at their last op, which may repeat for
+     * another pass of rows. */
+    for (int32_t i : ring_order_) {
+        Place& p = place_[i];
+        if (!p.retired && p.li < li && p.read) retire(p);
     }
     /* Stage further ahead into the freed room. */
     if (next_ <= li) next_ = li + 1;
