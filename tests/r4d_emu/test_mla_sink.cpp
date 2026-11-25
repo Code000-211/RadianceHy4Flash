@@ -222,7 +222,7 @@ struct Rope {
  * operand's columns, so a folded launch can be compared with a rotated one. */
 int launch(const Problem& p, bool sel, int form, std::vector<uint16_t>& out, int stable = -1,
            int64_t scratch_cut = 0, std::vector<uint32_t>* scr = nullptr,
-           const Rope* rope = nullptr, const std::vector<uint16_t>* qr = nullptr) {
+           const Rope* rope = nullptr, const std::vector<uint16_t>* qr = nullptr, int hg = 0) {
     const int M = p.rows();
     out.assign((size_t)M * p.heads * L, 0xffff);
     auto& P = const_cast<Problem&>(p);
@@ -249,6 +249,9 @@ int launch(const Problem& p, bool sel, int form, std::vector<uint16_t>& out, int
     ps.i("block_size", p.bs);
     ps.f("scale", kScale);
     if (stable >= 0) ps.i("stable", stable);
+    /* K-59's rad-tune axis: the workgroup's sixteen-head groups (the form pin is the test hook and
+     * wins over it; this picks the group where no pin is set). */
+    if (hg) ps.i("hg", hg);
     if (rope && rope->pos) {
         ps.f("rope_theta", rope->theta);
         ps.f("rope_scale", rope->scale);
@@ -478,6 +481,24 @@ void check_stable(const std::string& name, const Problem& p, bool forms_pins = t
         }
         report(name + " stable 1: HG 1 / 2 / 4, the element load and the fused form equal (bytes)",
                forms);
+        /* K-59: the `hg` axis rad-tune walks takes the same workgroup widths the form pins do, and
+         * the bytes do not move. The pin is off here, so only the axis picks the group; a value the
+         * shape cannot fill more than half (heads > 16 * (hg / 2), the law's own bound) must be
+         * refused rather than launched. */
+        bool axis = true;
+        char hgbuf[160] = "";
+        for (int g : { 1, 2, 4 }) {
+            std::vector<uint16_t> o;
+            const int rca = launch(p, false, 0, o, 1, 0, nullptr, nullptr, nullptr, g);
+            const bool fits = (long)p.heads > 16 * (g / 2);
+            const bool ok_g = fits ? (rca == RAD_OK && o == all) : (rca != RAD_OK);
+            if (!ok_g)
+                std::snprintf(hgbuf, sizeof hgbuf, "hg %d rc %d%s", g, rca,
+                              fits ? " bytes moved" : " accepted an unusable group");
+            axis = axis && ok_g;
+        }
+        report(name + " stable 1: the hg axis (1 / 2 / 4) equals the law, and refuses a group it "
+                        "cannot fill", axis, hgbuf);
     }
     if (p.window == 0) {
         Problem q = p;

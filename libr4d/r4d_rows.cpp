@@ -6413,6 +6413,54 @@ static const RadTunable tAttnSplit[] = {
   { "splits", kSplits, NELEM(kSplits), 0, "split-KV segments per sequence. 0 = libr4d's split law" },
 };
 
+/* ------------------------------------------------------------- the MLA sink's workgroup width
+ *
+ * mla_attn_paged_sink / mla_attn_sel_sink (r4d_mla_sink.hip): the sixteen-head groups one
+ * workgroup covers. A group loads each key chunk once for all of its heads and a head's reduction
+ * is its own, so every value computes the same bytes (the HG cases of
+ * tests/r4d_emu/test_mla_sink.cpp, pinned and by this axis). 0 is the launcher's law: the widest
+ * group that still leaves 64 workgroups, two to each of the card's 32 WGPs. A group the shape
+ * cannot fill more than half is refused at launch, so a sweep only pays for the points it can use.
+ * The planned `rt`, `sw` (F2.2) and `kb` (F2.3) kernels are not in the tree yet; when they land
+ * they join this table. */
+static const int64_t kMlaSinkHg[] = { 0, 1, 2, 4 };
+static const RadTunable tMlaSink[] = {
+  { "hg", kMlaSinkHg, NELEM(kMlaSinkHg), 0,
+    "sixteen-head groups a workgroup; 0 = the widest that leaves 64 workgroups" },
+};
+
+/* ------------------------------------------------------- the MoE rows' forms (moe_gemm_q's op)
+ *
+ * Three axes that were test hooks only (K-59), one body each, all bit-neutral:
+ *
+ * `form` (moe_gather_inv_bf16, moe_gather_inv_i8g, moe_gather_bf16; r4d_moe.hip): 1
+ * gather_kernel (a column a thread), 2 gather_wide_kernel (a wave a token), 3 gather_kernel16
+ * (sixteen slots, eight columns a lane); 0 the launcher's rule. Every form sums a column's slots
+ * in the same ascending order.
+ * `map` (moe_gemm_iqr, moe_gemm_iqr_mod4; r4d_moe_iqr.hip): 4 the run map, 8 the packed map, 0 the
+ * rule (packed from kPackMinRowsPerExpert rows an expert). Both name the same blocks.
+ * `dmt` (moe_gemm_i8a8, moe_gemm_i8a8_mod4; r4d_moe.hip): the M tiles a block of the 256-column
+ * down tile -- 4 is 64-row entries, 2 is 32-row entries with the 128-column tile -- 0 the rule
+ * (4 from kMoeDownMtRowsPerExpert rows an expert). A row is computed with the same WMMAs either
+ * way. Only the int8 down GEMMs take this axis; the trellis (IQR) and bf16 down forms choose
+ * their tile by the narrow-K rule.
+ *
+ * rad-tune walks them where the shapes reach them; the test hooks still win where a test sets
+ * one, so the selftest's byte comparisons cover the same forms. */
+static const int64_t kMoeGatherForm[] = { 0, 1, 2, 3 };
+static const RadTunable tMoeGather[] = {
+  { "form", kMoeGatherForm, NELEM(kMoeGatherForm), 0,
+    "1 a column a thread, 2 a wave a token, 3 sixteen slots; 0 = the launcher's rule" },
+};
+static const int64_t kMoeMap[] = { 0, 4, 8 };
+static const RadTunable tMoeIqrMap[] = {
+  { "map", kMoeMap, NELEM(kMoeMap), 0, "4 the run map, 8 the packed map; 0 = by rows an expert" },
+};
+static const int64_t kMoeDownMt[] = { 0, 2, 4 };
+static const RadTunable tMoeDown[] = {
+  { "dmt", kMoeDownMt, NELEM(kMoeDownMt), 0, "M tiles a block of the 256-column down tile; 0 = by rows an expert" },
+};
+
 /* ------------------------------------------------------------------- all-reduce launch geometry
  *
  * Four independent axes of the handshake: nblocks, nthreads, drain and acq. (`pub` is 1 in every
@@ -7441,7 +7489,7 @@ static const RadKernelInfo kKernels[] = {
   "latent_dim=512, rope_dim=64, heads 8..64 a multiple of 8, block_size a power of two <=256; one page table a "
   "sequence; stable 1 splits at every M (scratch for every row), stable 0 at M<=16 (window) / 32",
   "bf16 Q/rotary/cache/output, f32 sinks, softmax and partials; P as bf16 high plus low part",
-  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cMlaAttnPagedSink), NOTUNE,
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cMlaAttnPagedSink), ROW(tMlaSink), nullptr,
   nullptr, nullptr, r4d_rad_mla_attn_paged_sink, r4d_rad_mla_attn_paged_sink_scratch, nullptr,
   nullptr, r4d_shape_mla_attn_paged_sink },
 { "mla_attn_sel_sink_bf16", "mla_attn_sel_sink", "attn",
@@ -7450,7 +7498,7 @@ static const RadKernelInfo kKernels[] = {
   "latent_dim=512, rope_dim=64, heads 8..64 a multiple of 8, block_size a power of two <=256; stable 1 "
   "splits at every M, stable 0 at M<=32",
   "bf16 Q/rotary/cache/output, f32 sinks, softmax and partials; P as bf16 high plus low part",
-  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cMlaAttnSelSink), NOTUNE,
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cMlaAttnSelSink), ROW(tMlaSink), nullptr,
   nullptr, nullptr, r4d_rad_mla_attn_sel_sink, r4d_rad_mla_attn_sel_sink_scratch, nullptr,
   nullptr, r4d_shape_mla_attn_sel_sink },
 { "mla_project_bf16", "mla_project", "attn", "per-head absorbed MLA projections",
@@ -9843,7 +9891,7 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   "(row, 128 of K), bf16 out. dtype i8a8h: the weight rotated by a 128-wide Hadamard along K, the "
   "1/128 in its scale, against had_quant_act_i8g's activation",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
-  ROW(cMoeGemmI8), NOTUNE,
+  ROW(cMoeGemmI8), ROW(tMoeDown), nullptr,
   /* Both planes are the container's own bytes (r4d_rad_layout_i8_rowmajor), so an expert reaches
    * the kernel from any tier unchanged. */
   nullptr, nullptr, r4d_rad_moe_gemm_i8a8, r4d_rad_moe_gemm_q_scratch,
@@ -9856,7 +9904,7 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   "as moe_gemm_i8a8, every class",
   "as moe_gemm_i8a8",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
-  ROW(cMoeGemmI8), NOTUNE,
+  ROW(cMoeGemmI8), ROW(tMoeDown), nullptr,
   nullptr, nullptr, r4d_rad_moe_gemm_i8a8_mod4, r4d_rad_moe_gemm_q_scratch,
   r4d_rad_layout_moe_i8_mod4, nullptr,
   r4d_shape_moe_gemm_i8_mod4 },
@@ -9873,7 +9921,7 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   "the code's constants) and its scales (f32 a row, f32 a 128-K block), /fwht128 against "
   "had_quant_act_i8g's activation; bf16 out, the product within f32 rounding",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
-  ROW(cMoeGemmIqr), NOTUNE,
+  ROW(cMoeGemmIqr), ROW(tMoeIqrMap), nullptr,
   nullptr, nullptr, r4d_rad_moe_gemm_iqr, r4d_rad_moe_gemm_iqr_scratch,
   r4d_rad_layout_moe_iqr, r4d_rad_relayout_moe_iqr, nullptr, r4d_rad_unrelayout_moe_iqr },
 
@@ -9883,7 +9931,7 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   "as moe_gemm_iqr, every class",
   "as moe_gemm_iqr",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
-  ROW(cMoeGemmIqr), NOTUNE,
+  ROW(cMoeGemmIqr), ROW(tMoeIqrMap), nullptr,
   nullptr, nullptr, r4d_rad_moe_gemm_iqr_mod4, r4d_rad_moe_gemm_iqr_scratch,
   r4d_rad_layout_moe_iqr_mod4, r4d_rad_relayout_moe_iqr_mod4, nullptr,
   r4d_rad_unrelayout_moe_iqr_mod4 },
@@ -9898,7 +9946,7 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   "plane with codes indexing libquant's w4nl levels and an E4M3 scale per (row, 64 or 32 of K) "
   "under a fixed 2^-13, each level read as the nearest of one int8 set (r4d_args.h, kW4nlI8)",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
-  ROW(cMoeGemmW4I8), NOTUNE,
+  ROW(cMoeGemmW4I8), ROW(tMoeDown), nullptr,
   nullptr, nullptr, r4d_rad_moe_gemm_w4a8i8, r4d_rad_moe_gemm_w4a8_scratch,
   r4d_rad_layout_moe_w4, r4d_rad_relayout_moe_w4, nullptr, r4d_rad_unrelayout_moe_w4 },
 
@@ -9908,7 +9956,7 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   "as moe_gemm_w4a8i8, every class",
   "as moe_gemm_w4a8i8",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
-  ROW(cMoeGemmW4I8), NOTUNE,
+  ROW(cMoeGemmW4I8), ROW(tMoeDown), nullptr,
   nullptr, nullptr, r4d_rad_moe_gemm_w4a8i8_mod4, r4d_rad_moe_gemm_w4a8_scratch,
   r4d_rad_layout_moe_w4_mod4, r4d_rad_relayout_moe_w4_mod4, nullptr,
   r4d_rad_unrelayout_moe_w4_mod4 },
@@ -9933,7 +9981,7 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   "  with sixteen-byte rows takes the sixteen-slot form (eight columns a lane, one load a slot)",
   "bf16 in and out",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
-  ROW(cMoeGather), NOTUNE,
+  ROW(cMoeGather), ROW(tMoeGather), nullptr,
   nullptr, nullptr, r4d_rad_moe_gather, r4d_rad_moe_gather_scratch, nullptr, nullptr,
   r4d_shape_moe_gather },
 
@@ -9942,7 +9990,7 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   "any M and n; the decode kernel up to 512 slots, the prefill forms above, as moe_gather",
   "bf16 in and out, f32 or bf16 routing weights",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
-  ROW(cMoeGather), NOTUNE,
+  ROW(cMoeGather), ROW(tMoeGather), nullptr,
   nullptr, nullptr, r4d_rad_moe_gather_inv, nullptr, nullptr, nullptr,
   r4d_shape_moe_gather_inv },
 
@@ -9953,7 +10001,7 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   "four-byte-aligned codes; the codes are the standalone quantiser's bytes",
   "bf16 in, f32 or bf16 routing weights, int8 codes + f32 scales out",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
-  ROW(cMoeGatherQ8), NOTUNE,
+  ROW(cMoeGatherQ8), ROW(tMoeGather), nullptr,
   nullptr, nullptr, r4d_rad_moe_gather_inv_i8g, nullptr, nullptr, nullptr,
   r4d_shape_moe_gather_inv_i8g },
 

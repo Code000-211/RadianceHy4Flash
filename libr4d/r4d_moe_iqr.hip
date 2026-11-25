@@ -715,6 +715,15 @@ static std::atomic<int> g_moe_iqr_map_tiles{0};
 static uint32_t map_tiles_pin() {
     return (uint32_t)g_moe_iqr_map_tiles.load(std::memory_order_relaxed);
 }
+/* The `map` axis (K-59): rad-tune's, the same two maps the test hook pins -- 4 the run map, 8 the
+ * packed one, 0 the rule above. The hook wins where it is set, so the selftest's byte comparisons
+ * still pin them; both maps name the same blocks, so the choice moves no bits. */
+static uint32_t map_tiles_pin(const RadArgs* a) {
+    const uint32_t p = map_tiles_pin();
+    if (p) return p;
+    const long long m = r4d_geti_or(a, "map", 0);
+    return (uint32_t)(m == kMapTiles || m == kPackTiles ? m : 0);
+}
 /* The routed rows between which a narrow-K wave takes two weight tiles. Flash-Next's down
  * projection (2560 x 384:256, 512 experts, top 10), us a launch at one tile -> two: 10 rows 11.1 ->
  * 11.9 (too few waves to fill the card), 20 rows level, 30 rows 21.1 -> 20.3, 80 rows 48.0 -> 44.1,
@@ -939,7 +948,7 @@ int moe_iqr_launch(const RadArgs* a, RadStream stream, int ncls) {
          * pack_map_form), from kPackMinRowsPerExpert rows an expert or as pinned, where the rows'
          * 32-bit offsets reach all of the activation and the scratch holds its entries (an expert
          * at most one per 128 rows begun and one for its dot remainder, and the tail). */
-        const uint32_t pin = map_tiles_pin();
+        const uint32_t pin = map_tiles_pin(a);
         /* A split takes the packed map whatever the rows: its entries carry their row counts, and
          * its bytes are the run map's. */
         const bool split_on = split && split->data && split->dtype == RAD_I32;

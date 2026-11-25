@@ -8567,6 +8567,50 @@ static void moe_iqr_pack_case(const Plugin& pl, int64_t Mtok, bool down, int B =
                               " entries carry a row count (the run map was built)");
         }
     }
+    /* K-59's `map` axis (rad-tune's): the same two maps reached by the parameter, with the test hook
+     * off, and the map built is the one the axis named -- the run map (four tiles, no row counts in
+     * its entries) at 4, the packed one (eight tiles, row counts) at 8 -- over the run map's bytes. */
+    {
+        auto run_axis = [&](long long m, std::vector<uint16_t>& out, int64_t& entries,
+                            int64_t& with_rows, int& rca) {
+            std::vector<RadParam> p2 = ps;
+            p2.push_back(PI("map", m));
+            RadArgs a2 = a;
+            a2.p = p2.data(); a2.n_p = (int)p2.size();
+            st_memcpy(d_y, poison.data(), poison.size() * 2, hipMemcpyHostToDevice);
+            rca = r->launch(&a2, (RadStream) nullptr);
+            const bool fine = rca == RAD_OK && st_stream_sync(nullptr) == hipSuccess;
+            if (fine) {
+                st_memcpy(out.data(), d_y, out.size() * 2, hipMemcpyDeviceToHost);
+                map_rows(entries, with_rows);
+            } else {
+                entries = with_rows = 0;
+            }
+            return fine;
+        };
+        for (const long long m : { 4LL, 8LL }) {
+            const std::string what = std::string(nm) + ": the map axis takes " +
+                                     (m == 8 ? "the packed map at eight tiles" : "the run map at four tiles");
+            std::vector<uint16_t> y2((size_t)(Tr * N));
+            int64_t entries = 0, with_rows = 0;
+            int rca = 0;
+            if (!run_axis(m, y2, entries, with_rows, rca)) {
+                ok(what.c_str(), false, "launch failed rc " + std::to_string(rca));
+                continue;
+            }
+            int64_t diff = 0, first = -1;
+            for (size_t i = 0; i < y2.size(); ++i)
+                if (y2[i] != y0[i]) { if (first < 0) first = (int64_t)i; ++diff; }
+            const bool want_rows = m == 8;
+            ok(what.c_str(), diff == 0 && entries > 0 && (with_rows > 0) == want_rows,
+               diff ? std::to_string(diff) + " of " + std::to_string(y2.size()) +
+                          " elements differ from the run map's, first row " +
+                          std::to_string(first / N) + " column " + std::to_string(first % N)
+                    : std::to_string(with_rows) + " of " + std::to_string(entries) +
+                          " entries carry a row count (" + (want_rows ? "the run" : "the packed") +
+                          " map was built)");
+        }
+    }
     /* `split` (a checkpoint inside the step): with each expert's slots ascending, as the router's
      * stable sort leaves them, the rows of tokens before the split are a run of their own, so they
      * hold the bytes a pass of those tokens alone gives them -- whatever the rows after them. The
@@ -19971,6 +20015,43 @@ static void moe_down_mt_case(const Plugin& pl, int64_t Mtok) {
            diff ? std::to_string(diff) + " of " + std::to_string(y.size()) + " elements differ from the 32-row block's, first row " +
                       std::to_string(first / N) + " column " + std::to_string(first % N)
                 : "the 32-row block's bytes");
+    }
+    /* K-59's `dmt` axis (rad-tune's): the two M tiles a block reached by the parameter with the test
+     * hook off, over the 32-row block's bytes, and a value that is neither refused rather than taken
+     * as the rule. */
+    {
+        auto run_axis = [&](long long dm, std::vector<uint16_t>& out, int& rca) {
+            std::vector<RadParam> p2 = ps;
+            p2.push_back(PI("dmt", dm));
+            RadArgs a2 = a;
+            a2.p = p2.data(); a2.n_p = (int)p2.size();
+            st_memcpy(d_y, poison.data(), poison.size() * 2, hipMemcpyHostToDevice);
+            rca = r->launch(&a2, (RadStream) nullptr);
+            const bool fine = rca == RAD_OK && st_stream_sync(nullptr) == hipSuccess;
+            if (fine) st_memcpy(out.data(), d_y, out.size() * 2, hipMemcpyDeviceToHost);
+            return fine;
+        };
+        for (const long long dm : { 2LL, 4LL }) {
+            const std::string what = std::string(nm) + ": the dmt axis takes " +
+                                     std::to_string(dm) + " M tiles a block";
+            std::vector<uint16_t> y2((size_t)(Tr * N));
+            int rca = 0;
+            if (!run_axis(dm, y2, rca)) {
+                ok(what.c_str(), false, "launch failed rc " + std::to_string(rca));
+                continue;
+            }
+            int64_t diff = 0;
+            for (size_t i = 0; i < y2.size(); ++i) diff += y2[i] != y0[i];
+            ok(what.c_str(), diff == 0,
+               diff ? std::to_string(diff) + " of " + std::to_string(y2.size()) +
+                          " elements differ from the 32-row block's"
+                    : "the 32-row block's bytes");
+        }
+        std::vector<uint16_t> y2((size_t)(Tr * N));
+        int rca = 0;
+        run_axis(8, y2, rca);
+        ok((std::string(nm) + ": the dmt axis at eight tiles is refused").c_str(),
+           rca == RAD_E_UNSUPPORTED, "rc " + std::to_string(rca) + " for a value that is neither 2 nor 4");
     }
     dfree_all();
 }

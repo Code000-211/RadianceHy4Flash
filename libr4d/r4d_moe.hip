@@ -2395,6 +2395,14 @@ __global__ __launch_bounds__(NTHR) void scale_rows_kernel(
  * refused. All are bit-identical (r4d_selftest). */
 static int g_moe_gather_pin = 0;
 extern "C" void r4d_moe_gather_pin_form(int form) { g_moe_gather_pin = form; }
+/* The `form` axis (K-59): rad-tune's, the same three forms the test hook above pins and 0 the rule.
+ * The hook wins where it is set, so the selftest's byte comparisons still pin them; the forms sum a
+ * column's slots in the same ascending order, so the choice moves no bits. */
+static inline int r4d_moe_gather_form(const RadArgs* a) {
+    if (g_moe_gather_pin) return g_moe_gather_pin;
+    const long long f = r4d_geti_or(a, "form", 0);
+    return (int)(f < 0 || f > 3 ? 0 : f);
+}
 
 /* ============================================================== the plugin ABI entry points */
 
@@ -2866,8 +2874,15 @@ static int g_moe_down_tile_pin = 0;
  * r4d_selftest compares them byte for byte. */
 constexpr long long kMoeDownMtRowsPerExpert = 32;
 static int g_moe_down_mt_pin = -1;
-static inline int r4d_moe_down_mt(long long T, long long n_expert) {
+/* The `dmt` axis (K-59): rad-tune's, the same M tiles a block the test hook pins, 0 the rule. The
+ * hook wins where it is set. Four M tiles a block is 64-row entries with the 256-column tile; two
+ * is 32-row entries with the 128-column one, and a block's map covers fewer rows, so both compute
+ * every element of a row with the same WMMAs in the same order (r4d_selftest compares them byte for
+ * byte). A value other than 2 or 4 is refused, not silently taken as the rule. */
+static inline int r4d_moe_down_mt(const RadArgs* a, long long T, long long n_expert) {
     if (g_moe_down_mt_pin > 0) return g_moe_down_mt_pin;
+    const long long dm = r4d_geti_or(a, "dmt", 0);
+    if (dm) return (int)dm;
     return T >= kMoeDownMtRowsPerExpert * n_expert ? 4 : 2;
 }
 
@@ -3144,7 +3159,10 @@ static int moe_gemm_launch(const RadArgs* a, RadStream stream, int ncls = 2) {
         /* The 256-column tile's M tiles a block (r4d_moe_down_mt); the 64-row block's map has fewer
          * entries than the scratch holds. */
         int dmt = 2;
-        if constexpr (W4 == 2 && I8) { if (map && dn_wide) dmt = r4d_moe_down_mt(T, n_expert); }
+        if constexpr (W4 == 2 && I8) { if (map && dn_wide) {
+                dmt = r4d_moe_down_mt(a, T, n_expert);
+                if (dmt != 2 && dmt != 4) return R4D_NO(RAD_E_UNSUPPORTED);
+            } }
         const long long dfm = dmt * 16;
         const long long dcap = dmt == 2 ? cap : r4d_blockmap_cap(T, n_expert, dfm);
         if (map) {
@@ -3538,7 +3556,7 @@ static int moe_gather_body(const RadArgs* a, RadStream s, bool given, bool quant
      * the passes that keep the prepass. */
     const bool sixteen = top_k == 16 && n % (long long)kGatherCols == 0 && al16(ye->data, ye_ld) &&
                          al16(Y->data, y_ld) && (!sh || al16(sh->data, sh_ld));
-    const int gpin = g_moe_gather_pin;
+    const int gpin = r4d_moe_gather_form(a);
     if (gpin < 0 || gpin > 3) return R4D_NO(RAD_E_INVAL);
     if (gpin == 2 && !wide_ok) return R4D_NO(RAD_E_UNSUPPORTED);
     if (gpin == 3 && !sixteen) return R4D_NO(RAD_E_UNSUPPORTED);
