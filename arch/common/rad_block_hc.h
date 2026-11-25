@@ -135,6 +135,11 @@ struct HyperConn {
         rad_buf ye = 0, ew = 0, sorted = 0, sh = 0, sg = 0;   /* sh and sg: the shared arm, or 0 */
         int64_t top_k = 0;
         int64_t rows = 0;                                      /* one pass of the block, at most */
+        /* The block's gather also writes the sum's rotated int8 codes (`moe_gather_inv_i8g`, the
+         * block's `gather_q8`). This write replaces that gather and writes no codes, so folding it
+         * in would leave the linear that reads them with codes of a sum never written; the caller
+         * sets it from the block and no fold is declared. */
+        bool sum_codes = false;
     };
     GatherSrc  gsrc{};
     rad_op     op_ar_gather_write = 0, op_ar_gather_write6 = 0;
@@ -339,6 +344,9 @@ inline int HyperConn::declare(RadBuilder* b, Names& nm, const Geom& geom, const 
 
 inline int HyperConn::declare_gather(RadBuilder* b, const GatherSrc& src) {
     if (!op_ar_write || src.top_k <= 0 || !src.ye || !src.ew || !src.sorted) return RAD_OK;
+    /* A block whose gather keeps its sum's codes needs that launch: this write replaces it and
+     * writes no codes. The block gathers as it declared and the plain write reduces. */
+    if (src.sum_codes) return RAD_OK;
     /* Two or four ranks. At four only the exact form exists (op_ar_write6 is 0). Other widths keep
      * the block's own gather and both bounds stay 0. */
     if (g.world != 2 && g.world != 4) return RAD_OK;
@@ -429,6 +437,7 @@ struct HcProject {
     rad_buf      on = 0;           /* [rows] int32: 1 = project this row */
     rad_buf      h = 0;            /* the model's wide stream */
     int64_t      n = 0, hc = 0;
+    int          ps = 0;           /* 1: per-stream table, stream s reads its own direction */
 
     bool steered() const { return op != 0; }
 
@@ -454,12 +463,26 @@ struct HcProject {
         return rad_decl_buffer(b, name, &d);
     }
 
-    /* `layer`'s projection, when the vector steers it. Called for every layer; the unsteered ones
-     * (outside the file, outside the range, or no vector at all) declare nothing. */
+    /* `layer`'s projection `k` (a direction group: one row, or hc rows per stream), when the vector steers it. Called for every layer and
+     * every direction; the unsteered ones (outside the file, outside the range, or no vector at
+     * all) declare nothing. Directions of a layer are chained on the same stream, so with an
+     * orthonormal basis the layer removes its whole k-dimensional subspace. */
     int declare(RadBuilder* b, const char* name, const Geom& g, int64_t layer,
-                const RadControlVector* cv, rad_buf mask, rad_buf stream, int64_t hc_streams) {
+                const RadControlVector* cv, rad_buf mask, rad_buf stream, int64_t hc_streams,
+                int64_t k = 0) {
         if (!b || !mask || !stream || !cv || !cv->dir || hc_streams <= 1) return RAD_OK;
         if (layer <= 0 || layer >= cv->n_layers || layer >= g.n_layer) return RAD_OK;
+        /* `rank` is the rows a layer carries. A per-stream package holds hc of them per group, so
+         * it has rank / hc groups, and a row count that is no multiple of hc is no such package. */
+        const int64_t rank = cv->rank > 0 ? cv->rank : 1;
+        const int64_t per = cv->per_stream ? hc_streams : 1;
+        if (rank % per != 0) {
+            fprintf(stderr, "radiance: %s: a per-stream control vector of %lld rows a layer does "
+                            "not split into %lld streams\n",
+                    name, (long long) rank, (long long) hc_streams);
+            return RAD_E_INVAL;
+        }
+        if (k < 0 || k >= rank / per) return RAD_OK;
         const float scale = cv->scales ? cv->scales[(size_t) layer] : 0.0f;
         if (scale == 0.0f) return RAD_OK;
 
@@ -467,10 +490,15 @@ struct HcProject {
         hc  = hc_streams;
         on  = mask;
         h   = stream;
-        dir = cv->dir + (size_t) layer * (size_t) n;
+        /* A per-stream package holds one direction per hyper-connection stream inside each
+         * group, so group k's table is hc rows long and stream s reads row s. A single-direction
+         * package is one row shared by every stream (vsep 0, the pre-45 behaviour). */
+        ps  = cv->per_stream ? 1 : 0;
+        dir = cv->dir + (size_t) ((layer * rank) + (k * per)) * (size_t) n;
 
         op = rw(b, RAD_OP(b, "hc_project",
                    RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", n), RAD_INT("hc", hc),
+                              RAD_INT("vsep", ps ? n : 0),
                               RAD_F64("scale", (double) scale), RAD_STR("dtype", g.dtype)),
                    RAD_NOWEIGHTS),
                {h, mask}, {h});
@@ -490,7 +518,7 @@ struct HcProject {
         if (!op || !batch || !batch->control_vector) return;
         RAD_ISSUE_N(c_, op, rows,
                     brow_slice(h, r0, rows, hc * n),
-                    praw(dir, RAD_F32, n),
+                    praw(dir, RAD_F32, ps ? n * hc : n),
                     praw((const int32_t*) rad_buf_ptr(c_, on) + r0, RAD_I32, rows));
     }
 };

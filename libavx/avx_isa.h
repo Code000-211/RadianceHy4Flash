@@ -123,7 +123,7 @@ int         avx_par_force(int threads);
     /* ---- mixture of experts */                                                                 \
     X(router_topk)          X(moe_scatter)          X(moe_gemm)             X(moe_gemm_q)         \
     X(moe_gather)           X(row_topk)             X(row_topk_merge)       X(logit_rerank)     \
-    X(moe_gemm_q_mod4)      X(pair_argmax)          \
+    X(moe_gemm_q_mod4)      X(pair_argmax)          X(cast_row_topk)        \
     X(router_topk_scatter)  X(router_gemm_topk_scatter)                                          \
     /* ---- gated delta net */                                                                    \
     X(gdn_conv_prep)        X(gdn_conv_update)      X(gdn_kkt_solve)        X(gdn_chunk_scan)     \

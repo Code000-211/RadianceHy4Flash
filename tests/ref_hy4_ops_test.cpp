@@ -201,8 +201,9 @@ TEST(every_hy4_op_has_a_schema_with_f64_floats_and_str_enums_and_a_shape_descrip
     const char* ops[] = { "ihc_pre", "ihc_post", "mla_project_kv", "mla_attn_paged_sink",
         "mla_attn_sel_sink", "mla_kv_split", "attn_kv_sink", "gate_mul", "idx_pool_gated", "idx_pool_gated_fp8", "idx_pool_gated_i8",
         "idx_score", "engram_ids", "engram_norm", "engram_gate", "dfly_sel" };
-    const char* f64[] = { "eps", "hc_eps", "post_mag", "scale", "theta" };
-    const char* str[] = { "dtype", "mode", "sections" };
+    const char* f64[] = { "eps", "hc_eps", "post_mag", "scale", "theta", "rope_theta",
+                          "rope_scale" };
+    const char* str[] = { "dtype", "mode", "sections", "rope_mode", "rope_sections" };
     for (const char* op : ops) {
         const RadOpSchema* s = schema(op);
         const RadKernelInfo* k = kern(op);
