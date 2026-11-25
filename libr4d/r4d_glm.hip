@@ -17,20 +17,23 @@ namespace {
 __device__ __forceinline__ float weight_f32(float v) { return v; }
 __device__ __forceinline__ float weight_f32(uint16_t v) { return bf16_to_f32(v); }
 
+// One wave's R x C tile of the sums: the k loop and the butterfly, with no early return and no
+// store. It is a function of its own because of what the compiler makes of it (K-10's lane run,
+// notes/backlog/measurements/K-10.md): written inline in the body below, the eight-row form with
+// a stored-bf16 weight -- the served routers' form at verify heights, 17 to 63 rows -- ran 2.8 to
+// 3.6 times longer than with an f32 weight (60 to 140 us against 22 to 48 at N 512, K 3072, on a
+// R9700); split out like this the two weights cost the same. The bytes are the same either way.
 template <int R, int C, int U, class W>
 __device__ __forceinline__ void
-    gemm_nt_f32_tile_body(const uint16_t* x, const W* w, float* y, long xp, long wp, long yp,
-                          int m, int n, int k) {
-    const int lane = threadIdx.x & 31, c0 = (blockIdx.x * 4 + (threadIdx.x >> 5)) * C,
-              r0 = blockIdx.y * R;
-    if (c0 >= n) return;
+    gemm_nt_f32_tile_sums(const uint16_t* x, const W* w, float (&sum)[R][C], long xp, long wp,
+                          int m, int n, int k, int c0, int r0) {
+    const int lane = threadIdx.x & 31;
     const uint16_t* xr[R];
     const W* wc[C];
 #pragma unroll
     for (int q = 0; q < R; ++q) xr[q] = x + (long)(r0 + q < m ? r0 + q : m - 1) * xp;
 #pragma unroll
     for (int c = 0; c < C; ++c) wc[c] = w + (long)(c0 + c < n ? c0 + c : n - 1) * wp;
-    float sum[R][C];
 #pragma unroll
     for (int q = 0; q < R; ++q)
 #pragma unroll
@@ -71,6 +74,17 @@ __device__ __forceinline__ void
 #pragma unroll
             for (int mask = 16; mask; mask >>= 1) sum[q][c] += __shfl_xor(sum[q][c], mask, 32);
         }
+}
+
+template <int R, int C, int U, class W>
+__device__ __forceinline__ void
+    gemm_nt_f32_tile_body(const uint16_t* x, const W* w, float* y, long xp, long wp, long yp,
+                          int m, int n, int k) {
+    const int lane = threadIdx.x & 31, c0 = (blockIdx.x * 4 + (threadIdx.x >> 5)) * C,
+              r0 = blockIdx.y * R;
+    if (c0 >= n) return;
+    float sum[R][C];
+    gemm_nt_f32_tile_sums<R, C, U, W>(x, w, sum, xp, wp, m, n, k, c0, r0);
     if (lane) return;
 #pragma unroll
     for (int q = 0; q < R; ++q)

@@ -68,6 +68,23 @@ struct SchedMetrics {
     int64_t kv_resident_blocks = 0;
     int64_t kv_stream_misses = 0;
     int64_t kv_stream_bytes_in = 0;
+    /* Where the KV loan stops and what keeps it there (rad::SchedMetrics::kv_spare): the pieces of
+     * the loan's headroom for the group that lends least, in that group's blocks. A block released
+     * under the highest held one is free and still unlendable, so `held_top - held` is the
+     * fragmentation a compaction would recover and `live - held_top - buffer_blocks` the headroom
+     * the arbiter has not lent yet. `group` is empty when the engine cannot answer. */
+    struct KvLoan {
+        std::string group;
+        int64_t block_tokens  = 0;
+        int64_t block_bytes   = 0;
+        int64_t held          = 0;
+        int64_t held_top      = 0;
+        int64_t buffer_blocks = 0;
+        int64_t live          = 0;
+        int64_t spare_tokens  = 0;
+        int64_t loan_tokens   = 0;
+    };
+    KvLoan kv_loan;
 
     double  prefix_hit_rate = 0.0;    /* 0..1 */
     /* Cumulative prefix-cache evictions. They rise as reusable prefixes are dropped, while
