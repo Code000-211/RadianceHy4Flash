@@ -117,6 +117,11 @@ __device__ __forceinline__ void arij_rows(JuncLds<HC, POST, EG>& L, uint16_t* yb
         if (t.cq) { t.cq += (size_t)row * t.cqp; t.cs += (size_t)row * t.csp; }
         if (t.yr) t.yr += (size_t)row * yp;
         if (t.xr) t.xr += (size_t)row * xp;
+        if constexpr (EG) {   /* this row's operands: the mask one entry, key and val one row each */
+            t.eg_mask += row;
+            t.eg_key = (const uint16_t*)t.eg_key + (size_t)row * t.egkp;
+            t.eg_val = (const uint16_t*)t.eg_val + (size_t)row * t.egvp;
+        }
         junction_row<HC, POST, TAIL>(L, ybuf, t);
         __syncthreads();   /* ybuf and L are the next row's */
     }
