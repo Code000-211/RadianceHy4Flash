@@ -50,8 +50,9 @@ constexpr int kKeysWg  = kWaves * 16;   /* keys a workgroup */
 /* The row's sequence and the page of this lane's column, found before the step's keys: `cu` and
  * `bt` are uploaded by the host (input operands, and no op of a pass writes an input), so a chained
  * workgroup reads them in front of its wait and the poll covers the binary search's dependent round
- * trips (K-29). `nc` is qsa_work's, so it stays behind the acquire, where the scalar wait covers
- * it. */
+ * trips (K-29). `nc` is qsa_work's, so it stays behind the acquire; it is a lane-shared address but
+ * the compiler serves it with one global_load_b32, not a scalar load (tests/chain_scalar_audit.py on
+ * the gfx1201 assembly), so the wait's vector-cache acquire is the whole acquire it needs. */
 struct IdxScoreMeta {
     int b;      /* this lane's key column */
     int seq;    /* the row's sequence, -1 when the row is not in one */
@@ -134,7 +135,7 @@ void idx_score_kernel(IDX_SCORE_PARAMS) {
      * (see IdxScoreMeta). */
     const IdxScoreMeta meta = idx_score_meta(q, gate, key, bt, cu, nc, out, nseq, cols, out_cols,
                                             pages, q_ld, gate_ld, key_ld, bt_ld, out_ld, wscale);
-    if (CH::on) r4d_chain_wait();
+    if (CH::on) r4d_chain_wait_vec();
     idx_score_body(q, gate, key, bt, cu, nc, out, nseq, cols, out_cols, pages, q_ld, gate_ld,
                    key_ld, bt_ld, out_ld, wscale, meta);
     if (CH::on) r4d_chain_done();
