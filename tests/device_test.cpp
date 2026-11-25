@@ -2564,4 +2564,32 @@ TEST(the_resident_device_code_query_answers_for_whichever_backend_is_running) {
     }
 }
 
+/* The count is only worth printing if it is not zero where code did load: launch the backend's own
+ * module-loaded kernel (chain_probe), then the card must report bytes and modules, and a second
+ * read must not move (nothing loaded in between). */
+TEST(a_card_that_has_launched_a_kernel_reports_the_device_code_it_holds) {
+    if (std::strcmp(rad::device_backend_name(), "aql") != 0) SKIP("device code loads on the AQL backend only");
+    Stream st;
+    DevBuf<unsigned> x(64 * sizeof(unsigned), RAD_MEM_DEVICE);
+    DevBuf<unsigned> seen(4 * 8 * sizeof(unsigned), RAD_MEM_DEVICE);
+    REQUIRE(x && seen);
+    CHECK_OK(rad_memset_async(x, 0, 64 * sizeof(unsigned), st.s));
+    CHECK_OK(rad_memset_async(seen, 0, 4 * 8 * sizeof(unsigned), st.s));
+    CHECK_OK(rad_stream_sync(st.s));
+    void* gate = nullptr;
+    REQUIRE_EQ(rad_stream_gate(st.s, &gate), RAD_OK);
+    CHECK_OK(rad::aql::chain_probe(st.s, x, seen, 4, 8));
+    CHECK_OK(rad_gate_open(gate));
+    CHECK_OK(rad_stream_sync(st.s));
+    int64_t bytes = 0, bytes2 = 0;
+    int modules = 0, modules2 = 0;
+    CHECK_OK(rad::dev_code_resident(0, &bytes, &modules));
+    CHECK(bytes > 0);
+    CHECK(modules > 0);
+    CHECK_OK(rad::dev_code_resident(0, &bytes2, &modules2));
+    CHECK_EQ(bytes2, bytes);
+    CHECK_EQ(modules2, modules);
+    CHECK_EQ(rad::dev_code_resident(-1, &bytes, &modules), RAD_E_INVAL);
+}
+
 RAD_TEST_MAIN_HOST_KARGS()

@@ -153,7 +153,7 @@ static int resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudg
         b.code_modules = f.code_modules;
     }
     const std::string code_note = b.code_bytes > 0
-        ? fmt("  of which code      %10s   %d code module(s) resident, each loaded whole\n",
+        ? fmt("  of which code      %10s   %d code module(s) resident when the plan read it; the exit line has the served figure\n",
               humanb(b.code_bytes).c_str(), b.code_modules)
         : std::string();
 
