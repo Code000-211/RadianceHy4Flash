@@ -3841,10 +3841,13 @@ engram_gate(key, val, mask; w_key, w_query, w_val, w_branch, eg_eps)      h upda
 The tail is 1 only (`xn` and the quantiser read the sum, which the gate changes). The gate is the
 `engram_gate` row of the same library, byte for byte, so the op is byte-identical to the junction
 with `tail` 0, `engram_gate`, then the junction with `tail` 1 (libr4d's `replaces` hook publishes
-that chain, `r4d_selftest` and `tests/r4d_emu` hold it to the chain bit for bit); the block takes a
-row of the batch, as the gate does. A layer's `ihc_pre` takes the form where the gate would
-otherwise run between two launches; `arch/hyv4flash` takes it only in front of an Engram layer that
-is not the last (else the connection is computed twice) and only with the debug taps off.
+that chain, `tests/r4d_fuse_chain_test` holds the hook to it without a card, and `r4d_selftest`
+and `tests/r4d_emu` hold the kernel to the chain's bytes); the block takes a row of the batch, as
+the gate does. A layer's `ihc_pre` takes the form where the gate would otherwise run between two
+launches. `arch/hyv4flash` takes it only in front of an Engram layer that is not the last (whose
+rows the decode tail compacts while the gate's operands are not) and only with the debug taps off;
+where it does not take it the junction in front keeps `tail` 0 and the gate is a launch of its own
+between `ihc_post` and that layer's `ihc_pre`, which is the chain above.
 
 `ar_rmsnorm_ihc_junction` (device-only, `world_size` 2 or 4, plus the junction's parameters and
 operands) is the exact `all_reduce` of `a` (after the add, which each rank applies to its own

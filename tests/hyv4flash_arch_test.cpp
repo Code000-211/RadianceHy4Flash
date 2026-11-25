@@ -2520,3 +2520,105 @@ TEST(p07_the_junction_in_front_of_an_engram_takes_its_gate) {
     every_weight_read(off.b);
     steps_clean_at(off.b, 0, 1);
 }
+
+/* A model whose Engram opens the last layer: `engram_layer_ids` name one above the layer the memory
+ * sits in front of, so id `n_layers` is the last one. */
+struct DeclaredLastEngram {
+    MetaKV mk;
+    RadBuilder b;
+    RadBuildCtx ctx = build_ctx();
+    int rc = 0;
+    DeclaredLastEngram() : mk(mini_meta()) {
+        mk.set("engram_layer_ids", "3");
+        mk.drop("engram_layer_head_vocab_sizes.2");
+        mk.set("engram_layer_head_vocab_sizes.3", "11 13 17 19 23 29 31 37 41 43");
+        bf16_encs(&b);
+        G3Env g3env;
+        std::string err = stderr_of([&] { rc = hyv4flash::declare(&b, mk.meta(), &ctx); });
+        if (rc != RAD_OK && std::getenv("HY4_TEST_STDERR")) fputs(err.c_str(), stderr);
+    }
+};
+
+namespace {
+
+/* The junctions of `name` that carry `engram` 1, and those that carry `tail` 0. */
+int engram_junctions(const RadBuilder& b, const char* name) {
+    int n = 0;
+    for (const auto& o : b.ops) {
+        if (o.op != name) continue;
+        for (const auto& p : o.p)
+            if (p.key == "engram" && p.ival != 0) ++n;
+    }
+    return n;
+}
+int tail0_junctions(const RadBuilder& b, const char* name) {
+    int n = 0;
+    for (const auto& o : b.ops) {
+        if (o.op != name) continue;
+        for (const auto& p : o.p)
+            if (p.key == "tail" && p.ival == 0) ++n;
+    }
+    return n;
+}
+
+/* The gate issued before the layer's own enter: an `engram_gate` with an `ihc_pre` after it and a
+ * `rmsnorm` after that. A junction declared with the full tail runs ihc_pre inside itself, so no
+ * `ihc_pre` is issued there at all. */
+bool gate_then_enter(RadBuilder& b) {
+    auto k = kit(b, { 1 }, {});
+    k->b.positions_h = k->pos.data();
+    auto v = run_passes(b, hyv4flash::step, { k.get() }, 0, 1);
+    CHECK_PASSES(b, v);
+    const auto seq = issued_ops(b, *v[0]);
+    size_t g = seq.size();
+    for (size_t i = 0; i < seq.size(); ++i)
+        if (seq[i] == "engram_gate") { g = i; break; }
+    if (g == seq.size()) return false;
+    size_t pre = seq.size();
+    for (size_t i = g + 1; i < seq.size(); ++i)
+        if (seq[i] == "ihc_pre") { pre = i; break; }
+    for (size_t i = pre + 1; i < seq.size(); ++i)
+        if (seq[i] == "rmsnorm") return pre != seq.size();
+    return false;
+}
+
+}  // namespace
+
+/* P-07: where the gate does not fuse -- the debug taps are on (the gate carries the engram_out tap,
+ * which copies h before the gate writes it), or the Engram opens the last layer (whose rows this
+ * graph compacts for the decode tail while the gate's operands are not) -- the junction in front of
+ * the Engram keeps tail 0 and the gate runs between the launches, in front of this layer's ihc_pre
+ * and input norm. With the full tail there the junction would run ihc_post, ihc_pre and the norm
+ * off the ungated h and the gate would write h after them: another model, and one a parity run
+ * (the taps' own mode) sees on every Engram layer. */
+TEST(p07_a_gate_that_does_not_fuse_keeps_the_junction_behind_ihc_post) {
+    setenv("RADIANCE_HY4_TAPS", "1", 1);
+    Declared taps(bf16_encs, 1, 0);
+    unsetenv("RADIANCE_HY4_TAPS");
+    REQUIRE_EQ(taps.rc, RAD_OK);
+    CHECK_EQ(engram_junctions(taps.b, "rmsnorm_ihc_junction"), 0);
+    CHECK_EQ(count_op(taps.b, "engram_gate"), 1);                 /* a launch of its own */
+    CHECK_EQ(tail0_junctions(taps.b, "rmsnorm_ihc_junction"), 1);  /* in front of the Engram */
+    CHECK(gate_then_enter(taps.b));
+    every_weight_read(taps.b);
+    steps_clean_at(taps.b, 0, 1);
+
+    /* the same at two ranks, where the twin is the one in front of the Engram */
+    setenv("RADIANCE_HY4_TAPS", "1", 1);
+    Declared taps2(bf16_encs, 2, 0, true);
+    unsetenv("RADIANCE_HY4_TAPS");
+    REQUIRE_EQ(taps2.rc, RAD_OK);
+    CHECK_EQ(engram_junctions(taps2.b, "ar_rmsnorm_ihc_junction"), 0);
+    CHECK_EQ(tail0_junctions(taps2.b, "ar_rmsnorm_ihc_junction"), 1);
+    every_weight_read(taps2.b);
+
+    /* an Engram opening the last layer: the junction in front of it stops behind ihc_post too */
+    DeclaredLastEngram last;
+    REQUIRE_EQ(last.rc, RAD_OK);
+    CHECK_EQ(engram_junctions(last.b, "rmsnorm_ihc_junction"), 0);
+    CHECK_EQ(count_op(last.b, "engram_gate"), 1);
+    CHECK_EQ(tail0_junctions(last.b, "rmsnorm_ihc_junction"), 1);
+    CHECK(gate_then_enter(last.b));
+    every_weight_read(last.b);
+    steps_clean_at(last.b, 0, 1);
+}

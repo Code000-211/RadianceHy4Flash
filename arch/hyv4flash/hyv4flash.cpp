@@ -765,8 +765,9 @@ static int trunk_layer(RadBuilder* b, Model& m, int l, MoeFP8::Src* msrc) {
     HY4_NEED(lay.op_attn_norm, "rmsnorm");
     /* The previous layer's junction into this connection. One with an Engram in front of it takes the
      * Engram form (P-07): its gate runs between the junction's ihc_post and its ihc_pre, so the gate
-     * and the layer's own enter meet there. Where the library serves no such form the junction stops
-     * behind ihc_post (tail 0) and the Engram steps whole. */
+     * and the layer's own enter meet there. Where that form does not run -- the gate cannot fuse, or
+     * the library serves no such form -- the junction keeps tail 0 and the Engram writes h between
+     * the two launches, which this layer then runs as its own enter. */
     if (l > 0) {
         Layer& pv = m.layers[(size_t)l - 1];
         /* G-3b: the junction writes the rotated int8 codes the attention's three input linears read,
@@ -778,16 +779,22 @@ static int trunk_layer(RadBuilder* b, Model& m, int l, MoeFP8::Src* msrc) {
             if (cs && f.i8 && f.rot && f.g8 == RAD_FP8_BLOCK) jp = cs->get(E, f.g8, "junc_attn_in");
         }
         EgWire egw{};
-        /* the gate goes with the junction where the Engram opens a layer this graph then runs */
+        /* The gate goes with the junction where the Engram opens a layer whose rows this graph runs
+         * as they are: the last layer's rows may be compacted (rows.ids) while the gate's operands
+         * are not, so the Engram in front of it keeps the gate as a launch of its own. */
         if (lay.engram >= 0 && l + 1 < (int)m.layers.size())
             egw = m.engrams[(size_t)lay.engram].gate_wire();
+        /* The tail reaches ihc_pre and this layer's input norm only where the gate fuses in front of
+         * them. Anywhere else -- the taps on (gate_fusable is false), the Engram in front of the last
+         * layer, a library without the form -- the junction stops behind ihc_post (tail 0), and the
+         * gate runs between the launches below: otherwise the norm reads the ungated h. */
+        const bool eg = egw.ok;
+        const bool jt = eg || lay.engram < 0;
         RAD_ARCH_TRY(pv.j_end.declare(b, s, g, T, m.tr, pv.ffn.junction_a(), pv.ffn.junction_b(),
-                                      pv.ffn.post_gain, &lay.hc_attn, lay.attn_gain, m.tr.xn,
-                                      pv.ffn.op_join, pv.ffn.op_ar, jp, egw.ok ? &egw : nullptr));
-        if (egw.ok && !pv.j_end.eg)
-            RAD_ARCH_TRY(pv.j_end.declare(b, s, g, T, m.tr, pv.ffn.junction_a(), pv.ffn.junction_b(),
-                                          pv.ffn.post_gain, nullptr, 0, 0, pv.ffn.op_join,
-                                          pv.ffn.op_ar, nullptr));
+                                      pv.ffn.post_gain, jt ? &lay.hc_attn : nullptr,
+                                      jt ? lay.attn_gain : (rad_weight)0, jt ? m.tr.xn : 0,
+                                      pv.ffn.op_join, pv.ffn.op_ar, jt ? jp : nullptr,
+                                      eg ? &egw : nullptr));
     }
 
     /* P-07: the Engram's gate goes with the junction that runs it round its own ihc_post; where
