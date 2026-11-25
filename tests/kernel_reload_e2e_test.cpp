@@ -185,4 +185,35 @@ TEST(a_running_server_takes_a_rebuilt_override_without_reloading_its_model) {
     CHECK_EQ(s.stop(), 0);
 }
 
+/* A server over the library itself, with no override on its path: the route answers 409 naming
+ * why, and the server serves on with the build it loaded. */
+TEST(a_server_without_an_override_refuses_a_reload_by_name) {
+    if (!exists(std::string(RAD_E2E_HOME) + "/testoverride/rl/kernels/radtest_rl.so"))
+        SKIP("no reload test plugins under %s", RAD_E2E_HOME);
+    tiny::TempDir dir("kreload0");
+    REQUIRE(dir.ok());
+    const std::string model = dir / "qwen35";
+    REQUIRE(mkdir(model.c_str(), 0755) == 0);
+    REQUIRE(tiny::write_qwen35(model, {}));
+    const std::vector<std::string> env = {
+        "ROCR_VISIBLE_DEVICES=99", "RADIANCE_HOST_VRAM_MIB=1024", "OMP_WAIT_POLICY=passive",
+        "OMP_NUM_THREADS=2",
+        "RADIANCE_HOME=" + std::string(RAD_E2E_HOME) + "/testoverride/rl:" + RAD_E2E_HOME };
+    const std::vector<std::string> argv = radtest::config_argv(
+        { RAD_E2E_SERVER, "--model", model, "--kernels", "radtest_rl,libref",
+          "--debug-accept-reference-kernels", "--host", "127.0.0.1", "--port", "0" });
+    Server s;
+    REQUIRE(s.start_child(argv, env));
+
+    CHECK(all(tokens(s.port, 6), 3, 6));
+    std::string body;
+    const int st = reload(s.port, &body);
+    if (st != 409) fprintf(stderr, "    reload answered %d: %s\n", st, body.c_str());
+    CHECK_EQ(st, 409);
+    CHECK(body.find("is an override built by rad_add_kernel_override") != std::string::npos);
+    CHECK(all(tokens(s.port, 6), 3, 6));
+    CHECK_EQ(count(s.output(), " reloaded: "), (size_t)0);
+    CHECK_EQ(s.stop(), 0);
+}
+
 RAD_TEST_MAIN()
