@@ -162,6 +162,105 @@ class ProbePhasesTest(unittest.TestCase):
         self.assertEqual(len(ns["R"]["phases"]), 4)
 
 
+class _FakeServer:
+    """A stand-in for a served radiance: /health, /metrics and a streamed /v1/chat/completions that
+    answers `ntok` tokens. It takes `die_after` completions and cuts every request after them, /health
+    included, which is how an engine that stops in the middle of a wave looks from the probe."""
+
+    def __init__(self, die_after=None):
+        import http.server, threading
+        fake = self
+        self.taken, self.steps, self.die_after, self.lock = 0, 0, die_after, threading.Lock()
+        self.prompts = []
+
+        class H(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.0"
+
+            def log_message(self, *a):
+                pass
+
+            def do_GET(self):
+                with fake.lock:
+                    dead = fake.die_after is not None and fake.taken >= fake.die_after
+                if dead:
+                    self.connection.close(); return
+                body = b"ok"
+                if self.path == "/metrics":
+                    body = f"radiance:engine_steps_decode_total{{model=\"m\"}} {fake.steps}\n".encode()
+                self.send_response(200); self.end_headers(); self.wfile.write(body)
+
+            def do_POST(self):
+                req = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                n = req["max_tokens"]
+                with fake.lock:
+                    fake.taken += 1
+                    dead = fake.die_after is not None and fake.taken > fake.die_after
+                    if not dead:
+                        fake.prompts.append(req["messages"][0]["content"]); fake.steps += n
+                if dead:
+                    self.connection.close(); return
+                self.send_response(200); self.end_headers()
+                for _ in range(n):
+                    self.wfile.write(b'data: {"choices": [{"delta": {"content": "x"}}]}\n\n')
+                use = {"usage": {"completion_tokens": n, "prompt_tokens": 7}, "choices": []}
+                self.wfile.write(b"data: " + json.dumps(use).encode() + b"\n\ndata: [DONE]\n\n")
+
+        self.httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+        self.port = self.httpd.server_address[1]
+        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+        self.thread.start()
+
+    def close(self):
+        self.httpd.shutdown(); self.httpd.server_close()
+
+
+class StressPhaseTest(unittest.TestCase):
+    """`stress` (issue #251): waves of concurrent requests whose failures are counted, not raised, so
+    a run against an engine that stops says how far it got and that the server is gone."""
+
+    def run_stress(self, fake, waves):
+        import os
+        with tempfile.TemporaryDirectory() as d:
+            out = Path(d) / "probe.json"
+            env = dict(os.environ, RAD_STRESS_WAVES=str(waves), RAD_STRESS_CHARS="300", RAD_STRESS_NTOK="3")
+            r = subprocess.run([sys.executable, str(TOOLS / "probe.py"), str(fake.port), str(out), "nowarm,stress"],
+                               capture_output=True, text=True, env=env, timeout=120)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            return json.loads(out.read_text())["phases"][-1]
+
+    def test_every_request_of_every_wave_is_counted(self):
+        fake = _FakeServer()
+        try:
+            o = self.run_stress(fake, 4)
+        finally:
+            fake.close()
+        self.assertEqual((o["name"], o["waves"], o["of"], o["clients"]), ("stress", 4, 4, 8))
+        self.assertEqual((o["ok"], o["err"], o["server_dead"]), (32, 0, False))
+        self.assertEqual(o["steps"], {"engine_steps_decode_total": 96.0})
+        self.assertEqual([w["ok"] for w in o["per_wave"]], [8, 8, 8, 8])
+        # A wave's prompts are fresh, and the wave after it sends the same eight again.
+        p = fake.prompts
+        self.assertEqual(sorted(p[0:8]), sorted(p[8:16]))
+        self.assertEqual(sorted(p[16:24]), sorted(p[24:32]))
+        self.assertEqual(len(set(p)), 16)
+
+    def test_a_server_that_stops_ends_the_phase_with_its_count(self):
+        fake = _FakeServer(die_after=20)       # it stops four requests into the third wave
+        try:
+            o = self.run_stress(fake, 6)
+        finally:
+            fake.close()
+        self.assertTrue(o["server_dead"])
+        self.assertEqual((o["ok"], o["err"]), (20, 4))
+        self.assertEqual((o["waves"], o["of"]), (3, 6))   # and no wave is sent after it
+        self.assertTrue(o["per_wave"][-1]["errors"])
+
+    def test_stress_is_listed(self):
+        src = (TOOLS / "probe.py").read_text()
+        self.assertIn("stress", src.split('"""')[1])
+        self.assertIn("stress", src.split("no phase")[-1])
+
+
 if __name__ == "__main__":
     if not shutil.which("c++filt") and not shutil.which("llvm-cxxfilt"):
         sys.exit(77)

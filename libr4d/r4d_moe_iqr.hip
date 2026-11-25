@@ -832,6 +832,13 @@ constexpr uint32_t kOneWaveMinRows = 20;
 #define R4D_MOEIQR_FORMS(X)                                                                       \
     X(2, 15) X(2, 16) X(3, 16) X(4, 16) X(5, 16) X(6, 16)
 
+/* The forms the packed map's grid is built for: the 4-bit, 2^16-state one (Qwen3.8-Flash-Next's
+ * gate_up) and the 3-bit one (Hy4-flash's gate_up, 1536 rows by K 1536 at TP2). A form outside
+ * them keeps the run map until a pass of its own is measured with the packed one. */
+constexpr bool pack_map_form(uint32_t bits, uint32_t L) {
+    return L == 16u && (bits == 3u || bits == 4u);
+}
+
 struct Launch {
     const int8_t* x;
     const float* xs;
@@ -891,9 +898,9 @@ int launch_form(const Launch& g, RadStream stream) {
     const bool two = !wide_k && g.nkb < 8u && g.N % (16u * 8u) == 0u &&
                      g.T >= kTwoTileMinRows && g.T <= kTwoTileMaxRows;
     if (g.map && g.packed) {
-        /* the packed map's grid, the one form built with it (see moe_iqr_launch) */
+        /* the packed map's grid, the forms built with it (see moe_iqr_launch) */
         rc = R4D_NO(RAD_E_UNSUPPORTED);
-        if constexpr (F::B == 4 && F::L == 16)
+        if constexpr (pack_map_form(F::B, F::L))
             rc = R4D_EMIT(stream, (moe_iqr_kernel<F, 1u, 4u, true, kPackTiles, 1u, R4dUnchained, true>),
                           dim3(g.gx, g.N / 64u), dim3(4u * kWave), 0, g.x, g.xs, g.c[0], g.c[1],
                           g.c[2], g.c[3], g.sorted, g.off, g.y, (const uint32_t*)g.map, g.T,
@@ -1069,16 +1076,16 @@ int moe_iqr_launch(const RadArgs* a, RadStream stream, int ncls, bool gated = fa
         if (!a->scratch || a->scratch_bytes < r4d_moe_blockmap_bytes(cap))
             return R4D_NO(RAD_E_SCRATCH);
         g.map = (uint32_t*)a->scratch;
-        /* The packed map: the one form built with it (the 4-bit, 2^16-state one, Flash-Next's), from
-         * kPackMinRowsPerExpert rows an expert or as pinned, where the rows' 32-bit offsets reach
-         * all of the activation and the scratch holds its entries (an expert at most one per
-         * 128 rows begun and one for its dot remainder, and the tail). */
+        /* The packed map: the forms built with it (the 4-bit and the 3-bit 2^16-state ones, see
+         * pack_map_form), from kPackMinRowsPerExpert rows an expert or as pinned, where the rows'
+         * 32-bit offsets reach all of the activation and the scratch holds its entries (an expert
+         * at most one per 128 rows begun and one for its dot remainder, and the tail). */
         const uint32_t pin = map_tiles_pin();
         /* A split takes the packed map whatever the rows: its entries carry their row counts, and
          * its bytes are the run map's. */
         const bool split_on = split && split->data && split->dtype == RAD_I32;
         const long long capp = split_on ? pack_cap_split(T, n_expert) : pack_cap(T, n_expert);
-        g.packed = !gated && fm.bits == 4 && fm.L == 16 &&
+        g.packed = !gated && pack_map_form(fm.bits, fm.L) &&
                    (split_on || (pin ? pin == kPackTiles : T >= kPackMinRowsPerExpert * n_expert)) &&
                    (unsigned long long)M * (unsigned long long)a_ld + (unsigned long long)K <
                        (1ull << 32) &&

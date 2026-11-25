@@ -647,7 +647,7 @@ __global__ __launch_bounds__(kThreads) void r4dchain_gelu_mul(R4D_GM_PARAMS) {
 #define R4D_ROPE_ARGS                                                                            \
     qkv, pos, head_dim, n_rope_heads, rot, nfreq, den, gptj, theta, rscale, row_pitch, mode, s0, \
     s1, s2, n_sec, plane, yarn, l3
-__device__ __forceinline__ void rope_body(R4D_ROPE_PARAMS) {
+__device__ __forceinline__ void rope_body_at(R4D_ROPE_PARAMS, const RopePos& rp) {
     const uint32_t m = blockIdx.x;
     const uint32_t half = rot / 2;
     const int sec[3] = { s0, s1, s2 };
@@ -657,7 +657,7 @@ __device__ __forceinline__ void rope_body(R4D_ROPE_PARAMS) {
         const uint32_t h = t / half, i = t % half;
         uint16_t* __restrict__ hd = qkv + (size_t)m * row_pitch + (size_t)h * head_dim;
         float c, s;
-        rope_turn(pos, m, i, den, nfreq, theta, rscale, mode, sec, n_sec, plane, yarn, l3, &c, &s);
+        rope_turn_at(rp, i, den, nfreq, theta, mode, sec, n_sec, plane, yarn, l3, &c, &s);
         const uint32_t i0 = gptj ? 2 * i : i;
         const uint32_t i1 = gptj ? 2 * i + 1 : i + half;
         const float x0 = bf16_to_f32(hd[i0]), x1 = bf16_to_f32(hd[i1]);
@@ -665,12 +665,20 @@ __device__ __forceinline__ void rope_body(R4D_ROPE_PARAMS) {
         hd[i1] = f32_to_bf16(x0 * s + x1 * c);
     }
 }
+__device__ __forceinline__ void rope_body(R4D_ROPE_PARAMS) {
+    rope_body_at(R4D_ROPE_ARGS, rope_pos(pos, blockIdx.x, plane, rscale, n_sec));
+}
 __global__ __launch_bounds__(kThreads) void rope_kernel(R4D_ROPE_PARAMS) {
     rope_body(R4D_ROPE_ARGS);
 }
 __global__ __launch_bounds__(kThreads) void r4dchain_rope(R4D_ROPE_PARAMS) {
+    /* K-29: the token's position in front of the wait, which then covers its load; only the qkv row
+     * behind it is the launch in front's. The wait stays the scalar one: the audit counts the
+     * Yarn/Llama3 kernarg reloads behind it as scalar loads ("scalar loads behind the acquire: 5"),
+     * so the flush it does goes too. */
+    const RopePos rp = rope_pos(pos, blockIdx.x, plane, rscale, n_sec);
     r4d_chain_wait();
-    rope_body(R4D_ROPE_ARGS);
+    rope_body_at(R4D_ROPE_ARGS, rp);
     r4d_chain_done();
 }
 #undef R4D_ROPE_ARGS
@@ -736,9 +744,14 @@ __global__ __launch_bounds__(kThreads) void rope_rows_kernel(
     const uint16_t* __restrict__ k, const uint16_t* __restrict__ v,                              \
     const int32_t* __restrict__ slot, uint16_t* __restrict__ kv, uint32_t head_dim,              \
     uint32_t kv_heads, uint32_t block_size, uint32_t n_blocks, uint32_t k_ld, uint32_t v_ld
-__device__ __forceinline__ void kv_store_body(R4D_KVS_PARAMS) {
+/* One token's key and value rows into the cache slot it maps to: `s` is the row's slot, kept apart
+ * from the body so that a chained block can read the mapping in front of its wait (K-29). */
+__device__ __forceinline__ void kv_store_row(const uint16_t* __restrict__ k,
+                                             const uint16_t* __restrict__ v, int32_t s,
+                                             uint16_t* __restrict__ kv, uint32_t head_dim,
+                                             uint32_t kv_heads, uint32_t block_size,
+                                             uint32_t n_blocks, uint32_t k_ld, uint32_t v_ld) {
     const uint32_t t = blockIdx.x;
-    const int32_t s = slot[t];
     if (s < 0 || (uint32_t)s / block_size >= n_blocks) return;
     const uint32_t blk = (uint32_t)s / block_size, off = (uint32_t)s % block_size;
     const size_t slot_base = ((size_t)blk * kv_heads * block_size + (size_t)off) * 2 * head_dim;
@@ -751,12 +764,19 @@ __device__ __forceinline__ void kv_store_body(R4D_KVS_PARAMS) {
         c[head_dim + d] = v[(size_t)t * v_ld + j];
     }
 }
+__device__ __forceinline__ void kv_store_body(R4D_KVS_PARAMS) {
+    kv_store_row(k, v, slot[blockIdx.x], kv, head_dim, kv_heads, block_size, n_blocks, k_ld, v_ld);
+}
 __global__ __launch_bounds__(kThreads) void kv_store_kernel(R4D_KVS_PARAMS) {
     kv_store_body(k, v, slot, kv, head_dim, kv_heads, block_size, n_blocks, k_ld, v_ld);
 }
 __global__ __launch_bounds__(kThreads) void r4dchain_kv_store(R4D_KVS_PARAMS) {
-    r4d_chain_wait();
-    kv_store_body(k, v, slot, kv, head_dim, kv_heads, block_size, n_blocks, k_ld, v_ld);
+    /* K-29: the step's slot mapping in front of the wait, which then covers its load; nothing else
+     * the body reads there is a scalar load (tests/chain_scalar_audit.py), so the vector-cache wait
+     * does. */
+    const int32_t s = slot[blockIdx.x];
+    r4d_chain_wait_vec();
+    kv_store_row(k, v, s, kv, head_dim, kv_heads, block_size, n_blocks, k_ld, v_ld);
     r4d_chain_done();
 }
 #undef R4D_KVS_PARAMS
@@ -790,6 +810,12 @@ struct MlaRowFront {
 static_assert(sizeof(MlaRowFront) == 104, "MlaRowFront has padding");
 template <bool WF32, class CH>
 __global__ __launch_bounds__(kThreads) void mla_row_front_kernel(MlaRowFront p) {
+    /* K-29: the step's position and slot mapping in front of the wait, which then covers their
+     * loads; the row's own columns behind it are the launch in front's. The wait stays the scalar
+     * one: the audit counts the struct's kernarg reloads behind it as scalar loads ("scalar loads
+     * behind the acquire: 4"), so the flush it does goes too. */
+    const RopePos rp = rope_pos(p.pos, blockIdx.x, p.plane, p.rscale, p.n_sec);
+    const int32_t sl = p.slot[blockIdx.x];
     if (CH::on) r4d_chain_wait();
     __shared__ float lds[kThreads / kWave];
     const uint32_t m = blockIdx.x;
@@ -797,7 +823,6 @@ __global__ __launch_bounds__(kThreads) void mla_row_front_kernel(MlaRowFront p) 
     const int sec[3] = { p.s0, p.s1, p.s2 };
     uint16_t* __restrict__ yr = p.row + (size_t)m * p.pitch;
     /* kv_store_body's rule: a negative slot is padding and stores nothing. */
-    const int32_t sl = p.slot[m];
     uint16_t* __restrict__ c = nullptr;
     if (sl >= 0 && (uint32_t)sl / p.block_size < p.n_blocks) {
         const uint32_t blk = (uint32_t)sl / p.block_size, off = (uint32_t)sl % p.block_size;
@@ -847,8 +872,8 @@ __global__ __launch_bounds__(kThreads) void mla_row_front_kernel(MlaRowFront p) 
     for (uint32_t i = threadIdx.x; i < rhalf; i += kThreads) {
         uint16_t* __restrict__ hd = yr + p.L;
         float cc, sn;
-        rope_turn(p.pos, m, i, (int)p.R, rhalf, p.theta, p.rscale, p.mode, sec, p.n_sec, p.plane,
-                  RadYarn{}, RadLlama3{}, &cc, &sn);
+        rope_turn_at(rp, i, (int)p.R, rhalf, p.theta, p.mode, sec, p.n_sec, p.plane, RadYarn{},
+                     RadLlama3{}, &cc, &sn);
         const uint32_t i0 = p.gptj ? 2 * i : i;
         const uint32_t i1 = p.gptj ? 2 * i + 1 : i + rhalf;
         const float x0 = bf16_to_f32(hd[i0]), x1 = bf16_to_f32(hd[i1]);
