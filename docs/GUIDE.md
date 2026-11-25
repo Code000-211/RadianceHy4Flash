@@ -849,7 +849,11 @@ expert slab and the KV cache:
   with virtual memory management), the experts keep on the card what the pinned host pool cannot
   hold, plus one expert unit of packing slack. The cache takes the rest, up to what it could ever
   address (`max-num-seqs` x `max-model-len`), and lends every block no live request holds back
-  to the expert slab in place. The prefill staging region comes out of the cache's side.
+  to the expert slab in place. The prefill staging region comes out of the cache's side. A
+  sliding-window group pages one window per sequence slot, so the slots no request occupies go the
+  same way, on a loan of their own: what one such group can spare is sized by slots, not by the
+  token axis the other groups lend on, and a request needing one of those blocks takes it back
+  before it runs.
 - **Without a lender** (`deterministic`, an explicit `placement: all_vram` or `layer_offload`, or
   no virtual memory management), the experts come first and the cache keeps one `max-model-len`
   sequence.
@@ -1024,6 +1028,17 @@ always complete); later starts check samples of it against the container and reu
 `ram=DIR`'s, so a file never serves another model; remove the file to have it filled again. Reads go
 to it as `disk` reads the container, through the row cache with direct I/O, so `DIR`'s filesystem must
 support `O_DIRECT` (tmpfs since Linux 6.6 does, but a tmpfs is what `ram` is for).
+
+`keep-container-cache: true` leaves the container's pages in the page cache after the load instead
+of dropping every range behind the read, so the next start reads the container at memory speed
+rather than from the drive. The load reads the container buffered for it (an O_DIRECT read never
+fills the page cache), so the first start pays the copy and the buffered rate; every later start
+reads from memory. It is off by default and only kept when `MemAvailable` after the load's pins
+leaves the whole container plus `memory.host-headroom-mib` free, so a table placed in host memory or
+a host KV tier is never taken from; when the RAM is not there the startup line says so and the pages
+are dropped as usual. The pages are reclaimable, but they are the same spare host RAM a bigger
+`host-mib` pool, `prefix-cache-mib` or `--kv-resident` would take: spend it on the one that pays for
+the workload, and do not ask for all of them.
 
 **`weights-disk-tier`** serves a model larger than the card and the host pool together, with every
 step paced by the drive. A routed expert that fits neither lives only in the container. Before each
@@ -2802,6 +2817,7 @@ switch is set with `true`. The fleet's own keys (a model's `aliases`, `priority`
 | `memory.host-headroom-mib: N` | 4096 | host RAM left free for the system when startup pins host memory, kept for the unpooled allocations, staging and page cache (§4.3). A snapshot store's floor takes back the shortfall from it, down to 1 GiB, rather than come up with none (`checkpoint-slots`, §4.8) |
 | `embedding-placement: WHERE` | ram | `ram` or `vram`: the token embedding pinned in host memory beside `host-pool-mib` and read in place, or on the card (§4.3) |
 | `ngram-placement: WHERE` | auto | `auto`, `vram`, `ram` or `disk`: an n-gram table on the card, as a copy in RAM made at load and read by the card, or read from the container (§4.3); `ram=DIR` shares the RAM copy between engines, `disk=DIR` reads the table from its own file in `DIR` |
+| `keep-container-cache: true` | off | keep the container in the page cache after the load (the load reads it buffered for that) so later starts read it at memory speed rather than from disk; only when `MemAvailable` after the load's pins leaves the container plus `memory.host-headroom-mib` free. The first start is slower; the pages are the same spare host RAM a bigger `host-mib` pool, `prefix-cache-mib` or `--kv-resident` takes, so spend it on one (§4.3) |
 | `vision-tower-placement: WHERE` | vram | `vram` or `ram`: the encoder towers (vision, and audio where a model has one) on the card, or pinned in host memory beside `host-pool-mib` and read in place once an image (§4.3) |
 | `weights-disk-tier: true` | off | read weights that fit neither VRAM nor the host pool from the container (O_DIRECT); routed experts a layer at a time |
 

@@ -73,10 +73,12 @@ int DirectFile::open(const char* path, int flags) {
     if (flags & RAD_DIO_CREATE) oflags |= O_CREAT;
     if (flags & RAD_DIO_TRUNC)  oflags |= O_TRUNC;
 
-    fd_ = ::open(path, oflags | O_DIRECT, 0600);
-    direct_ = fd_ >= 0;
+    fd_ = (flags & RAD_DIO_BUFFERED) ? ::open(path, oflags, 0600)
+                                     : ::open(path, oflags | O_DIRECT, 0600);
+    direct_ = fd_ >= 0 && !(flags & RAD_DIO_BUFFERED);
 
-    if (fd_ < 0 && (errno == EINVAL || errno == ENOTSUP || errno == EOPNOTSUPP)) {
+    if (fd_ < 0 && !(flags & RAD_DIO_BUFFERED) &&
+        (errno == EINVAL || errno == ENOTSUP || errno == EOPNOTSUPP)) {
         /* tmpfs and some network mounts refuse O_DIRECT outright. */
         if (flags & RAD_DIO_ALLOW_BUFFERED) {
             fd_ = ::open(path, oflags, 0600);

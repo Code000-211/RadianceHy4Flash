@@ -11,3 +11,6 @@ __pycache__/
 
 # a measurement's before tree (a checkout of the merge base beside this one), never committed
 /.k41-base/
+
+# per-user tool state (gh, etc.) must never be committed
+.local/

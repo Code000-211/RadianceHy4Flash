@@ -226,6 +226,39 @@ TEST(stats_carries_the_engine_the_requests_and_the_snapshot) {
     CHECK_EQ(g.get("/graph").value("order", json()).size(), (size_t)0);
 }
 
+/* /stats says why the loan stops: the pieces of its headroom for the group that lends least, so a
+ * reader can tell free room above the held top from free blocks left under it. Blocks of that
+ * group, since a block is the unit the loan's mark moves in. */
+TEST(stats_says_where_the_kv_loan_stops_and_what_keeps_it_there) {
+    Dash d(false);
+    d.sched.m.kv_loan.group         = "full";
+    d.sched.m.kv_loan.block_tokens  = 64;
+    d.sched.m.kv_loan.block_bytes   = 131072;
+    d.sched.m.kv_loan.held          = 1000;
+    d.sched.m.kv_loan.held_top      = 1040;
+    d.sched.m.kv_loan.buffer_blocks = 8;
+    d.sched.m.kv_loan.live          = 1048;
+    d.sched.m.kv_loan.spare_tokens  = 0;
+    d.sched.m.kv_loan.loan_tokens   = 512;
+    const json s = d.get("/stats");
+    REQUIRE(s.contains("kv_loan"));
+    const json& l = s["kv_loan"];
+    CHECK_EQ(l.value("group", ""), std::string("full"));
+    CHECK_EQ(l.value("block_tokens", (int64_t)0), (int64_t)64);
+    CHECK_EQ(l.value("block_bytes", (int64_t)0), (int64_t)131072);
+    CHECK_EQ(l.value("held", (int64_t)0), (int64_t)1000);
+    CHECK_EQ(l.value("held_top", (int64_t)0), (int64_t)1040);
+    CHECK_EQ(l.value("buffer_blocks", (int64_t)0), (int64_t)8);
+    CHECK_EQ(l.value("live", (int64_t)0), (int64_t)1048);
+    CHECK_EQ(l.value("spare_tokens", (int64_t)-1), (int64_t)0);
+    CHECK_EQ(l.value("loan_tokens", (int64_t)0), (int64_t)512);
+
+    /* An engine whose manager cannot answer says nothing: absent, not a row of zeros that would
+     * read as a pool with no room to lend. */
+    Dash e(false);
+    CHECK(!e.get("/stats").contains("kv_loan"));
+}
+
 /* /sessions lists each stored conversation with where its blocks are, the pool as the card holds
  * it (each block once), the tiers' counters and the snapshot store. */
 TEST(sessions_lists_each_conversation_and_what_the_tiers_did) {
@@ -490,6 +523,43 @@ TEST(the_bridge_reads_the_binding_paged_group_and_sums_only_bytes) {
     CHECK_EQ(p.kv_tokens_total, (int64_t)(200 * 16));
     CHECK_EQ(p.kv_tokens_used, (int64_t)(190 * 16));
     CHECK_EQ(p.kv_tokens_max, (int64_t)(100 * 16));
+}
+
+/* The loan's pieces cross the bridge with the name of the group they are counted in, so a reader
+ * of /stats needs no index into the per-group array that only /metrics carries. A manager that
+ * cannot answer says group -1, and that must not name group 0. */
+TEST(the_bridge_names_the_group_the_kv_loan_stops_in) {
+    rad::SchedMetrics m;
+    m.n_kv_groups = 2;
+    m.kv[0].name = "full";
+    m.kv[1].name = "window";
+    m.kv_spare.group         = 1;
+    m.kv_spare.block_tokens  = 32;
+    m.kv_spare.block_bytes   = 4096;
+    m.kv_spare.held          = 10;
+    m.kv_spare.held_top      = 12;
+    m.kv_spare.buffer_blocks = 4;
+    m.kv_spare.live          = 16;
+    m.kv_spare.spare_tokens  = 99;
+    m.kv_spare.loan_tokens   = 77;
+    const server::SchedMetrics o = bridge_metrics(m);
+    CHECK_EQ(o.kv_loan.group, std::string("window"));
+    CHECK_EQ(o.kv_loan.block_tokens, (int64_t)32);
+    CHECK_EQ(o.kv_loan.block_bytes, (int64_t)4096);
+    CHECK_EQ(o.kv_loan.held, (int64_t)10);
+    CHECK_EQ(o.kv_loan.held_top, (int64_t)12);
+    CHECK_EQ(o.kv_loan.buffer_blocks, (int64_t)4);
+    CHECK_EQ(o.kv_loan.live, (int64_t)16);
+    CHECK_EQ(o.kv_loan.spare_tokens, (int64_t)99);
+    CHECK_EQ(o.kv_loan.loan_tokens, (int64_t)77);
+
+    rad::SchedMetrics none;   /* group -1: no paged FULL group, or a follower */
+    none.n_kv_groups = 2;
+    const server::SchedMetrics p = bridge_metrics(none);
+    CHECK(p.kv_loan.group.empty());
+    CHECK_EQ(p.kv_loan.held_top, (int64_t)0);
+    CHECK_EQ(p.kv_loan.buffer_blocks, (int64_t)0);
+    CHECK_EQ(p.kv_loan.spare_tokens, (int64_t)0);
 }
 
 /* SchedulerBridge copies S-07's seven reasons one for one: each keeps its own counter, so a

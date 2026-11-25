@@ -925,6 +925,13 @@ struct Config {
      * config_parse divides it by --tp. */
     int64_t host_pool_mib = 0;
     int64_t host_headroom_mib = 4096; /* --host-headroom-mib: RAM left free for the system at startup */
+    /* --keep-container-cache: leave the pages a load read into the page cache instead of dropping
+     * them behind the read, so the next start reads the container at memory speed. Off by default:
+     * those pages are the same spare RAM a host KV tier, a host prefix cache or a pinned table
+     * would take, and the load keeps them only when MemAvailable after its pins leaves the
+     * container plus host_headroom_mib free. Conflicts with X-01/M-01 by design: the operator
+     * spends the RAM on the one that pays. */
+    bool    keep_container_cache = false;
     /* File tier for weights: what fits in neither the VRAM slab nor the pinned host pool is read
      * from the container with O_DIRECT ahead of the ops that read it (a scheduled unit by the
      * exact prefetch, a routed expert a routed layer at a time). Off by default because disk

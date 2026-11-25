@@ -38,6 +38,10 @@ Ranges complement(Ranges keep) {
     return rad_keep_complement(kTables, kSize, std::move(keep));
 }
 
+Ranges drop_ranges(Ranges keep, bool keep_all) {
+    return rad_drop_ranges(kTables, kSize, std::move(keep), keep_all);
+}
+
 /* Total bytes a set of ranges covers, which is what "freed" or "kept" means to a page cache. */
 int64_t covered(const Ranges& r) {
     int64_t n = 0;
@@ -180,6 +184,19 @@ TEST(the_recorded_range_is_what_the_drop_is_asked_to_keep) {
     for (const auto& r : freed) {
         CHECK(!(r.first < off + len && off < r.first + r.second));   /* no overlap with the keep */
     }
+}
+
+/* ---- --keep-container-cache -------------------------------------------------------------- */
+
+TEST(keeping_the_whole_container_asks_the_drop_for_no_range) {
+    /* B-04: with the container kept in the page cache (--keep-container-cache), the load must not
+     * free behind the read, or the next start reads it from the drive again. The mapped tier's
+     * keep ranges are still no reason to free less when the whole container is kept. */
+    CHECK(drop_ranges({}, true).empty());
+    CHECK(drop_ranges({{kTables + 4096, 64 * 1024}}, true).empty());
+    /* Off, the geometry is unchanged: the same keep frees the blob less the kept bytes. */
+    CHECK_EQ(covered(drop_ranges({}, false)), kBlob);
+    CHECK_EQ(covered(drop_ranges({{kTables + 4096, 64 * 1024}}, false)), kBlob - 64 * 1024);
 }
 
 RAD_TEST_MAIN()

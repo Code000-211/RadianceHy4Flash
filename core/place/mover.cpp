@@ -1270,8 +1270,10 @@ int Mover::issue(const Swap& s, HeatEngine* heat) {
 
 /* ------------------------------------------------------------------ the loan */
 static const char* lender_name(int lender) {
-    return lender == Mover::kLendKV ? "KV cache" : lender == Mover::kLendArena ? "activation arena"
-                                                                             : "fleet's free VRAM";
+    return lender == Mover::kLendKV            ? "KV cache"
+           : lender == Mover::kLendKvWindow    ? "KV cache (sliding window)"
+           : lender == Mover::kLendArena       ? "activation arena"
+                                               : "fleet's free VRAM";
 }
 
 static char* align_down_ptr(char* p) {
@@ -1279,7 +1281,7 @@ static char* align_down_ptr(char* p) {
     return (char*)(v - v % (uintptr_t)RAD_ALIGN_UNIT);
 }
 
-int Mover::lend_from(int lender, const std::vector<LoanStrip>& strips) {
+int Mover::lend_from(int lender, const std::vector<LoanStrip>& strips, bool share_unit_budget) {
     if (!plan_ || !plan_->dynamic) return RAD_OK;      /* a static plan never moves a unit */
     if (lender < 0 || lender >= kLenders) return RAD_E_INVAL;
     for (const ClassPools& cp : pools_)
@@ -1299,6 +1301,12 @@ int Mover::lend_from(int lender, const std::vector<LoanStrip>& strips) {
         if (!plan_->units[u].movable) continue;
         ++want[(size_t)us.klass];
     }
+    if (share_unit_budget)
+        for (size_t c = 0; c < nc; ++c) {
+            int64_t taken = 0;
+            for (const ClassPools::Lent& l : pools_[c].lent) taken += (int64_t)l.need.size();
+            want[c] = want[c] > taken ? want[c] - taken : 0;
+        }
     std::vector<double> weight(nc, 0.0);
     for (size_t c = 0; c < nc; ++c)
         weight[c] = pools_[c].stride > 0 ? (double)want[c] * (double)pools_[c].stride : 0.0;
@@ -1495,6 +1503,9 @@ int64_t Mover::donor_slot(size_t klass, int32_t layer, HeatEngine* heat) {
         d.at = dispatch_;
         d.by_layer.assign((size_t)std::max(n_layers_, 1), {});
         for (const ClassPools::Lent& l : cp.lent) {
+            /* The KV cache's loan only: its recall is an address change. A window group's slots
+             * hold the same experts but a sequence needs those blocks back at an admission, so a
+             * donation there would not be free to take back. */
             if (l.lender != kLendKV) continue;
             const int64_t lo = cp.slab.seg_lo(l.seg), hi = cp.slab.target(l.seg);
             for (int32_t u = 0; u < (int32_t)unit_.size(); ++u) {

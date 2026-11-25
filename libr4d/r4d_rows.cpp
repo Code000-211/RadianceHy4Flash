@@ -720,7 +720,7 @@ static const RadOperandSpec oMlaKvSplit[] = {
 };
 static const RadParamSpec pEngramIds[] = {
     P_INT("M"), P_INT("heads"), P_INT("ngram"), P_INT("pad"), P_INT("map_size"),
-    P_INTO("image"), P_INTO("video"),
+    P_INTO("image"), P_INTO("video"), P_INTO("advance"),
 };
 static const RadOperandSpec oEngramIds[] = {
     {"tok", RAD_OPD_IN, 0}, {"state", RAD_OPD_INOUT, 0}, {"cu", RAD_OPD_IN, 0},
@@ -3990,7 +3990,8 @@ static const RadOpSchema kSchemas[] = {
            "ngram_ids' window of committed ids. With `ahead_ids` present, `tok` holds the following "
            "prompt of the last sequence past the step's rows (numel(ahead_ids) / heads tokens, positions "
            "continuing its last), and their ids land in `ahead_ids` (a read-ahead hint); the window written "
-           "back is the step's own."),
+           "back is the step's own. `advance` 0 (default 1) reads the window and leaves it as it was, so "
+           "layers sharing one history hash the window a step opened with."),
     SCHEMA("engram_norm", pEngramNorm, oEngramNorm,
            "One rms norm a head over the gathered rows: y[i] = round(gain[i] * x[i] * rsqrt(mean_head(x^2) + "
            "eps)). eps is a parameter: 0.0078125 (HF in bf16) or 1.19e-7."),
@@ -6796,6 +6797,24 @@ static const RadConstraint cNemotronRope64[] = { C_IN("dtype", "bf16"), C_GE("M"
 static const RadConstraint cNemotronRope128[] = { C_IN("dtype", "bf16"), C_GE("M", 1), C_LE("M", 2147483647), C_EQ("head_dim",128) };
 static const RadConstraint cNemotronAttn64[] = { C_IN("dtype", "bf16"), C_GE("M", 1), C_LE("M", 2147483647), C_EQ("head_dim",64), C_EQ("causal",0) };
 static const RadConstraint cNemotronAttn128[] = { C_IN("dtype", "bf16"), C_GE("M", 1), C_LE("M", 2147483647), C_EQ("head_dim",128), C_EQ("causal",0) };
+
+/* attn_kv_sink_h256's only axis: the query rows a workgroup (128: 16 waves, 512 threads; 64: 8
+ * waves, 256). A workgroup reads window + bq - 1 keys, of which each of its rows sees `window`, so
+ * at window 512 the share read and masked falls from 20 % to 11 % with 64 rows; the narrower
+ * workgroup moves a row's key tile grid with it, so the axis trades a little arithmetic for time
+ * rather than time alone. Both points stay inside this op's prefill bound against libref, which is
+ * why the axis is legal (perf.md §1, E4); tests/r4d_emu/test_attn_kv_sink.cpp runs both and the two
+ * against each other. The default is the 128-row tile: on one lane (iks, one R9700 at the 210 W cap,
+ * gfx1201, `--perfkvsink 20` in both orders) 64 rows is 4.4-8.8 % faster at window 512 (8.0 % at
+ * 64 heads M 1024, 4.4 % at M 2048) and 2.7-5.3 % slower where every row's mask is the same (window
+ * 0, the dense layers; the one M 512 point there is inside the lane's spread), while the 128-row
+ * point is the pre-change kernel to within the lane's 2 % spread; so the tuner picks it per shape
+ * and the dense path keeps 128. `notes/backlog/closed/K-56b.md` carries the rows and the commands. */
+static const int64_t kAkvSinkBq[] = { 64, 128 };
+static const RadTunable tAttnKvSink[] = {
+  { "bq", kAkvSinkBq, NELEM(kAkvSinkBq), 128, "query rows a workgroup: 128 (16 waves) or 64 (8 waves)" },
+};
+
 static const RadKernelInfo kKernels[] = {
 { "gemm_bf16_pixtral_patch", "gemm_nt", "gemm", "RGB 14x14 patch projection with ordered f32 dots",
   "K=588, M<=INT_MAX, N<=INT_MAX, pitched bf16 rows", "bf16",
@@ -7280,7 +7299,8 @@ static const RadKernelInfo kKernels[] = {
 { "gemm_bf16_nt_bias_tiled", "gemm_nt_bias", "gemm",
   "biased GEMM C = res + act(A @ W^T + bias) over 64-deep K tiles, the K tail staged as zeros, "
   "the activation and residual in the store: from 32 blocks of 128x128 the weight read straight "
-  "into registers and the activation staged through LDS, below that both staged at 64x64",
+  "into registers and the activation staged through LDS, below that both staged at 64x64; at "
+  "decode heights (M <= 64) either form in its chained form",
   "any M, N; K a multiple of 8; A rows 16-byte aligned; `res` may be the output itself",
   "bf16 A / W / C / res, bf16 or f32 bias, fp32 accumulate, three RNE roundings in the store",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
@@ -8266,12 +8286,12 @@ R4D_WINSINK_ROW(128, 16, i8kv, i8, cWinH128G16I8, "int8 (an f16 scale of K and o
 
 /* attn_kv_sink: Hy4-flash's non-absorbed prefill over kv_b-expanded keys and values
  * (r4d_attn_kv_sink_h256.hip). head_dim 256 for keys and values alike, any window, any heads up to
- * the grid's 65535. */
+ * the grid's 65535. `bq` is its only axis (tAttnKvSink above). */
 { "attn_kv_sink_h256", "attn_kv_sink", "attn",
   "dense causal WMMA attention over separate key and value rows, a window and a sink a head",
-  "head_dim=256 (keys and values), heads<=65535, any window, ragged cu_q/cu_k, 128 query rows a workgroup",
+  "head_dim=256 (keys and values), heads<=65535, any window, ragged cu_q/cu_k, bq 64 or 128 query rows a workgroup",
   "bf16 q/k/v/out (16-byte aligned rows), f32 sinks; bf16 Q.K, f16 P.V, f32 softmax",
-  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cAttnKvSink), NOTUNE,
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cAttnKvSink), ROW(tAttnKvSink), nullptr,
   nullptr, nullptr, r4d_rad_attn_kv_sink_h256, nullptr, nullptr, nullptr,
   r4d_shape_attn_kv_sink },
 

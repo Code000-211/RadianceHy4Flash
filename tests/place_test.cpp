@@ -2328,6 +2328,34 @@ TEST(the_lent_slots_hold_nothing_until_a_loan_covers_them) {
     CHECK_EQ(none.flex_offered_bytes(), (int64_t)0);
 }
 
+/* A slot stands for the unit that fills it, so a lender lending a region an earlier lender already
+ * carved slots in takes only the units that one left (M-11: the sliding-window's blocks are lent to
+ * the same experts). A full second budget would carve slots no unit can fill: the KV blocks are
+ * marked lent and nothing ever lands in them. */
+TEST(a_lender_sharing_the_unit_budget_takes_only_the_units_the_first_left) {
+    int64_t alone = 0;
+    {
+        LoanRig r;
+        CHECK_OK(r.build());
+        alone = r.m.flex_capacity();
+        CHECK(alone > 0);
+        CHECK_EQ(alone, (int64_t)r.pooled() * r.hf.plan.classes[0].stride);   /* a slot a unit */
+        /* The rig lends kLendKV first, as the engine does. A lender with a budget of its own takes
+         * another full set of slots below those. */
+        CHECK_OK(r.m.lend_from(Mover::kLendKvWindow, r.loan.strips));
+        CHECK(r.m.flex_capacity() > alone);
+    }
+    {
+        LoanRig r;
+        CHECK_OK(r.build());
+        CHECK_OK(r.m.lend_from(Mover::kLendKvWindow, r.loan.strips, /*share_unit_budget=*/true));
+        CHECK_EQ(r.m.flex_capacity(), alone);
+        /* And a lender that carved nothing lends nothing: the arbiter must not move its mark. */
+        CHECK_EQ(r.m.loan_ceiling(Mover::kLendKvWindow), (int64_t)0);
+        CHECK(r.m.loan_ceiling(Mover::kLendKV) > 0);
+    }
+}
+
 /* An empty lent slot wastes VRAM every step, so a loan is filled in the dispatch it arrives in:
  * every slot beyond the turnover slots at once, hottest units first. */
 TEST(every_lent_slot_is_filled_in_one_dispatch) {
