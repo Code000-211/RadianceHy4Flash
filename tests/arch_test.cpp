@@ -9617,6 +9617,31 @@ TEST(the_step_lint_reports_each_rule_it_checks) {
         CHECK(any_has(p.lint({ { p.wA, RAD_B(p.A) }, { mm, half } }), "not contiguous"));
         CHECK_EQ(report_lint(p.lint({ { p.wA, RAD_B(p.A) }, { mm, whole } })), (size_t)0);
     }
+    {   /* rad_buf_full_write: a buffer rewritten whole at every stretch of uses has one run per
+         * stretch, and an op inside the envelope but between two runs is still undeclared (the
+         * packer lends those bytes to another buffer). A buffer written at op 1, read at op 2 and
+         * written again at op 5 lives 1..2 and 5..5, so op 4 may not touch it. */
+        LintProgram p;
+        rad_buf_full_write(&p.b, p.A);
+        LintProgram::rw(p.b, "fill", {}, { p.A });        /* op 5 */
+        const auto f = p.lint({ { p.wA, RAD_B(p.A) }, { p.rA, RAD_B(p.A) },
+                                { p.rX, RAD_B(p.A) } });
+        CHECK(any_has(f, "undeclared use of 'A' (planned ops 1..2, 5..5)"));
+    }
+    {   /* rad_buf_full_write: the plan lends such a buffer's bytes to another buffer between its
+         * runs, so each run must write every byte it reads. A column-sliced write covering the
+         * four columns read is fine; a read reaching past what the run wrote is not -- the rest of
+         * that value was written in an earlier run and its bytes are gone. */
+        LintProgram p;
+        rad_buf_full_write(&p.b, p.A);
+        const RadOperand col = RAD_B_COL(p.A, 12, 4);
+        CHECK_EQ(report_lint(p.lint({ { p.wA, col }, { p.rA, col } })), (size_t)0);
+        CHECK(any_has(p.lint({ { p.wA, col }, { p.rA, RAD_B(p.A) } }),
+                      "never wrote there, but the buffer is declared rad_buf_full_write"));
+        /* A run that writes nothing at all cannot satisfy a read either. */
+        CHECK(any_has(p.lint({ { p.wX, RAD_B(p.X) }, { p.rA, RAD_B(p.A) } }),
+                      "never wrote there"));
+    }
     {   /* A raw pointer into a buffer counts as that buffer. */
         LintProgram p;
         RadCtx c{ .b = &p.b };

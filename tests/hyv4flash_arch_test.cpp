@@ -394,6 +394,43 @@ TEST(every_step_kind_is_lint_clean) {
     CHECK_EQ(count_issued(a.b, c, "sub_i32"), 1);   /* P-04: absorbed on every layer, rebased once */
 }
 
+/* P-11: a plane of a layer that every one of its writers writes from one end to the other is dead
+ * between its stretches of uses (rad_buf_full_write), so the arena lends its bytes to whatever the
+ * layer does next. What the item asks for is visible here, in the declaration order the plan works
+ * from: the attention's scratch is live while the layer attends, the MoE's while it routes and
+ * folds, and the two take turns layer after layer instead of both spanning the whole step. */
+TEST(the_attention_scratch_and_the_moe_scratch_take_turns) {
+    Declared d;
+    REQUIRE_EQ(d.rc, RAD_OK);
+    auto k = kit(d.b, {}, { 12 }, 0);
+    RadCtx c{ .b = &d.b, .batch = &k->b };
+    hyv4flash::step(&c, &k->b);
+    CHECK(c.step_fail.empty());
+    CHECK_LINT(d.b, &c);
+    const std::vector<Live> L = liveness(d.b);
+    auto runs = [&](const char* n) {
+        for (size_t i = 0; i < d.b.bufs.size(); ++i)
+            if (d.b.bufs[i].name == n) {
+                CHECK(in(d.b.full_write, (rad_buf)(i + 1)));
+                CHECK(L[i + 1].planned);
+                return L[i + 1].runs;
+            }
+        CHECK(std::string("no buffer named ") + n == "");
+        return std::vector<std::pair<int32_t, int32_t>>{};
+    };
+    const auto attn = runs("sparse.k");
+    const auto moe  = runs("moe.routed");
+    CHECK(attn.size() > 1);
+    CHECK_EQ(attn.size(), moe.size());
+    /* One run per layer each, and the layer attends before it routes: the k-plane is written and
+     * read, then dead, before the routed plane of the same layer is written. */
+    for (size_t i = 0; i < attn.size() && i < moe.size(); ++i) {
+        CHECK(attn[i].first < moe[i].first);
+        CHECK(attn[i].second < moe[i].first);
+        if (i + 1 < attn.size()) CHECK(moe[i].second < attn[i + 1].first);
+    }
+}
+
 /* P-05 (audit F15): the ahead ids are hashed only where a gather reads them. A prefill step with
  * a following prompt hashes them into eg.ids_ahead and hands them to the gather only when the
  * step's embed_lookup_q dispatches to the host domain (the table on disk, read by libavx's
