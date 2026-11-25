@@ -1597,123 +1597,6 @@ TEST(quantised_routed_experts_are_served_clamped) {
     }
 }
 
-/* K-53: with the clamped int8 swiglu fusion on, the routed gate_up GEMM of a prefill step writes the
- * down projection's codes and scale itself (`moe_gemm_q_gated`), so the [rows * top_k, 2F] bf16
- * plane it used to stage is written and read by nobody and the pair's two launches become the GEMM's
- * own epilogue; the down GEMM reads exactly what the gate_up wrote, and neither a `swiglu_clamped`
- * nor a quantiser op stands between them. With that row undeclared, the pair is back with the plane
- * it stages. */
-/* trellis_i8 with the fused gate_up row refused, for the arm below. */
-static void trellis_i8_no_gated(RadBuilder* b) {
-    bf16_encs(b);
-    b->encs[0].second = b->encs[1].second = enc_trellis(RAD_U4, true);
-    b->refuse.insert("moe_gemm_q_gated");
-}
-
-TEST(k53_the_routed_gate_up_writes_the_down_codes_itself) {
-    auto trellis_i8 = [](RadBuilder* b) {
-        bf16_encs(b);
-        b->encs[0].second = b->encs[1].second = enc_trellis(RAD_U4, true);
-    };
-    g3_fusions = true;
-    Declared on(trellis_i8);
-    g3_fusions = false;
-    REQUIRE_EQ(on.rc, RAD_OK);
-    /* both MoE layers' gate_up GEMMs are the fused row, at the model's clamp, over the pair's own
-     * operands (activation, its scale, the sort and its offsets, and each class's codes and scale as
-     * weights) and the down GEMM's two outputs */
-    CHECK_EQ(count_op(on.b, "moe_gemm_q_gated"), 2);
-    CHECK_EQ(count_op(on.b, "moe_gemm_q"), 2);   /* the down projections, and only them */
-    const rad_buf egu = buf_named(on.b, "moe.expert_gate_up");
-    REQUIRE(egu != 0);
-    int plane_r = 0, plane_w = 0;
-    for (const auto& o : on.b.ops) {
-        plane_r += (int)in(o.reads, egu);
-        plane_w += (int)in(o.writes, egu);
-    }
-    CHECK_EQ(plane_r, 0);
-    CHECK_EQ(plane_w, 0);
-    for (int i = 0; i < 2; ++i) {
-        const RecOp* f = find_op(on.b, "moe_gemm_q_gated", i);
-        REQUIRE(f != nullptr);
-        CHECK_EQ(pstr(f, "dtype"), std::string("i8a8h"));
-        CHECK_EQ(pint(f, "parts"), 2);
-        CHECK_EQ(pint(f, "group"), 128);
-        CHECK(std::fabs(pflt(f, "limit") - 10.0) < 1e-12);
-        REQUIRE_EQ(f->reads.size(), (size_t)4);
-        REQUIRE_EQ(f->writes.size(), (size_t)2);
-        /* the only readers of its outputs are the two down GEMMs -- the buffers are slot views, so
-         * both layers' rows are the one handle -- and each of them reads both */
-        int readers = 0;
-        for (const auto& o : on.b.ops) {
-            if (!in(o.reads, f->writes[0]) && !in(o.reads, f->writes[1])) continue;
-            CHECK_EQ(o.op, std::string("moe_gemm_q"));
-            CHECK(in(o.reads, f->writes[0]));
-            CHECK(in(o.reads, f->writes[1]));
-            ++readers;
-        }
-        CHECK_EQ(readers, 2);
-    }
-    every_weight_read(on.b);
-    steps_clean_at(on.b, 0, 1);
-
-    /* the row undeclared: the GEMM stages the plane and the clamped int8 quantiser reads it into the
-     * down GEMM's codes, two launches a layer */
-    g3_fusions = true;
-    Declared off([](RadBuilder* b) {
-        bf16_encs(b);
-        b->encs[0].second = b->encs[1].second = enc_trellis(RAD_U4, true);
-        b->undeclared.insert("moe_gemm_q_gated");
-    });
-    g3_fusions = false;
-    REQUIRE_EQ(off.rc, RAD_OK);
-    CHECK_EQ(count_op(off.b, "moe_gemm_q_gated"), 0);
-    CHECK_EQ(count_op(off.b, "moe_gemm_q"), 4);
-    const rad_buf egu_off = buf_named(off.b, "moe.expert_gate_up");
-    REQUIRE(egu_off != 0);
-    int gu_w = 0, cl_r = 0, cl_w = 0;
-    for (const auto& o : off.b.ops) {
-        if (in(o.writes, egu_off)) {
-            CHECK_EQ(o.op, std::string("moe_gemm_q"));
-            ++gu_w;
-        }
-        if (o.op == "swiglu_clamped_had_quant_i8g" && in(o.reads, egu_off)) {
-            ++cl_r;
-            cl_w += (int)o.writes.size();
-        }
-    }
-    CHECK_EQ(gu_w, 2);
-    CHECK_EQ(cl_r, 2);
-    CHECK_EQ(cl_w, 4);
-
-    /* A checkpoint whose gate_up row is not the fused one's family: the fused op is asked for and
-     * resolves nothing (`rad_op_resolved`), and the block stages the pair's plane again -- the
-     * quantiser declares and the plane has its writer and reader back. */
-    {
-        g3_fusions = true;
-        Declared unr(trellis_i8_no_gated);
-        g3_fusions = false;
-        REQUIRE_EQ(unr.rc, RAD_OK);
-        CHECK_EQ(count_op(unr.b, "moe_gemm_q_gated"), 2);   /* asked, refused */
-        CHECK_EQ(count_op(unr.b, "moe_gemm_q"), 4);        /* two down, two gate_up */
-        CHECK_EQ(count_op(unr.b, "swiglu_clamped_had_quant_i8g"), 2);
-        const rad_buf egu2 = buf_named(unr.b, "moe.expert_gate_up");
-        REQUIRE(egu2 != 0);
-        int pw = 0, pr = 0;
-        bool any_resolved = false;
-        for (const auto& o : unr.b.ops) {
-            pw += (int)in(o.writes, egu2);
-            pr += (int)in(o.reads, egu2);
-            if (o.op == "moe_gemm_q_gated" && o.resolved) any_resolved = true;
-        }
-        CHECK_EQ(pw, 2);
-        CHECK(pr >= 1);
-        CHECK(!any_resolved);
-    }
-
-    every_weight_read(off.b);
-}
-
 /* K-18: the block declares the sort's inverse table, so the fused selection or the separate
  * `moe_scatter_inv` writes `moe.expert_slot` and `moe_gather_inv` reads it instead of rebuilding
  * it; without the device rows the pair falls back to `moe_scatter` / `moe_gather`, which scan the
@@ -3371,12 +3254,12 @@ TEST(the_trunk_writes_its_selection_into_the_snapshot_and_clears_it_on_a_dense_s
         hyv4flash::step(&c, &k->b);
         CHECK(c.step_fail.empty());
         CHECK_LINT(d.b, &c);
-        size_t sel = SIZE_MAX, zero = SIZE_MAX, attn = SIZE_MAX;
+        size_t sel = SIZE_MAX, cp = SIZE_MAX, zero = SIZE_MAX, attn = SIZE_MAX;
         int cps = 0, zeros = 0;
         for (size_t i = 0; i < c.issues.size(); ++i) {
             const rad_op op = c.issues[i].op;
             if (op == m.layers[2].ix.op_select && sel == SIZE_MAX) sel = i;
-            if (op == m.df.op_sel) ++cps;
+            if (op == m.df.op_sel) { cp = i; ++cps; }
             if (op == m.df.op_zero) { zero = i; ++zeros; }
             if ((op == m.layers[2].attn.op_sel || op == m.layers[2].attn.op_paged) &&
                 attn == SIZE_MAX)

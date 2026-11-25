@@ -2311,8 +2311,6 @@ the gather `moe_gather_inv`, which reads the table instead of scanning the sort 
 |---|---|---|
 | `moe_gemm_q` | `M`(range) `N` `K` `n_expert` `top_k` `group` `a_order` `dtype` `N_odd`/opt `K_odd`/opt `parts`/opt `a_group`/opt | `a`, `a_scale`?, `w`wt, `w_scale`wt, `sorted_tok`, `expert_offset`, `w_odd`wt, `w_odd_scale`wt → `y` |
 | `moe_gemm_q_mod4` | `M`(range) `N` `K` `n_expert` `top_k` `group` `a_order` `dtype` `N_1`/opt `K_1`/opt `N_2`/opt `K_2`/opt `N_3`/opt `K_3`/opt `parts`/opt `a_group`/opt | `a`, `a_scale`?, `w`wt, `w_scale`wt, `sorted_tok`, `expert_offset`, `w_1`wt, `w_1_scale`wt, `w_2`wt, `w_2_scale`wt, `w_3`wt, `w_3_scale`wt → `y` |
-| `moe_gemm_q_gated` | `M`(range) `N` `K` `n_expert` `top_k` `group` `a_order` `dtype` `limit`:f64 `N_odd`/opt `K_odd`/opt `parts`/opt `a_group`/opt | `a`, `a_scale`?, `w`wt, `w_scale`wt, `sorted_tok`, `expert_offset`, `w_odd`wt, `w_odd_scale`wt → `q`, `s`, `split`/opt |
-| `moe_gemm_q_gated_mod4` | `M`(range) `N` `K` `n_expert` `top_k` `group` `a_order` `dtype` `limit`:f64 `N_1`/opt `K_1`/opt `N_2`/opt `K_2`/opt `N_3`/opt `K_3`/opt `parts`/opt `a_group`/opt | `a`, `a_scale`?, `w`wt, `w_scale`wt, `sorted_tok`, `expert_offset`, `w_1`wt, `w_1_scale`wt, `w_2`wt, `w_2_scale`wt, `w_3`wt, `w_3_scale`wt → `q`, `s`, `split`/opt |
 | `scale_rows` | `M`(range) `n` `act` `dtype` | `x`, `s`, `add`? → `y` |
 
 The arithmetic is the same whether a kernel is handed the tables or the stacked form
@@ -2430,17 +2428,6 @@ experts on every rank. It is a separate op, not a parameter on `moe_gemm_q`, bec
 divides a table op's weights over its table operands by count alone, so the operand list is the
 class count. Everything else (`parts`, the zero fill, `a_order`) is `moe_gemm_q`'s, and the weight
 list is class 0's codes and scales, then class 1's, 2's and 3's.
-
-**`moe_gemm_q_gated`** is `moe_gemm_q` with the clamped SwiGLU and the rotated int8 quantisation in
-its epilogue (`swiglu_clamped_had_quant_i8g`'s pass), so the `[M*top_k, N]` bf16 plane between them
-is never written or read: a block owns 128 gate columns and the matching 128 up columns (`parts` 2),
-reads its run map, and rotates and quantises the product before the run ends. It writes `q`
-(`[M*top_k, N/parts]`, i8) and `s` (`[M*top_k, N/parts/128]`, f32) instead of `y`, byte-identical
-to the pair's codes and scales: the epilogue rounds the bf16 product the same way and calls the same
-128-column quantiser. `limit` is the clamp. It is a separate schema for `gemm_nt_q_gated`'s reason,
-that it does not produce `y`; the four-class form is `moe_gemm_q_gated_mod4`. libr4d's rows are
-`moe_gemm_iqr_gated` and `moe_gemm_iqr_gated_mod4`, and they declare the chain they replace, so
-rad-kbench checks the fused bytes against the pair.
 
 **The codebook forms** (`w4nla8h`, `w4nl64a8h`, `w4nl32a8h`, `w5nl64a8h`, `w6nl64a8h`;
 `docs/MOE-W4.md`, `docs/MOE-W6.md`) hold u4, u5 or u6 codes into an f32 table of 16, 32 or 64

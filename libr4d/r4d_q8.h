@@ -67,26 +67,6 @@ __device__ __forceinline__ void q8_row_i8g(const uint16_t* row, signed char* __r
     }
 }
 
-// One 128-column group of such a row: the rotation, the absmax over the wave, the scale and the
-// four codes a lane. `row` is the group's first column and `kb` the group, i.e. its index in `s`;
-// the lane's four columns are kb * 128 + lane * 4. Split out of q8_row_had_i8g so a producer that
-// rotates one group of a row at a time writes the same bytes through the same code
-// (r4d_moe_iqr.hip's fused gate_up epilogue).
-__device__ __forceinline__ void q8_had_group_i8g(const uint16_t* __restrict__ row,
-                                                signed char* __restrict__ q,
-                                                float* __restrict__ s, uint32_t kb, uint32_t lane) {
-    const uint32_t c0 = kb * 128u + lane * 4u;
-    float v[4];
-#pragma unroll
-    for (int j = 0; j < 4; ++j) v[j] = __uint_as_float((uint32_t)row[c0 + j] << 16);
-    r4d_fwht_wave<128>(v, (int)lane);
-    float m = fmaxf(fmaxf(fabsf(v[0]), fabsf(v[1])), fmaxf(fabsf(v[2]), fabsf(v[3])));
-    m = r4d_wave_max(m);
-    const float sc = m > 0.0f ? m * (1.0f / q8_top<true>()) : 1.0f;
-    if (lane == 0) s[kb] = sc;
-    *(uint32_t*)(q + c0) = q8_pack4<true>(v[0], v[1], v[2], v[3], 1.0f / sc);
-}
-
 // q8_row_i8g with the 128-wide Hadamard between the staged values and the absmax: the codes
 // had_quant_act_i8g writes over the same bf16 row (r4d_fwht_wave's mapping is this one's, a wave a
 // group and four consecutive columns a lane), for a producer whose row crossed threads on the way
@@ -95,6 +75,16 @@ template <uint32_t THR>
 __device__ __forceinline__ void q8_row_had_i8g(const uint16_t* row, signed char* __restrict__ q,
                                                float* __restrict__ s, uint32_t n) {
     const uint32_t lane = threadIdx.x & 31u, wave = threadIdx.x >> 5;
-    for (uint32_t kb = wave; kb < n / 128u; kb += THR / 32u)
-        q8_had_group_i8g(row, q, s, kb, lane);
+    for (uint32_t kb = wave; kb < n / 128u; kb += THR / 32u) {
+        const uint32_t c0 = kb * 128u + lane * 4u;
+        float v[4];
+#pragma unroll
+        for (int j = 0; j < 4; ++j) v[j] = __uint_as_float((uint32_t)row[c0 + j] << 16);
+        r4d_fwht_wave<128>(v, (int)lane);
+        float m = fmaxf(fmaxf(fabsf(v[0]), fabsf(v[1])), fmaxf(fabsf(v[2]), fabsf(v[3])));
+        m = r4d_wave_max(m);
+        const float sc = m > 0.0f ? m * (1.0f / q8_top<true>()) : 1.0f;
+        if (lane == 0) s[kb] = sc;
+        *(uint32_t*)(q + c0) = q8_pack4<true>(v[0], v[1], v[2], v[3], 1.0f / sc);
+    }
 }

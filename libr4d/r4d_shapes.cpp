@@ -1800,8 +1800,7 @@ extern "C" int r4d_shape_moe_scatter_inv(const RadParam* p, int n_p, int operand
 
 /* `i8`: moe_gemm_i8a8's operands, int8 codes on both sides and the weight's scale per (row, group
  * of K). */
-static int moe_gemm_q_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out, bool i8,
-                           bool gated = false) {
+static int moe_gemm_q_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out, bool i8) {
     const int64_t M  = pi(p, n_p, "M");
     const int64_t N0 = pi(p, n_p, "N"), K0 = pi(p, n_p, "K");
     const int64_t N1 = pi(p, n_p, "N_odd", N0), K1 = pi(p, n_p, "K_odd", K0);
@@ -1821,10 +1820,6 @@ static int moe_gemm_q_shape(const RadParam* p, int n_p, int operand, RadOpdDesc*
     const uint32_t C = i8 ? (uint32_t)RAD_I8 : (uint32_t)RAD_F8E4M3;
     auto srows = [&](int64_t n) { return i8 ? n : (n + g - 1) / g; };
     const int64_t ag = pi(p, n_p, "a_group", g) > 0 ? pi(p, n_p, "a_group", g) : g;
-    /* `gated`: the epilogue writes the down projection's codes and their scale where the pair
-     * writes its bf16 plane -- one f32 scale a (row, 128-column group) of N/parts, `parts` the
-     * gate's copy of the width. */
-    const int64_t F = gated ? N / (pi(p, n_p, "parts", 2) > 0 ? pi(p, n_p, "parts", 2) : 2) : N;
     const RadOpdDesc l[] = {
         opd(C, AR, K),                 /* a -- see `a_order` */
         opd((uint32_t)RAD_F32, AR, (K + ag - 1) / ag),    /* a_scale */
@@ -1837,8 +1832,7 @@ static int moe_gemm_q_shape(const RadParam* p, int n_p, int operand, RadOpdDesc*
         opd_idx(ne + 1, 0, M * k + 1, -1),                /* expert_offset -- see the note above */
         opd(C, ne1, N1, K1),           /* w_odd -- the odd experts */
         opd((uint32_t)RAD_BF16, ne1, srows(N1), (K1 + g - 1) / g),   /* w_odd_scale */
-        gated ? opd((uint32_t)RAD_I8, M * k, F) : opd(D, M * k, N),   /* y, or the codes */
-        gated ? opd((uint32_t)RAD_F32, M * k, (F + g - 1) / g) : opd_none(),   /* the codes' scale */
+        opd(D, M * k, N),                                 /* y, in sorted order */
         opd_none(),                                       /* split -- optional */
     };
     R4D_PICK(l);
@@ -1847,15 +1841,11 @@ static int moe_gemm_q_shape(const RadParam* p, int n_p, int operand, RadOpdDesc*
 extern "C" int r4d_shape_moe_gemm_i8(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     return moe_gemm_q_shape(p, n_p, operand, out, true);
 }
-extern "C" int r4d_shape_moe_gemm_q_gated(const RadParam* p, int n_p, int operand,
-                                          RadOpdDesc* out) {
-    return moe_gemm_q_shape(p, n_p, operand, out, true, true);
-}
 
 /* The four-class form: class q holds the experts e with e % 4 == q at [N_q, K_q], defaulting to
  * class 0's, ceil((n - q) / 4) of them; `y` follows the last class. */
 static int moe_gemm_q_mod4_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out,
-                                 bool i8, bool gated = false) {
+                                 bool i8) {
     const int64_t M  = pi(p, n_p, "M");
     int64_t Nc[4], Kc[4];
     Nc[0] = pi(p, n_p, "N");
@@ -1882,7 +1872,6 @@ static int moe_gemm_q_mod4_shape(const RadParam* p, int n_p, int operand, RadOpd
     const uint32_t C = i8 ? (uint32_t)RAD_I8 : (uint32_t)RAD_F8E4M3;
     auto wq = [&](int q) { return opd(C, nq[q], Nc[q], Kc[q]); };
     const int64_t ag = pi(p, n_p, "a_group", g) > 0 ? pi(p, n_p, "a_group", g) : g;
-    const int64_t F = gated ? N / (pi(p, n_p, "parts", 2) > 0 ? pi(p, n_p, "parts", 2) : 2) : N;
     auto sq = [&](int q) {
         return opd((uint32_t)RAD_BF16, nq[q], i8 ? Nc[q] : (Nc[q] + g - 1) / g,
                    (Kc[q] + g - 1) / g);
@@ -1894,8 +1883,7 @@ static int moe_gemm_q_mod4_shape(const RadParam* p, int n_p, int operand, RadOpd
         opd_idx(M * k, 0, M * k, -1),                     /* sorted_tok */
         opd_idx(ne + 1, 0, M * k + 1, -1),                /* expert_offset */
         wq(1), sq(1), wq(2), sq(2), wq(3), sq(3),         /* classes 1, 2, 3 */
-        gated ? opd((uint32_t)RAD_I8, M * k, F) : opd(D, M * k, N),   /* y, or the codes */
-        gated ? opd((uint32_t)RAD_F32, M * k, (F + g - 1) / g) : opd_none(),   /* the codes' scale */
+        opd(D, M * k, N),                                 /* y -- in SORTED order */
         opd_none(),                                       /* split -- optional */
     };
     R4D_PICK(l);
@@ -1903,10 +1891,6 @@ static int moe_gemm_q_mod4_shape(const RadParam* p, int n_p, int operand, RadOpd
 extern "C" int r4d_shape_moe_gemm_i8_mod4(const RadParam* p, int n_p, int operand,
                                           RadOpdDesc* out) {
     return moe_gemm_q_mod4_shape(p, n_p, operand, out, true);
-}
-extern "C" int r4d_shape_moe_gemm_q_gated_mod4(const RadParam* p, int n_p, int operand,
-                                               RadOpdDesc* out) {
-    return moe_gemm_q_mod4_shape(p, n_p, operand, out, true, true);
 }
 
 extern "C" int r4d_shape_moe_gather(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {

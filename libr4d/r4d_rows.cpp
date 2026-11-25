@@ -1278,51 +1278,6 @@ static const RadOperandSpec oMoeGemmQMod4[] = {
     { "y",             RAD_OPD_OUT,  0 },
     { "split",         RAD_OPD_IN,   1 },
 };
-/* The gate_up GEMM with the clamped SwiGLU and the rotated int8 quantisation in its epilogue
- * (K-53, r4d_moe_iqr.hip's moe_iqr_gated_kernel): `q`/`s` in place of `y`, one launch where the
- * pair is two, and the bf16 plane [rows, 2N] never written or read. `limit` is the clamp the
- * quantiser applies (``swiglu_clamped_had_quant_i8g``'s). */
-static const RadParamSpec pMoeGemmQGated[] = {
-    P_INT("M"), P_INT("N"), P_INT("K"), P_INT("n_expert"), P_INT("top_k"), P_INT("group"),
-    P_STR("a_order"), P_STR("dtype"), P_INTO("N_odd"), P_INTO("K_odd"), P_INTO("parts"),
-    P_INTO("a_group"), P_F64("limit"),
-};
-static const RadOperandSpec oMoeGemmQGated[] = {
-    { "a",             RAD_OPD_IN,   0 },
-    { "a_scale",       RAD_OPD_IN,   1 },
-    { "w",             RAD_OPD_WTAB, 0 },
-    { "w_scale",       RAD_OPD_WTAB, 0 },
-    { "sorted_tok",    RAD_OPD_IN,   0 },
-    { "expert_offset", RAD_OPD_IN,   0 },
-    { "w_odd",         RAD_OPD_WTAB, 0 },
-    { "w_odd_scale",   RAD_OPD_WTAB, 0 },
-    { "q",             RAD_OPD_OUT,  0 },
-    { "s",             RAD_OPD_OUT,  0 },
-    { "split",         RAD_OPD_IN,   1 },
-};
-/* As above over four classes by expert number mod 4. */
-static const RadParamSpec pMoeGemmQGatedMod4[] = {
-    P_INT("M"), P_INT("N"), P_INT("K"), P_INT("n_expert"), P_INT("top_k"), P_INT("group"),
-    P_STR("a_order"), P_STR("dtype"), P_INTO("N_1"), P_INTO("K_1"), P_INTO("N_2"), P_INTO("K_2"),
-    P_INTO("N_3"), P_INTO("K_3"), P_INTO("parts"), P_INTO("a_group"), P_F64("limit"),
-};
-static const RadOperandSpec oMoeGemmQGatedMod4[] = {
-    { "a",             RAD_OPD_IN,   0 },
-    { "a_scale",       RAD_OPD_IN,   1 },
-    { "w",             RAD_OPD_WTAB, 0 },
-    { "w_scale",       RAD_OPD_WTAB, 0 },
-    { "sorted_tok",    RAD_OPD_IN,   0 },
-    { "expert_offset", RAD_OPD_IN,   0 },
-    { "w_1",           RAD_OPD_WTAB, 0 },
-    { "w_1_scale",     RAD_OPD_WTAB, 0 },
-    { "w_2",           RAD_OPD_WTAB, 0 },
-    { "w_2_scale",     RAD_OPD_WTAB, 0 },
-    { "w_3",           RAD_OPD_WTAB, 0 },
-    { "w_3_scale",     RAD_OPD_WTAB, 0 },
-    { "q",             RAD_OPD_OUT,  0 },
-    { "s",             RAD_OPD_OUT,  0 },
-    { "split",         RAD_OPD_IN,   1 },
-};
 static const RadParamSpec pMoeGather[] = {
     P_INT("M"), P_INT("n"), P_INT("top_k"), P_STR("dtype"),
     /* The shared arm's gate, present exactly when `shared` and `shared_gate` are: "sigmoid" or
@@ -4165,16 +4120,6 @@ static const RadOpSchema kSchemas[] = {
            "hold class 0 at [N, K] and `w_q`/`w_q_scale` class q at [N_q, K_q], expert e at entry "
            "e/4 of class e%4. The output is as wide as the widest class in `parts` stacked parts, "
            "and a narrower class fills each part's leading columns and zeros the rest."),
-    SCHEMA("moe_gemm_q_gated", pMoeGemmQGated, oMoeGemmQGated,
-           "moe_gemm_q with the clamped SwiGLU and the rotated int8 quantisation in its epilogue: "
-           "`q`[M*top_k, N/parts] is i8 and `s`[M*top_k, N/parts/128] f32, the codes and the one "
-           "scale a "
-           "128-column group that `swiglu_clamped_had_quant_i8g` writes over the `y` plane, so the "
-           "plane is never written or read. `limit` is the clamp. The block grid is the run map's "
-           "over both parts, so `split` has no place here."),
-    SCHEMA("moe_gemm_q_gated_mod4", pMoeGemmQGatedMod4, oMoeGemmQGatedMod4,
-           "moe_gemm_q_gated over FOUR weight-table classes by the expert's number mod 4, as "
-           "moe_gemm_q_mod4 is over moe_gemm_q."),
     SCHEMA("moe_gather", pMoeGather, oMoeGather,
            "scatters the sorted expert output back to token order and weights it. The sum over a "
            "token's slots runs in ASCENDING SLOT order, which is what makes it reproducible -- "
@@ -9942,35 +9887,6 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   nullptr, nullptr, r4d_rad_moe_gemm_iqr_mod4, r4d_rad_moe_gemm_iqr_scratch,
   r4d_rad_layout_moe_iqr_mod4, r4d_rad_relayout_moe_iqr_mod4, nullptr,
   r4d_rad_unrelayout_moe_iqr_mod4 },
-
-{ "moe_gemm_iqr_gated", "moe_gemm_q_gated", "moe",
-  "moe_gemm_iqr with the clamped SwiGLU and the rotated int8 quantisation in its epilogue: a "
-  "block owns one 128-column group of the gate part and the group's matching up columns, a wave "
-  "two tiles, and after them the group's rotation and its codes -- so `q`/`s` are written where "
-  "the pair writes the bf16 plane and the second launch reads it back, and the plane never "
-  "exists (K-53)",
-  "as moe_gemm_iqr, parts 2, N/parts a multiple of 128, and a `y` plane of the pair's width in "
-  "place of `q`/`s`",
-  "i8 activation with an f32 scale per (row, 128 or 256 of K), each expert an IQR weight, i8 out "
-  "with one f32 scale a (row, 128-column group): the codes swiglu_clamped_had_quant_i8g writes "
-  "over the pair's bf16 plane, byte for byte",
-  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
-  ROW(cMoeGemmIqr), NOTUNE,
-  nullptr, nullptr, r4d_rad_moe_gemm_iqr_gated, r4d_rad_moe_gemm_iqr_gated_scratch,
-  r4d_rad_layout_moe_iqr_gated, r4d_rad_relayout_moe_iqr_gated, r4d_shape_moe_gemm_q_gated,
-  r4d_rad_unrelayout_moe_iqr_gated, r4d_fuse_moe_gemm_q_gated },
-
-{ "moe_gemm_iqr_gated_mod4", "moe_gemm_q_gated_mod4", "moe",
-  "moe_gemm_iqr_gated over four classes of experts by number mod 4: the same kernel, each run "
-  "reading its class's table",
-  "as moe_gemm_iqr_gated, every class",
-  "as moe_gemm_iqr_gated",
-  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
-  ROW(cMoeGemmIqr), NOTUNE,
-  nullptr, nullptr, r4d_rad_moe_gemm_iqr_gated_mod4, r4d_rad_moe_gemm_iqr_gated_scratch,
-  r4d_rad_layout_moe_iqr_gated_mod4, r4d_rad_relayout_moe_iqr_gated_mod4,
-  r4d_shape_moe_gemm_q_gated_mod4,
-  r4d_rad_unrelayout_moe_iqr_gated_mod4, r4d_fuse_moe_gemm_q_gated_mod4 },
 
 { "moe_gemm_w4a8i8", "moe_gemm_q", "moe",
   "moe_gemm_w4a8 against an INT8 activation: the same stored planes, the nibbles expanded to int8 "
