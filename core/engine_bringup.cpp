@@ -3409,6 +3409,12 @@ static int sweep_container(RadFile* file, std::vector<LoadRun>& runs,
     *read_out = 0;
     if (runs.empty()) return RAD_OK;
 
+    /* --keep-container-cache wants the container's pages to stay, and an O_DIRECT read never puts
+     * them in the page cache. Read buffered then: the first load pays the copy and the lower rate,
+     * later starts read the whole container from memory (load_weights has checked the room). */
+    const int dio_flags = RAD_DIO_READ |
+        (file->keep_pages() ? RAD_DIO_BUFFERED : RAD_DIO_ALLOW_BUFFERED);
+
     /* Sort by file offset into a reading order; the span tie-break makes the order total, so the
      * same load always issues copies in the same sequence. */
     std::sort(runs.begin(), runs.end(), [](const LoadRun& a, const LoadRun& b) {
@@ -3481,7 +3487,7 @@ static int sweep_container(RadFile* file, std::vector<LoadRun>& runs,
          * blocks wider). A filesystem that refuses O_DIRECT is read buffered. Opened here once so
          * a file that cannot be read fails before any window is pinned; the readers open their
          * own. */
-        RAD_TRY(dio.open(file->path(), RAD_DIO_READ | RAD_DIO_ALLOW_BUFFERED));
+        RAD_TRY(dio.open(file->path(), dio_flags));
         /* The first window is pinned here and the others by a helper while the first reads run
          * (below, `pinner`): a window takes ~7 ms to pin (its pages faulted and zeroed, then
          * locked for every card), and all eight ahead of the first read cost every sweep ~60 ms
@@ -3683,7 +3689,7 @@ static int sweep_container(RadFile* file, std::vector<LoadRun>& runs,
         auto busy0 = std::chrono::steady_clock::now();
         auto reader = [&] {
             DirectFile f;
-            const int orc = f.open(file->path(), RAD_DIO_READ | RAD_DIO_ALLOW_BUFFERED);
+            const int orc = f.open(file->path(), dio_flags);
             for (;;) {
                 size_t k;
                 {
@@ -3831,7 +3837,8 @@ static int sweep_container(RadFile* file, std::vector<LoadRun>& runs,
      * stay (RadFile::keep_cached, named where load_weights publishes a mapped weight): an n-gram
      * table is gathered from its mapping on every step, and with its pages dropped the first long
      * prefill after each load or restore faults them back from the drive (a 103 GiB table: 1460
-     * against 1998 tok/s on a 24k prompt). */
+     * against 1998 tok/s on a 24k prompt). With --keep-container-cache the whole container stays
+     * instead (drop_blob_cache asks rad_drop_ranges for no range). */
     file->drop_blob_cache();
     /* Drain before freeing: a sweep that failed part-way may have copies outstanding. */
     if (rc < 0) {
@@ -4288,6 +4295,26 @@ int Engine::load_weights() {
         RAD_ERR("%lld declared weights are absent from the container; the model cannot run",
                 (long long)n_missing);
         return RAD_E_NOTFOUND;
+    }
+
+    /* B-04: the walk has pinned the tables it will pin, so this is the "after pinning" check the
+     * backlog asks for: keep the container's pages only if the RAM is still there beside them. The
+     * table copies above dropped their pages behind the read; the sweep below reads the container
+     * buffered when it is kept, so those are the pages that stay and the next start reads.
+     * Dropping them here still frees everything the walk read, and drop_blob_cache takes the blob
+     * as usual when the check refuses. */
+    if (file_ && cfg_.keep_container_cache) {
+        std::string why;
+        if (lockable_room(file_->size(), 0, host_margin_bytes(), false, &why)) {
+            file_->keep_pages(true);
+            RAD_INFO("load: the container stays in the page cache (%s): the sweep reads it "
+                     "buffered for that, and the next start reads it at memory speed",
+                     humanb(file_->size()).c_str());
+        } else {
+            file_->keep_pages(false);
+            RAD_INFO("load: the container's pages are dropped behind the read: --keep-container-"
+                     "cache is on but %s", why.c_str());
+        }
     }
 
     /* ============================================================== the sweep */
