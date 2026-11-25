@@ -5077,6 +5077,33 @@ static void hy4_cases(std::vector<Hand>& hs) {
         hs.push_back(std::move(h));
     }
 
+    {
+        /* `advance` 0: a decode step hashes against the window and leaves it as it was, so the
+         * Engram layers that share one history all read the window the step opened with and only
+         * the last of them commits to it. The window [2, 1] and the row's own token 3 (through an
+         * identity map) pin the ids by hand: heads 2 over two orders, mix_1 = 3 ^ 2 = 1 at head 0
+         * (7) and mix_2 = 1 ^ 8 = 9 at head 1 (offset 100). */
+        const int64_t M = 1, heads = 2, ngram = 3, W = 2, map = 4;
+        static const int64_t mult[3] = { 1, 2, 4 }, vsz[2] = { 7, 11 }, off[2] = { 0, 100 };
+        Hand h("advance 0: the window is read, not committed", "engram_ids", 0.0);
+        h.idx({ 3 })
+         .dense(RAD_I32, { 1, W }, [](int64_t i) { return i == 0 ? 2.0f : 1.0f; }, false)
+         .idx({ 0, 1 })
+         .idx({ 5 })
+         .dense(RAD_I32, { map }, [](int64_t i) { return (float)i; })
+         .raw(RAD_I64, { 3 }, mult)
+         .raw(RAD_I64, { 2 }, vsz)
+         .raw(RAD_I64, { 2 }, off)
+         .idx({ 1 })
+         .none()
+         .dense(RAD_I32, { M, heads }, [](int64_t) { return -5.0f; }, true)
+         .dense(RAD_I32, { M }, sent, true)
+         .pi("M", M).pi("heads", heads).pi("ngram", ngram).pi("pad", 0).pi("map_size", map)
+         .pi("advance", 0)
+         .expect(10, { 1, 109 });
+        hs.push_back(std::move(h));
+    }
+
     /* ---- iHC ---------------------------------------------------------------------------- */
     for (const bool post : { true, false }) {
         /* h is a column slice of a wider plane; base far below zero saturates a gate at hc_eps. */

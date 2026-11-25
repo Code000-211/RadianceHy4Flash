@@ -720,7 +720,7 @@ static const RadOperandSpec oMlaKvSplit[] = {
 };
 static const RadParamSpec pEngramIds[] = {
     P_INT("M"), P_INT("heads"), P_INT("ngram"), P_INT("pad"), P_INT("map_size"),
-    P_INTO("image"), P_INTO("video"),
+    P_INTO("image"), P_INTO("video"), P_INTO("advance"),
 };
 static const RadOperandSpec oEngramIds[] = {
     {"tok", RAD_OPD_IN, 0}, {"state", RAD_OPD_INOUT, 0}, {"cu", RAD_OPD_IN, 0},
@@ -3990,7 +3990,8 @@ static const RadOpSchema kSchemas[] = {
            "ngram_ids' window of committed ids. With `ahead_ids` present, `tok` holds the following "
            "prompt of the last sequence past the step's rows (numel(ahead_ids) / heads tokens, positions "
            "continuing its last), and their ids land in `ahead_ids` (a read-ahead hint); the window written "
-           "back is the step's own."),
+           "back is the step's own. `advance` 0 (default 1) reads the window and leaves it as it was, so "
+           "layers sharing one history hash the window a step opened with."),
     SCHEMA("engram_norm", pEngramNorm, oEngramNorm,
            "One rms norm a head over the gathered rows: y[i] = round(gain[i] * x[i] * rsqrt(mean_head(x^2) + "
            "eps)). eps is a parameter: 0.0078125 (HF in bf16) or 1.19e-7."),
