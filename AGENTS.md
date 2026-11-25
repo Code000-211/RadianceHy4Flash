@@ -49,6 +49,31 @@ Without a GPU, open the PR as `[needs testing]`. When the review approves the co
 gets `ready-for-testing`; someone with a free GPU posts a measurement on the issue, you commit
 it as the file above and write `/done` again. Never claim numbers you did not run.
 
+## Iterating on one kernel (with a GPU)
+
+Work on one libr4d kernel needs neither a whole-library build nor a server restart. Read
+`docs/PLUGIN.md` §14 before using it; the short form:
+
+- **Override:** `cmake -B build -DR4D_OVERRIDE_UNITS=<unit>[;<unit>]` then
+  `cmake --build build --target libr4d_override` compiles only those units into
+  `build/override_home/kernels/libr4d.so`. Run with
+  `RADIANCE_HOME=build/override_home:build/radiance_home`: it shadows libr4d with the same rows,
+  flags and selection, and only the hooks those units define are new. Add
+  `-DR4D_OVERRIDE_BASE=<path>/libr4d.so` to build over a libr4d built elsewhere (e.g. the merge
+  base's), so nothing else compiles.
+- **Reload:** rebuild the override in place, then `curl -X POST http://127.0.0.1:<port>/admin/kernels/reload`.
+  Every engine switches at a step boundary, in about 0.1 s; the model stays loaded. The reply
+  names the rows that took new hooks; a 409 names why nothing changed.
+- **Limits:** only hooks reload (`launch`, `scratch` of the same size, `tune_valid`). A change
+  to a row's declaration, constraints, layout, shapes, fusion, `init` / `fini`, or a header
+  other units include, needs a rebuild of libr4d (name every unit that includes the header, or
+  rebuild). Replace the file as a new file (`mv`, `install`, the linker); `cp` over it rewrites
+  the file the server has mapped. Each reload keeps the old copy mapped (~100 MB VRAM a card on
+  the first one).
+
+An override is for iterating. The measurement that merges is still the before / after of
+CARDS.md §6 step 3 on the full build of each commit.
+
 ## How the review works here
 
 - `/done` on the issue starts a review round of your PR's current head. The review is posted
