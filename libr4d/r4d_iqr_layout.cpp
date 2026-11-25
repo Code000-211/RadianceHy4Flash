@@ -1035,4 +1035,8 @@ int moe_params(const RadParam* p, int n_p, int operand, bool mod4, MoeParams* v)
     }
 R4D_MOE_IQR_HOOKS(moe_iqr, false)
 R4D_MOE_IQR_HOOKS(moe_iqr_mod4, true)
+/* The fused epilogue's row answers its weight operands the same way; `q` / `s` are not weight
+ * operands and the dense hooks refuse them as they do `y`. */
+R4D_MOE_IQR_HOOKS(moe_iqr_gated, false)
+R4D_MOE_IQR_HOOKS(moe_iqr_gated_mod4, true)
 #undef R4D_MOE_IQR_HOOKS
