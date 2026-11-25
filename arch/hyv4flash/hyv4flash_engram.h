@@ -67,10 +67,18 @@ struct EngramWire {
     /* The ahead queue's depth in steps: core/sched/batch.cpp's k_ahead_chunks (as kAheadChunks in
      * rad_block_ple.h); a larger offer is clamped to the buffer. */
     static constexpr int64_t kAheadChunks = 2;
-    rad_buf ids = 0;      /* [T, heads] i32, host domain */
-    rad_buf ahead = 0;    /* [kAheadChunks * T, heads] i32, host domain: the following prompt's ids */
+    /* The gather's planes in both domains: the card's pair is what a device gather reads and
+     * writes in place, the host arena's is what libavx's host kernel touches. The table's placement
+     * (--ngram-placement) is decided after the declare, so both exist and step() picks one by
+     * rad_op_domain; the pair it does not pick is a transient nothing issues, which takes no
+     * space. */
+    rad_buf ids = 0;      /* [T, heads] i32 */
+    rad_buf ahead = 0;    /* [kAheadChunks * T, heads] i32: the following prompt's ids */
     rad_buf mask = 0;     /* [T] i32 */
-    rad_buf raw = 0;      /* [T, heads * hd] the gathered rows, host domain */
+    rad_buf raw = 0;      /* [T, heads * hd] the gathered rows */
+    rad_buf ids_h = 0;    /* the same three in the host arena, for a host gather */
+    rad_buf ahead_h = 0;
+    rad_buf raw_h = 0;
     rad_buf q = 0;        /* [T * heads, hd] e4m3, the round trip's codes */
     rad_buf qs = 0;       /* [T * heads, 1] f32 */
     rad_buf rt = 0;       /* [T, heads * hd] the round trip */
@@ -81,11 +89,16 @@ struct EngramWire {
     rad_buf m1 = 0;       /* [T, hc * n] -1, the tap's subtraction */
     int declare(RadBuilder* b, Names& nm, const Shape& s, const Geom& g) {
         const int64_t T = g.max_tok, H = s.engram_heads, HD = s.engram_head_dim, W = H * HD;
-        ids = decl_b(b, nm.f("eg.ids"), RAD_I32, { T, H }, RAD_BUF_TRANSIENT, RAD_DOMAIN_HOST);
-        ahead = decl_b(b, nm.f("eg.ids_ahead"), RAD_I32, { kAheadChunks * T, H }, RAD_BUF_TRANSIENT,
+        ids = decl_b(b, nm.f("eg.ids"), RAD_I32, { T, H });
+        ahead = decl_b(b, nm.f("eg.ids_ahead"), RAD_I32, { kAheadChunks * T, H });
+        ids_h = decl_b(b, nm.f("eg.ids_host"), RAD_I32, { T, H }, RAD_BUF_TRANSIENT,
                        RAD_DOMAIN_HOST);
+        ahead_h = decl_b(b, nm.f("eg.ids_ahead_host"), RAD_I32, { kAheadChunks * T, H },
+                         RAD_BUF_TRANSIENT, RAD_DOMAIN_HOST);
         mask = decl_b(b, nm.f("eg.mask"), RAD_I32, { T });
-        raw = decl_b(b, nm.f("eg.rows"), RAD_BF16, { T, W }, RAD_BUF_TRANSIENT, RAD_DOMAIN_HOST);
+        raw = decl_b(b, nm.f("eg.rows"), RAD_BF16, { T, W });
+        raw_h = decl_b(b, nm.f("eg.rows_host"), RAD_BF16, { T, W }, RAD_BUF_TRANSIENT,
+                       RAD_DOMAIN_HOST);
         q = decl_b(b, nm.f("eg.rows.q"), RAD_F8E4M3, { T * H, HD });
         qs = decl_b(b, nm.f("eg.rows.s"), RAD_F32, { T * H, 1 });
         rt = decl_b(b, nm.f("eg.rows.rt"), RAD_BF16, { T, W });
@@ -97,8 +110,8 @@ struct EngramWire {
             before = decl_b(b, nm.f("eg.before"), RAD_BF16, { T, s.hc * s.n_embd }, RAD_BUF_PERSIST);
             m1 = decl_b(b, nm.f("eg.minus_one"), RAD_BF16, { T, s.hc * s.n_embd }, RAD_BUF_PERSIST);
         }
-        return ids && ahead && mask && raw && q && qs && rt && e && key && val &&
-                       (!taps_on() || (before && m1))
+        return ids && ahead && mask && raw && ids_h && ahead_h && raw_h && q && qs && rt && e &&
+                       key && val && (!taps_on() || (before && m1))
                    ? RAD_OK
                    : RAD_E_INVAL;
     }
@@ -262,10 +275,13 @@ struct Engram {
                                     RAD_INT("video", s.video_token) };
             const rad_weight ws[] = { map, mult, vsz, off };
             rad_op& op = dec ? op_ids_dec : op_ids;
-            /* The prefill form also writes the following prompt's ids (`ahead`). */
-            op = dec ? rw(b, rad_decl_op(b, "engram_ids", ps, 7, ws, 4), {}, { w.ids, w.mask })
+            /* Both domains' ids: the kernel the step issues names the pair its gather wrote (K-58),
+             * and the plan gives each pair a lifetime over the ops that may name it. The prefill
+             * form also writes the following prompt's ids (`ahead`). */
+            op = dec ? rw(b, rad_decl_op(b, "engram_ids", ps, 7, ws, 4), {},
+                          { w.ids, w.ids_h, w.mask })
                      : rw(b, rad_decl_op(b, "engram_ids", ps, 7, ws, 4), {},
-                          { w.ids, w.mask, w.ahead });
+                          { w.ids, w.ids_h, w.mask, w.ahead, w.ahead_h });
             HY4_NEED(op, "engram_ids");
         }
         {
@@ -273,14 +289,14 @@ struct Engram {
             const RadParam ps[] = { RAD_RANGE("M", 1, T * H), RAD_INT("n_embd", HD),
                                     RAD_INT("n_vocab", rows), RAD_STR("dtype", "bf16") };
             op_gather = rw(b, rad_decl_op(b, "embed_lookup_q", ps, 4, ws, table_bf16 ? 1 : 2),
-                           { w.ids, w.ahead }, { w.raw });
+                           { w.ids, w.ids_h, w.ahead, w.ahead_h }, { w.raw, w.raw_h });
             HY4_NEED(op_gather, "embed_lookup_q");
         }
         if (roundtrip) {
             op_quant = mk(b, "quant_act_fp8",
                           { RAD_RANGE("M", 1, T * H), RAD_INT("n", HD), RAD_INT("group", HD),
                             RAD_STR("dtype", "bf16") },
-                          {}, { w.raw }, { w.q, w.qs });
+                          {}, { w.raw, w.raw_h }, { w.q, w.qs });
             op_dequant = mk(b, "dequant",
                             { RAD_RANGE("M", 1, T * H), RAD_INT("n", HD), RAD_INT("group", HD),
                               RAD_STR("dtype", "bf16") },
@@ -293,6 +309,8 @@ struct Engram {
                      { RAD_RANGE("M", 1, T), RAD_INT("heads", H), RAD_INT("n", HD),
                        RAD_F64("eps", eps), RAD_STR("dtype", "bf16") },
                      { head_gain }, { normed_in }, { w.e });
+        /* The rows it reads arrive from whichever pair the gather wrote (K-58). */
+        if (!roundtrip) rad_op_reads(b, op_norm, &w.raw_h, 1);
         op_key = mk(b, "gemm_nt_bias",
                     { RAD_RANGE("M", 1, T), RAD_INT("N", s.hc * E), RAD_INT("K", W),
                       RAD_STR("dtype", "bf16") },
@@ -326,7 +344,8 @@ struct Engram {
                             {}, { h, w.before }, { t_out.buf });
             HY4_NEED(op_tap_copy && op_tap_m1 && op_tap_mul && op_tap_add,
                      "the engram_out tap (cast, fill, mul, add)");
-            RAD_ARCH_TRY(t_ids.declare(b, nm, T, "engram_hash_ids", l, RAD_I32, H, w.ids));
+            RAD_ARCH_TRY(t_ids.declare(b, nm, T, "engram_hash_ids", l, RAD_I32, H, w.ids, false,
+                                       w.ids_h));
 
         }
         return RAD_OK;
@@ -355,6 +374,14 @@ struct Engram {
         const int64_t P = S - D;
         const RadOperand tok = praw(batch->token_ids, RAD_I32, T);
         const RadOperand pos = praw(batch->positions, RAD_I32, T);
+        /* The gather's planes: the card's when it is a device kernel (vram, or a RAM copy the card
+         * reads zero-copy), the host arena's when it is libavx's (the table on a drive). A device
+         * gather that wrote a host plane put 3 KiB of rows a token over the link for the norm to
+         * read back, and the ids twice; on the card both stay put (K-58). */
+        const bool host_gather = rad_op_domain(c, op_gather) == RAD_DOMAIN_HOST;
+        const rad_buf b_ids = host_gather ? w.ids_h : w.ids;
+        const rad_buf b_ahead = host_gather ? w.ahead_h : w.ahead;
+        const rad_buf b_raw = host_gather ? w.raw_h : w.raw;
         /* cache_idx: column 0 of each sequence's state slots. */
         if (D > 0) {
             RadOperand sd = praw2(sidx, RAD_I32, D, pitch);
@@ -362,7 +389,7 @@ struct Engram {
             RAD_ISSUE_N(c, op_ids_dec, T, tok, kv_cache(hist, layer),
                         praw(batch->cu_seqlens, RAD_I32, D + 1), pos, RAD_W(map), RAD_W(mult),
                         RAD_W(vsz), RAD_W(off), praw(batch->num_accepted, RAD_I32, D), sd,
-                        brows(w.ids, T), brows(w.mask, T));
+                        brows(b_ids, T), brows(w.mask, T));
         }
         /* The prompt after the last prefill chunk (RadBatch::n_ahead, stored in token_ids past the
          * step's), hashed by the same launch as a continuation of that sequence. Only the host
@@ -370,8 +397,7 @@ struct Engram {
          * the host domain (the table on disk, or a RAM copy the card cannot read zero-copy); a
          * device gather ignores them. ahead_forced() hashes them anyway (the A/B arm). */
         const int64_t A =
-            P > 0 && !no_ahead() &&
-                    (ahead_forced() || rad_op_domain(c, op_gather) == RAD_DOMAIN_HOST)
+            P > 0 && !no_ahead() && (ahead_forced() || host_gather)
                 ? std::min<int64_t>(batch->n_ahead, EngramWire::kAheadChunks * g.max_tok)
                 : 0;
         if (P > 0) {
@@ -379,20 +405,20 @@ struct Engram {
             sp.cols = 1;
             RAD_ISSUE_N(c, op_ids, T, praw(batch->token_ids, RAD_I32, T + A), kv_cache(hist, layer),
                         praw(batch->cu_seqlens + D, RAD_I32, P + 1), pos, RAD_W(map), RAD_W(mult),
-                        RAD_W(vsz), RAD_W(off), RAD_NONE, sp, brows(w.ids, T), brows(w.mask, T),
-                        A > 0 ? brows(w.ahead, A) : RAD_NONE);
+                        RAD_W(vsz), RAD_W(off), RAD_NONE, sp, brows(b_ids, T), brows(w.mask, T),
+                        A > 0 ? brows(b_ahead, A) : RAD_NONE);
         }
-        t_ids.step(c, brows(w.ids, T), T);
-        RAD_ISSUE_N(c, op_gather, T * H, brows(w.ids, T), RAD_W(table),
-                    table_bf16 ? RAD_NONE : RAD_W(table_scale), brows(w.raw, T),
-                    A > 0 ? brows(w.ahead, A) : RAD_NONE);
+        t_ids.step(c, brows(b_ids, T), T, host_gather);
+        RAD_ISSUE_N(c, op_gather, T * H, brows(b_ids, T), RAD_W(table),
+                    table_bf16 ? RAD_NONE : RAD_W(table_scale), brows(b_raw, T),
+                    A > 0 ? brows(b_ahead, A) : RAD_NONE);
         if (roundtrip) {
-            RadOperand raw = brows(w.raw, T);
+            RadOperand raw = brows(b_raw, T);
             RAD_ISSUE_N(c, op_quant, T * H, raw, brows(w.q, T * H), brows(w.qs, T * H));
             RAD_ISSUE_N(c, op_dequant, T * H, brows(w.q, T * H), brows(w.qs, T * H),
                         brows(w.rt, T));
         }
-        RAD_ISSUE_N(c, op_norm, T, brows(roundtrip ? w.rt : w.raw, T), RAD_W(head_gain),
+        RAD_ISSUE_N(c, op_norm, T, brows(roundtrip ? w.rt : b_raw, T), RAD_W(head_gain),
                     brows(w.e, T));
         RAD_ISSUE_N(c, op_key, T, brows(w.e, T), RAD_W(key_w), RAD_W(key_b), RAD_NONE,
                     brows(w.key, T));
