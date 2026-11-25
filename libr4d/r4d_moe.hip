@@ -2253,16 +2253,17 @@ __global__ void gather_scatter_kernel(const int32_t* __restrict__ sorted,
  *
  * Here a wave owns one token and 256 columns, eight per lane: the slot table is read first (scalar
  * loads), then every slot's sixteen bytes are issued before any is used. Arithmetic is
- * gather_kernel's (ascending slot order, dropped slots skipped, f32 `acc += w * x`, the shared
- * arm's two narrows), so the bits match.
+ * gather_kernel's (ascending slot order, dropped slots skipped, the shared arm's two narrows), and
+ * its f32 law with it -- `fmaf` a slot in when the scales are f32, `acc + w * x` when they are bf16
+ * -- so the bits match either way.
  */
 constexpr uint32_t kGatherWideSlots = 16;      /* top_k at most this: the slots live in registers */
 constexpr uint32_t kGatherWideCols  = 8;       /* columns a lane, one sixteen-byte load */
 static_assert(kGatherWideSlots <= kWave, "slot j is read off lane j");
 
-template <uint32_t NW, bool Q = false>
+template <uint32_t NW, bool F32 = false, bool Q = false>
 __device__ __forceinline__ void gather_wide_body(
-    const uint16_t* __restrict__ ye, const uint16_t* __restrict__ ew,
+    const uint16_t* __restrict__ ye, const void* __restrict__ ew,
     const int32_t* __restrict__ inv, uint16_t* __restrict__ y,
     uint32_t M, uint32_t n, uint32_t top_k, uint32_t ye_ld, uint32_t ew_ld, uint32_t y_ld,
     const uint16_t* __restrict__ sh, const uint16_t* __restrict__ sg,
@@ -2281,13 +2282,16 @@ __device__ __forceinline__ void gather_wide_body(
      * any lane. */
     const uint32_t jl = lane < top_k ? lane : 0u;
     const int32_t  il = inv[(size_t)t * top_k + jl];
-    const int32_t  wl = (int32_t)ew[(size_t)t * ew_ld + jl];
+    /* f32 scales ride the lanes as their bits, the same way the bf16 ones do. */
+    const uint32_t wl = F32 ? __float_as_uint(((const float*)ew)[(size_t)t * ew_ld + jl])
+                            : (uint32_t)((const uint16_t*)ew)[(size_t)t * ew_ld + jl];
     int32_t si[kGatherWideSlots];
     float   sw[kGatherWideSlots];
 #pragma unroll
     for (uint32_t j = 0; j < kGatherWideSlots; ++j) {
         si[j] = __builtin_amdgcn_readlane(il, (int)j);
-        sw[j] = bf16_to_f32((uint16_t)__builtin_amdgcn_readlane(wl, (int)j));
+        const uint32_t wj = (uint32_t)__builtin_amdgcn_readlane((int)wl, (int)j);
+        sw[j] = F32 ? __uint_as_float(wj) : bf16_to_f32((uint16_t)wj);
     }
     if (c >= n) return;
     /* No break or continue in these loops: an early exit keeps the slot loop rolled and `yv` goes
@@ -2320,8 +2324,10 @@ __device__ __forceinline__ void gather_wide_body(
             const uint32_t d[4] = { yv[j].x, yv[j].y, yv[j].z, yv[j].w };
 #pragma unroll
             for (uint32_t q = 0; q < 4; ++q) {
-                acc[2 * q]     += wj * bf16_to_f32((uint16_t)(d[q] & 0xFFFFu));
-                acc[2 * q + 1] += wj * bf16_to_f32((uint16_t)(d[q] >> 16));
+                acc[2 * q]     = r4d_moegather::gather_mac<F32>(
+                    wj, bf16_to_f32((uint16_t)(d[q] & 0xFFFFu)), acc[2 * q]);
+                acc[2 * q + 1] = r4d_moegather::gather_mac<F32>(
+                    wj, bf16_to_f32((uint16_t)(d[q] >> 16)), acc[2 * q + 1]);
             }
         }
     }
@@ -2348,19 +2354,21 @@ __device__ __forceinline__ void gather_wide_body(
         r4d_moegather::gather_quant(o, lane, c, g8, q8 + (size_t)t * q_ld + c, s8 + (size_t)t * s_ld);
 }
 
-/* `Q` adds the sum's rotated int8 codes and their scales (moe_gather_inv_i8g, K-19) to the same
- * sums and store, so one kernel and one argument list serve both forms (moe_gather_body's wide
- * branch); the codes' operands are unused and may be null without it. */
-template <uint32_t NW, bool Q = false>
+/* `F32` reads the router's f32 scales where the layer has them (Hy4-flash at prefill, K-45) and
+ * sums with gather_kernel's f32 law; `Q` adds the sum's rotated int8 codes and their scales
+ * (moe_gather_inv_i8g, K-19) to the same sums and store, so one kernel and one argument list serve
+ * every form (moe_gather_body's wide branch); the codes' operands are unused and may be null
+ * without it. */
+template <uint32_t NW, bool F32 = false, bool Q = false>
 __global__ __launch_bounds__(NW * kWave) void gather_wide_kernel(
-    const uint16_t* __restrict__ ye, const uint16_t* __restrict__ ew,
+    const uint16_t* __restrict__ ye, const void* __restrict__ ew,
     const int32_t* __restrict__ inv, uint16_t* __restrict__ y,
     uint32_t M, uint32_t n, uint32_t top_k, uint32_t ye_ld, uint32_t ew_ld, uint32_t y_ld,
     const uint16_t* __restrict__ sh, const uint16_t* __restrict__ sg,
     uint32_t sh_ld, uint32_t sg_ld, int sig, uint8_t* __restrict__ q8, float* __restrict__ s8,
     uint32_t q_ld, uint32_t s_ld, uint32_t g8) {
-    gather_wide_body<NW, Q>(ye, ew, inv, y, M, n, top_k, ye_ld, ew_ld, y_ld, sh, sg, sh_ld, sg_ld,
-                            sig, q8, s8, q_ld, s_ld, g8);
+    gather_wide_body<NW, F32, Q>(ye, ew, inv, y, M, n, top_k, ye_ld, ew_ld, y_ld, sh, sg, sh_ld,
+                                 sg_ld, sig, q8, s8, q_ld, s_ld, g8);
 }
 
 /* ================================================================== scale_rows
@@ -2390,9 +2398,9 @@ __global__ __launch_bounds__(NTHR) void scale_rows_kernel(
 
 /* The gather's form, pinnable for tests: 0 the launcher's rule, 1 gather_kernel (a column per
  * thread), 2 gather_wide_kernel (a wave per token), 3 gather_kernel16 (sixteen slots, eight
- * columns a lane). The rule takes 2 past the self-scan bound where the shape allows and 3 wherever
- * top_k is 16 and the rows are sixteen-byte aligned (r4d_rad_moe_gather); an impossible pin is
- * refused. All are bit-identical (r4d_selftest). */
+ * columns a lane). The rule takes 2 past the self-scan bound where the shape allows, at bf16 and
+ * f32 scales alike, and 3 wherever top_k is 16 and the rows are sixteen-byte aligned
+ * (r4d_rad_moe_gather); an impossible pin is refused. All are bit-identical (r4d_selftest). */
 static int g_moe_gather_pin = 0;
 extern "C" void r4d_moe_gather_pin_form(int form) { g_moe_gather_pin = form; }
 
@@ -3525,12 +3533,14 @@ static int moe_gather_body(const RadArgs* a, RadStream s, bool given, bool quant
     }
 
     /* The prefill form (gather_wide_kernel, a wave per token, sixteen bytes per lane) past the
-     * self-scan bound, where top_k fits kGatherWideSlots and every row is 16-byte aligned. Same
-     * sums as gather_kernel, which serves everything else. */
+     * self-scan bound, where top_k fits kGatherWideSlots and every row is 16-byte aligned, at bf16
+     * and f32 scales alike (Hy4-flash's router writes f32, K-45). Same sums as gather_kernel,
+     * which serves everything else. */
     auto al16 = [](const void* p, long long ld) {
         return ((uintptr_t)p % 16) == 0 && ld % (long long)kGatherWideCols == 0;
     };
-    const bool wide_ok = ew->dtype == RAD_BF16 && !small && top_k <= (long long)kGatherWideSlots &&
+    const bool wide_ok = (ew->dtype == RAD_BF16 || ew->dtype == RAD_F32) && !small &&
+                         top_k <= (long long)kGatherWideSlots &&
                          n % (long long)kGatherWideCols == 0 && al16(ye->data, ye_ld) &&
                          al16(Y->data, y_ld) && (!sh || al16(sh->data, sh_ld));
     /* The sixteen-slot form (gather_kernel16, eight columns a lane, one sixteen-byte load a slot):
@@ -3553,15 +3563,21 @@ static int moe_gather_body(const RadArgs* a, RadStream s, bool given, bool quant
         float*   const sp = quant ? (float*)s8->data : nullptr;
 #define R4D_MGW(...)                                                                             \
         hipLaunchKernelGGL((__VA_ARGS__), grid, blk, 0, (hipStream_t)s,                          \
-                           (const uint16_t*)ye->data, (const uint16_t*)ew->data, inv,            \
+                           (const uint16_t*)ye->data, (const void*)ew->data, inv,              \
                            (uint16_t*)Y->data, (uint32_t)M, (uint32_t)n, (uint32_t)top_k,        \
                            (uint32_t)ye_ld, (uint32_t)ew_ld, (uint32_t)y_ld,                     \
                            sh ? (const uint16_t*)sh->data : nullptr,                             \
                            sh ? (const uint16_t*)sg->data : nullptr,                             \
                            (uint32_t)sh_ld, (uint32_t)sg_ld, sig, qp, sp,                        \
                            (uint32_t)q_ld, (uint32_t)s_ld, (uint32_t)g8)
-        if (quant) { R4D_MGW(gather_wide_kernel<NW, true>); }
-        else       { R4D_MGW(gather_wide_kernel<NW>); }
+        if (ew->dtype == RAD_F32) {
+            if (quant) { R4D_MGW(gather_wide_kernel<NW, true, true>); }
+            else       { R4D_MGW(gather_wide_kernel<NW, true>); }
+        } else if (quant) {
+            R4D_MGW(gather_wide_kernel<NW, false, true>);
+        } else {
+            R4D_MGW(gather_wide_kernel<NW>);
+        }
 #undef R4D_MGW
         R4D_MOE_CHK();
         return RAD_OK;

@@ -3560,7 +3560,7 @@ static void moe_gather_at(const Plugin& pl, const RadKernelInfo* r, const MoeGat
     for (const Var& v : kVar) {
         const std::string label = "moe_gather, " + std::string(v.name) + at;
         const int rc = run(v.form, got);
-        if ((v.wide && (!sh.wide || f32)) || (v.six && !sixteen)) {
+        if ((v.wide && !sh.wide) || (v.six && !sixteen)) {
             /* A shape the form cannot take refuses the pin rather than run another form. */
             ok((label + " is refused").c_str(), rc == RAD_E_UNSUPPORTED, "rc=" + std::to_string(rc));
             continue;
@@ -3580,7 +3580,7 @@ static void moe_gather_at(const Plugin& pl, const RadKernelInfo* r, const MoeGat
                " differ from a column a thread" + first);
     }
 
-    if (M >= 2048 && sh.wide && !f32) {
+    if (M >= 2048 && sh.wide) {
         hipEvent_t e0, e1;
         st_ev_create(&e0);
         st_ev_create(&e1);
@@ -3667,7 +3667,11 @@ static void moe_gather_case(const Plugin& pl) {
     for (int64_t m : { 1, 4, 65 })
         for (int64_t n : { 2048, 4096 })
             for (bool shared : { false, true })
-                moe_gather_at(pl, r, { m, n, 8, shared ? "none" : nullptr, false }, true);
+                moe_gather_at(pl, r, { m, n, 8, shared ? "none" : nullptr, m > 32 }, true);
+    // Hy4-flash's prefill chunk, whose router writes f32 scales (K-45): past the self-scan bound
+    // the wave-per-token form now takes it, timed against a column a thread.
+    for (bool shared : { false, true })
+        moe_gather_at(pl, r, { 2048, 1536, 8, shared ? "none" : nullptr, true }, true);
 }
 
 /* ------------------------------------------------------- the vocab-parallel top-R, end to end

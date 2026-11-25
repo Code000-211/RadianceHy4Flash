@@ -15,6 +15,13 @@
  * none, and slices that drop slots. moe_scatter's three-pass form (T > 1024) is not exercised
  * here; the card checks it (r4d_selftest --case moe_scatter_inv_i32).
  *
+ * moe_gather's wave-per-token form (gather_wide_kernel) with f32 routing weights (K-45), through
+ * the published op at Hy4-flash's prefill chunk: the rule must arm that form where it used to keep
+ * the column-per-thread one, and its bytes must be that kernel's at f32 and bf16 weights, with the
+ * ungated shared arm, a sigmoid-gated one and none, over a slice that drops slots, with padded
+ * pitches, and at a decode height and a width eight-column pieces do not tile, which still refuse
+ * it.
+ *
  * moe_gather_inv_i8g through its published entry point (libr4d/r4d_moe.hip), which is where the
  * wave form is chosen and where its refusals live: the sixteen-slot quantising kernel at a decode
  * height, the wide (256-column-wave) one at prefill with bf16 routing weights (and each pinned),
@@ -762,6 +769,7 @@ void gather_quant_launcher_cases(std::mt19937& rng, int& cases, int& fails) {
         { 48, 512, 256, 0, false, true },
         { 48, 2560, 128, 3, false, false },   /* the sixteen-slot form, pinned at prefill */
         { 48, 512, 128, 2, false, true },     /* the wide form, pinned */
+        { 48, 512, 128, 2, true, true },      /* ... with f32 routing weights (K-45) */
     };
     const int k = 16, ne = 288;
     const float s_poison = -1234.5f;
@@ -906,7 +914,6 @@ void gather_quant_launcher_cases(std::mt19937& rng, int& cases, int& fails) {
         { "a scale group of 64", 2, 512, 64, 16, 0, RAD_E_UNSUPPORTED, false, false, false },
         { "top_k 8 (the op's band is 16)", 2, 512, 128, 8, 0, RAD_E_UNSUPPORTED, false, false, false },
         { "the scalar form, pinned", 48, 512, 128, 16, 1, RAD_E_UNSUPPORTED, false, false, false },
-        { "the wide form with f32 routing weights", 48, 512, 128, 16, 2, RAD_E_UNSUPPORTED, false, false, true },
         { "no codes operand", 2, 512, 128, 16, 0, RAD_E_INVAL, true, false, false },
         { "int8 scales", 2, 512, 128, 16, 0, RAD_E_DTYPE, false, true, false },
     };
@@ -945,6 +952,187 @@ void gather_quant_launcher_cases(std::mt19937& rng, int& cases, int& fails) {
     }
 }
 
+/* moe_gather's wave-per-token form (gather_wide_kernel, libr4d/r4d_moe.hip) with f32 routing
+ * weights (K-45): Hy4-flash's prefill chunk (`w.ew` f32, top_k 8, T = 16384) kept the
+ * column-per-thread kernel because the form read bf16 scales only. Through the published op, the
+ * rule has to arm the form on such a shape, and its bytes have to stay gather_kernel<256, F32>'s
+ * (a column's slots in ascending order, `fmaf` a slot in) at f32 and bf16 weights, with the
+ * ungated shared arm, a sigmoid-gated one and none, over a slice that drops slots, and with the
+ * pitches padded past every row so an overrun shows. A decode height and a width eight-column
+ * pieces do not tile still refuse the form. */
+void gather_wide_cases(std::mt19937& rng, int& cases, int& fails) {
+    struct WideShape {
+        int M, n, nl, base, shared, pin; /* pin: 0 the launcher's rule, 2 the wide form */
+        bool f32w;                       /* the router's scales, as Hy4-flash has them */
+        bool wide;                       /* the form the launcher must run */
+    };
+    const WideShape shapes[] = {
+        { 65, 1536, 288, 0, 1, 0, true, true },     /* Hy4's chunk, the rule's own choice */
+        { 65, 1536, 288, 0, 2, 2, true, true },     /* pinned, a sigmoid-gated shared arm */
+        { 65, 1536, 288, 0, 0, 2, true, true },     /* pinned, no shared expert */
+        { 65, 1536, 288, 0, 1, 2, false, true },    /* pinned, bf16 scales (unchanged) */
+        { 65, 2048, 256, 64, 2, 2, true, true },    /* a slice: the slots outside it are dropped */
+        { 65, 512, 288, 0, 1, 0, true, true },      /* a narrow chunk */
+        { 8, 1536, 288, 0, 1, 0, true, false },     /* a decode height: the scalar form */
+    };
+    const int k = 8, ne = 288;
+    std::normal_distribution<float> nd(0.f, 1.f);
+    auto mat = [](void* d, uint32_t dt, int64_t r, int64_t c, int64_t ld) {
+        RadTensor t{};
+        t.data = d;
+        t.dtype = dt;
+        t.rank = 2;
+        t.shape[0] = r;
+        t.shape[1] = c;
+        t.stride[0] = ld;
+        t.stride[1] = 1;
+        return t;
+    };
+    auto vec1 = [](void* d, uint32_t dt, int64_t len) {
+        RadTensor t{};
+        t.data = d;
+        t.dtype = dt;
+        t.rank = 1;
+        t.shape[0] = len;
+        t.stride[0] = 1;
+        return t;
+    };
+    for (const WideShape& sh : shapes) {
+        const int M = sh.M, n = sh.n, T = M * k;
+        std::vector<int32_t> ids((size_t)T);
+        for (int r = 0; r < M; ++r) {
+            std::vector<int32_t> pool(ne);
+            for (int e = 0; e < ne; ++e) pool[(size_t)e] = e;
+            std::shuffle(pool.begin(), pool.end(), rng);
+            for (int j = 0; j < k; ++j) ids[(size_t)(r * k + j)] = pool[(size_t)j];
+        }
+        Scatter plain = scatter_kernel(ids, sh.nl, sh.base, nullptr, true);
+        ++cases;
+        if (plain.rc != RAD_OK) {
+            std::printf("FAIL moe_gather's wave-per-token form with f32 weights: the sort at M=%d "
+                        "slice %d+%d\n", M, sh.base, sh.nl);
+            ++fails;
+            continue;
+        }
+        std::vector<int32_t> table = inverse_of(plain.sorted);
+        const int ye_ld = n + 8, ew_ld = k + 2, y_ld = n + 8, sh_ld = n + 8, sg_ld = 2;
+        std::vector<uint16_t> ye((size_t)T * ye_ld), shp((size_t)M * sh_ld), sg((size_t)M * sg_ld);
+        std::vector<float> ewf((size_t)M * ew_ld);
+        std::vector<uint16_t> ewb((size_t)M * ew_ld);
+        if (((uintptr_t)ye.data() | (uintptr_t)shp.data() | (uintptr_t)ewf.data()) % 16 != 0) {
+            std::printf("FAIL moe_gather's wave-per-token form with f32 weights: unaligned buffers "
+                        "at M=%d\n", M);
+            ++fails;
+            continue;
+        }
+        for (auto& v : ye) v = f2b(nd(rng));
+        for (auto& v : shp) v = f2b(nd(rng));
+        for (size_t i = 0; i < sg.size(); ++i) sg[i] = sh.shared == 1 ? f2b(1.f) : f2b(nd(rng));
+        for (size_t i = 0; i < ewf.size(); ++i) {
+            ewf[i] = std::fabs(nd(rng)) * 0.3f;
+            ewb[i] = f2b(ewf[i]);
+        }
+        const void* ew = sh.f32w ? (const void*)ewf.data() : (const void*)ewb.data();
+        const uint16_t* shv = sh.shared ? shp.data() : nullptr;
+        const uint16_t* sgv = sh.shared ? sg.data() : nullptr;
+        const int sig = sh.shared == 2;
+        std::vector<uint16_t> y((size_t)M * y_ld, kGatePoison), y_ref((size_t)M * y_ld, kGatePoison);
+        /* No 'act' for the ungated arm, as the layer passes it. */
+        RadParam sa{};
+        sa.key  = "act";
+        sa.kind = RAD_P_STR;
+        sa.sval = sig ? "sigmoid" : "none";
+        RadParam p[3] = { pint("n", n), pint("top_k", k), sa };
+        RadTensor t[6] = {
+            mat(ye.data(), RAD_BF16, T, n, ye_ld),
+            mat(sh.f32w ? (void*)ewf.data() : (void*)ewb.data(), sh.f32w ? RAD_F32 : RAD_BF16, M, k,
+                ew_ld),
+            vec1(table.data(), RAD_I32, T),
+            mat(shv ? (void*)shv : nullptr, RAD_BF16, M, n, sh_ld),
+            mat(sgv ? (void*)sgv : nullptr, RAD_BF16, M, 1, sg_ld),
+            mat(y.data(), RAD_BF16, M, n, y_ld)};
+        RadArgs a{};
+        a.t          = t;
+        a.n_t        = 6;
+        a.p          = p;
+        a.n_p        = 3;
+        a.world_size = 1;
+        r4d_moe_gather_pin_form(sh.pin);
+        const int rc = r4d_rad_moe_gather_inv(&a, nullptr);
+        r4d_moe_gather_pin_form(0);
+        const char* want_kernel = sh.wide ? "gather_wide_kernel" : "gather_kernel";
+        if (rc != RAD_OK || !std::strstr(emu_last_kernel, want_kernel)) {
+            std::printf("FAIL moe_gather through its launcher at M=%d n=%d shared %d pin %d %s "
+                        "weights: rc %d, %s, wanted the %s form\n", M, n, sh.shared, sh.pin,
+                        sh.f32w ? "f32" : "bf16", rc, emu_last_kernel, want_kernel);
+            ++fails;
+            continue;
+        }
+        /* The reference: the column-per-thread form over the same table, as form 1 launches it. */
+        const dim3 grid1((unsigned)M, (unsigned)((n + 255) / 256));
+        if (sh.f32w)
+            R4D_EMIT(nullptr, (r4d_moegather::gather_kernel<256, true>), grid1, dim3(256), 0,
+                     ye.data(), ew, table.data(), y_ref.data(), (uint32_t)M, (uint32_t)n,
+                     (uint32_t)k, (uint32_t)ye_ld, (uint32_t)ew_ld, (uint32_t)y_ld, nullptr,
+                     (uint32_t)T, shv, sgv, (uint32_t)sh_ld, (uint32_t)sg_ld, sig);
+        else
+            R4D_EMIT(nullptr, (r4d_moegather::gather_kernel<256, false>), grid1, dim3(256), 0,
+                     ye.data(), ew, table.data(), y_ref.data(), (uint32_t)M, (uint32_t)n,
+                     (uint32_t)k, (uint32_t)ye_ld, (uint32_t)ew_ld, (uint32_t)y_ld, nullptr,
+                     (uint32_t)T, shv, sgv, (uint32_t)sh_ld, (uint32_t)sg_ld, sig);
+        ++cases;
+        if (y != y_ref) {
+            size_t first = 0;
+            while (first < y.size() && y[first] == y_ref[first]) ++first;
+            std::printf("FAIL moe_gather through its launcher at M=%d n=%d shared %d %s weights: "
+                        "the bytes differ from the column-per-thread form's, first at %zu (row %zu "
+                        "column %zu)\n", M, n, sh.shared, sh.f32w ? "f32" : "bf16", first,
+                        first / (size_t)y_ld, first % (size_t)y_ld);
+            ++fails;
+        }
+    }
+
+    /* The form stays refused where its shape does not hold: at a decode height (the self-scan's
+     * bound) and at a width eight-column pieces do not tile. */
+    struct Refuse {
+        const char* what;
+        int M, n, want;
+    };
+    const Refuse refusals[] = {
+        { "the wave-per-token form at a decode height", 8, 1536, RAD_E_UNSUPPORTED },
+        { "the wave-per-token form at a width eight-column pieces do not tile", 65, 1532,
+          RAD_E_UNSUPPORTED },
+    };
+    for (const Refuse& rf : refusals) {
+        const int M = rf.M, n = rf.n, T = M * k;
+        std::vector<int32_t> ids((size_t)T, 0);
+        Scatter plain = scatter_kernel(ids, ne, 0, nullptr, true);
+        std::vector<int32_t> table = inverse_of(plain.sorted);
+        std::vector<uint16_t> ye((size_t)T * n), y((size_t)M * n, kGatePoison);
+        std::vector<float> ewf((size_t)M * k, 0.25f);
+        RadParam p[2] = { pint("n", n), pint("top_k", k) };
+        RadTensor t[6] = { mat(ye.data(), RAD_BF16, T, n, n),
+                           mat(ewf.data(), RAD_F32, M, k, k), vec1(table.data(), RAD_I32, T),
+                           mat(nullptr, RAD_BF16, M, n, n), mat(nullptr, RAD_BF16, M, 1, 2),
+                           mat(y.data(), RAD_BF16, M, n, n) };
+        RadArgs a{};
+        a.t          = t;
+        a.n_t        = 6;
+        a.p          = p;
+        a.n_p        = 2;
+        a.world_size = 1;
+        ++cases;
+        r4d_moe_gather_pin_form(2);
+        const int rc = r4d_rad_moe_gather_inv(&a, nullptr);
+        r4d_moe_gather_pin_form(0);
+        if (rc != rf.want) {
+            std::printf("FAIL moe_gather should refuse %s with rc %d, got %d\n", rf.what, rf.want,
+                        rc);
+            ++fails;
+        }
+    }
+}
+
 }   // namespace
 
 int main() {
@@ -955,6 +1143,7 @@ int main() {
     gather_sixteen_cases(rng, cases, fails);
     gather_quant_cases(rng, cases, fails);
     gather_quant_launcher_cases(rng, cases, fails);
+    gather_wide_cases(rng, cases, fails);
     std::printf("%d case(s), %d failure(s)\n", cases, fails);
     return fails ? 1 : 0;
 }
