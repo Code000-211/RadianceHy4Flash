@@ -100,7 +100,9 @@ __device__ __forceinline__ float idx_head_sum(v8f acc, const unsigned short* gp,
  * workgroup reads them in front of its wait and the poll covers the binary search's dependent round
  * trips (K-29). `nc` is qsa_work's, so it stays behind the acquire; it is a lane-shared address but
  * the compiler serves it with one global_load_b32, not a scalar load (tests/chain_scalar_audit.py on
- * the gfx1201 assembly), so the wait's vector-cache acquire is the whole acquire it needs. */
+ * the gfx1201 assembly, which is a ctest of its own -- `chain_scalar_audit`, tests/CMakeLists.txt --
+ * and so re-checks this on every build), so the wait's vector-cache acquire is the whole acquire it
+ * needs. */
 struct IdxScoreMeta {
     int b;      /* this lane's key column */
     int seq;    /* the row's sequence, -1 when the row is not in one */
