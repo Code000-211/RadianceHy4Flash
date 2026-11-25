@@ -75,12 +75,7 @@ for fn in sorted(sfs):
             continue
         if s.startswith("global_inv") and ("SCOPE_DEV" in s or "SCOPE_SYS" in s):
             cur["inv"] += 1
-        # Only the invalidate BEHIND the in-kernel acquire (inv>0) is the one this audit governs.
-        # r4d_chain_wait_impl also empties the scalar cache at ENTRY, before the record read and
-        # before any acquire (a bare chained launch carries no packet-processor acquire, so the
-        # host-written record could otherwise be read stale); that one is inv==0 and must not
-        # mask the behind-wait check for the wait_vec kernels.
-        if s.startswith("s_dcache_inv") and cur["inv"] > 0:
+        if s.startswith("s_dcache_inv"):
             cur["dc"] += 1
         ops = [o.strip() for o in s.split(None, 1)[1].split(",")] if " " in s else []
         op = s.split()[0]
