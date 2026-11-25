@@ -288,6 +288,9 @@ struct OpInfo {
      * follow): recorded unresolved and never handed to the plugin, so it is never issued and the
      * reference-kernel gate does not count it. */
     bool                  lora_declined = false;
+    /* Unresolved, and the plugin declared its fallback in its place (rad_op_dropped): never issued,
+     * so neither a hole nor a dead op, and the reference-kernel gate does not count it. */
+    bool                  dropped = false;
 };
 
 struct KVGroupInfo {
@@ -526,6 +529,10 @@ public:
      * there; attention over a VRAM cache is the case that matters. Shared by the engine's startup
      * refusal and the tools that count holes. */
     std::vector<const Miss*> device_holes(bool host_backend) const;
+    /* Ops resolved in no domain at all, the dropped ones (OpInfo::dropped) left out: nothing
+     * serves them anywhere, so nothing has checked the planned encoding of the weights they take.
+     * rad-convert refuses a program with any and picks the KV cache width by this count. */
+    size_t dead_ops() const;
 
     /* One per kernel instantiation that rad-tune would benchmark (spec §15). `info` is the
      * kernel's row, so the tuner can read the RadTunable axes, their legal values and the validity
@@ -925,6 +932,13 @@ struct Config {
      * config_parse divides it by --tp. */
     int64_t host_pool_mib = 0;
     int64_t host_headroom_mib = 4096; /* --host-headroom-mib: RAM left free for the system at startup */
+    /* --keep-container-cache: leave the pages a load read into the page cache instead of dropping
+     * them behind the read, so the next start reads the container at memory speed. Off by default:
+     * those pages are the same spare RAM a host KV tier, a host prefix cache or a pinned table
+     * would take, and the load keeps them only when MemAvailable after its pins leaves the
+     * container plus host_headroom_mib free. Conflicts with X-01/M-01 by design: the operator
+     * spends the RAM on the one that pays. */
+    bool    keep_container_cache = false;
     /* File tier for weights: what fits in neither the VRAM slab nor the pinned host pool is read
      * from the container with O_DIRECT ahead of the ops that read it (a scheduled unit by the
      * exact prefetch, a routed expert a routed layer at a time). Off by default because disk

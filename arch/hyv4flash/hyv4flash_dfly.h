@@ -781,7 +781,7 @@ struct Dfly {
                            RAD_F64("scale", 1.0), RAD_STR("mode", "gptj"),
                            RAD_INT("block_size", s.ix_pool), RAD_STR("dtype", "bf16") },
                          { d.kv_norm }, { row }, { row });
-                if (h && rad_op_resolved(b, h)) d.op_row_q = h;
+                if (const rad_op hr = optional_op(b, h)) d.op_row_q = hr;
             }
             if (rad_op_declared(b, "kv_store_streamed"))
                 d.op_store_stream = mk(b, "kv_store_streamed",
@@ -828,7 +828,7 @@ struct Dfly {
                                      RAD_INT("v_dim", VD), RAD_INT("latent_dim", L),
                                      RAD_INT("group", d.p_out.lin.g8), RAD_STR("dtype", "bf16") },
                                    { d.kv_b }, { lat, gt }, { d.p_out.lin.q8, d.p_out.lin.s8 });
-                if (d.op_expand_q && !rad_op_resolved(b, d.op_expand_q)) d.op_expand_q = 0;
+                d.op_expand_q = optional_op(b, d.op_expand_q);
             }
             RAD_ARCH_TRY(d.t_oproj.declare(b, nm, Md, "dfly.attn_o_proj", li, RAD_BF16, E, o));
             if (d.post) d.op_post = decl_rmsnorm(b, Md, E, s.eps, d.post_norm, o, y);
@@ -856,7 +856,7 @@ struct Dfly {
                                   RAD_INT("group", d.p_down.lin.g8), RAD_STR("dtype", "bf16"),
                                   RAD_STR("act", "silu") },
                                 {}, { ffgu }, { d.p_down.lin.q8, d.p_down.lin.s8 });
-                if (d.op_gated && !rad_op_resolved(b, d.op_gated)) d.op_gated = 0;
+                d.op_gated = optional_op(b, d.op_gated);
             }
             RAD_ARCH_TRY(d.t_mlp.declare(b, nm, Md, "dfly.mlp_out", li, RAD_BF16, E, y));
             d.op_add2 = add(Md, x, y, x);
@@ -906,7 +906,7 @@ struct Dfly {
                               { RAD_RANGE("M", 1, Md), RAD_INT("n", E), RAD_F64("eps", s.eps),
                                 RAD_STR("dtype", "bf16") },
                               { out_norm }, { x, y }, { x, z });
-            if (op_final_add && !rad_op_resolved(b, op_final_add)) op_final_add = 0;
+            op_final_add = optional_op(b, op_final_add);
             if (op_final_add) {
                 op_final = 0;
                 if (!lay.empty()) lay.back().op_add2 = 0;   /* the add moved into the norm */
@@ -971,7 +971,7 @@ struct Dfly {
                                      { RAD_RANGE("M", 1, S), RAD_INT("N", Vr), RAD_INT("R", R),
                                        RAD_STR("dtype", "f32") },
                                      {}, { logits }, { cidx, cval });
-                if (st.op_ctopk && !rad_op_resolved(b, st.op_ctopk)) st.op_ctopk = 0;
+                st.op_ctopk = optional_op(b, st.op_ctopk);
             }
             if (!st.op_ctopk) {
                 st.op_lcast = mk(b, "cast",
@@ -1089,10 +1089,12 @@ struct Dfly {
     /* rmsnorm_had_quant_i8g: the norm of `in` into `out` that writes `q8`/`s8` -- the pair of the
      * linear that reads them -- as well, byte-identical to the norm and the quantiser of that
      * linear's input it replaces. With the rank's chained quantisers (Geom::chain_q8) it carries the
-     * chain, as the trunk's does. */
+     * chain, as the trunk's does. Only libr4d declares it: elsewhere (libref, libavx) the plain
+     * norm and the linear's own quantiser run, as where it does not resolve. */
     static rad_op decl_norm_codes(RadBuilder* b, const Geom& g, int64_t rows, int64_t n, double eps,
                                   rad_weight gain, rad_buf in, rad_buf out, rad_buf q8,
                                   rad_buf s8, int64_t grp) {
+        if (!rad_op_declared(b, "rmsnorm_had_quant_i8g")) return 0;
         rad_op h = g.chain_q8
             ? mk(b, "rmsnorm_had_quant_i8g",
                  { RAD_RANGE("M", 1, rows), RAD_INT("n", n), RAD_F64("eps", eps),
@@ -1102,7 +1104,7 @@ struct Dfly {
                  { RAD_RANGE("M", 1, rows), RAD_INT("n", n), RAD_F64("eps", eps),
                    RAD_INT("group", grp), RAD_STR("dtype", "bf16") },
                  { gain }, { in }, { q8, s8, out });
-        return h && rad_op_resolved(b, h) ? h : 0;
+        return optional_op(b, h);
     }
     /* Whether `p` quantises its input itself (an int8 plan of its own, not a fed one), into the
      * pair a fused producer can write instead. */

@@ -16,6 +16,7 @@
 #include <sys/sysmacros.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <utility>
 
 #if defined(__linux__)
 #include <sys/syscall.h>
@@ -117,6 +118,14 @@ std::vector<std::pair<int64_t, int64_t>> rad_keep_complement(
     return out;
 }
 
+std::vector<std::pair<int64_t, int64_t>> rad_drop_ranges(
+    int64_t tables, int64_t size, std::vector<std::pair<int64_t, int64_t>> keep, bool keep_all) {
+    /* --keep-container-cache keeps the whole container: nothing behind the read is dropped, so a
+     * restart reads the container at memory speed (B-04). */
+    if (keep_all) return {};
+    return rad_keep_complement(tables, size, std::move(keep));
+}
+
 int64_t RadFile::keep_cached(const void* p, int64_t n) {
     int64_t off = 0, len = 0;
     if (rad_blob_range(base_, size_, p, n, &off, &len) &&
@@ -131,9 +140,10 @@ void RadFile::drop_blob_cache() const {
     if (!base_ || !hdr_ || fd_ < 0) return;
     const int64_t tables = (int64_t)hdr_->data_off < size_ ? (int64_t)hdr_->data_off : size_;
     if (tables >= size_) return;
-    /* Unmap first, then drop the cache: the kernel cannot drop a page still mapped here. Only the
-     * ranges that are not kept (keep_cached); with none kept this is the whole blob. */
-    for (const auto& r : rad_keep_complement(tables, size_, keep_)) {
+    /* Unmap first, then drop the cache: the kernel cannot drop a page still mapped here.
+     * rad_drop_ranges gives the ranges to free: the complement of keep_cached, or none while
+     * keep_pages() (--keep-container-cache). */
+    for (const auto& r : rad_drop_ranges(tables, size_, keep_, keep_pages_)) {
         ::madvise(base_ + r.first, (size_t)r.second, MADV_DONTNEED);
         ::posix_fadvise(fd_, (off_t)r.first, (off_t)r.second, POSIX_FADV_DONTNEED);
     }
@@ -142,7 +152,7 @@ void RadFile::drop_blob_cache() const {
 /* Advisory, with no madvise: the load reads with pread and never maps these pages. The one region
  * read through the mapping (a Tier::Mapped table) is never passed here. */
 void RadFile::drop_range(int64_t off, int64_t bytes) const {
-    if (fd_ < 0 || bytes <= 0) return;
+    if (keep_pages_ || fd_ < 0 || bytes <= 0) return;
     ::posix_fadvise(fd_, (off_t)off, (off_t)bytes, POSIX_FADV_DONTNEED);
 }
 

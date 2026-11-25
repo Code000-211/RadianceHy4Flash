@@ -32,6 +32,11 @@ read these before working:
 
 ## What you can verify (and must, before pushing)
 
+A HIP build uses radiance's own HIP compiler, the one the Dockerfile ships (ROCm's clang over the
+VOPD-repeatable libLLVM, `-DRAD_HIP_VOPD_REPEATABLE=ON`): see CARDS.md §1.1 for the exact cmake line.
+Stock ROCm clang 24 builds, but with VOPD off and different device code, so its kernel timings are not
+the shipped engine's.
+
 No GPU: the CPU build (`./build.sh` or CMake presets), `tests/r4d_emu/`, the libref / libavx
 reference paths, `tests/chain_scalar_audit.py`, the plugin lints (`hyv4flash_arch_test`), the
 scheduler tests (`sched_test`), every ctest that runs without a card. Run the touched ones;

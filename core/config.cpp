@@ -124,6 +124,12 @@ static const Flag g_flags[] = {
     "                                    pin equal shares of it (N / --tp each)" },
     { "--host-headroom-mib",  "N",      "host RAM to leave free for the system when radiance\n"
     "                                    pins its host memory at startup (default 4096)" },
+    { "--keep-container-cache", nullptr, "keep the container in the page cache after the load, so\n"
+    "                                    later starts read it at memory speed rather than from disk:\n"
+    "                                    the load reads it buffered for that, and only when\n"
+    "                                    MemAvailable after the load's pins leaves the container plus\n"
+    "                                    --host-headroom-mib free. Off by default: every range is\n"
+    "                                    dropped behind the read" },
     { "--embedding-placement", "WHERE", "ram (default) | vram: where the token embedding lives. ram\n"
     "                                    pins it in host memory beside --host-pool-mib, read over the\n"
     "                                    link in place; by default a model whose output head reads the\n"
@@ -890,6 +896,7 @@ int config_parse(int argc, char** argv, Config* c) {
             c->tower_placement = p;
         }
         else if (S("--weights-disk-tier"))     { c->weights_disk_tier = true; }
+        else if (S("--keep-container-cache"))  { c->keep_container_cache = true; }
         else if (S("--prefix-cache-mib"))      { if (!num(0, INT32_MAX, &c->prefix_cache_mib)) return RAD_E_INVAL; }
         else if (S("--prefix-cache-ttl"))      { if (!num(0, INT32_MAX, &c->prefix_cache_ttl)) return RAD_E_INVAL; }
         else if (S("--lora")) {
@@ -1844,6 +1851,7 @@ const ShowRow kShow[] = {
           return dir.empty() ? v : v + "=" + dir; } },
     { "--vision-tower-placement", [](const Config& c) { return std::string(table_placement_name(c.tower_placement)); } },
     { "--weights-disk-tier",  [](const Config& c) { return onoff(c.weights_disk_tier); } },
+    { "--keep-container-cache", [](const Config& c) { return onoff(c.keep_container_cache); } },
     { "--prefix-cache-mib",   [](const Config& c) {
           return c.prefix_cache_mib ? num(c.prefix_cache_mib) : std::string("0 (off)"); } },
     { "--prefix-cache-ttl",   [](const Config& c) {
