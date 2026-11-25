@@ -38954,6 +38954,10 @@ static void device_phase(const Plugin& pl) {
         mla_sink_check(pl, false, 64, { 20 }, { 600 }, 512, 4); /* past 16 rows: unsplit */
         mla_sink_check(pl, false, 32, { 100 }, { 300 }, 0, 4);
         mla_sink_bytes(pl, 64, { 8, 1 }, { 530, 2100 }, 512, 4);
+        /* K-40: the value tile is staged in eight-token halves; a chunk that ends at a half's edge
+         * (eight visible tokens) and one that ends inside a half (twelve) must agree bit for bit. */
+        mla_sink_bytes(pl, 32, { 64 }, { 64 }, 8, 4);
+        mla_sink_bytes(pl, 32, { 64 }, { 64 }, 12, 4);
         mla_sink_bytes(pl, 32, { 1, 1, 1 }, { 511, 512, 513 }, 512, 16);
         mla_sink_bytes(pl, 32, { 5, 1 }, { 2049, 600 }, 0, 4);
         mla_sink_bytes(pl, 16, { 3 }, { 513 }, 0, 4);

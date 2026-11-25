@@ -791,6 +791,11 @@ int main(int argc, char** argv) {
         { 64, { 1, 3 }, { 512, 520 }, 512, 4, true },
         { 64, { 2 }, { 300 }, 0, 4, true },
         { 32, { 1, 2 }, { 33, 530 }, 0, 4, true },
+        /* A chunk of exactly eight visible tokens, and one of twelve: the value tile's column-major
+         * staging writes the eight-token halves whole, so the part of a half the chunk does not
+         * reach must be zeros there too. 64 rows keep 64 workgroups, so the 32 heads run HG 2. */
+        { 32, { 64 }, { 64 }, 8, 4, true },
+        { 32, { 64 }, { 64 }, 12, 4, true },
     };
     if (quick) cases.resize(3);
     for (const auto& c : cases) {
