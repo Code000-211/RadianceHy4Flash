@@ -683,13 +683,14 @@ int Mover::start_stage(int32_t unit, int64_t slab_slot) {
 
 /* ---- staging within a pass (see mover.h) ---------------------------------------------------- */
 int Mover::stage_units(const std::vector<int32_t>& units, char* dst, int64_t cap, RadEvent after,
-                       RadEvent done, std::vector<int32_t>* staged) {
+                       RadEvent done, std::vector<int32_t>* staged, StagePart* part) {
     const StageSpan one{dst, cap};
-    return stage_units(units, &one, 1, after, done, staged);
+    return stage_units(units, &one, 1, after, done, staged, part);
 }
 
 int Mover::stage_units(const std::vector<int32_t>& units, const StageSpan* spans, int n_spans,
-                       RadEvent after, RadEvent done, std::vector<int32_t>* staged) {
+                       RadEvent after, RadEvent done, std::vector<int32_t>* staged,
+                       StagePart* part) {
     if (!plan_ || !spans || n_spans < 1 || n_spans > 2 || !staged || !done) return RAD_E_INVAL;
     for (int k = 0; k < n_spans; ++k)
         if (!spans[k].dst) return RAD_E_INVAL;
@@ -702,7 +703,7 @@ int Mover::stage_units(const std::vector<int32_t>& units, const StageSpan* spans
         const ClassPools& cp = pools_[(size_t)us.klass];
         const char* src = (const char*)cp.pool_base + us.pool_slot * cp.stride;
         stage_picks_.push_back(StagePick{src, u, us.bytes, align_up(us.bytes, RAD_ALIGN_UNIT),
-                                         nullptr});
+                                         nullptr, true});
     }
     if (stage_picks_.empty()) return RAD_OK;
     /* Spans are filled in pool order, so units on neighbouring pool slots land side by side and
@@ -713,19 +714,48 @@ int Mover::stage_units(const std::vector<int32_t>& units, const StageSpan* spans
      * across the link in place. */
     std::sort(stage_picks_.begin(), stage_picks_.end(),
               [](const StagePick& a, const StagePick& b) { return a.src < b.src; });
+    /* Which units go. All of them when the room holds the list. When it does not, the hottest go:
+     * a step's rows route the same experts over and over, so a unit left in place should be one
+     * they route least, not one that happens to sit late in the pool (M-04). The set is picked in
+     * heat order and then packed in pool order below, so it still goes as runs. */
+    int64_t cap = 0;
+    for (int j = 0; j < n_spans; ++j) cap += spans[j].cap;
+    int64_t need_all = 0;
+    for (const StagePick& p : stage_picks_) need_all += p.need;
+    if (need_all > cap && heat_ && heat_->enabled()) {
+        stage_by_heat_.clear();
+        for (const StagePick& p : stage_picks_) stage_by_heat_.push_back(&p);
+        std::stable_sort(stage_by_heat_.begin(), stage_by_heat_.end(),
+                         [this](const StagePick* a, const StagePick* b) {
+                             return heat_->heat_of(a->u) > heat_->heat_of(b->u);
+                         });
+        for (StagePick& p : stage_picks_) p.take = false;
+        int64_t want = 0;
+        for (const StagePick* p : stage_by_heat_) {
+            if (want + p->need > cap) continue;   /* the coldest are the ones read in place */
+            want += p->need;
+            stage_picks_[(size_t)(p - stage_picks_.data())].take = true;
+        }
+    }
     int k = 0;
     int64_t off = 0;
     size_t taken = 0;
     for (StagePick& p : stage_picks_) {
+        if (!p.take) continue;
         if (off + p.need > spans[k].cap && k + 1 < n_spans && p.need <= spans[k + 1].cap) {
             ++k;
             off = 0;
         }
-        if (off + p.need > spans[k].cap) { ++stats_.stage_overflow; continue; }
+        if (off + p.need > spans[k].cap) { p.take = false; continue; }   /* a span split ate it */
         p.dst = spans[k].dst + off;
         off += p.need;
         ++taken;
     }
+    const int64_t left = (int64_t)stage_picks_.size() - (int64_t)taken;
+    const int64_t over = part ? (part->last ? left : 0) : left;
+    if (over > 0) stats_.stage_overflow += (uint64_t)over;
+    if ((part ? part->first : true) && taken > 0) ++stats_.stage_layers;
+    if (part) part->left = left;
     if (taken == 0) return RAD_OK;
     if (after) RAD_TRY(rad_event_wait(mover_, after));
     stage_segs_.clear();
@@ -748,7 +778,6 @@ int Mover::stage_units(const std::vector<int32_t>& units, const StageSpan* spans
         const MoveUnit& mu = plan_->units[(size_t)p.u];
         for (size_t i = 0; i < mu.weights.size(); ++i) res_.publish(mu.weights[i], p.dst + mu.offset[i]);
     }
-    ++stats_.stage_layers;
     stats_.staged_units += (uint64_t)staged->size();
     stats_.stage_copies += (uint64_t)stage_segs_.size();
     return RAD_OK;

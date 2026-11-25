@@ -3401,6 +3401,168 @@ TEST(the_stager_ring_laps_without_overwriting_a_published_layer) {
     rad_stream_destroy(compute);
 }
 
+/* A routed layer heavier than half the ring goes out in two parts: half the ring before the run
+ * reaches it, the rest at its own first op, when the layers before it have retired and the room
+ * past its first part is the rest of the ring. The ring keeps that rest free for it, so a heavy
+ * layer never falls back to a read in place for want of room (M-04). */
+TEST(the_stager_splits_a_heavy_layer_and_keeps_the_rest_of_it_room) {
+    Fixture f;
+    const rad_weight emb = f.weight("token_embd.weight", 1 * MiB, RAD_ACCESS_VOCAB, -1, -1);
+    f.op("embed", {emb}, false);
+    constexpr int kL = 4;
+    const int kE[kL] = {2, 2, 6, 2};          /* layer 2 needs more than half the ring */
+    std::vector<std::vector<rad_weight>> lw(kL);
+    for (int l = 0; l < kL; ++l)
+        for (int e = 0; e < kE[l]; ++e)
+            lw[(size_t)l].push_back(f.weight("blk." + std::to_string(l) + ".ffn_gate_exps." +
+                                             std::to_string(e) + ".weight", 1 * MiB,
+                                             RAD_ACCESS_CONDITIONAL, l, e));
+    for (int l = 0; l < kL; ++l) f.op("moe" + std::to_string(l), lw[(size_t)l], false);
+    Config cfg = base_config();
+    cfg.placement = "expert_tiered";
+    cfg.vram_weights_mib = 1;                 /* every expert is off the card */
+    cfg.host_pool_mib = 64;
+    Plan plan;
+    PlannerInput in{&f.prog, &cfg, 0, 1, nullptr, 0};
+    CHECK_OK(Planner(in).plan(&plan));
+    REQUIRE(plan.dynamic);
+
+    Mover m;
+    MoverConfig mc;
+    CHECK_OK(m.init(f.prog, plan, mc));
+    RadStream compute = nullptr;
+    CHECK_OK(rad_stream_create(&compute, 0));
+    CHECK_OK(m.bind_compute_stream(compute));
+
+    std::vector<std::vector<rad_weight>> pw(kL);
+    for (int l = 0; l < kL; ++l) {
+        for (rad_weight w : lw[(size_t)l])
+            if (plan.weight[w].tier == Tier::HostPinned) pw[(size_t)l].push_back(w);
+        REQUIRE_EQ(pw[(size_t)l].size(), (size_t)kE[l]);
+    }
+    std::vector<void*> home(f.prog.weights.size(), nullptr);
+    for (rad_weight w = 1; (size_t)w < f.prog.weights.size(); ++w)
+        home[w] = m.residency()->lookup(w)->ptr;
+
+    /* Half the ring holds four units, so layer 2's six do not fit it whole. */
+    const int64_t each = align_up(1 * MiB, RAD_ALIGN_UNIT);
+    const int64_t ring = each * 8;
+    std::vector<char> region((size_t)ring);
+    auto in_ring = [&](rad_weight w) {
+        const char* p = (const char*)m.residency()->lookup(w)->ptr;
+        return p >= region.data() && p < region.data() + ring;
+    };
+    auto at_home = [&](const std::vector<rad_weight>& ws) {
+        for (rad_weight w : ws) if (m.residency()->lookup(w)->ptr != home[w]) return false;
+        return true;
+    };
+
+    PrefillStager st;
+    CHECK_OK(st.init(f.prog, plan, &m, region.data(), nullptr, ring, 64));
+    REQUIRE(st.enabled());
+    CHECK_EQ(st.n_layers(), (size_t)kL);
+    REQUIRE(st.ring_bytes() == ring);
+    RadBatch b{};
+    b.n_tok = 128;
+    st.set_ring(st.ring_full());
+    REQUIRE(st.begin_pass(&b));
+
+    bool resync = false;
+    CHECK_OK(st.before_op(0, compute, &resync));      /* embed: the first layers go out */
+    for (rad_weight w : pw[0]) CHECK(in_ring(w));
+    for (rad_weight w : pw[1]) CHECK(in_ring(w));
+    /* Layer 2 goes out by half the ring -- the first four of its pool slots -- and the other two
+     * wait its own op. */
+    int ahead = 0;
+    for (rad_weight w : pw[2]) if (in_ring(w)) ++ahead;
+    CHECK_EQ(ahead, 4);
+    /* Its rest is the ring's room: the layer after it is not staged over it. */
+    CHECK(at_home(pw[3]));
+    CHECK_OK(st.after_op(0, compute));
+    CHECK_OK(st.before_op(1, compute, &resync));      /* moe0 */
+    CHECK_OK(st.after_op(1, compute));
+    CHECK_OK(st.before_op(2, compute, &resync));      /* moe1 */
+    for (rad_weight w : pw[1]) CHECK(in_ring(w));
+    CHECK(at_home(pw[0]));
+    CHECK_OK(st.after_op(2, compute));
+    CHECK_OK(st.before_op(3, compute, &resync));      /* moe2: the heavy layer's own op */
+    CHECK_OK(rad_stream_sync(m.transfer_stream()));
+    for (rad_weight w : pw[2]) CHECK(in_ring(w));      /* all six, the rest staged here */
+    for (rad_weight w : pw[3]) CHECK(in_ring(w));      /* and the layer after it */
+    CHECK_OK(st.after_op(3, compute));
+    CHECK_OK(st.before_op(4, compute, &resync));      /* moe3 */
+    for (rad_weight w : pw[3]) CHECK(in_ring(w));
+    CHECK(at_home(pw[2]));
+    CHECK_OK(st.after_op(4, compute));
+    CHECK_OK(st.end_pass(compute));
+    CHECK_EQ(m.stats().stage_overflow, (uint64_t)0);
+    /* The heavy layer is one routed layer however many parts it took. */
+    CHECK_EQ(m.stats().stage_layers, (uint64_t)kL);
+    for (int l = 0; l < kL; ++l)
+        for (rad_weight w : pw[(size_t)l]) CHECK(m.residency()->lookup(w)->ptr == home[w]);
+    CHECK_OK(rad_stream_sync(m.transfer_stream()));
+    rad_stream_destroy(compute);
+}
+
+/* Room for all but one unit of a layer goes to the hottest units: a step's rows route the same
+ * experts again and again, so what stays home and is read across the link should be a unit they
+ * route least, not the last one in pool order. The chosen units still pack in pool order, so the
+ * copies stay runs (M-04). */
+TEST(staging_a_share_of_a_layer_keeps_its_hottest_units) {
+    HeatFixture hf;
+    Mover m;
+    MoverConfig mc;
+    CHECK_OK(m.init(hf.f.prog, hf.plan, mc));
+    RadStream compute = nullptr;
+    CHECK_OK(rad_stream_create(&compute, 0));
+    CHECK_OK(m.bind_compute_stream(compute));
+    HeatEngine h;
+    HeatParams hp;
+    CHECK_OK(h.init(hf.plan, hp));
+    CHECK(h.enabled());
+
+    std::vector<int32_t> units, pooled;
+    for (int32_t u = 0; u < (int32_t)hf.plan.units.size(); ++u) {
+        if (hf.plan.units[(size_t)u].expert < 0) continue;
+        units.push_back(u);
+        if (hf.plan.units[(size_t)u].tier == Tier::HostPinned) pooled.push_back(u);
+    }
+    REQUIRE(pooled.size() >= 3);
+    /* Pool order would leave out the last unit of the layer; make that one hot instead. */
+    const int32_t hot = pooled.back();
+    const int32_t cold = pooled[pooled.size() - 2];
+    const int32_t ids[1] = {hf.plan.units[(size_t)hot].expert};
+    const int32_t counts[1] = {10};
+    h.observe_ids(hf.plan.units[(size_t)hot].layer, ids, counts, 1);
+    CHECK_OK(m.begin_dispatch(1, &h));
+
+    const int64_t each = align_up(hf.plan.units[(size_t)pooled[0]].bytes, RAD_ALIGN_UNIT);
+    const int64_t cap = each * (int64_t)(pooled.size() - 1);
+    std::vector<char> buf((size_t)cap);
+    RadEvent done = nullptr;
+    CHECK_OK(rad_event_create_local(&done));
+    std::vector<void*> home(hf.f.prog.weights.size(), nullptr);
+    for (rad_weight w = 1; (size_t)w < hf.f.prog.weights.size(); ++w)
+        home[w] = m.residency()->lookup(w)->ptr;
+    std::vector<int32_t> staged;
+    CHECK_OK(m.stage_units(units, buf.data(), cap, nullptr, done, &staged));
+    CHECK_EQ(staged.size(), pooled.size() - 1);
+    CHECK_EQ(m.stats().stage_overflow, (uint64_t)1);
+    CHECK_EQ(m.stats().stage_layers, (uint64_t)1);
+    /* The hot unit is staged and the coldest of the rest stays home. */
+    CHECK(std::find(staged.begin(), staged.end(), hot) != staged.end());
+    CHECK(std::find(staged.begin(), staged.end(), cold) == staged.end());
+    for (rad_weight w : hf.plan.units[(size_t)cold].weights)
+        CHECK(m.residency()->lookup(w)->ptr == home[w]);
+    for (int32_t u : staged) {
+        const char* p = (const char*)m.residency()->lookup(hf.plan.units[(size_t)u].weights[0])->ptr;
+        CHECK(p >= buf.data() && p < buf.data() + cap);
+    }
+    CHECK_OK(rad_stream_sync(m.transfer_stream()));
+    rad_event_destroy(done);
+    rad_stream_destroy(compute);
+}
+
 /* The next step's first layers and the draft head. Six trunk layers plus a declared draft head's
  * seventh, which is never staged. When the next step continues with a prompt, a pass's end stages
  * the next trunk pass's first PrefillStager::lead() layers; a draft pass in between neither arms

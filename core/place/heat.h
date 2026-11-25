@@ -278,6 +278,13 @@ public:
     void abandon(const Swap& s);
 
     float heat(int32_t unit) const { return heat_[(size_t)pos_[(size_t)unit]]; }
+    /* heat() for a unit that may have no position (nothing movable, or nothing this engine ranks):
+     * the coldest value, so a caller ordering a list it did not build stays correct. */
+    float heat_of(int32_t unit) const {
+        if (!enabled_ || unit < 0 || (size_t)unit >= pos_.size()) return 0.f;
+        const int32_t p = pos_[(size_t)unit];
+        return p >= 0 ? heat_[(size_t)p] : 0.f;
+    }
     /* Resident units in this unit's layer: the tie-break every residency decision needs (see
      * `res_count_`). `pick` uses it on an exact heat tie, and so must anything else that chooses. */
     int32_t layer_residents(int32_t unit) const {

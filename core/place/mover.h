@@ -684,7 +684,10 @@ public:
      *               into `dst`, packed at the allocation unit; a unit with no room is read in
      *               place. Runs on the mover's stream behind `after` (if set) and records `done`.
      *               Copies are published settled: the caller waits on `done` once instead of
-     *               once per weight (a few hundred per layer).
+     *               once per weight (a few hundred per layer). Room for only part of the list
+     *               goes to the hottest units, so the ones left in place are the ones a step's
+     *               rows route least; the chosen set is still packed in pool order, so it still
+     *               goes as runs.
      * unstage_units publishes those units at their pool slots again. The caller must already have
      *               ordered the next writer of `dst` behind every reader of the copies.
      * stage_need    the room stage_units would use with no cap, for sizing shares of a region;
@@ -693,10 +696,22 @@ public:
      * The span form packs into up to two stretches (a ring region that wraps is two).
      */
     struct StageSpan { char* dst; int64_t cap; };
+    /* What a call left over, for a layer staged in more than one part: `left` is the units no room
+     * held (they keep their pool addresses and are read in place), `first` that this call began the
+     * layer and `last` that it ended it. Only a first part counts as a routed layer staged, and
+     * only a last part counts its leftover in the exit report's overflow -- a layer staged ahead
+     * in two parts has not overflowed the part it has yet to stage (M-04). A call without `part`
+     * is a whole layer: it counts itself both ways. */
+    struct StagePart {
+        int64_t left  = 0;
+        bool    first = true;
+        bool    last  = true;
+    };
     int  stage_units(const std::vector<int32_t>& units, char* dst, int64_t cap, RadEvent after,
-                     RadEvent done, std::vector<int32_t>* staged);
+                     RadEvent done, std::vector<int32_t>* staged, StagePart* part = nullptr);
     int  stage_units(const std::vector<int32_t>& units, const StageSpan* spans, int n_spans,
-                     RadEvent after, RadEvent done, std::vector<int32_t>* staged);
+                     RadEvent after, RadEvent done, std::vector<int32_t>* staged,
+                     StagePart* part = nullptr);
     void unstage_units(const std::vector<int32_t>& staged);
     int64_t stage_need(const std::vector<int32_t>& units, int64_t* largest = nullptr) const;
 
@@ -872,8 +887,10 @@ private:
     RadStream compute_ = nullptr;
     RadEvent  gate_ = nullptr;          /* recorded on compute, waited on by the mover stream */
     std::vector<RadCopySeg> stage_segs_;   /* stage_units' list, kept so a layer allocates nothing */
-    struct StagePick { const char* src; int32_t u; int64_t bytes, need; char* dst; };
+    struct StagePick { const char* src; int32_t u; int64_t bytes, need; char* dst; bool take; };
     std::vector<StagePick>  stage_picks_;  /* the units stage_units may take, in pool order */
+    /* stage_picks_ in heat order, for the share a short ring holds (stage_units). */
+    std::vector<const StagePick*> stage_by_heat_;
     int       gate_dispatch_ = -1;
 
     /* A dispatch's swap copies (demotions, promotions, migrations) go to the card's DMA engine as
