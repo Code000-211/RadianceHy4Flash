@@ -14,7 +14,10 @@ longctx.md measured as N8 48K, where the stager overflows its ring -- longctx-pr
 the JSON), and lctxN (N sessions of RAD_LCTX_CHARS characters -- 190,000 is the 58,903-token
 conversation of notes/backlog/CARDS.md §1.3, so the default is a 60K session -- filled by a one-token
 wave and then decoded for RAD_LCTX_NTOK tokens: the long-context decode stamps of T-03, at one
-decoder as `lctx1` and at four as `lctx4`, with `lctxN-pre` / `lctxN-decode` in the JSON). The token
+decoder as `lctx1` and at four as `lctx4`, with `lctxN-pre` / `lctxN-decode` in the JSON), and stress (issue #251: RAD_STRESS_WAVES waves
+of eight requests at once, RAD_STRESS_CHARS characters of context and RAD_STRESS_NTOK tokens each, a
+fresh wave and then the same prompts again; failed requests and a server that stops are counted, not
+raised: `ok` / `err` / `server_dead`). The token
 counts are the ones the backlog's own runs measured on these phases, so a lane's
 ttft compares with the numbers in notes/backlog/."""
 import hashlib, json, sys, threading, time, urllib.request, os
@@ -347,6 +350,36 @@ def lctx(n, chars, ntok):
     return [phase(f"lctx{n}-pre", ps, 1), phase(f"lctx{n}-decode", ps, ntok)]
 
 R = {"phases": []}
+def stress(waves, chars, ntok, clients=8):
+    """Sustained concurrent load (issue #251): `waves` waves of `clients` requests at once, each a
+    ~`chars`-character context decoded for `ntok` tokens. A wave's prompts are fresh (cold prefill
+    beside the others' decode) and the wave after it sends the same ones again (prefix hit, decode
+    at that context). A request that fails or a server that stops answering is counted,
+    not raised: `ok` / `err` and whether /health still answers are the result."""
+    ok = err = slow = 0; pr = []; t0 = time.time(); dead = False; wv = []; m0 = metrics(); m1 = {}
+    for wi in range(waves):
+        if wi % 2 == 0: pr = [long_prompt(chars, 300 + wi * clients + i, stamp=True) for i in range(clients)]
+        res = [None] * clients
+        def w(i):
+            try: res[i] = request(pr[i], ntok)
+            except Exception as e: res[i] = {"error": repr(e)[:120]}
+        th = [threading.Thread(target=w, args=(i,)) for i in range(clients)]
+        tw = time.time()
+        for t in th: t.start()
+        for t in th: t.join()
+        good = [r for r in res if "error" not in r and r["gen"] > 0]
+        ok += len(good); err += clients - len(good); slow += sum(1 for r in good if r["ttft"] > 30)
+        wv.append({"wave": wi, "ok": len(good), "wall": round(time.time() - tw, 2), "gen": sum(r["gen"] for r in good),
+                   "errors": [r["error"] for r in res if "error" in r][:2]})
+        print(json.dumps(wv[-1]), flush=True)
+        try: get("/health"); m1 = metrics()
+        except Exception: dead = True; break
+    o = {"name": "stress", "waves": len(wv), "of": waves, "clients": clients, "chars": chars, "ntok": ntok,
+         "ok": ok, "err": err, "slow": slow, "server_dead": dead, "wall": round(time.time() - t0, 1),
+         "steps": {k.split(":")[1]: m1[k] - m0.get(k, 0) for k in m1 if "engine_steps" in k and m1[k] != m0.get(k, 0)},
+         "per_wave": wv}
+    print(json.dumps({k: v for k, v in o.items() if k != "per_wave"}), flush=True)
+    return o
 def record(o):
     """One phase's result into the JSON. A composite phase (`longctx`, `long8`) keeps its summary entry
     as it always did, and now also records the waves it ran as phases of their own: the stamp readers
@@ -390,7 +423,11 @@ for ph in PH:
     elif ph.startswith("resume"):  # resumeN: a ~N-character session, then N-row turns resumed
         record(resume(int(ph[6:]), int(os.environ.get("RAD_RESUME_EXTRA", 900))))
     elif ph == "idle": record(idle(int(os.environ.get("RAD_IDLE_CHARS", 72000))))
+    elif ph == "nowarm": pass  # read above: no warmup requests
+    elif ph == "stress":  # issue #251: RAD_STRESS_WAVES waves of eight ~12K-token requests
+        R["phases"].append(stress(int(os.environ.get("RAD_STRESS_WAVES", 40)), int(os.environ.get("RAD_STRESS_CHARS", 39500)),
+                                  int(os.environ.get("RAD_STRESS_NTOK", 96))))
     elif ph == "long8": record(long8(int(os.environ.get("RAD_LONG8_CHARS", 140000))))
     else: sys.exit(f"probe.py: no phase '{ph}'; phases: c1 c1b c1s c2 c4 c8 c8s think pf2 pf6 pf6c pf8 pf20 "
-                  "greedy longctx lctxN stall1 stall4 arr60 tailN idle long8 resumeN nowarm")
+                  "greedy longctx lctxN stall1 stall4 arr60 tailN idle long8 resumeN stress nowarm")
 json.dump(R, open(OUT, "w"), indent=1)
