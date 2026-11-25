@@ -3238,12 +3238,21 @@ order, not a slow one.
 | `kv_resolve` | `M`(range) `blocks` `slots` `sel_pitch` `block_bytes` | `sel`:inout, `nsel`, `res`:inout, `slot_block`:inout, `slot_state`:inout, `ctl`:inout, `host`, `kv_cache`:inout |
 | `qsa_tail_store` | `M`(range) `n` `ratio` `ring` `seqs` `dtype` | `k`, `pos`, `cu`, `state`:inout, `sidx` |
 | `qsa_work` | `M`(range) `n` `ratio` `ring` `seqs` `work` `dtype` | `k`, `pos`, `cu`, `state`, `sidx`, `bt`, `rope`? → `stage`, `page`, `bpos`, `nc` |
+| `qsa_work_pool_tail` | `M`(range) `n` `ratio` `ring` `seqs` `rotary_dim` `eps`:f64 `theta`:f64 `mode` `sections`/opt `block_size`/opt `dtype` `work` | `k`, `pos`, `cu`, `state`:inout, `sidx`, `bt`, `wv`w, `wg`w, `ape`w, `gain`w, `rope`?, `page`, `bpos`, `nc`, `cache`:inout? |
 
 Five ops decompose one indexer, which scores blocks of key history against the query and hands
 `attn_paged` a shorter block table. `docs/QSA.md` describes the decomposition and
 `arch/common/rad_qsa.h` issues all five. libref implements all five (the oracle for libr4d's
 kernels), and libavx all five for the host path. `kv_resolve` sits between the last of them and the
 attention when the group's KV streams; it is described below, after `qsa_select`.
+`qsa_work_pool_tail` is not a sixth step: it is `qsa_work`, `idx_pool_gated` and `qsa_tail_store`
+in one launch for the exact key path, and has no libref row of its own (the three are its oracle).
+An architecture asks for it only where a loaded library serves it (`rad_op_declared`,
+`abi/rad_builder.h`), so the reference and host backends keep the three; and a library that carries
+the row serves it only at the geometries its kernel was compiled for (the indexer width `n`), where
+the declaration answers a null handle and the three run as well. The row declares the three as the chain it
+replaces, so `r4d_selftest` and rad-kbench compare the one launch with them byte for byte where the
+ring holds the step.
 
 ### `qsa_block_key`
 
@@ -3495,6 +3504,41 @@ block-key kernel with two sources, a per-key source selector and a tail layout.
 - **`nc` is complete blocks per sequence**, `(last position + 1) / ratio`, which the scorer and the
   selection both need and this op computes on the way. It is not the number of blocks that completed
   this step; the two agree only for a sequence that starts at zero.
+
+### `qsa_work_pool_tail` (device-only)
+
+The three ops above in one launch, for the exact (bf16) key path: `qsa_work`'s gather, the pool's
+group key (`idx_pool_gated` with `wv`, `wg`, `ape`, `gain`, no `stage` in between) and the tail store
+of the chunk's last `ring` tokens. The gathered keys go from the gather straight into the pooling
+through shared memory, so the fused op writes no `stage`, and one workgroup does a whole work item:
+it resolves the item, pools it, and publishes `page`, `bpos` and `nc` as `qsa_work` does.
+
+```
+out[w] = idx_pool_gated( gather(w) )        gather(w) = the item's `ratio` raw keys
+state   = the chunk's last `ring` keys, when the chunk fits
+```
+
+- **It is `qsa_work` + `idx_pool_gated` + `qsa_tail_store` byte for byte**, and the caller may issue
+  it where it issued those three. `page`, `bpos` and `nc` are `qsa_work`'s, `cache` is the pool's,
+  and `state` is the store's.
+- **It declares that chain**, so the repository's fusion oracle (`r4d_selftest`, rad-kbench's fusion
+  check) runs the three unfused ops over the same inputs and memcmps the result: `qsa_work` with
+  its `stage` a temporary, the pool over that temporary with `bpos` as its positions and no `out`,
+  then the store. A geometry whose step could outgrow the tail bound below is declined there (the
+  hook cannot see per-sequence row counts, and the kernel left those rows to the caller), and so is
+  a geometry without `cache`, which has nowhere for the pooled key to go.
+- **The three ops' operands keep their meanings.** `k` and `state` are the gather's two sources,
+  `rope` is `qsa_work`'s M-RoPE planes, `page`/`bpos`/`nc` its outputs. The pool's `page` is not an
+  operand here: the item's destination comes off `bt` and `page`, both already in hand.
+- **The tail store is conditional, and its bound is the whole reason the op exists.** A chunk's rows
+  are stored only while its token count is `<= ring - ratio + 1`. A longer chunk would write a row
+  of a position that its own first group still has to read out of the tail (a group turns at
+  `first`, and `first + ring` lands inside the chunk only once the chunk has more than
+  `ring - ratio + 1` rows). Those chunks are left to `qsa_tail_store`, which the caller issues after
+  every gather of the step. A caller that cannot bound a chunk keeps `qsa_tail_store` uncondition-
+  ally; a wrong bound is silent.
+- **The fp8 and int8 indexers and a tapped step keep the three ops**, because they read `qsa_work`'s
+  staged keys, and this op writes none; so does a library that does not carry it.
 
 ### GLM-5.3's indexer and latent attention
 
