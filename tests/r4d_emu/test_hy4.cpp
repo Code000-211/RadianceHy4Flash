@@ -282,6 +282,68 @@ static void idx_score_forms() {
     }
 }
 
+/* P-10 (arch/hyv4flash/hyv4flash_indexer.h): the indexer scores a step a row tile at a time, and
+ * the tile after the first reads its cu rebased by the tile's first row (the plugin's sub_i32) and
+ * its own rows of q and gate. idx_score finds a row's sequence from cu alone, so the tiles must give
+ * what one whole-chunk launch gives, byte for byte: this runs a 600-row, two-sequence chunk whole
+ * and then in 256 + 256 + 88 tiles, the last tile part way through the second sequence. */
+static void idx_score_tiles() {
+    ++g_cases;
+    const int64_t H = 16, n = 128, BT = 320, SC = 300, R = 256, M = 600, S = 2, pages = 400;
+    const std::vector<int32_t> cu_all = { 0, 300, 600 };
+    const std::vector<int32_t> nc = { 250, 137 };
+    Rng rng(600);
+    std::vector<uint16_t> q((size_t)(M * H * n)), gate((size_t)(M * H)), key((size_t)(pages * n));
+    for (auto& v : q) v = f2b(rng.n() * 0.5f);
+    for (auto& v : gate) v = f2b(rng.r(10) == 0 ? 0.0f : rng.n());
+    for (auto& v : key) v = f2b(rng.n() * 0.5f);
+    std::vector<int32_t> bt((size_t)(S * BT));
+    for (int64_t i = 0; i < (int64_t)bt.size(); ++i)
+        bt[(size_t)i] = i % 23 == 7 ? -1 : (int32_t)((i * 37) % pages);
+    auto tens = [](void* p, uint32_t dt, std::vector<int64_t> sh) {
+        RadTensor t{};
+        t.data = p; t.dtype = dt; t.rank = (uint32_t)sh.size();
+        int64_t st = 1;
+        for (int i = (int)sh.size() - 1; i >= 0; --i) {
+            t.shape[i] = sh[(size_t)i]; t.stride[i] = st; st *= sh[(size_t)i];
+        }
+        return t;
+    };
+    auto launch = [&](int64_t m0, int64_t rows, const std::vector<int32_t>& cu, std::vector<float>& out) {
+        std::vector<RadTensor> t = {
+            tens(q.data() + m0 * H * n, RAD_BF16, { rows, H, n }),
+            tens(gate.data() + m0 * H, RAD_BF16, { rows, H }),
+            tens(key.data(), RAD_BF16, { pages, 1, 4, n / 4 }),
+            tens(bt.data(), RAD_I32, { S, BT }), tens((void*)cu.data(), RAD_I32, { S + 1 }),
+            tens((void*)nc.data(), RAD_I32, { S }), tens(out.data() + m0 * SC, RAD_F32, { rows, SC }) };
+        std::vector<RadParam> p = { pi("M", rows), pi("n", n), pi("heads", H), pi("blocks", BT),
+                                    pi("seqs", S), ps("dtype", "bf16") };
+        RadArgs a{};
+        a.t = t.data(); a.n_t = (int)t.size(); a.p = p.data(); a.n_p = (int)p.size(); a.world_size = 1;
+        return r4d_rad_idx_score(&a, nullptr);
+    };
+    std::vector<float> whole((size_t)(M * SC), 7.0f), tiles((size_t)(M * SC), 7.0f);
+    int rc = launch(0, M, cu_all, whole);
+    for (int64_t m0 = 0; m0 < M; m0 += R) {
+        const int64_t rows = std::min(R, M - m0);
+        std::vector<int32_t> cu(cu_all);
+        for (auto& v : cu) v -= (int32_t)m0;      /* what the indexer's sub_i32 writes */
+        rc |= launch(m0, rows, cu, tiles);
+    }
+    const bool same = std::memcmp(whole.data(), tiles.data(), whole.size() * 4) == 0;
+    int64_t fin = 0;
+    for (float v : whole) fin += std::isfinite(v);
+    char w[128];
+    std::snprintf(w, sizeof w, "idx_score M %lld in 256-row tiles = one launch, %lld scores", (long long)M,
+                  (long long)fin);
+    if (rc != RAD_OK || !same || !fin) {
+        std::printf("FAIL %s: rc=%d, %s\n", w, rc, same ? "equal" : "the tiles DIFFER");
+        ++g_fails;
+    } else {
+        std::printf("ok   %s\n", w);
+    }
+}
+
 static void ihc_pre() {
     struct G { int64_t hc, n, M, pad; bool post; };
     for (const G& g : { G{ 4, 96, 3, 0, true }, G{ 4, 40, 2, 5, true }, G{ 2, 17, 3, 0, true },
@@ -771,6 +833,7 @@ int main() {
     engram_norm_gate();
     dfly_sel();
     idx_score_forms();
+    idx_score_tiles();
     std::printf("%d case(s), %d failure(s)\n", g_cases, g_fails);
     return g_fails ? 1 : 0;
 }

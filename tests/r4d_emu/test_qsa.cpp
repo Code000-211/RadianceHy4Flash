@@ -298,6 +298,76 @@ int run(Fix& f, Form form) {
     return bad_rows ? 1 : 0;
 }
 
+/* P-10 (arch/hyv4flash/hyv4flash_indexer.h): the indexer selects a step a row tile at a time, the
+ * tile after the first reading its cu rebased by the tile's first row (the plugin's sub_i32), its own
+ * rows of positions and its own slot of the score plane. A row's choice comes from its own score row,
+ * its own position and its sequence (cu alone), so the tiles must give libref's per-row answer, byte
+ * for byte: this runs the same fixture in 256-row tiles and compares against `ref_select`. */
+int run_tiled(Fix& f) {
+    std::vector<int32_t> want, want_n, want_su;
+    ref_select(f, want, want_n, want_su);
+    const int kTile = 256, W = f.topk + 1;
+    std::vector<int32_t> se((size_t)f.M * f.o_ld, kSentinel), ns((size_t)f.M, kSentinel),
+                         su((size_t)f.M, kSentinel);
+    int rc = RAD_OK;
+    for (int t0 = 0; t0 < f.M && rc == RAD_OK; t0 += kTile) {
+        const int n = std::min(kTile, f.M - t0);
+        std::vector<int32_t> cu(f.cu);
+        for (auto& v : cu) v -= t0;                        /* what the indexer's sub_i32 writes */
+        RadTensor t[8] = {
+            tens(f.sc.data() + (size_t)t0 * f.s_ld, RAD_F32, { n, f.nb_s }, f.s_ld),
+            tens(f.bt.data(), RAD_I32, { f.S, f.nb_t }, f.t_ld),
+            tens(f.nc.data(), RAD_I32, { f.S }),
+            tens(f.pos.data() + t0, RAD_I32, { n }),
+            tens(cu.data(), RAD_I32, { f.S + 1 }),
+            tens(se.data() + (size_t)t0 * f.o_ld, RAD_I32, { n, W }, f.o_ld),
+            tens(ns.data() + t0, RAD_I32, { n }),
+            tens(su.data() + t0, RAD_I32, { n }),
+        };
+        RadParam p[6]{};
+        p[0] = {"M", RAD_P_INT, n}; p[1] = {"blocks", RAD_P_INT, f.nb()}; p[2] = {"topk", RAD_P_INT, f.topk};
+        p[3] = {"ratio", RAD_P_INT, f.ratio}; p[4] = {"seqs", RAD_P_INT, f.S}; p[5] = {"signed", RAD_P_INT, 1};
+        RadArgs a{}; a.t = t; a.n_t = 8; a.p = p; a.n_p = f.sgn ? 6 : 5;
+        const int64_t need = r4d_rad_qsa_select_scratch(&a);
+        std::vector<uint32_t> scratch((size_t)(need / 4 + 1), 0xA5A5A5A5u);
+        if (need) { a.scratch = scratch.data(); a.scratch_bytes = need; }
+        rc = r4d_rad_qsa_select(&a, nullptr);
+    }
+    int bad = 0;
+    if (rc != RAD_OK) { std::printf("FAIL %-48s tiles: launch returned %d\n", f.name.c_str(), rc); ++bad; }
+    for (int m = 0; m < f.M && bad < 5; ++m) {
+        bool diff = false;
+        for (int i = 0; i < W; ++i) diff |= se[(size_t)m * f.o_ld + i] != want[(size_t)m * W + i];
+        if (!diff && ns[(size_t)m] == want_n[(size_t)m] && su[(size_t)m] == want_su[(size_t)m]) continue;
+        std::printf("FAIL %-48s tiles row %d: nsel %d want %d, seqused %d want %d\n", f.name.c_str(), m,
+                    ns[(size_t)m], want_n[(size_t)m], su[(size_t)m], want_su[(size_t)m]);
+        ++bad;
+    }
+    if (!bad)
+        std::printf("ok   %-48s tiles: %d rows in %d-row tiles = libref, row for row\n", f.name.c_str(), f.M,
+                    kTile);
+    return bad ? 1 : 0;
+}
+
+/* P-10: a 600-row, two-sequence chunk -- the last tile holds the tail of the second sequence -- one
+ * page dead in three, topk 16 so the choice is a real ranking, the bound the closed block count. */
+Fix fix_tiles() {
+    Fix f; f.name = "tiles: 600 rows over two sequences";
+    const int M = 600, nb = 2000, topk = 16, ratio = 4, pages = 4096, n1 = 1300, n2 = 700;
+    f.shape(2, M, nb, nb, topk, ratio);
+    f.cu = { 0, 300, 600 };
+    f.nc = { n1, n2 };
+    for (int s = 0; s < 2; ++s)
+        for (int b = 0; b < nb; ++b) f.page(s, b) = b % 3 == 1 ? -1 : (b * 131 + s * 17) % pages;
+    for (int m = 0; m < M; ++m) {
+        const int s = f.seq_of(m);
+        f.pos[m] = (s == 0 ? ratio * n1 : ratio * n2) + m % 4;
+    }
+    for (int m = 0; m < M; ++m)
+        for (int b = 0; b < nb; ++b) f.score(m, b) = (float)((b * 23 + m * 5) % 41) * 0.5f;
+    return f;
+}
+
 uint64_t g_x = 0;
 uint64_t rnd() { g_x ^= g_x << 13; g_x ^= g_x >> 7; g_x ^= g_x << 17; return g_x; }
 
@@ -629,6 +699,13 @@ int main(int argc, char** argv) {
     for (auto& make : fixtures) {
         Fix f = make();
         for (Form form : { kSingle, kWide, kAuto }) { fails += run(f, form); ++launches; }
+    }
+    if (!sweep) {
+        /* P-10: the same rows in 256-row launches, each with its own slot of the planes and its cu
+         * rebased by its first row, must give libref's answer for every row. */
+        Fix ft = fix_tiles();
+        fails += run_tiled(ft);
+        ++launches;
     }
     if (sweep) {
         for (const auto& [p, c] : g_paths) std::printf("  %5d row(s): %s\n", c, p.c_str());
