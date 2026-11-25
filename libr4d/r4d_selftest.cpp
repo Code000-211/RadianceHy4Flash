@@ -37825,6 +37825,9 @@ static void device_phase(const Plugin& pl) {
                 iqr_gemm_case(pl, f, 17, 512, 1024);
                 iqr_gemm_case(pl, f, 64, 512, 2560);
                 iqr_gemm_case(pl, f, 300, 512, 1024);
+                /* A prefill chunk's band count: sixteen M bands over the eight parts of an N tile,
+                 * the M the served chunk runs at. */
+                iqr_gemm_case(pl, f, 1984, 1024, 1024);
             }
             /* K-02's shapes first, at the GEMV the pair serves: a sliding layer's q_nope 6144 and
              * q_rope 2048 at TP2 (four waves a tile for one part, eight for the other: the mix the
