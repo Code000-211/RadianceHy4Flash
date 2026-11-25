@@ -97,6 +97,14 @@ RadEncoding enc_i8(bool rot) {
     if (rot) rad_enc_copy_str(e.transform, "fwht128");
     return e;
 }
+/* IQ8R: int8 codes rotated 128 wide, a u8 scale a [1 x 256] and one bf16 scale a row (libquant's
+ * `codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128`). */
+RadEncoding enc_iq8r() {
+    RadEncoding e = rad_enc_affine(RAD_I8, RAD_U8, 1, 256);
+    rad_enc_add_plane(&e, "scale.1", RAD_BF16, 1, 0);
+    rad_enc_copy_str(e.transform, "fwht128");
+    return e;
+}
 /* The codebook at E4M3 scales a 64 of K under a fixed f32: w4nl64, w5nl64, w6nl64. */
 RadEncoding enc_nl64(int bits) {
     RadEncoding e = rad_enc_affine(bits == 4 ? RAD_U4 : bits == 5 ? RAD_U5 : RAD_U6, RAD_F8E4M3,
@@ -2869,6 +2877,7 @@ MetaKV dfly_meta(int layers = 1, bool wide = false, int64_t n_embd = 128) {
     k.set("dfly_target_index_topk", "16");
     return k;
 }
+/* The meta built out, declared (with an optional op the library does not serve), and stepped. */
 struct DeclDfly {
     MetaKV mk;
     RadBuilder b;
@@ -2876,9 +2885,10 @@ struct DeclDfly {
     int rc = 0;
     std::string err;
     explicit DeclDfly(int depth = 5, MetaKV m = dfly_meta(), int world = 1, int rank = 0,
-                      void (*encs)(RadBuilder*) = bf16_encs)
+                      void (*encs)(RadBuilder*) = bf16_encs, const char* undeclared = nullptr)
         : mk(std::move(m)) {
         encs(&b);
+        if (undeclared) b.undeclared.insert(undeclared);
         ctx = spec_ctx(rank, world, depth);
         err = stderr_of([&] { rc = hyv4flash::declare(&b, mk.meta(), &ctx); });
         if (rc != RAD_OK && std::getenv("HY4_TEST_STDERR")) fputs(err.c_str(), stderr);
@@ -3003,13 +3013,21 @@ TEST(an_engine_step_with_dfly2_is_lint_clean_and_the_query_pass_touches_no_trunk
         CHECK_EQ(std::count(q.begin(), q.end(), std::string("cast_row_topk")), depth);
         CHECK_EQ(std::count(q.begin(), q.end(), std::string("row_topk")), 0);
         const auto& df = d.df();
-        size_t store = SIZE_MAX, attn = SIZE_MAX;
+        size_t store = SIZE_MAX, attn = SIZE_MAX, front = SIZE_MAX;
         for (size_t i = 0; i < ps[2]->issues.size(); ++i) {
             if (ps[2]->issues[i].op == df.lay[0].op_store && store == SIZE_MAX) store = i;
+            if (ps[2]->issues[i].op == df.lay[0].op_row_front && front == SIZE_MAX) front = i;
             if (ps[2]->issues[i].op == df.lay[0].op_attn) attn = i;
         }
-        REQUIRE(store != SIZE_MAX && attn != SIZE_MAX);
-        CHECK(store < attn);
+        REQUIRE(attn != SIZE_MAX);
+        /* the row front is one row for the latent norm, the key's rotary and the store (D-01) */
+        if (df.lay[0].op_row_front) {
+            REQUIRE(front != SIZE_MAX);
+            CHECK(front < attn);
+        } else {
+            REQUIRE(store != SIZE_MAX);
+            CHECK(store < attn);
+        }
         /* The trunk step (contexts 40+ pass mini's dense limit of 16) writes its selection
          * straight into the snapshot plane (P-09): no copy launch, the selection's own op. */
         const auto& m = *hyv4flash::models[0];
@@ -3273,6 +3291,29 @@ void dfly_trellis_encs(RadBuilder* b) {
     dfly_i8_encs(b);
     b->encs.insert(b->encs.begin(), { "dfly.blk.0.attn_q_a.weight", enc_nl64(4) });
 }
+/* D-01: the six draft linears of a layer read rotated int8 of one 128 group, so each has a fused
+ * producer to write its codes (the wide meta puts the output projection's input at 128, q128 the q
+ * residual's). The junction and the correction arm stay bf16 so their quantisers do not count. */
+void dfly_fused_encs(RadBuilder* b) {
+    bf16_encs(b);
+    std::vector<std::pair<std::string, RadEncoding>> q;
+    for (const char* n : { "attn_q_a", "attn_q_b", "attn_gate", "attn_output", "ffn_gate_up",
+                           "ffn_down" })
+        q.push_back({ std::string("dfly.blk.0.") + n + ".weight", enc_i8(true) });
+    b->encs.insert(b->encs.begin(), q.begin(), q.end());
+}
+/* D-01 at an IQ8R output projection (256 a group): the other five linears keep the 128 group, so
+ * the expansion's expansion+gate+quantiser is the one producer whose group no longer fits. */
+void dfly_iq8r_out_encs(RadBuilder* b) {
+    dfly_fused_encs(b);
+    b->encs.insert(b->encs.begin(), { "dfly.blk.0.attn_output.weight", enc_iq8r() });
+}
+/* The drafter's q residual at one whole 128 group (mini's 64), as the trunk's test does. */
+MetaKV dfly_q128_meta() {
+    MetaKV k = dfly_meta(1, true);
+    k.set("q_lora_rank", "128");
+    return k;
+}
 }  // namespace
 TEST(dfly2_reads_quantised_linears_as_the_trunk_does) {
     const char* lin[] = { "attn_q_a", "attn_gate", "ffn_gate_up" };
@@ -3345,6 +3386,105 @@ TEST(dfly2_reads_quantised_linears_as_the_trunk_does) {
         CHECK(find_w(d.b, "dfly.blk.0.attn_q_a.scale") != nullptr);
         CHECK(find_w(d.b, "dfly.blk.0.attn_gate.scale") != nullptr);
     }
+}
+
+/* D-01: a draft layer's producers are the trunk's (rmsnorm_had_quant_i8g, mla_row_norm_rope_store,
+ * mla_expand_gate_had_quant_i8g, gated_had_quant_i8g), each writing the rotated int8 codes the
+ * linear behind it would otherwise quantise itself, so the layer issues no quantiser of its own and
+ * the chain it replaces is not issued either. Each lever and each producer the library lacks brings
+ * that one chain back, and only that one. */
+TEST(dfly2_draft_layers_use_the_trunks_fused_producers) {
+    struct Case {
+        const char* what;
+        const char* lever;        /* set to "0" for the case, or nullptr */
+        const char* undeclared;   /* the producer the library does not serve, or nullptr */
+        int norms;                /* rmsnorm_had_quant_i8g: the attention norm, q_a's, the FFN's */
+        int row;                  /* mla_row_norm_rope_store */
+        int expand;               /* mla_expand_gate_had_quant_i8g */
+        int silu;                 /* gated_had_quant_i8g */
+        int quant;                /* had_quant_act_i8g: the readers no producer feeds */
+    };
+    const Case cases[] = {
+        { "the fused producers", nullptr, nullptr, 3, 1, 1, 1, 0 },
+        { "RADIANCE_HY4_FUSED_QUANT=0", "RADIANCE_HY4_FUSED_QUANT", nullptr, 0, 1, 1, 0, 4 },
+        { "RADIANCE_HY4_CACHE_ROW=0", "RADIANCE_HY4_CACHE_ROW", nullptr, 3, 0, 1, 1, 0 },
+        { "RADIANCE_HY4_FUSE_EXPAND_QUANT=0", "RADIANCE_HY4_FUSE_EXPAND_QUANT", nullptr, 3, 1, 0, 1,
+          1 },
+        { "no rmsnorm_had_quant_i8g", nullptr, "rmsnorm_had_quant_i8g", 0, 1, 1, 1, 3 },
+        { "no mla_row_norm_rope_store", nullptr, "mla_row_norm_rope_store", 3, 0, 1, 1, 0 },
+        { "no mla_expand_gate_had_quant_i8g", nullptr, "mla_expand_gate_had_quant_i8g", 3, 1, 0, 1,
+          1 },
+        { "no gated_had_quant_i8g", nullptr, "gated_had_quant_i8g", 3, 1, 1, 0, 1 },
+    };
+    const int arm_silu = 5;   /* the correction arm's silus, one a block row (D-01 leaves it) */
+    const char* levers[] = { "RADIANCE_HY4_FUSED_QUANT", "RADIANCE_HY4_CACHE_ROW",
+                             "RADIANCE_HY4_FUSE_EXPAND_QUANT" };
+    for (const Case& cs : cases) {
+        /* every producer on except the one this case takes away */
+        for (const char* k : levers)
+            setenv(k, cs.lever && std::strcmp(cs.lever, k) == 0 ? "0" : "1", 1);
+        DeclDfly d(5, dfly_q128_meta(), 1, 0, dfly_fused_encs, cs.undeclared);
+        REQUIRE_EQ(d.rc, RAD_OK);
+        if (!d.df().served) fprintf(stderr, "%s: %s\n", cs.what, d.df().why.c_str());
+        REQUIRE(d.df().served);
+        RadBuilder& b = d.b;
+        auto trunk = kit(b, std::vector<int>(2, 6), {});
+        trunk->b.positions_h = trunk->pos.data();
+        auto ctxp = context_pass(b, *trunk);
+        Query qp(b, 2, 6, 5);
+        auto ps = run_passes(b, hyv4flash::step, { trunk.get(), ctxp.get(), qp.k.get() }, 0, 1);
+        CHECK_PASSES(b, ps);
+        const RadCtx& c = *ps[2];
+        CHECK_EQ(count_issued(b, c, "rmsnorm_had_quant_i8g"), cs.norms);
+        CHECK_EQ(count_issued(b, c, "mla_row_norm_rope_store"), cs.row);
+        CHECK_EQ(count_issued(b, c, "mla_expand_gate_had_quant_i8g"), cs.expand);
+        CHECK_EQ(count_issued(b, c, "gated_had_quant_i8g"), cs.silu);
+        CHECK_EQ(count_issued(b, c, "had_quant_act_i8g"), cs.quant);
+        /* The chain each fusion replaces is not issued either, and only it comes back. */
+        CHECK_EQ(count_issued(b, c, "kv_store"), cs.row ? 0 : 1);
+        CHECK_EQ(count_issued(b, c, "silu_mul"), cs.silu ? arm_silu : arm_silu + 1);
+        CHECK_EQ(count_issued(b, c, "gate_mul"), cs.expand ? 0 : 1);
+        CHECK_EQ(count_issued(b, c, "mla_project_kv"), cs.expand ? 1 : 2);
+        CHECK_EQ(count_issued(b, c, "rope"), cs.row ? 1 : 2);
+        for (const char* k : levers) unsetenv(k);
+    }
+}
+
+/* D-01: mla_expand_gate_had_quant_i8g is libr4d's 128-group row (r4d_shape_mla_expand_gate_had_quant_i8g
+ * refuses any other group: its FWHT and its u8 scale are both 128 wide), as the trunk's own guard
+ * says. At an IQ8R output projection, 256 a group, the row would resolve a host kernel and no
+ * device one, and the planner, placing the projection's widened weight in the container's mapping,
+ * stops the startup. The layer keeps the chain and its own quantiser; the producers the library
+ * does serve at 256 stay. */
+TEST(dfly2_expand_quant_is_declared_only_at_the_libraries_128_group) {
+    MetaKV mk = dfly_q128_meta();
+    mk.set("v_head_dim", "64");   /* wide heads x 64: the output projection's input is 256 */
+    mk.set("swa_v_head_dim", "64");
+    const char* levers[] = { "RADIANCE_HY4_FUSED_QUANT", "RADIANCE_HY4_CACHE_ROW",
+                             "RADIANCE_HY4_FUSE_EXPAND_QUANT" };
+    for (const char* k : levers) setenv(k, "1", 1);
+    DeclDfly d(5, mk, 1, 0, dfly_iq8r_out_encs);
+    for (const char* k : levers) unsetenv(k);
+    REQUIRE_EQ(d.rc, RAD_OK);
+    if (!d.df().served) fprintf(stderr, "%s\n", d.df().why.c_str());
+    REQUIRE(d.df().served);
+    RadBuilder& b = d.b;
+    auto trunk = kit(b, std::vector<int>(2, 6), {});
+    trunk->b.positions_h = trunk->pos.data();
+    auto ctxp = context_pass(b, *trunk);
+    Query qp(b, 2, 6, 5);
+    auto ps = run_passes(b, hyv4flash::step, { trunk.get(), ctxp.get(), qp.k.get() }, 0, 1);
+    CHECK_PASSES(b, ps);
+    const RadCtx& c = *ps[2];
+    CHECK_EQ(count_issued(b, c, "mla_expand_gate_had_quant_i8g"), 0);
+    CHECK_EQ(count_issued(b, c, "had_quant_act_i8g"), 1);
+    CHECK_EQ(count_issued(b, c, "gate_mul"), 1);
+    CHECK_EQ(count_issued(b, c, "mla_project_kv"), 2);
+    /* The producers libr4d serves at 256 are still declared: the norms' codes and the row. */
+    CHECK_EQ(count_issued(b, c, "rmsnorm_had_quant_i8g"), 3);
+    CHECK_EQ(count_issued(b, c, "mla_row_norm_rope_store"), 1);
+    CHECK_EQ(count_issued(b, c, "gated_had_quant_i8g"), 1);
+    CHECK_EQ(count_issued(b, c, "kv_store"), 0);
 }
 
 /* §3.2 / P-09: a dense trunk step clears the snapshot's counts with the one fill over the
