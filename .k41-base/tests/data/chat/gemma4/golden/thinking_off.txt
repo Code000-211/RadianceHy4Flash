@@ -1,5 +1,0 @@
-<bos><|turn>user
-Hi.<turn|>
-<|turn>model
-<|channel>thought
-<channel|>

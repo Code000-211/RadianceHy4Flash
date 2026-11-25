@@ -1,6 +1,0 @@
-<bos><|turn>system
-<|think|>
-You are terse.<turn|>
-<|turn>user
-What is 2+2?<turn|>
-<|turn>model

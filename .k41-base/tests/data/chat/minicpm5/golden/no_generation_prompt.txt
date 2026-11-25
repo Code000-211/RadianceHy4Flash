@@ -1,8 +1,0 @@
-<s><|im_start|>user
-Hi.<|im_end|>
-<|im_start|>assistant
-<think>
-
-</think>
-
-Hello.<|im_end|>

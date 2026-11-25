@@ -1,6 +1,0 @@
-<bos><|turn>system
-<|think|>
-<turn|>
-<|turn>user
-Hi.<turn|>
-<|turn>model
