@@ -971,6 +971,7 @@ struct FusedShape {
     const char* protect;
     int hqg = 0;         /* the latent's codes in the same launch: 128 or 256, 0 for none */
     bool hqi8 = false;   /* int8 codes rather than E4M3 */
+    int hqK = 0;         /* the codes of a second activation this wide (`hq_x`), 0: of x itself */
 };
 
 void fused_router_cases(std::mt19937& rng, int& cases, int& fails) {
@@ -1001,6 +1002,12 @@ void fused_router_cases(std::mt19937& rng, int& cases, int& fails) {
         { 24, 512, 288, 8, 1, true, 0, 96, 32, true, true, "3,7,90", 256, true },
         { 48, 512, 288, 8, 1, true, 0, 0, 0, false, true, nullptr, 128, false },
         { 64, 512, 512, 16, 0, true, 0, 0, 0, false, false, nullptr, 128, true },
+        /* The codes of another activation than the router's (Hy4-flash: the router reads the
+         * 3072-wide state, the codes are the 1536-wide latent's), at each tile form. */
+        { 1, 3072, 512, 16, 1, true, 0, 0, 0, false, true, nullptr, 128, true, 1536 },
+        { 8, 768, 288, 8, 1, true, 0, 0, 0, true, true, nullptr, 128, false, 384 },
+        { 16, 512, 288, 8, 1, false, 1, 0, 0, true, false, nullptr, 256, true, 1024 },
+        { 40, 512, 288, 8, 1, true, 0, 0, 0, true, true, nullptr, 128, true, 256 },
     };
     constexpr float kLogPoison = -7.25f;
     std::uniform_int_distribution<int> ud(-1000, 1000);
@@ -1097,7 +1104,13 @@ void fused_router_cases(std::mt19937& rng, int& cases, int& fails) {
 
         /* The latent's codes, when the row fills them: the served quantiser over the same
          * activation is the reference, pitched and guarded as the fused operands are. */
-        const int hqg = sh.hqg, hqp = hqg ? K + 4 : 0, hsp = hqg ? K / hqg : 0;
+        const int Kq = sh.hqK ? sh.hqK : K;
+        const int hqg = sh.hqg, hqp = hqg ? Kq + 4 : 0, hsp = hqg ? Kq / hqg : 0;
+        const long hxp = Kq + 6;
+        std::vector<uint16_t> hx(sh.hqK ? (size_t)M * hxp : 0);
+        for (auto& v : hx) v = f2b((float)ud(rng) / 300.f);
+        RadTensor t_hx = t[0];
+        if (sh.hqK) mat(t_hx, hx.data(), RAD_BF16, M, Kq, hxp);
         const uint32_t hqdt = sh.hqi8 ? (uint32_t)RAD_I8 : (uint32_t)RAD_F8E4M3;
         std::vector<uint8_t> ref_q, q2;
         std::vector<float> ref_s, s2;
@@ -1158,12 +1171,12 @@ void fused_router_cases(std::mt19937& rng, int& cases, int& fails) {
         if (hqg) {
             ref_q.assign((size_t)M * hqp + 8, 0x5A);
             ref_s.assign((size_t)M * hsp + 4, -7.25f);
-            RadTensor qt[3] = { t[0], RadTensor{}, RadTensor{} };
-            mat(qt[1], ref_q.data(), hqdt, M, K, hqp);
+            RadTensor qt[3] = { t_hx, RadTensor{}, RadTensor{} };
+            mat(qt[1], ref_q.data(), hqdt, M, Kq, hqp);
             mat(qt[2], ref_s.data(), RAD_F32, M, hsp, hsp);
             RadParam qp[4]{};
             qp[0] = { "M", RAD_P_INT, M };
-            qp[1] = { "n", RAD_P_INT, K };
+            qp[1] = { "n", RAD_P_INT, Kq };
             qp[2] = { "group", RAD_P_INT, hqg };
             qp[3].key = "dtype";
             qp[3].kind = RAD_P_STR;
@@ -1191,8 +1204,9 @@ void fused_router_cases(std::mt19937& rng, int& cases, int& fails) {
                 off2((size_t)nl + 5, kPoison), cnt2((size_t)nl + 4, kPoison),
                 inv2((size_t)T + 4, kPoison);
             std::vector<uint16_t> g2((size_t)(M + 2) * gp, kGatePoison);
-            RadTensor f[13];
+            RadTensor f[14];
             std::memcpy(f, t, sizeof t);
+            f[13] = RadTensor{};
             f[3].data = lg.data();
             f[4].data = ids2.data();
             f[5].data = w.data();
@@ -1203,13 +1217,17 @@ void fused_router_cases(std::mt19937& rng, int& cases, int& fails) {
             f[10].data = inv2.data();
             f[11] = RadTensor{};
             f[12] = RadTensor{};
-            RadParam p2[13];
+            RadParam p2[14];
             std::memcpy(p2, p, sizeof p);
             int n_p2 = n_p;
             if (hqg) {
                 q2.assign(ref_q.size(), 0x5A);
                 s2.assign(ref_s.size(), -7.25f);
-                mat(f[11], q2.data(), hqdt, M, K, hqp);
+                mat(f[11], q2.data(), hqdt, M, Kq, hqp);
+                if (sh.hqK) {
+                    f[13] = t_hx;
+                    p2[n_p2++] = { "hq_K", RAD_P_INT, Kq };
+                }
                 mat(f[12], s2.data(), RAD_F32, M, hsp, hsp);
                 if (!with_inv) f[10].data = nullptr;   /* the codes' operands sit past both */
                 p2[n_p2++] = { "hq_group", RAD_P_INT, hqg };
@@ -1221,7 +1239,7 @@ void fused_router_cases(std::mt19937& rng, int& cases, int& fails) {
             fa.t = f;
             fa.p = p2;
             fa.n_p = n_p2;
-            fa.n_t = hqg ? 13 : (with_inv ? 11 : (sh.gate ? 10 : 9));
+            fa.n_t = sh.hqK ? 14 : hqg ? 13 : (with_inv ? 11 : (sh.gate ? 10 : 9));
             ++cases;
             const int rc = r4d_rad_router_gemm_sigmoid_scatter(&fa, nullptr);
             int bad = 0;

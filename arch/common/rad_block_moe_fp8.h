@@ -451,6 +451,9 @@ struct MoeFP8 {
     int64_t sigmoid_gemm_rows = 0;
     bool    sigmoid_gemm_gate = false;
     bool    sigmoid_gemm_hq = false;
+    /* ...and the latent is not the router's own input (`router_k`), so the row reads it as a
+     * second input (`hq_x`). */
+    bool    sigmoid_gemm_hq_x = false;
     /* The rotated re-quantisation of the block input, declared only when `expert_rot` is set and
      * the caller does not already write `w.hr`. */
     rad_op op_hq = 0;
@@ -1831,20 +1834,28 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
         sigmoid_gemm_rows = sigmoid_scatter_rows < band ? sigmoid_scatter_rows : band;
         if (sigmoid_gemm_rows > 0) {
             const RadParam gp[] = {
-                RAD_RANGE("M", 1, sigmoid_gemm_rows), RAD_INT("K", g.n_embd),
+                RAD_RANGE("M", 1, sigmoid_gemm_rows), RAD_INT("K", glm_router.g.n_embd),
                 RAD_INT("n_expert", c.n_expert_all), RAD_INT("n_local", c.n_expert),
                 RAD_INT("top_k", c.top_k), RAD_INT("weight_bf16", glm_router.projection_bf16),
                 RAD_INT("norm", c.norm_topk), RAD_F64("route_scale", c.route_scale),
                 RAD_STR("dtype", "f32"), RAD_INT("expert_base", c.expert_base),
                 RAD_INT("hq_group", hq_fold ? gin_g : 0),
                 RAD_STR("hq_dtype", a8 ? "i8" : "f8e4m3"),
+                /* the latent's width: the row takes it as a second input where the router reads
+                 * another state (`router_k`), and as its own `x` where it reads the latent */
+                RAD_INT("hq_K", g.n_embd),
                 RAD_STR("protect", prot_list),
             };
             const int n_gp = (int)(sizeof(gp) / sizeof(gp[0])) - (prot_list ? 0 : 1);
             const rad_weight gw[2] = { w_router, glm_router.correction };
             op_sigmoid_gemm = rad_decl_op(b, "router_gemm_sigmoid_scatter", gp, n_gp, gw, 2);
             if (op_sigmoid_gemm) {
-                const rad_buf rd[1] = { w.h.x };
+                /* The router's own input (`w.route` under `router_k`, else the latent), and the
+                 * latent beside it where the codes are folded and it is another buffer. */
+                rad_buf rd[2] = { glm_router.w.input };
+                int n_rd = 1;
+                sigmoid_gemm_hq_x = hq_fold && glm_router.w.input != w.h.x;
+                if (sigmoid_gemm_hq_x) rd[n_rd++] = w.h.x;
                 rad_buf wr[10] = { w.logits, w.ids, w.ew, w.sorted, w.eoff, w.ecnt };
                 int n_wr = 6;
                 if (sigmoid_scatter_gate) wr[n_wr++] = w.sgate;
@@ -1853,11 +1864,12 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
                     wr[n_wr++] = gin_q;
                     wr[n_wr++] = gin_s;
                 }
-                rad_op_reads (b, op_sigmoid_gemm, rd, 1);
+                rad_op_reads (b, op_sigmoid_gemm, rd, n_rd);
                 rad_op_writes(b, op_sigmoid_gemm, wr, n_wr);
             }
             sigmoid_gemm_gate = op_sigmoid_gemm && sigmoid_scatter_gate;
             sigmoid_gemm_hq = op_sigmoid_gemm && hq_fold;
+            sigmoid_gemm_hq_x = sigmoid_gemm_hq && sigmoid_gemm_hq_x;
         }
     }
 
@@ -1995,7 +2007,8 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
     const bool sgfused = op_sigmoid_gemm && rows <= sigmoid_gemm_rows &&
                          !glm_router.split.takes(rows);
     if (sgfused) {
-        RAD_ISSUE_N(c_, op_sigmoid_gemm, rows, brow_slice(w.h.x, r0, rows, g.n_embd),
+        RAD_ISSUE_N(c_, op_sigmoid_gemm, rows,
+                    brow_slice(glm_router.w.input, r0, rows, glm_router.g.n_embd),
                     RAD_W(w_router), RAD_W(glm_router.correction),
                     brow_slice(w.logits, r0, rows, ne_all), brow_slice(w.ids, r0, rows, k),
                     brow_slice(w.ew, r0, rows, k), brows(w.sorted, rows * k),
@@ -2003,7 +2016,8 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
                     sigmoid_gemm_gate ? brow_slice(w.sgate, r0, rows, 1) : RAD_NONE,
                     scatter_inv ? brows(w.inv, rows * k) : RAD_NONE,
                     sigmoid_gemm_hq ? brow_slice(gin_q, r0, rows, g.n_embd) : RAD_NONE,
-                    sigmoid_gemm_hq ? brow_slice(gin_s, r0, rows, g.n_embd / gin_g) : RAD_NONE);
+                    sigmoid_gemm_hq ? brow_slice(gin_s, r0, rows, g.n_embd / gin_g) : RAD_NONE,
+                    sigmoid_gemm_hq_x ? brow_slice(w.h.x, r0, rows, g.n_embd) : RAD_NONE);
     } else if (sfused) {
         glm_router.project(c_, r0, rows, r0);
         RAD_ISSUE_N(c_, op_sigmoid_scatter, rows, brow_slice(w.logits, r0, rows, ne_all),

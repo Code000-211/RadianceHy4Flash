@@ -23908,9 +23908,11 @@ static void moefuse_router(const Plugin& pl, int64_t rows, int mode, int iters,
  * the six routing buffers, the gate, the inverse and the latent's codes and scales, byte for byte
  * over their tails too. `hq` 0 leaves the quantiser out (a pass whose routed arm is fed codes), 128
  * or 256 sets the codes' group, and `i8` picks int8 (`had_quant_act_i8g`) over E4M3; `wb` 1 makes the
- * weight bf16. Timed, the launches back to back against the one. */
+ * weight bf16. `hqK` above 0 gives the codes an activation of their own, `hqK` wide, beside the
+ * router's `x` (Hy4-flash: the router reads the 3072-wide state, the experts the 1536-wide latent).
+ * Timed, the launches back to back against the one. */
 static void moefuse_router_gemm(const Plugin& pl, int64_t rows, int64_t K, int hq, bool i8, int wb,
-                                int iters) {
+                                int iters, int64_t hqK = 0) {
     const bool check = iters < 0;
     if (iters == 0) iters = 200;
     const char* what = "router_gemm_sigmoid_scatter_f32";
@@ -23919,7 +23921,8 @@ static void moefuse_router_gemm(const Plugin& pl, int64_t rows, int64_t K, int h
     const RadKernelInfo* sc = find(pl, "router_sigmoid_topk_scatter_f32");
     const RadKernelInfo* qt = hq ? find(pl, i8 ? "had_quant_act_i8g" : "had_quant_act_fp8") : nullptr;
     if (!fr || !gm || !sc || (hq && !qt)) { ok(what, false, "a row is absent"); return; }
-    const int64_t ne = 288, k = 8, slots = rows * k, ng = hq ? K / hq : 0;
+    const int64_t Kq = hq && hqK > 0 ? hqK : K;
+    const int64_t ne = 288, k = 8, slots = rows * k, ng = hq ? Kq / hq : 0;
     if (rows < 1 || slots > 1024) {
         std::printf("  router gemm at M=%lld: past the sort's one workgroup (M <= 128); the separate "
                     "launches serve\n", (long long)rows);
@@ -23947,9 +23950,18 @@ static void moefuse_router_gemm(const Plugin& pl, int64_t rows, int64_t K, int h
                             (size_t)slots * 4 + 64,    (size_t)slots * 4 + 64,
                             (size_t)(ne + 1) * 4 + 64, (size_t)ne * 4 + 64,
                             (size_t)rows * 2 + 64,     (size_t)slots * 4 + 64,
-                            (size_t)(rows * K) + 64,   (size_t)(rows * ng) * 4 + 64 };
+                            (size_t)(rows * Kq) + 64,  (size_t)(rows * ng) * 4 + 64 };
     const int n_out = hq ? 10 : 8;
     void* d_x = dalloc((size_t)(rows * K) * 2);
+    /* the codes' own activation, when it is not the router's */
+    std::vector<uint16_t> hxv((size_t)(hq && hqK > 0 ? rows * Kq : 0));
+    for (size_t i = 0; i < hxv.size(); ++i) {
+        const int u = (int)(st_mix32((uint32_t)i * 13u + 29u + (uint32_t)rows) % 2001) - 1000;
+        hxv[i] = h_to_bf16((float)u / 700.0f);
+    }
+    void* d_hx = hxv.empty() ? nullptr : dalloc(hxv.size() * 2);
+    if (!hxv.empty() && !d_hx) { ok(what, false, "allocation failed"); return; }
+    if (d_hx) st_memcpy(d_hx, hxv.data(), hxv.size() * 2, hipMemcpyHostToDevice);
     void* d_w = dalloc((size_t)(ne * K) * (wb ? 2 : 4));
     void* d_b = dalloc((size_t)ne * 4);
     void* o[2][10];
@@ -23974,7 +23986,7 @@ static void moefuse_router_gemm(const Plugin& pl, int64_t rows, int64_t K, int h
                                      T(o[f][6], RAD_BF16, { rows, 1 }),
                                      T(o[f][7], RAD_I32, { slots }) };
         if (hq) {
-            t.push_back(T(o[f][8], qdt, { rows, K }));
+            t.push_back(T(o[f][8], qdt, { rows, Kq }));
             t.push_back(T(o[f][9], RAD_F32, { rows, ng }));
         }
         return t;
@@ -23984,22 +23996,24 @@ static void moefuse_router_gemm(const Plugin& pl, int64_t rows, int64_t K, int h
     const std::vector<RadTensor> t_gemm = { x, wt, ch[0] };
     const std::vector<RadTensor> t_sel = { ch[0], T(d_b, RAD_F32, { ne }), ch[1], ch[2], ch[3],
                                            ch[4], ch[5], ch[6], ch[7] };
-    std::vector<RadTensor> t_qt = { x };
+    const RadTensor hx = d_hx ? T(d_hx, RAD_BF16, { rows, Kq }) : x;
+    std::vector<RadTensor> t_qt = { hx };
     if (hq) { t_qt.push_back(ch[8]); t_qt.push_back(ch[9]); }
     std::vector<RadTensor> fu = { x, wt, T(d_b, RAD_F32, { ne }) };
     for (const RadTensor& t : fu_full) fu.push_back(t);
+    if (d_hx) fu.push_back(hx);   /* operand 13, behind the codes and the scales */
     std::vector<RadParam> p_gemm = { PI("M", rows), PI("N", ne), PI("K", K), PS("dtype", "bf16"),
                                      PI("weight_bf16", wb) };
     std::vector<RadParam> p_sel = { PI("M", rows), PI("n_expert", ne), PI("n_local", ne),
                                     PI("top_k", k), PI("norm", 1), PF("route_scale", 2.5),
                                     PS("dtype", "f32"), PI("expert_base", 0) };
-    std::vector<RadParam> p_qt = { PI("M", rows), PI("n", K), PI("group", hq),
+    std::vector<RadParam> p_qt = { PI("M", rows), PI("n", Kq), PI("group", hq),
                                    PS("dtype", "bf16") };
     std::vector<RadParam> p_fu = { PI("M", rows), PI("K", K), PI("n_expert", ne),
                                    PI("n_local", ne), PI("top_k", k), PI("weight_bf16", wb),
                                    PI("norm", 1), PF("route_scale", 2.5), PS("dtype", "f32"),
                                    PI("expert_base", 0), PI("hq_group", hq),
-                                   PS("hq_dtype", i8 ? "i8" : "f8e4m3") };
+                                   PS("hq_dtype", i8 ? "i8" : "f8e4m3"), PI("hq_K", Kq) };
     auto args = [](const std::vector<RadTensor>& t, const std::vector<RadParam>& p) {
         RadArgs a{};
         a.t = t.data(); a.n_t = (int)t.size(); a.p = p.data(); a.n_p = (int)p.size(); a.world_size = 1;
@@ -24023,8 +24037,9 @@ static void moefuse_router_gemm(const Plugin& pl, int64_t rows, int64_t K, int h
         if (fetch_bytes(o[0][j], sz[j]) != fetch_bytes(o[1][j], sz[j])) { same = false; if (first < 0) first = j; }
     static const char* const kOut[10] = { "logits", "ids", "weights", "sorted", "offsets", "counts",
                                           "gate", "inverse", "codes", "scales" };
-    const std::string name = fmt("%s at M=%lld K=%lld%s%s%s", what, (long long)rows, (long long)K,
+    const std::string name = fmt("%s at M=%lld K=%lld%s%s%s%s", what, (long long)rows, (long long)K,
                                  wb ? ", bf16 weight" : "",
+                                 d_hx ? fmt(", codes of a %lld-wide latent", (long long)Kq).c_str() : "",
                                  hq ? fmt(", group %d", hq).c_str() : "",
                                  hq ? (i8 ? ", int8" : ", E4M3") : ", no plane");
     if (check) {
@@ -24036,7 +24051,9 @@ static void moefuse_router_gemm(const Plugin& pl, int64_t rows, int64_t K, int h
     if (!ran) { std::printf("--perfmoefuse: router gemm launch failed (rc %d / %d)\n", orc, nrc); return; }
     const double us_old = st_time_us([&](int) { chain(); }, iters, nullptr);
     const double us_new = st_time_us([&](int) { fused(); }, iters, nullptr);
-    fuse_line(fmt("gemm%s + router + quant", wb ? " (bf16 w)" : "").c_str(), us_old, us_new, same);
+    fuse_line(fmt("gemm%s + router + quant%s", wb ? " (bf16 w)" : "",
+                  d_hx ? fmt(" (K %lld, latent %lld)", (long long)K, (long long)Kq).c_str() : "").c_str(),
+              us_old, us_new, same);
 }
 
 /* moe_scatter_inv and moe_gather_inv against moe_scatter and moe_gather at GLM's shape (288 experts,
@@ -24284,6 +24301,10 @@ static void moefuse_perf(const Plugin& pl, int64_t rows, int iters) {
     moefuse_router_gemm(pl, rows, 4096, 0, false, 0, iters);
     moefuse_router_gemm(pl, rows, 4096, 128, false, 0, iters);
     moefuse_router_gemm(pl, rows, 4096, 256, true, 0, iters);
+    /* Hy4-flash's shape: a bf16 projection of the 3072-wide state, int8 codes of the 1536-wide
+     * latent (and the bare pass at that width). */
+    moefuse_router_gemm(pl, rows, 3072, 0, false, 1, iters);
+    moefuse_router_gemm(pl, rows, 3072, 128, true, 1, iters, 1536);
     moefuse_gather(pl, rows, false, iters);
     /* the quantising gather: the sixteen-slot form at `rows`, the wide one at 40 (M > 32 with bf16
      * weights), each form pinned at 40, and f32 routing weights (which offer only the sixteen) */
@@ -39209,6 +39230,14 @@ static void device_phase(const Plugin& pl) {
                     moefuse_router_gemm(pl, rows, K, 128, true, wb, -1);
                     moefuse_router_gemm(pl, rows, K, 256, true, wb, -1);
                 }
+        /* Hy4-flash's shape: the router reads the 3072-wide state and the codes are the 1536-wide
+         * latent's, a second input of the same launch. */
+        for (int64_t rows : { 1, 8, 16, 17, 64 })
+            for (int wb : { 0, 1 }) {
+                moefuse_router_gemm(pl, rows, 3072, 128, true, wb, -1, 1536);
+                moefuse_router_gemm(pl, rows, 3072, 128, false, wb, -1, 1536);
+                moefuse_router_gemm(pl, rows, 3072, 256, true, wb, -1, 1536);
+            }
     }
     if (sel("moe_gather_inv_i8g")) {
         /* both groups an IQ8R trunk or an ordinary one takes, both weight dtypes (bf16 offers the

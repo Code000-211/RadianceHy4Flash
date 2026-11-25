@@ -2187,7 +2187,7 @@ The VAEs' convolutions are `conv3d_ndhwc` with `tpad` and the audio VAE's `conv2
 | `moe_scatter` | `M`(range) `n_expert` `top_k` `expert_base`/opt `protect`:str/opt | `expert_ids` → `sorted_tok`, `expert_offset`, `expert_count` |
 | `router_topk_scatter` | `M`(range) `n_expert` `n_local`/opt `top_k` `norm` `dtype` `expert_base`/opt `protect`:str/opt | `logits` → `expert_ids`, `expert_w`, `sorted_tok`, `expert_offset`, `expert_count` |
 | `router_gemm_topk_scatter` | `M`(range) `K` `n_expert` `n_local`/opt `top_k` `norm` `dtype` `expert_base`/opt `protect`:str/opt | `a`, `b`w, `gate_b`w? → `logits`, `expert_ids`, `expert_w`, `sorted_tok`, `expert_offset`, `expert_count`, `gate`? |
-| `router_gemm_sigmoid_scatter` | `M`(range) `K` `n_expert` `n_local`/opt `top_k` `weight_bf16`/opt `norm` `route_scale`:f64 `dtype` `expert_base`/opt `protect`:str/opt `hq_group`/opt `hq_dtype`/opt | `x`, `weight`w, `bias`w → `logits`, `ids`, `weights`, `sorted_tok`, `expert_offset`, `expert_count`, `gate`?, `inverse`?, `hq_q`?, `hq_s`? |
+| `router_gemm_sigmoid_scatter` | `M`(range) `K` `n_expert` `n_local`/opt `top_k` `weight_bf16`/opt `norm` `route_scale`:f64 `dtype` `expert_base`/opt `protect`:str/opt `hq_group`/opt `hq_dtype`/opt `hq_K`/opt | `x`, `weight`w, `bias`w → `logits`, `ids`, `weights`, `sorted_tok`, `expert_offset`, `expert_count`, `gate`?, `inverse`?, `hq_q`?, `hq_s`?; `hq_x`? (in) |
 | `moe_gemm` | `M`(range) `N` `K` `n_expert` `top_k` `a_order` `dtype` | `a`, `w`wt, `sorted_tok`, `expert_offset` → `y` |
 | `router_sigmoid_topk` | `M`(range) `n_expert` `top_k` `norm` `route_scale`:f64 `dtype` | `logits`, `bias`w → `ids`, `weights` |
 | `router_sigmoid_group_topk` | `M`(range) `n_expert` `top_k` `n_group` `topk_group` `norm` `route_scale`:f64 `dtype` | `logits`, `bias`w → `ids`, `weights` |
@@ -2409,6 +2409,10 @@ either group, E4M3 at 128, by `hq_dtype`) and `hq_s` `[M, K / hq_group]` are `ha
 or `had_quant_act_fp8`'s bytes of `x` at that group, computed by the waves the grid leaves idle
 after the block's arrival, so the pass issues one launch fewer and reads `x` once more only in
 those idle waves. It is `had_quant_act_*`'s plane exactly: same rotation, same scale, same rounding.
+Where the router does not read the latent the codes are of (Hy4-flash: the projection reads the
+3072-wide state, the experts run in a 1536-wide latent), the latent is a second input, `hq_x`
+`[M, hq_K]`, the last operand, and `hq_q` / `hq_s` are `[M, hq_K]` and `[M, hq_K / hq_group]`;
+without it (or with `hq_K` equal to `K`) the codes are of `x`.
 
 **`moe_scatter_inv`** and **`moe_gather_inv`** (device-only) are `moe_scatter` and `moe_gather`
 with the gather's slot table passed between them. `inverse` `[M * top_k]` holds, for slot

@@ -582,10 +582,11 @@ __global__ void __launch_bounds__(NW * 32)
     router_gemm_sigmoid_scatter_kernel(const uint16_t* x, const W* w, const float* bias,
                                        float* logits, int* ids, float* weights, int32_t* sorted,
                                        int32_t* off, int32_t* cnt, uint16_t* gate, int32_t* inv,
-                                       unsigned int* ctr, uint8_t* hq_q, float* hq_s, long xp,
-                                       long wp, long yp, long bp, long ip, long wq, long gp,
-                                       long hqp, long hsp, int m, int n, int n_local, int k,
-                                       int kw, int hq_kb, int hq_sub, int hq_i8, int norm,
+                                       unsigned int* ctr, const uint16_t* hq_x, uint8_t* hq_q,
+                                       float* hq_s, long xp, long wp, long yp, long bp, long ip,
+                                       long wq, long gp, long hxp, long hqp, long hsp, int m, int n,
+                                       int n_local, int k, int kw, int hq_kw, int hq_kb,
+                                       int hq_sub, int hq_i8, int norm,
                                        float factor, int base, r4d_moesort::Protect prot) {
     if (CH::on) r4d_chain_wait();
     const int lane = threadIdx.x & 31, wave = threadIdx.x >> 5;
@@ -616,8 +617,11 @@ __global__ void __launch_bounds__(NW * 32)
         s_arrived = __hip_atomic_fetch_add(ctr, 1u, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT);
     __syncthreads();
     const bool last = s_arrived + 1u == gridDim.x * gridDim.y;
-    // The latent's codes, in the wave slots this block's share of the GEMM left it.
-    if (hq_kb > 0) router_quant_plane(x, hq_q, hq_s, xp, hqp, hsp, m, kw, hq_kb, hq_sub, hq_i8);
+    // The latent's codes, in the wave slots this block's share of the GEMM left it. `hq_x` is the
+    // activation they are of: the router's own `x`, or the latent of a block whose router reads a
+    // wider state (the launcher passes `x` again where they are the same).
+    if (hq_kb > 0)
+        router_quant_plane(hq_x, hq_q, hq_s, hxp, hqp, hsp, m, hq_kw, hq_kb, hq_sub, hq_i8);
     if (!last) {
         if (CH::on) r4d_chain_done();
         return;
@@ -772,6 +776,7 @@ int router_sgemm_body(const RadArgs* a, RadStream stream) {
     const RadTensor* inv = a->n_t > 10 ? r4d_opt(a, 10) : nullptr;
     const RadTensor* hq_q = a->n_t > 11 ? r4d_opt(a, 11) : nullptr;
     const RadTensor* hq_s = a->n_t > 12 ? r4d_opt(a, 12) : nullptr;
+    const RadTensor* hq_x = a->n_t > 13 ? r4d_opt(a, 13) : nullptr;
     const long ne = r4d_geti_or(a, "n_expert", 0), k = r4d_geti_or(a, "top_k", 0);
     const long nl = r4d_geti_or(a, "n_local", ne), base = r4d_geti_or(a, "expert_base", 0);
     const float factor = (float)r4d_getf(a, "route_scale", 0);
@@ -812,20 +817,29 @@ int router_sgemm_body(const RadArgs* a, RadStream stream) {
     // The latent's codes, when the pass has none to feed the routed arm: had_quant_act_fp8's (E4M3)
     // or had_quant_act_i8g's (int8) mapping over the same `x`, `group` wide, a 256-wide group being
     // the int8 quantiser's alone. The plane is the two buffers and the group together or neither.
+    // `hq_x` is the activation the codes are of where that is not the router's `x`: Hy4-flash's
+    // router reads the 3072-wide state while its experts run in the 1536-wide latent. Absent, the
+    // codes are of `x`.
     const long hqg = r4d_geti_or(a, "hq_group", 0);
-    if ((hq_q != nullptr) != (hqg > 0) || (hq_s != nullptr) != (hqg > 0)) return RAD_E_INVAL;
+    if ((hq_q != nullptr) != (hqg > 0) || (hq_s != nullptr) != (hqg > 0) || (hq_x && !hq_q))
+        return RAD_E_INVAL;
+    const RadTensor& qx = hq_x ? *hq_x : x;
+    const long kq = hq_q ? (long)qx.shape[1] : 0;
     if (hq_q) {
         if (hq_q->dtype != RAD_I8 && hq_q->dtype != RAD_F8E4M3) return RAD_E_DTYPE;
-        if (hq_s->dtype != RAD_F32) return RAD_E_DTYPE;
-        if ((hqg != 128 && hqg != 256) || (hqg == 256 && hq_q->dtype != RAD_I8) || kw % hqg)
+        if (hq_s->dtype != RAD_F32 || qx.dtype != RAD_BF16) return RAD_E_DTYPE;
+        if (!qx.data || qx.rank != 2 || qx.shape[0] != m || kq < 1 || qx.stride[1] != 1 ||
+            qx.stride[0] < kq)
+            return RAD_E_SHAPE;
+        if ((hqg != 128 && hqg != 256) || (hqg == 256 && hq_q->dtype != RAD_I8) || kq % hqg)
             return RAD_E_SHAPE;
         if (!hq_q->data || !hq_s->data || hq_q->rank != 2 || hq_s->rank != 2 ||
-            hq_q->shape[0] < m || hq_q->shape[1] < kw || hq_q->stride[1] != 1 ||
-            hq_q->stride[0] < kw || hq_s->shape[0] < m || hq_s->shape[1] < kw / hqg ||
+            hq_q->shape[0] < m || hq_q->shape[1] < kq || hq_q->stride[1] != 1 ||
+            hq_q->stride[0] < kq || hq_s->shape[0] < m || hq_s->shape[1] < kq / hqg ||
             !r4d_contig(hq_s))
             return RAD_E_SHAPE;
     }
-    const int hq_kb = hq_q ? (int)(kw / hqg) : 0;
+    const int hq_kb = hq_q ? (int)(kq / hqg) : 0;
     const int hq_sub = hq_q ? (int)(hqg / 128) : 0;
     const int hq_i8 = hq_q && hq_q->dtype == RAD_I8;
     // One counter per (stream, logits) as gemm_fp8a8's split_ctr: the launch leaves it zero, and two
@@ -847,13 +861,14 @@ int router_sgemm_body(const RadArgs* a, RadStream stream) {
              (const float*)bias.data, (float*)lg.data, (int*)ids.data, (float*)wk.data,            \
              (int32_t*)sorted->data, (int32_t*)off->data, (int32_t*)cnt->data,                     \
              gate ? (uint16_t*)gate->data : (uint16_t*)nullptr,                                    \
-             inv ? (int32_t*)inv->data : (int32_t*)nullptr, ctr,                                   \
+             inv ? (int32_t*)inv->data : (int32_t*)nullptr, ctr, (const uint16_t*)qx.data,         \
              hq_q ? (uint8_t*)hq_q->data : (uint8_t*)nullptr,                                      \
              hq_s ? (float*)hq_s->data : (float*)nullptr, (long)x.stride[0],                      \
              (long)rw.stride[0], (long)lg.stride[0], (long)bias.stride[0], (long)ids.stride[0],    \
-             (long)wk.stride[0], (long)gp, hq_q ? (long)hq_q->stride[0] : 0,                       \
-             hq_s ? (long)hq_s->stride[0] : 0, (int)m, (int)ne, (int)nl, (int)k, (int)kw, hq_kb,   \
-             hq_sub, hq_i8, norm, factor, (int)base, prot)
+             (long)wk.stride[0], (long)gp, (long)qx.stride[0],                                     \
+             hq_q ? (long)hq_q->stride[0] : 0, hq_s ? (long)hq_s->stride[0] : 0, (int)m, (int)ne,  \
+             (int)nl, (int)k, (int)kw, (int)kq, hq_kb, hq_sub, hq_i8, norm, factor, (int)base,     \
+             prot)
     // The router's weight is stored bf16 on the arms that read it that way (K-11): both widen to
     // f32 in registers and accumulate the same chain.
 #define R4D_RSG_C(R, C, U, OWN, NW, INV, W)                                                        \

@@ -2264,11 +2264,12 @@ static const RadOperandSpec oRouterSigmoidScatter[] = {
 /* The router's projection, the selection it feeds and the latent's rotated codes as one op:
  * `logits` is the projection's output and the selection's read, so it is written here, the rest is
  * router_sigmoid_topk_scatter's, and `hq_q` / `hq_s` are had_quant_act_fp8's or had_quant_act_i8g's
- * codes and scales of `x` (absent when the pass already holds codes to feed the routed arm). */
+ * codes and scales of `x` (absent when the pass already holds codes to feed the routed arm), or of
+ * `hq_x`, `hq_K` wide, where the router reads another state than the latent the codes are of. */
 static const RadParamSpec pRouterGemmSigmoidScatter[] = { P_INT("M"), P_INT("K"),
     P_INT("n_expert"), P_INTO("n_local"), P_INT("top_k"), P_INTO("weight_bf16"), P_INT("norm"),
     P_F64("route_scale"), P_STR("dtype"), P_INTO("expert_base"), P_STRO("protect"),
-    P_INTO("hq_group"), P_STRO("hq_dtype") };
+    P_INTO("hq_group"), P_STRO("hq_dtype"), P_INTO("hq_K") };
 static const RadOperandSpec oRouterGemmSigmoidScatter[] = {
     { "x", RAD_OPD_IN, 0 },             { "weight", RAD_OPD_WEIGHT, 0 },
     { "bias", RAD_OPD_WEIGHT, 0 },      { "logits", RAD_OPD_OUT, 0 },
@@ -2276,7 +2277,7 @@ static const RadOperandSpec oRouterGemmSigmoidScatter[] = {
     { "sorted_tok", RAD_OPD_OUT, 0 },   { "expert_offset", RAD_OPD_OUT, 0 },
     { "expert_count", RAD_OPD_OUT, 0 }, { "gate", RAD_OPD_OUT, 1 },
     { "inverse", RAD_OPD_OUT, 1 },      { "hq_q", RAD_OPD_OUT, 1 },
-    { "hq_s", RAD_OPD_OUT, 1 }
+    { "hq_s", RAD_OPD_OUT, 1 },         { "hq_x", RAD_OPD_IN, 1 }
 };
 /* `logit_softcap`'s, matching ref's `pMnCap` (spec §2.3). `cap` must be > 0; the op refuses a
  * non-positive cap (a division by zero in every lane). */
@@ -9779,8 +9780,8 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   "workgroup that finishes the grid ranks -- with the ungated shared gate's fill and the inverse, "
   "and the latent's rotated codes in the wave slots the grid leaves idle",
   "single group, M <= 64 and M*top_k <= 1024, experts <=512, top_k<=32; `hq_group` > 0 adds "
-  "had_quant_act_fp8's or had_quant_act_i8g's quantiser over K, which then needs group 128 (or "
-  "IQ8R's 256, int8) and K a multiple of it",
+  "had_quant_act_fp8's or had_quant_act_i8g's quantiser over K (or over `hq_x`'s `hq_K`), which "
+  "then needs group 128 (or IQ8R's 256, int8) and that width a multiple of it",
   "bf16 activation, bf16 or f32 weight, f32 bias, logits and weights; i32 ids, sorted slots, "
   "offsets and counts; bf16 gate; with `hq_group`, the same codes and scales had_quant_act_fp8 or "
   "had_quant_act_i8g write of the activation",

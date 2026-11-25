@@ -1815,7 +1815,7 @@ void no_router_gemm_fuse_encs(RadBuilder* b) {
  * block quantises its own input (`rot`), so it is where the third plane has anything to fold. */
 TEST(the_router_projection_joins_its_selection_where_a_library_serves_it) {
     struct Run { const char* what; int dq, pq, world; bool plain, off;
-                 int fused, scatter, topk; int hq; bool rotexp; };
+                 int fused, scatter, topk; int hq; bool rotexp; int64_t latent = 0; };
     /* Two MoE layers of the mini model (the third is dense). 96 rows stay inside the selection's
      * own bound (top_k * rows <= 1024 at a declared 256) and past the fused row's band. `plain` is
      * the bf16 trunk, for the ranks the mini's quantised experts do not split over; `off` is a
@@ -1843,12 +1843,21 @@ TEST(the_router_projection_joins_its_selection_where_a_library_serves_it) {
         { "decode, rotated experts", 1, 0, 1, false, false, 2, 0, 0, 128, true },
         { "prefill, rotated experts", 0, 96, 1, false, false, 0, 2, 0, 128, true },
         { "decode, no library row", 1, 0, 1, false, true, 0, 2, 0, 0, false },
+        /* The served shape: the router reads the state (n_embd wide) and the experts a latent of
+         * another width, so the row's `x` is the router's input and the codes it folds are of a
+         * second input, the latent. (The first lane run refused this: the row had been handed the
+         * latent as the projection's input.) */
+        { "decode, a 256-wide latent", 1, 0, 1, false, false, 2, 0, 0, 0, false, 256 },
+        { "decode, rotated experts, a 256-wide latent", 1, 0, 1, false, false, 2, 0, 0, 128, true,
+          256 },
+        { "prefill 16 rows, rotated experts, a 256-wide latent", 0, 16, 1, false, false, 2, 0, 0,
+          128, true, 256 },
     };
     for (const Run& r : runs) {
         fprintf(stderr, "run %s\n", r.what);
         Declared d(r.off ? no_router_gemm_fuse_encs
                          : (r.plain ? bf16_encs : (r.rotexp ? int8_experts_encs : int8_trunk_encs)),
-                  r.world, 0);
+                  r.world, 0, false, 128, r.latent);
         REQUIRE_EQ(d.rc, RAD_OK);
         const RecOp* o = find_op(d.b, "router_gemm_sigmoid_scatter");
         if (r.off) {
@@ -1856,7 +1865,16 @@ TEST(the_router_projection_joins_its_selection_where_a_library_serves_it) {
         } else {
             REQUIRE(o != nullptr);
             CHECK_EQ(count_op(d.b, "router_gemm_sigmoid_scatter"), 2);
-            CHECK_EQ(pint(o, "K"), 128);             /* n_embd */
+            CHECK_EQ(pint(o, "K"), 128);             /* the router's input: n_embd */
+            /* The projection reads the router's own input, not the latent; the latent is a second
+             * read only where its codes are folded, at its own width. */
+            const rad_buf lat = buf_named(d.b, "moe.latent");
+            REQUIRE(lat != 0);
+            REQUIRE(!o->reads.empty());
+            CHECK_EQ((int)o->reads.size(), r.hq ? 2 : 1);
+            CHECK(o->reads[0] != lat);
+            if (r.hq) CHECK_EQ(o->reads[1], lat);
+            CHECK_EQ(pint(o, "hq_K"), r.latent ? r.latent : 128);
             CHECK_EQ(pint(o, "n_expert"), 4);
             CHECK_EQ(pint(o, "top_k"), 2);
             CHECK_EQ(pint(o, "weight_bf16"), 1);     /* the mini's router weight is bf16 */
