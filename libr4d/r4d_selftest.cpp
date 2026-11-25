@@ -20781,7 +20781,8 @@ struct SinkOps {
  * last). */
 static SinkOps sink_ops(bool sel, int64_t heads, const std::vector<int64_t>& qlen,
                         const std::vector<int64_t>& ctx, int64_t window, int64_t bs,
-                        int64_t sel_keep = 0, uint32_t seed = 1, int stable = -1) {
+                        int64_t sel_keep = 0, uint32_t seed = 1, int stable = -1,
+                        bool fold = false) {
     SinkOps o;
     const int64_t L = 512, R = 64, S = (int64_t)qlen.size();
     int64_t M = 0, bmax = 1, pages = 0;
@@ -20812,8 +20813,8 @@ static SinkOps sink_ops(bool sel, int64_t heads, const std::vector<int64_t>& qle
     if (stable >= 0) o.ps.push_back(PI("stable", stable));
     const int n = sel ? 7 : 8;
     o.out = n - 1;
-    o.host.assign((size_t)n, RadTensor{});
-    o.bytes.assign((size_t)n, {});
+    o.host.assign((size_t)(n + (fold ? 1 : 0)), RadTensor{});
+    o.bytes.assign(o.host.size(), {});
     auto& q = o.host[0];
     q = T(nullptr, RAD_BF16, { M, heads, L });
     q.stride[1] = L + 3;
@@ -20837,17 +20838,33 @@ static SinkOps sink_ops(bool sel, int64_t heads, const std::vector<int64_t>& qle
     out = T(nullptr, RAD_BF16, { M, heads, L });
     out.stride[1] = L + 5;
     out.stride[0] = heads * (L + 5) + 7;
-    for (int i = 0; i < n; ++i) {
-        RadTensor& t = o.host[(size_t)i];
+    /* K-26: the query's rotary folded into the launch. q_rope then holds the projection's raw
+     * columns and the launch turns them at the step's own positions; rope's parameters are the
+     * launch's, with the scale taken off 1 so the fold's use of it is the one under test. */
+    if (fold) {
+        o.host[(size_t)n] = T(nullptr, RAD_I32, { M });
+        o.ps.push_back(PF("rope_theta", 10000.0));
+        o.ps.push_back(PF("rope_scale", 1.2));
+        o.ps.push_back(PS("rope_mode", "gptj"));
+    }
+    for (size_t i = 0; i < o.host.size(); ++i) {
+        RadTensor& t = o.host[i];
         const int64_t elements = t.shape[0] * t.stride[0];
-        o.bytes[(size_t)i].assign((size_t)elements * esz(t.dtype) + 256, 0xa5);
-        t.data = o.bytes[(size_t)i].data() + 128;
+        o.bytes[i].assign((size_t)elements * esz(t.dtype) + 256, 0xa5);
+        t.data = o.bytes[i].data() + 128;
         if (i <= 2)
             for (int64_t e = 0; e < elements; ++e) {
                 const float v = (float)((int)(st_mix32((uint32_t)(e * 7 + i * 7919 + seed * 104729)) %
                                               2001) - 1000) / 1000.0f;
                 ((uint16_t*)t.data)[e] = h_to_bf16(i == 2 ? v : 0.6f * v);
             }
+    }
+    if (fold) {
+        int64_t row = 0;
+        for (int64_t s = 0; s < S; ++s)
+            for (int64_t i = 0; i < qlen[(size_t)s]; ++i, ++row)
+                ((int32_t*)o.host[(size_t)n].data)[row] =
+                    (int32_t)(ctx[(size_t)s] - qlen[(size_t)s] + i);
     }
     for (int64_t h = 0; h < heads; ++h)
         ((float*)o.host[(size_t)n - 2].data)[h] = sink_cycle[h % 8] + 0.01f * (float)h;
@@ -20939,10 +20956,12 @@ static const RadKernelInfo* sink_oracle(void*& ref, const char* op) {
             if (!std::strcmp(at(i)->op, op)) return at(i);
     return nullptr;
 }
-/* One case against libref: every element within 0.002 + 0.008 |want|, margins untouched. */
+/* One case against libref: every element within 0.002 + 0.008 |want|, margins untouched. With
+ * `fold` the launch applies the query's rotary itself (K-26), so the oracle is libref's own
+ * rope-then-sink over the same raw columns and positions. */
 static void mla_sink_check(const Plugin& pl, bool sel, int64_t heads, std::vector<int64_t> qlen,
                            std::vector<int64_t> ctx, int64_t window, int64_t bs,
-                           int64_t sel_keep = 0, int stable = -1) {
+                           int64_t sel_keep = 0, int stable = -1, bool fold = false) {
     const char* what = sel ? "mla_attn_sel_sink_bf16" : "mla_attn_paged_sink_bf16";
     const auto* row = find(pl, what);
     if (!row || !g_plugin) {
@@ -20956,12 +20975,13 @@ static void mla_sink_check(const Plugin& pl, bool sel, int64_t heads, std::vecto
         if (ref) dlclose(ref);
         return;
     }
-    SinkOps o = sink_ops(sel, heads, qlen, ctx, window, bs, sel_keep, 1, stable);
-    std::string label = fmt("%s H=%lld bs=%lld%s%s%s ctx", sel ? "sel_sink" : "paged_sink",
+    SinkOps o = sink_ops(sel, heads, qlen, ctx, window, bs, sel_keep, 1, stable, fold);
+    std::string label = fmt("%s H=%lld bs=%lld%s%s%s%s ctx", sel ? "sel_sink" : "paged_sink",
                             (long long)heads, (long long)bs,
                             sel ? "" : fmt(" w=%lld", (long long)window).c_str(),
                             sel_keep ? fmt(" keep=%lld", (long long)sel_keep).c_str() : "",
-                            stable >= 0 ? fmt(" stable=%d", stable).c_str() : "");
+                            stable >= 0 ? fmt(" stable=%d", stable).c_str() : "",
+                            fold ? " folded" : "");
     for (size_t s = 0; s < ctx.size(); ++s)
         label += fmt(" %lld/%lld", (long long)qlen[s], (long long)ctx[s]);
     std::vector<uint8_t> got;
@@ -21007,19 +21027,21 @@ static void mla_sink_check(const Plugin& pl, bool sel, int64_t heads, std::vecto
  * 1..3 (5: 64 heads a workgroup; 6: the fused form) against the rule (form 0). With `stable 1`
  * at any row count and number of sequences (WP16 3.4.1: verify == decode at any stream count). */
 static void mla_sink_bytes(const Plugin& pl, int64_t heads, std::vector<int64_t> qlen,
-                           std::vector<int64_t> ctx, int64_t window, int64_t bs, int stable = -1) {
+                           std::vector<int64_t> ctx, int64_t window, int64_t bs, int stable = -1,
+                           bool fold = false) {
     const auto* paged = find(pl, "mla_attn_paged_sink_bf16");
     const auto* selr = find(pl, "mla_attn_sel_sink_bf16");
     if (!paged || !selr) {
         ok("mla_sink bytes", false, "kernel missing");
         return;
     }
-    std::string label = fmt("sink bytes H=%lld w=%lld bs=%lld%s ctx", (long long)heads,
+    std::string label = fmt("sink bytes H=%lld w=%lld bs=%lld%s%s ctx", (long long)heads,
                             (long long)window, (long long)bs,
-                            stable >= 0 ? fmt(" stable=%d", stable).c_str() : "");
+                            stable >= 0 ? fmt(" stable=%d", stable).c_str() : "",
+                            fold ? " folded" : "");
     for (size_t s = 0; s < ctx.size(); ++s)
         label += fmt(" %lld/%lld", (long long)qlen[s], (long long)ctx[s]);
-    SinkOps all = sink_ops(false, heads, qlen, ctx, window, bs, 0, 1, stable);
+    SinkOps all = sink_ops(false, heads, qlen, ctx, window, bs, 0, 1, stable, fold);
     std::vector<uint8_t> base;
     if (!sink_device(pl, paged, all, 0, base)) {
         ok(label.c_str(), false, "device launch failed");
@@ -21038,7 +21060,7 @@ static void mla_sink_bytes(const Plugin& pl, int64_t heads, std::vector<int64_t>
     int64_t r = 0;
     for (size_t s = 0; s < qlen.size(); ++s)
         for (int64_t i = 0; i < qlen[s]; ++i, ++r) {
-            SinkOps one = sink_ops(false, heads, { 1 }, { ctx[s] }, window, bs, 0, 1, stable);
+            SinkOps one = sink_ops(false, heads, { 1 }, { ctx[s] }, window, bs, 0, 1, stable, fold);
             /* the whole launch's cache */
             one.bytes[2] = all.bytes[2];
             one.host[2] = all.host[2];
@@ -21048,6 +21070,8 @@ static void mla_sink_bytes(const Plugin& pl, int64_t heads, std::vector<int64_t>
             for (int64_t b = 0; b < one.host[3].shape[1]; ++b)
                 ((int32_t*)one.host[3].data)[b] = ((int32_t*)bt.data)[(int64_t)s * bt.stride[0] + b];
             ((int32_t*)one.host[4].data)[0] = (int32_t)(ctx[s] - qlen[s] + i + 1);
+            /* the fold turns the row at its own position, not at the launch's last one */
+            if (fold) ((int32_t*)one.host.back().data)[0] = (int32_t)(ctx[s] - qlen[s] + i);
             for (int k = 0; k < 2; ++k) {
                 const RadTensor &src = all.host[(size_t)k], &dst = one.host[(size_t)k];
                 for (int64_t h = 0; h < heads; ++h)
@@ -21068,7 +21092,7 @@ static void mla_sink_bytes(const Plugin& pl, int64_t heads, std::vector<int64_t>
         ok(fmt("%s form %d == rule", label.c_str(), form).c_str(), ran && g == base);
     }
     if (!window) {
-        SinkOps s = sink_ops(true, heads, qlen, ctx, 0, bs, 0, 1, stable);
+        SinkOps s = sink_ops(true, heads, qlen, ctx, 0, bs, 0, 1, stable, fold);
         std::vector<uint8_t> g;
         bool eq = sink_device(pl, selr, s, 0, g);
         for (int64_t rr = 0; eq && rr < ot.shape[0]; ++rr)
@@ -37666,6 +37690,12 @@ static void device_phase(const Plugin& pl) {
             iqr_dual_case(pl, fd[0], 1, 3072, 1024, 1536);
             iqr_dual_case(pl, fd[1], 1, 6144, 2048, 3072);
             iqr_dual_case(pl, fd[1], 1, 2048, 6144, 3072);   /* the roles the other way round */
+            /* K-03's pair: q_a's 1024 (eight waves a tile) in front of the gate's 4096 / 8192
+             * (four), at the attention input's K -- both kinds of layer's gate width, and the
+             * pair under the trellis's other code. */
+            iqr_dual_case(pl, fd[0], 1, 1024, 4096, 3072);
+            iqr_dual_case(pl, fd[0], 1, 1024, 8192, 3072);
+            iqr_dual_case(pl, fd[1], 1, 1024, 4096, 3072);
             iqr_dual_case(pl, fd[0], 2, 6144, 2048, 3072, /* refuse */ true);
             for (size_t i = 2; i < sizeof fd / sizeof fd[0]; ++i) {
                 iqr_dual_case(pl, fd[i], 1, 3072, 1024, 1024);
@@ -38774,6 +38804,16 @@ static void device_phase(const Plugin& pl) {
         mla_sink_check(pl, false, 64, { 20 }, { 600 }, 512, 4, 0, 1);
         mla_sink_check(pl, false, 32, { 100 }, { 300 }, 0, 4, 0, 1);
         mla_sink_check(pl, false, 16, { 6, 6, 6, 6 }, { 530, 2100, 700, 4097 }, 512, 16, 0, 1);
+        /* K-26: the query fragment's rotary inside the launch (its `rope_pos`), against libref at
+         * the same positions and scale: a decode row, a verify's rows, and the paged form at
+         * window 0 where the sparse layers' dense path runs it. */
+        mla_sink_check(pl, false, 64, { 1, 1, 1 }, { 511, 512, 513 }, 512, 4, 0, 1, true);
+        mla_sink_check(pl, false, 32, { 8, 4 }, { 520, 2100 }, 512, 16, 0, 1, true);
+        mla_sink_check(pl, false, 16, { 6, 6 }, { 530, 4097 }, 0, 4, 0, 1, true);
+        /* The fold is the launch's own, so what the launch promises of its rows still holds with
+         * it on: a verify's rows equal their single-row decode and the three forms agree. */
+        mla_sink_bytes(pl, 32, { 6, 6 }, { 600, 520 }, 512, 4, 1, true);
+        mla_sink_bytes(pl, 16, { 3 }, { 513 }, 0, 4, -1, true);
         mla_sink_bytes(pl, 64, { 6, 6, 6, 6 }, { 530, 2100, 700, 1200 }, 512, 4, 1);
         /* the sliding layer's shape at TP2 at the widest speculative step (8 streams x 6 = 48
          * rows, the `stable 1` split cap) and one row past it */
@@ -38798,6 +38838,10 @@ static void device_phase(const Plugin& pl) {
         mla_sink_check(pl, true, 32, { 80 }, { 2200 }, 0, 4, 512); /* unsplit */
         mla_sink_check(pl, true, 32, { 80 }, { 2200 }, 0, 4, 512, 1); /* the stable law */
         mla_sink_check(pl, true, 8, { 24, 24 }, { 3000, 2600 }, 0, 4, 512, 1);
+        /* K-26: the same fold on the selection's sink, a rank's heads in its stable form. */
+        mla_sink_check(pl, true, 32, { 4, 1 }, { 3000, 4100 }, 0, 4, 512, 1, true);
+        mla_sink_check(pl, true, 8, { 24, 24 }, { 3000, 2600 }, 0, 4, 512, 1, true);
+        mla_sink_bytes(pl, 32, { 6, 6 }, { 3000, 2600 }, 0, 4, 1, true);
     }
     if (sel("mla_attn_rows_bf16")) {
         /* A rank's run of rows with all 64 heads (GLM's prefill split by rows), against the matrix
