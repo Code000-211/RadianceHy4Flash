@@ -377,7 +377,13 @@ static int64_t lockable_bytes(int64_t still, int64_t margin, std::string* limit)
  * container, and pins it either way. Only a table of kTableShareMin or more is shared: the gather's
  * scale is an n-gram weight too, since it moves with the table between gather sites, and as a file
  * its two bytes would cost the 2 MiB header and a 2 MiB page. One copy per container address,
- * shared by every rank; freed in ~Engine. */
+ * shared by every rank; freed in ~Engine.
+ *
+ * The read is not waited for here: the four Engram tables are 59 GiB, and one after the other they
+ * took 42 s of a 66 s startup. Each fill is started as its table is met, so it reads beside the
+ * tables before it and beside the container pass, and join_table_fills waits for them all once that
+ * pass is done (B-01). The memory is reserved here, so the pointer is known, and a copy another
+ * engine filled is only checked: there is nothing to read. */
 int Engine::copy_table(const uint8_t* src, int64_t n, int64_t foff, bool card, void** out,
                        std::string* why) {
     for (const auto& c : table_copy_of_)
@@ -387,6 +393,8 @@ int Engine::copy_table(const uint8_t* src, int64_t n, int64_t foff, bool card, v
         return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     };
     void* base = nullptr;
+    PendingTable p;
+    p.bytes = n;
     if (card && !cfg_.ngram_share_dir.empty() && n >= kTableShareMin) {
         const std::string id = table_share_id(file_->path(), foff, n);
         if (id.empty()) {
@@ -404,50 +412,111 @@ int Engine::copy_table(const uint8_t* src, int64_t n, int64_t foff, bool card, v
             table_share_close(&s);
             return RAD_E_NOMEM;
         }
-        if (s.filler) {
-            rc = table_copy_fill(*file_, src, n, foff, static_cast<uint8_t*>(base), why);
-            if (rc == RAD_OK) rc = table_share_mark_ready(&s, n, id, why);
-        } else {
+        if (!s.filler) {
             rc = table_copy_check(src, n, static_cast<const uint8_t*>(base), why);
-            if (rc != RAD_OK)
-                *why = fmt("the shared file %s does not match the container (%s)", s.path.c_str(),
-                           why->c_str());
-        }
-        if (rc != RAD_OK) {
+            if (rc == RAD_OK) {
+                card_copies_.push_back(base);
+                table_shares_.push_back(s);
+                RAD_INFO("placement: n-gram table in pinned memory the cards read, %s in shared "
+                         "file %s, reused (probes match) in %.1f s%s", humanb(n).c_str(),
+                         s.path.c_str(), since(), at_now().c_str());
+                table_copy_of_.push_back({ src, base });
+                *out = base;
+                return RAD_OK;
+            }
+            *why = fmt("the shared file %s does not match the container (%s)", s.path.c_str(),
+                       why->c_str());
             rad_dev_free(base, RAD_MEM_HOST_MAPPED);
             table_share_close(&s);
             return rc;
         }
-        card_copies_.push_back(base);
-        table_shares_.push_back(s);
-        RAD_INFO("placement: n-gram table in pinned memory the cards read, %s in shared file %s, "
-                 "%s in %.1f s%s", humanb(n).c_str(), s.path.c_str(),
-                 s.filler ? "filled" : "reused (probes match)", since(), at_now().c_str());
+        p.shared = true;
+        p.share = s;
+        p.id = id;
+        p.line = fmt("n-gram table in pinned memory the cards read, %s in shared file %s",
+                     humanb(n).c_str(), s.path.c_str());
     } else if (card) {
         base = rad_dev_alloc(n, RAD_MEM_HOST_MAPPED);
         if (!base) {
             *why = fmt("pinning %s: %s", humanb(n).c_str(), rad_dev_last_error());
             return RAD_E_NOMEM;
         }
-        const int rc = table_copy_fill(*file_, src, n, foff, static_cast<uint8_t*>(base), why);
-        if (rc != RAD_OK) {
-            rad_dev_free(base, RAD_MEM_HOST_MAPPED);
-            return rc;
-        }
-        card_copies_.push_back(base);
-        RAD_INFO("placement: n-gram table copied into pinned memory the cards read, %s in %.1f s%s",
-                 humanb(n).c_str(), since(), at_now().c_str());
+        p.line = fmt("n-gram table copied into pinned memory the cards read, %s",
+                     humanb(n).c_str());
     } else {
         TableCopy tc;
-        const int rc = table_copy_make(*file_, src, n, foff, &tc, why);
+        const int rc = table_copy_reserve(n, &tc, why);
         if (rc != RAD_OK) return rc;
-        table_copies_.push_back(tc);
         base = tc.base;
-        RAD_INFO("placement: n-gram table copied into locked memory, %s in %.1f s%s",
-                 humanb(n).c_str(), since(), at_now().c_str());
+        p.copy = tc;
+        p.locked = true;
+        p.line = fmt("n-gram table copied into locked memory, %s", humanb(n).c_str());
     }
+    const int started = p.fill.start(*file_, src, n, foff, static_cast<uint8_t*>(base));
+    if (started != RAD_OK) {
+        /* No reader runs, so the memory is still this call's to release, as a failed copy's is. */
+        *why = fmt("starting the read of %s: %s", humanb(n).c_str(), rad_strerror(started));
+        if (p.shared) {
+            rad_dev_free(base, RAD_MEM_HOST_MAPPED);
+            table_share_close(&p.share);
+        } else if (p.locked) {
+            table_copy_free(&p.copy);
+        } else {
+            rad_dev_free(base, RAD_MEM_HOST_MAPPED);
+        }
+        return started;
+    }
+    p.base = base;
+    pending_tables_.push_back(std::move(p));
     table_copy_of_.push_back({ src, base });
     *out = base;
+    return RAD_OK;
+}
+
+/* B-01: waits for the fills copy_table started, once the container pass has read beside them. Each
+ * table keeps its placement line with the read's own length added, and the copy is published only
+ * once its bytes are there and check out: a fill that failed releases its memory and the load
+ * fails, auto placement included (a pin the machine declined fails before the read starts, where
+ * auto still falls back to the disk; what fails here is the container's read). */
+int Engine::join_table_fills() {
+    if (pending_tables_.empty()) return RAD_OK;
+    int bad = RAD_OK;
+    std::string bwhy;
+    for (PendingTable& p : pending_tables_) {
+        std::string why;
+        int rc = p.fill.wait(&why);
+        if (rc == RAD_OK && p.shared) rc = table_share_mark_ready(&p.share, p.bytes, p.id, &why);
+        if (rc != RAD_OK) {
+            if (p.shared) {
+                rad_dev_free(p.base, RAD_MEM_HOST_MAPPED);
+                table_share_close(&p.share);
+            } else if (p.locked) {
+                table_copy_free(&p.copy);
+            } else {
+                rad_dev_free(p.base, RAD_MEM_HOST_MAPPED);
+            }
+            if (bad == RAD_OK) {
+                bad = rc;
+                bwhy = fmt("%s: %s", p.line.c_str(), why.c_str());
+            }
+            continue;
+        }
+        if (p.shared) {
+            card_copies_.push_back(p.base);
+            table_shares_.push_back(p.share);
+        } else if (p.locked) {
+            table_copies_.push_back(p.copy);
+        } else {
+            card_copies_.push_back(p.base);
+        }
+        RAD_INFO("placement: %s, filled beside the container pass in %.1f s%s", p.line.c_str(),
+                 p.fill.seconds(), at_now().c_str());
+    }
+    pending_tables_.clear();
+    if (bad != RAD_OK) {
+        RAD_ERR("an n-gram table's read beside the container pass failed: %s", bwhy.c_str());
+        return bad;
+    }
     return RAD_OK;
 }
 
@@ -1485,6 +1554,15 @@ int Engine::declare() {
             return RAD_E_INVAL;
         }
     }
+    if (cvec_.loaded() && cvec_.rank > 1 && plugins_.arch_plugin != "hyv4flash") {
+        /* Only hyv4flash declares k chained projections (PLAN §14). Another arch would declare one
+         * and silently steer 1 of k directions, with the basis scale, and say nothing. */
+        RAD_ERR("--control-vector %s: it carries %lld directions per layer, and the '%s' plugin "
+                "projects one direction per layer", cfg_.control_vector.c_str(),
+                (long long) cvec_.rank, plugins_.arch_plugin.c_str());
+        cvec_ = ControlVector{};
+        return RAD_E_UNSUPPORTED;
+    }
     if (cvec_.loaded()) {
         cvec_views_.assign(ranks_.size(), RadControlVector{});
         cvec_salt_ = control_vector_salt(cvec_);
@@ -1492,10 +1570,16 @@ int Engine::declare() {
          * request that could carry the field. */
         const bool default_on = cfg_.control_vector == "on";
         cvec_default_.store(default_on);
-        RAD_INFO("control vectors: %s: %lld directions of %lld, layers %d..%d, scale %.3f -- "
+        /* n_dirs counts tensors, which is the direction count only for a rank-1 file. */
+        const std::string rank_note =
+            cvec_.rank > 1 ? " (rank " + std::to_string(cvec_.rank) + ", " +
+                                  std::to_string(cvec_.n_dirs * cvec_.rank) + " total)"
+                            : "";
+        RAD_INFO("control vectors: %s: %lld directions of %lld%s, layers %d..%d, scale %.3f -- "
                  "default %s%s",
                  cvec_.path.c_str(), (long long) cvec_.n_dirs,
-                 (long long) cvec_.n_embd, cvec_.first, cvec_.last, (double) cvec_.user_scale,
+                 (long long) cvec_.n_embd, rank_note.c_str(),
+                 cvec_.first, cvec_.last, (double) cvec_.user_scale,
                  default_on ? "ON" : "off",
                  default_on ? " (--control-vector on; a request can still say false)"
                             : " until a request asks for it (the dashboard's switch, or a request's "
@@ -1900,6 +1984,12 @@ int Engine::plan() {
             f.queue_scratch = rad_dev_resident_scratch_bytes(&props);
             f.capacity = props.vram_bytes;
             f.free     = props.vram_free;
+            /* And what of the memory `free` excludes is device code: the code objects this card has
+             * loaded, each one whole from its module at its kernel's first launch (module_load in
+             * core/device/aql.cpp). The receipt prints it beside `already held`, so a lane can say
+             * what a build carrying only the kernel forms this model runs would give back (M-14).
+             * A backend that loads no device code says so, and the line stays out of its receipt. */
+            dev_code_resident(r->device, &f.code_bytes, &f.code_modules);
             /* Unified memory: the pinned host pool is the same RAM as the card, so the
              * budget charges it against the one ledger. */
             f.unified     = props.unified != 0;
@@ -3889,6 +3979,14 @@ int Engine::load_weights() {
     /* Of the container's own bytes, what the mapped tier reads: left in the page cache. */
     int64_t mapped_kept = 0;
 
+    /* B-01: the Engram tables' fills run beside the container pass and are joined once, after it.
+     * Any return before that join (a failed walk, a failed sweep) still joins them, so no reader
+     * outlives the load; the normal path below joins, takes the error, and clears the guard. */
+    struct JoinFills {
+        Engine* e;
+        ~JoinFills() { if (e) e->join_table_fills(); }
+    } join_fills{this};
+
     /* Two phases. The walk decides which rank wants which bytes, where they land, and what is
      * refused, without touching the disk; sweep_container then reads the container once in file
      * order (reading per rank in declaration order would run far below the sequential rate and
@@ -4219,8 +4317,13 @@ int Engine::load_weights() {
         }
     }
     const int pool_st = pool.finish();
+    /* The Engram fills have had the whole pass to read beside it: join them before the phase ends,
+     * so the weights phase's timers carry them and nothing maps a table before its bytes are in. */
+    const int fills_st = join_table_fills();
+    join_fills.e = nullptr;
     RAD_TRY(sw_st);
     RAD_TRY(pool_st);
+    RAD_TRY(fills_st);
     if (!staged.empty() && file_)
         RAD_INFO("load: %zu weight(s), %s of planes, rearranged for their kernels by %d worker(s) "
                  "behind the read, %s held at most; done %.1f s after the read began",
@@ -4244,6 +4347,30 @@ int Engine::load_weights() {
                  cfg_.tp > 1 ? " (summed over ranks, which map the same file: the resident bytes "
                                "are that divided by --tp)" : "",
                  humanb(mapped_kept).c_str());
+
+    /* ---- M-01: the host pool's mirror of the resident units --------------------------------
+     * The mover sized each class's pool to every unit the host-pool budget had room for, so the
+     * resident units it holds slots for have no host copy yet. They get one here, once, on each
+     * rank's mover stream: after this a demotion of such a unit is an address change and its next
+     * promotion keeps the slot, so the bytes are never copied off the card again. Nothing else may
+     * be in flight (the sweep above synced every rank's stream), and the bytes never change. */
+    {
+        const auto mt0 = std::chrono::steady_clock::now();
+        int64_t mirrored = 0;
+        int64_t mirror_bytes = 0;
+        for (auto& r : ranks_) {
+            if (r->mover.mirror_slots() <= 0) continue;
+            RAD_TRY(rad_dev_set(r->device));
+            RAD_TRY(r->mover.fill_mirrors());
+            mirrored += r->mover.mirror_slots();
+            mirror_bytes += r->mover.mirror_bytes();
+        }
+        if (mirrored > 0)
+            RAD_INFO("load: %lld pool slot(s) mirror a resident unit (%s), copied once off the "
+                     "card in %.1f s: their demotions are address changes",
+                     (long long)mirrored, humanb(mirror_bytes).c_str(),
+                     std::chrono::duration<double>(std::chrono::steady_clock::now() - mt0).count());
+    }
     return RAD_OK;
 }
 

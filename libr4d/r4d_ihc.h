@@ -66,29 +66,40 @@ __device__ __forceinline__ void acc_piece(float (&acc)[R + 1], const float (&f)[
     }
 }
 
-// The lanes, then the waves through `part`; one thread forms r, the gates (into `gate`) and the
-// write weights (into `post_row` when POST). Every thread calls; a barrier on entry to `part`'s
-// reads and one behind the gates, so `gate` is readable on return.
-template <int HC, bool POST>
-__device__ __forceinline__ void finish(float (&acc)[(POST ? 2 * HC : HC) + 1],
-                                       float (*part)[(POST ? 2 * HC : HC) + 1], float* gate,
-                                       const float* __restrict__ scale, const float* __restrict__ base,
-                                       float* __restrict__ post_row, uint32_t width, float eps,
-                                       float heps, float pmag) {
+// The lanes' sums of `acc` into `put(wave, k, sum)`: the waves [wlo, whi) this block owns (all of
+// them with the row on one block, its run of them when the row is split over blocks), then the
+// barrier that publishes them. Every thread calls; a wave's 32 lanes take the same branch, so the
+// xor_sum sees a whole wave either way.
+template <int HC, bool POST, class P>
+__device__ __forceinline__ void finish_sums(const float (&acc)[(POST ? 2 * HC : HC) + 1], P put,
+                                            int wlo, int whi) {
     constexpr int R = POST ? 2 * HC : HC;
-    const uint32_t t = threadIdx.x, lane = t & 31u, wave = t >> 5;
+    const uint32_t lane = threadIdx.x & 31u, wave = threadIdx.x >> 5;
+    if ((int)wave >= wlo && (int)wave < whi) {
 #pragma unroll
-    for (int k = 0; k <= R; ++k) {
-        const float s = r4d_xor_sum<32>(acc[k]);
-        if (lane == 0) part[wave][k] = s;
+        for (int k = 0; k <= R; ++k) {
+            const float s = r4d_xor_sum<32>(acc[k]);
+            if (lane == 0) put(wave, k, s);
+        }
     }
     __syncthreads();
-    if (t == 0) {
+}
+
+// The waves' sums of the row (through `pread(wave, k)`) into r, the gates (into `gate`) and the
+// write weights (into `post_row` when POST); one thread forms them. Every thread calls; a barrier
+// on entry to the reads and one behind the gates, so `gate` is readable on return.
+template <int HC, bool POST, class P>
+__device__ __forceinline__ void finish_gates(float* gate, const float* __restrict__ scale,
+                                             const float* __restrict__ base,
+                                             float* __restrict__ post_row, uint32_t width, float eps,
+                                             float heps, float pmag, P pread) {
+    constexpr int R = POST ? 2 * HC : HC;
+    if (threadIdx.x == 0) {
         float s[R + 1];
 #pragma unroll
         for (int k = 0; k <= R; ++k) {
             float v = 0.0f;
-            for (int w = 0; w < kWaves; ++w) v += part[w][k];
+            for (int w = 0; w < kWaves; ++w) v += pread(w, k);
             s[k] = v;
         }
         const float inv = 1.0f / sqrtf(s[R] / (float)width + eps);
@@ -101,6 +112,18 @@ __device__ __forceinline__ void finish(float (&acc)[(POST ? 2 * HC : HC) + 1],
         }
     }
     __syncthreads();
+}
+
+// The row on one block: the lanes, then the waves through the block's LDS `part`.
+template <int HC, bool POST>
+__device__ __forceinline__ void finish(float (&acc)[(POST ? 2 * HC : HC) + 1],
+                                       float (*part)[(POST ? 2 * HC : HC) + 1], float* gate,
+                                       const float* __restrict__ scale, const float* __restrict__ base,
+                                       float* __restrict__ post_row, uint32_t width, float eps,
+                                       float heps, float pmag) {
+    finish_sums<HC, POST>(acc, [&](uint32_t w, int k, float v) { part[w][k] = v; }, 0, kWaves);
+    finish_gates<HC, POST>(gate, scale, base, post_row, width, eps, heps, pmag,
+                           [&](int w, int k) { return part[w][k]; });
 }
 
 // x[i] = bf16(sum_j gate[j] * f32(h[j][i])), j ascending, for the 8-column groups q = t, t + 512,
@@ -216,39 +239,45 @@ struct JuncRow {
 };
 static_assert(sizeof(JuncRow) == 24 * 8 + 12 * 4, "JuncRow carries no padding");
 
+// The row's first two stages over the waves [wlo, whi): 1. y = rmsnorm(input) back into ybuf
+//    (and `yr` when asked), 2. h += post * y and the next connection's sums in `acc` (TAIL).
+// A thread's words and pieces are its own index's whatever wlo/whi are, so a block that owns a run
+// of the waves writes and sums exactly what the same thread index did with the row on one block:
+// only the writes are guarded, and ybuf is filled whole either way (a piece reads the words of the
+// waves it passes over). `owns` is constant true for a row on one block.
 template <int HC, bool POST, bool TAIL, bool EG = false>
-__device__ __forceinline__ void junction_row(JuncLds<HC, POST, EG>& L, uint16_t* ybuf,
-                                            const JuncRow& r) {
+__device__ __forceinline__ void junction_pieces(JuncLds<HC, POST, EG>& L, uint16_t* ybuf,
+                                                const JuncRow& r, int wlo, int whi,
+                                                float (&acc)[(POST ? 2 * HC : HC) + 1]) {
     constexpr int R = POST ? 2 * HC : HC;
     const uint32_t t = threadIdx.x, n = r.n;
+    const bool owns = (int)(t >> 5) >= wlo && (int)(t >> 5) < whi;
     if (t < (uint32_t)HC) L.pv[t] = r.post_row[t];
-    __syncthreads();   // the input row in ybuf and pv
-    // 1. y = rmsnorm(input), back into ybuf: every thread has read what the sum needs before
-    //    norm_sum's barrier, and each writes only its own words.
+    __syncthreads();   // the input row in ybuf (the caller's copy) and pv
     norm_row(ybuf, r.w_post, n, r.eps, r.wadd, r.mult, L.red1, [&](uint32_t q, uint4 w) {
         *(uint4*)(ybuf + 8u * q) = w;
-        if (r.yr) *(uint4*)(r.yr + 8u * q) = w;
+        if (r.yr && owns) *(uint4*)(r.yr + 8u * q) = w;
     });
     __syncthreads();
-    // 2. h += post * y, and the next connection's sums from the same registers.
-    float acc[R + 1];
 #pragma unroll
     for (int k = 0; k <= R; ++k) acc[k] = 0.0f;
     const uint32_t pieces = (uint32_t)HC * n / 8u;
-    for (uint32_t p = t; p < pieces; p += kThreads) {
-        const uint32_t c0 = 8u * p, j = c0 / n, i0 = c0 - j * n;
-        float hf[8], yf[8], f[8];
-        unpack8(*(const uint4*)(r.hr + c0), hf);
-        unpack8(*(const uint4*)(ybuf + i0), yf);
-        const float pj = L.pv[j];
-        uint16_t b[8];
+    if (owns) {   // no early exit: the barriers of finish_sums and the tail are every thread's
+        for (uint32_t p = t; p < pieces; p += kThreads) {
+            const uint32_t c0 = 8u * p, j = c0 / n, i0 = c0 - j * n;
+            float hf[8], yf[8], f[8];
+            unpack8(*(const uint4*)(r.hr + c0), hf);
+            unpack8(*(const uint4*)(ybuf + i0), yf);
+            const float pj = L.pv[j];
+            uint16_t b[8];
 #pragma unroll
-        for (int e = 0; e < 8; ++e) {
-            b[e] = f32_to_bf16(__fadd_rn(__fmul_rn(pj, yf[e]), hf[e]));
-            f[e] = bf16_to_f32(b[e]);
+            for (int e = 0; e < 8; ++e) {
+                b[e] = f32_to_bf16(__fadd_rn(__fmul_rn(pj, yf[e]), hf[e]));
+                f[e] = bf16_to_f32(b[e]);
+            }
+            *(uint4*)(r.hr + c0) = pack8(b);
+            if constexpr (TAIL && !EG) acc_piece<R, true>(acc, f, 8u, r.fn, r.fp, c0);
         }
-        *(uint4*)(r.hr + c0) = pack8(b);
-        if constexpr (TAIL && !EG) acc_piece<R, true>(acc, f, 8u, r.fn, r.fp, c0);
     }
     if constexpr (EG) {
         // 2b. The Engram's gate over the h just written (engram_gate's row: its first 256 threads'
@@ -273,26 +302,104 @@ __device__ __forceinline__ void junction_row(JuncLds<HC, POST, EG>& L, uint16_t*
             acc_piece<R, true>(acc, f, 8u, r.fn, r.fp, 8u * p);
         }
     }
+}
+
+// The row's tail (TAIL): the collapse into ybuf, its norm, and the quantiser's codes from it.
+template <int HC, bool POST, bool EG = false>
+__device__ __forceinline__ void junction_tail(JuncLds<HC, POST, EG>& L, uint16_t* ybuf,
+                                              const JuncRow& r) {
+    const uint32_t n = r.n;
+    collapse8<HC>(r.hr, L.gate, n, [&](uint32_t q, uint4 w) {
+        *(uint4*)(ybuf + 8u * q) = w;
+        if (r.xr) *(uint4*)(r.xr + 8u * q) = w;
+    });
+    __syncthreads();
+    norm_row(ybuf, r.w_next, n, r.eps, r.wadd, r.mult, L.red2, [&](uint32_t q, uint4 w) {
+        *(uint4*)(r.xnr + 8u * q) = w;
+        if (r.cq) *(uint4*)(ybuf + 8u * q) = w;   // each thread its own words, read before
+    });
+    // G-3b: had_quant_act_i8g's codes over the bf16 row just stored (q8_row_had_i8g, a wave a
+    // 128-column group), so the consumers of xn read them and no quantiser follows.
+    if (r.cq) {
+        __syncthreads();
+        q8_row_had_i8g<kThreads>(ybuf, r.cq, r.cs, n);
+    }
+}
+
+template <int HC, bool POST, bool TAIL, bool EG = false>
+__device__ __forceinline__ void junction_row(JuncLds<HC, POST, EG>& L, uint16_t* ybuf,
+                                            const JuncRow& r) {
+    constexpr int R = POST ? 2 * HC : HC;
+    float acc[R + 1];
+    junction_pieces<HC, POST, TAIL, EG>(L, ybuf, r, 0, kWaves, acc);
     if constexpr (TAIL) {
         // 3. gates and post (finish's barriers also publish h to the block), the collapse into
         //    ybuf, its norm.
-        finish<HC, POST>(acc, L.part, L.gate, r.scale, r.base, r.post_row, (uint32_t)HC * n,
+        finish<HC, POST>(acc, L.part, L.gate, r.scale, r.base, r.post_row, (uint32_t)HC * r.n,
                          r.ieps, r.heps, r.pmag);
-        collapse8<HC>(r.hr, L.gate, n, [&](uint32_t q, uint4 w) {
-            *(uint4*)(ybuf + 8u * q) = w;
-            if (r.xr) *(uint4*)(r.xr + 8u * q) = w;
-        });
-        __syncthreads();
-        norm_row(ybuf, r.w_next, n, r.eps, r.wadd, r.mult, L.red2, [&](uint32_t q, uint4 w) {
-            *(uint4*)(r.xnr + 8u * q) = w;
-            if (r.cq) *(uint4*)(ybuf + 8u * q) = w;   // each thread its own words, read before
-        });
-        // G-3b: had_quant_act_i8g's codes over the bf16 row just stored (q8_row_had_i8g, a wave a
-        // 128-column group), so the consumers of xn read them and no quantiser follows.
-        if (r.cq) {
-            __syncthreads();
-            q8_row_had_i8g<kThreads>(ybuf, r.cq, r.cs, n);
+        junction_tail<HC, POST, EG>(L, ybuf, r);
+    }
+}
+
+// ------------------------------------------------- K-13: the row's waves over several blocks
+// The piece sums are per wave (finish_sums: a wave's 32 lanes, then the waves ascending), so a row
+// divides over blocks by whole waves without moving a bit: block `part` of `parts` owns the waves
+// [part * kWaves / parts, (part + 1) * kWaves / parts) and, through junction_pieces, exactly the
+// words and pieces the same thread index handled with the row on one block. The blocks of a row
+// meet at two words a (launch parity, row): `folded`, which the block that pushed and folded the
+// row sets so that the others may read the reduced row, and `arrive`, which every block adds to
+// once its h and its waves' sums are out, whose last arriver finishes the row (the gates, the
+// collapse, the norm and the quantiser's codes) and resets both. Both are zero at a launch's start:
+// zeroed at allocation, reset by the row's last arriver, and two launches in flight use different
+// parities (the wire's own rule).
+enum { kSplitRows = 8, kSplitParts = 4, kSplitStride = 2 * 8 + 1 };   /* 17: the widest R + 1 */
+struct JuncSplit {
+    float part[2][kSplitRows][kWaves][kSplitStride];   // the waves' sums, R + 1 a wave
+    unsigned int arrive[2][kSplitRows];
+    unsigned int folded[2][kSplitRows];
+};
+
+// One row over `parts` blocks: the stages of junction_row, the last arriver taking the tail. `part`
+// is this row's scratch (its 16 waves' sums), `arrive` and `folded` its two words.
+template <int HC, bool POST, bool TAIL>
+__device__ __forceinline__ void junction_row_split(JuncLds<HC, POST>& L, uint16_t* ybuf,
+                                                   const JuncRow& r, int wlo, int whi, int parts,
+                                                   float* part, unsigned int* arrive,
+                                                   unsigned int* folded) {
+    constexpr int R = POST ? 2 * HC : HC;
+    const uint32_t t = threadIdx.x;
+    float acc[R + 1];
+    junction_pieces<HC, POST, TAIL>(L, ybuf, r, wlo, whi, acc);
+    if constexpr (TAIL) {
+        // 3. my waves' sums straight out to the launch's scratch.
+        finish_sums<HC, POST>(acc, [&](uint32_t w, int k, float v) {
+            part[(uint32_t)w * kSplitStride + (uint32_t)k] = v;
+        }, wlo, whi);
+    }
+    // My h and my waves' sums device-wide before my arrival; the row's last block takes it on (the
+    // recurrent update's paired workgroups do the same).
+    __threadfence();
+    __syncthreads();
+    __shared__ unsigned int s_last;
+    if (t == 0)
+        s_last = __hip_atomic_fetch_add(arrive, 1u, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT) + 1u ==
+                 (unsigned int)parts;
+    __syncthreads();
+    if (!s_last) return;
+    if (t == 0) {
+        __hip_atomic_store(arrive, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+        __hip_atomic_store(folded, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    }
+    __threadfence();
+    if constexpr (TAIL) {
+        if (t < (uint32_t)(kWaves * (R + 1))) {   // the row's sums into LDS, one a thread
+            const uint32_t w = t / (uint32_t)(R + 1), k = t - w * (uint32_t)(R + 1);
+            L.part[w][k] = part[w * kSplitStride + k];
         }
+        __syncthreads();
+        finish_gates<HC, POST>(L.gate, r.scale, r.base, r.post_row, (uint32_t)HC * r.n, r.ieps,
+                               r.heps, r.pmag, [&](int w, int k) { return L.part[w][k]; });
+        junction_tail<HC, POST>(L, ybuf, r);
     }
 }
 

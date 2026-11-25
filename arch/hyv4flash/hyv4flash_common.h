@@ -100,6 +100,15 @@ inline rad_op mk(RadBuilder* b, const char* name, std::initializer_list<RadParam
                                  ws.size() ? ws.begin() : nullptr, (int)ws.size());
     return rw(b, h, reads, writes);
 }
+/* mk with the params assembled at run time: an op whose optional parameters exist only on some of
+ * its instances (the latent sinks' folded rotary) cannot write them in an initializer list. */
+inline rad_op mk_list(RadBuilder* b, const char* name, const std::vector<RadParam>& ps,
+                      std::initializer_list<rad_weight> ws, std::initializer_list<rad_buf> reads,
+                      std::initializer_list<rad_buf> writes) {
+    const rad_op h = rad_decl_op(b, name, ps.data(), (int)ps.size(),
+                                 ws.size() ? ws.begin() : nullptr, (int)ws.size());
+    return rw(b, h, reads, writes);
+}
 
 /* An op that must resolve: a graph with a hole would look servable. */
 #define HY4_NEED(h, what)                                                                      \
@@ -323,16 +332,45 @@ inline bool chain_q8_on() {
     return !(e && *e && std::strcmp(e, "0") == 0);
 }
 
+/* K-19: the routed MoE gather writes the sum's rotated int8 codes and scales in the launch that sums
+ * it (moe_gather_inv_i8g), so ffn_latent_out declares no quantiser of its own -- one launch fewer a
+ * layer, the same codes. It needs the slot table, no shared arm in the gather and a rotated int8
+ * latent_out at a group the latent divides; where those do not hold the plain gather serves and the
+ * linear quantises for itself. Off: RADIANCE_HY4_FUSE_GATHER_Q8=0. */
+inline bool gather_q8_on() {
+    const char* e = std::getenv("RADIANCE_HY4_FUSE_GATHER_Q8");
+    return !(e && *e && std::strcmp(e, "0") == 0);
+}
+
 /* The G-3 launch fusions (levers-general.md L3), each behind its own switch, on by default:
  * RADIANCE_HY4_FUSE_SWIGLU (the routed arm's clamped SwiGLU with its rotated int8 quantiser),
  * RADIANCE_HY4_FUSE_EXPAND_QUANT (the expansion with the gate and the quantiser of attn_output's
  * input), RADIANCE_HY4_FUSE_JUNCTION_Q (the junction writes the codes its consumers read),
- * RADIANCE_HY4_FUSE_QPROJ (q_nope and q_rope in one launch). Off with 0; each is byte-identical to
- * the chain it replaces. */
+ * RADIANCE_HY4_FUSE_QPROJ (q_nope and q_rope in one launch: dual_fuse_on below). Off with 0; each
+ * is byte-identical to the chain it replaces. */
 inline bool fuse_on(const char* name) {
     const char* e = std::getenv(name);
     return !(e && *e && std::strcmp(e, "0") == 0);
 }
+
+/* K-02's pair launch: a layer's `q_nope` and `q_rope`, both over the one set of codes q_a's
+ * quantiser writes, in one `gemm_nt_q_dual` (Lin::declare_dual). Byte-identical to the two
+ * launches, and one launch and one ramp cheaper a layer at a decode step, where each of the two
+ * moves 0.7-1.3 MB. Off: RADIANCE_HY4_FUSE_QPROJ=0, which keeps the two launches -- P-14: this is
+ * the switch fuse_on's list names, now read here. */
+inline bool dual_fuse_on() { return fuse_on("RADIANCE_HY4_FUSE_QPROJ"); }
+
+/* K-03: q_a and the gate read one set of codes -- the attention input's, which q_a owns and the
+ * gate is fed from it -- and both are GEMVs at a decode step, while the gate's product is not read
+ * until `mla_expand_gate` (so it is off the critical path until then), which is the pair a launch
+ * wants: one `gemm_nt_q_dual` carries both where their encodings agree. Its own switch, so each
+ * pair's arm can be measured alone. Off with 0. */
+inline bool qa_gate_fuse_on() { return fuse_on("RADIANCE_HY4_FUSE_QA_GATE"); }
+
+/* The rows a pair's block covers of one part, off that part's own width: the GEMV takes four waves
+ * a tile above 4096 columns and eight below (libr4d/r4d_gemm_iqr.hip), and a block of eight waves
+ * is then two of its 16-row tiles or one. A part's N must be a whole number of them. */
+inline int64_t dual_block_rows(int64_t n) { return n >= 4096 ? 32 : 16; }
 
 /* MoeFP8's fused selection and sort (Config::router_fuse). Off: RADIANCE_HY4_ROUTER_FUSE=0. */
 inline bool router_fuse_on() {
@@ -375,6 +413,22 @@ struct Lin : LinearFP8 {
     const Lin* feed = nullptr;
     const ActFP8* fed_codes = nullptr;
     bool fed = false;   /* declared without a quantiser: its codes come from `feed` or `fed_codes` */
+    /* The pair's launch (`gemm_nt_q_dual`, K-02): `op_dual` over this Lin's weight and `w2`'s, both
+     * products written where their own launches write them -- this Lin's into its `y`, the mate's
+     * into `dual_y`. `dual_mate` is the second Lin of a pair: its own `op` is issued above the band
+     * the pair serves, and below it the first Lin's launch writes its product. */
+    rad_op op_dual = 0;
+    rad_weight w2 = 0, ws2 = 0;
+    rad_buf dual_y = 0;
+    int64_t dual_n = 0;   /* the mate's N: the pair's N2, its own row length */
+    bool dual_mate = false;
+    /* The heights a pair's launch serves: the GEMV's, one token a step. The pair is two launches'
+     * launch and ramp cost, which only the GEMV pays; a wider pass keeps both Lins' launches. */
+    static constexpr int64_t kDualMaxM = 1;
+    /* This Lin's weight encoding as LinearFP8 read it: a pair's launch reads one form's codes for
+     * both weights, so the two must be one encoding -- its planes' runs and row-blocks included,
+     * which is what rad_enc_equal sees and what the fold needs to agree on. */
+    RadEncoding wenc{};
     ActFP8 with_codes(const ActFP8& a) const {
         ActFP8 r = a;
         if (q8 && !r.q8) {
@@ -417,6 +471,7 @@ struct Lin : LinearFP8 {
                 return RAD_E_DTYPE;
             }
             form = code_form(b, wn);
+            wenc = e;
             Codes* c = codes_of(b);
             if (!c) return RAD_E_INVAL;
             if (fed_codes && fed_codes->q8 && fed_codes->s8 && fed_codes->g8 == form.g8 &&
@@ -446,9 +501,68 @@ struct Lin : LinearFP8 {
         return LinearFP8::declare(b, nm, gl, base, n_out, n_in, shard, grp, src, with_codes(a), y,
                                   max_rows, row_parts, span_lo, span_hi);
     }
+    /* One launch over this Lin's weight and `mate`'s, both over the codes this Lin's input was
+     * quantised to (`mate` reads them: Lin::feed). Declared beside both Lins' own ops, taken at the
+     * height it serves (kDualMaxM, the GEMV's); above it the two launches run. The pair must be one
+     * form -- equal code and scale views and one encoding, run and row-block included, so one decode
+     * serves both -- and one K. Its two Ns are its own: each part's blocks are the blocks its own
+     * launch gives it, which is what keeps the pair byte-identical from one launch (the row's claim
+     * and its oracle's). */
+    int declare_dual(RadBuilder* b, Lin& mate, rad_buf x, rad_buf y, rad_buf mate_y, int64_t rows) {
+        if (bf16 || mate.bf16 || !q8 || !s8) return RAD_OK;
+        if (!iqr || !mate.iqr || !form.rot) return RAD_OK;
+        if (!mate.fed || mate.q8 != q8 || mate.s8 != s8 || mate.g8 != g8) return RAD_OK;
+        if (mate.K != K || !form.same(mate.form)) return RAD_OK;
+        if (!rad_enc_equal(&wenc, &mate.wenc)) return RAD_OK;
+        if (!rad_op_declared(b, "gemm_nt_q_dual")) return RAD_OK;
+        /* Each part's blocks cover its own tiles: two 16-row tiles where its own launch takes four
+         * waves a tile (4096 columns and up), one where it takes eight. The row refuses a part whose
+         * N is not a whole number of them, so the pair is not declared here either. */
+        if (N % dual_block_rows(N) || mate.N % dual_block_rows(mate.N)) return RAD_OK;
+        const RadParam ps[] = { RAD_RANGE("M", 1, rows < kDualMaxM ? rows : kDualMaxM),
+                                RAD_INT("N", N), RAD_INT("N2", mate.N), RAD_INT("K", K),
+                                RAD_INT("group", g8), RAD_STR("dtype", "i8a8h") };
+        const rad_weight wts[] = { w, ws, mate.w, mate.ws };
+        op_dual = rw(b, rad_decl_op(b, "gemm_nt_q_dual", ps, 6, wts, 4), { x, q8, s8 },
+                     { y, mate_y });
+        if (!op_dual) return RAD_E_INVAL;
+        w2 = mate.w;
+        ws2 = mate.ws;
+        dual_y = mate_y;
+        dual_n = mate.N;
+        mate.dual_mate = true;
+        return RAD_OK;
+    }
+    /* The pair's launch: this Lin's quantiser (it owns the codes then) and one GEMM over both
+     * weights into both products. */
+    void dual_step(RadCtx* c, const ActFP8& a, rad_buf y, int64_t T, int64_t r0, int64_t rows,
+                   int64_t y0, bool codes_ready) const {
+        if (rows <= 0) rows = T - r0;
+        const int64_t yr = y0 < 0 ? r0 : y0;
+        if (op_q && !codes_ready)
+            RAD_ISSUE_N(c, op_q, rows, brow_slice(a.x, r0, rows, K), brow_slice(a.q8, r0, rows, K),
+                        brow_slice(a.s8, r0, rows, K / a.g8));
+        RAD_ISSUE_N(c, op_dual, rows, brow_slice(a.q8, r0, rows, K),
+                    brow_slice(a.s8, r0, rows, K / a.g8), RAD_W(w), RAD_W(ws),
+                    brow_slice(y, yr, rows, N), RAD_W(w2), RAD_W(ws2),
+                    brow_slice(dual_y, yr, rows, dual_n));
+    }
     void step(RadCtx* c, const ActFP8& a, rad_buf y, int64_t T, int64_t r0 = 0, int64_t rows = 0,
               int64_t y0 = -1, bool codes_ready = false) const {
-        LinearFP8::step(c, with_codes(a), y, T, r0, rows, y0, codes_ready);
+        const int64_t n = rows > 0 || !T ? rows : T - r0;
+        /* The pair's second Lin: within the band the first Lin's launch writes this product. */
+        if (dual_mate && n <= kDualMaxM) return;
+        const ActFP8 in = with_codes(a);
+        if (op_dual && n <= kDualMaxM) return dual_step(c, in, y, T, r0, rows, y0, codes_ready);
+        LinearFP8::step(c, in, y, T, r0, rows, y0, codes_ready);
+    }
+    /* The input's codes alone, for a caller whose epilogue reads them (the gated GEMM of a gated
+     * MLP): issued when this linear quantises its own input, nothing when they are fed. */
+    void quantise(RadCtx* c, const ActFP8& a, int64_t T, int64_t r0 = 0, int64_t rows = 0) const {
+        if (rows <= 0) rows = T - r0;
+        if (!i8 || !op_q || rows <= 0 || !a.q8 || !a.s8 || a.g8 <= 0) return;
+        RAD_ISSUE_N(c, op_q, rows, brow_slice(a.x, r0, rows, K), brow_slice(a.q8, r0, rows, K),
+                    brow_slice(a.s8, r0, rows, K / a.g8));
     }
 };
 
@@ -462,16 +576,28 @@ inline bool taps_on() {
     return e && *e && std::strcmp(e, "0") != 0;
 }
 
+/* RADIANCE_HY4_CVEC_TAPS=1: only the control-vector derivation tap (dbg.cvec.<l>), without the
+ * rest of the harness tap set. That set is a PERSIST buffer a feature, and at 2048 rows it costs
+ * a ~12.4 GiB activation arena -- more than the cards have left after the weights. The cvec tap
+ * is shallow (one scroll of 192 rows) and costs ~4.7 MiB a layer. */
+inline bool cvec_taps_on() {
+    const char* e = std::getenv("RADIANCE_HY4_CVEC_TAPS");
+    return e && *e && std::strcmp(e, "0") != 0;
+}
+
 struct Tap {
     rad_buf buf = 0;
     rad_op op = 0;
     int64_t width = 0;
+    int64_t rows = 0;      /* rows the buffer holds; a step may copy fewer */
     explicit operator bool() const { return op != 0; }
-    /* `src` read [rows, width]; `width` 0 takes the tap's. */
+    /* `src` read [rows, width]; `width` 0 takes the tap's. `force` declares the tap even with
+     * RADIANCE_HY4_TAPS off (the cvec tap uses RADIANCE_HY4_CVEC_TAPS instead). */
     int declare(RadBuilder* b, Names& nm, int64_t max_rows, const char* key, int layer,
-                uint32_t dt, int64_t w, rad_buf src) {
-        if (!taps_on()) return RAD_OK;
+                uint32_t dt, int64_t w, rad_buf src, bool force = false) {
+        if (!taps_on() && !force) return RAD_OK;
         width = w;
+        rows = max_rows;
         const char* name = layer < 0 ? nm.f("dbg.%s", key) : nm.f("dbg.%s.%d", key, layer);
         buf = decl_b(b, name, dt, { max_rows, w }, RAD_BUF_PERSIST);
         if (!buf) return RAD_E_INVAL;
@@ -479,8 +605,9 @@ struct Tap {
         HY4_NEED(op, "the debug taps' copy (cast)");
         return RAD_OK;
     }
-    void step(RadCtx* c, RadOperand src, int64_t rows) const {
-        if (op && rows > 0) RAD_ISSUE_N(c, op, rows, src, brows(buf, rows));
+    void step(RadCtx* c, RadOperand src, int64_t nrows) const {
+        if (op && nrows > 0) RAD_ISSUE_N(c, op, rows > 0 && nrows > rows ? rows : nrows, src,
+                                        brows(buf, rows > 0 && nrows > rows ? rows : nrows));
     }
 };
 
