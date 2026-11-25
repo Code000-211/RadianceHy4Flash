@@ -1693,6 +1693,38 @@ static const RadOperandSpec oIdxPoolGatedFp8[] = {
     { "q",     RAD_OPD_OUT,    1 },
     { "scale", RAD_OPD_OUT,    1 },
 };
+/* K-24: the indexer's key side in one op -- qsa_work's work list, idx_pool_gated's pool and the
+ * rows qsa_tail_store would store, from one scan of the step. Its operand list is qsa_work's gather
+ * and the pool's arithmetic joined at `stage`/`page`/`pos` (which it fills in LDS instead of in
+ * global), and `state` is INOUT because the tail is written here too. `work`, `ring` and `seqs` are
+ * qsa_work's and qsa_tail_store's; the rest is the pool's. */
+static const RadParamSpec pQsaWorkPoolTail[] = {
+    P_INT("M"), P_INT("n"), P_INT("ratio"), P_INT("ring"), P_INT("seqs"),
+    P_INT("rotary_dim"), P_F64("eps"), P_F64("theta"), P_STR("mode"), P_STRO("sections"),
+    P_INTO("block_size"), P_STR("dtype"),
+    /* A capacity: the launch is as wide as `page` (r4d_qsa_work_bf16.hip); past the real count an
+     * item reports page -1. */
+    { "work", RAD_P_INT, RAD_OPTIONAL, RAD_PROLE_CAPACITY },
+};
+static const RadOperandSpec oQsaWorkPoolTail[] = {
+    { "k",     RAD_OPD_IN,     0 },
+    { "pos",   RAD_OPD_IN,     0 },
+    { "cu",    RAD_OPD_IN,     0 },
+    /* INOUT: the gather reads the rows of the tokens before this chunk, the store writes the
+     * rows of the ones that close nothing. */
+    { "state", RAD_OPD_INOUT,  0 },
+    { "sidx",  RAD_OPD_IN,     0 },
+    { "bt",    RAD_OPD_IN,     0 },
+    { "wv",    RAD_OPD_WEIGHT, 0 },
+    { "wg",    RAD_OPD_WEIGHT, 0 },
+    { "ape",   RAD_OPD_WEIGHT, 0 },
+    { "gain",  RAD_OPD_WEIGHT, 0 },
+    { "rope",  RAD_OPD_IN,     1 },
+    { "page",  RAD_OPD_OUT,    0 },
+    { "bpos",  RAD_OPD_OUT,    0 },
+    { "nc",    RAD_OPD_OUT,    0 },
+    { "cache", RAD_OPD_INOUT,  1 },
+};
 static const RadParamSpec pIdxScore[] = {
     P_INT("M"), P_INT("n"), P_INT("heads"), P_INT("blocks"), P_INT("seqs"), P_STR("dtype"),
 };
@@ -4288,6 +4320,17 @@ static const RadOpSchema kSchemas[] = {
            "`rotary_dim` channels rotated as adjacent pairs at the group's first position (mode "
            "gptj, or imrope_gptj with `sections`, pos [3, W]) and rounded again. Written to "
            "cache[page[w]] and/or out[w]."),
+    SCHEMA("qsa_work_pool_tail", pQsaWorkPoolTail, oQsaWorkPoolTail,
+           "qsa_work, idx_pool_gated and qsa_tail_store over one step in one launch, for the "
+           "exact (bf16) key path: the blocks that became complete gather their `ratio` raw keys "
+           "out of THIS step's `k` and out of the `state` tail exactly as qsa_work does, the pool "
+           "reads them straight out of shared memory (the same arithmetic, r4d_idx_pool_body.h), "
+           "and the chunk's last `ring` tokens are stored into the tail on the way. `page`, "
+           "`bpos` and `nc` are qsa_work's and `cache` is the pool's, byte for byte. THE TAIL IS "
+           "STORED HERE ONLY WHILE THE CHUNK'S ROW COUNT IS <= ring - ratio + 1: a longer chunk "
+           "could write a row its own gather still has to read, so it is left to qsa_tail_store, "
+           "which the caller issues under the same bound. The fp8 and int8 indexers and a tapped "
+           "step keep the three ops, since they read qsa_work's staged keys."),
     SCHEMA("idx_pool_gated_i8", pIdxPoolGated, oIdxPoolGatedFp8,
            "idx_pool_gated_fp8's key (f32, no bf16 rounding, the 128-wide Hadamard times n^-0.5) as "
            "symmetric INT8 codes at an f32 scale max(amax, 1e-4) / 127, nearest even, clamped to "
@@ -5923,6 +5966,14 @@ static const RadConstraint cQsaSelect[] = { C_GE("blocks", 1), C_GE("topk", 1), 
 static const RadConstraint cIdxPoolGated[] = {
     C_EQ("n", 128), C_EQ("ratio", 4), C_GE("rotary_dim", 2), C_LE("rotary_dim", 128),
     C_DIV("rotary_dim", 2), C_IN("mode", "gptj imrope_gptj"), C_IN("dtype", "bf16"),
+};
+/* K-24's fused key side: cIdxPoolGated's arithmetic, qsa_work's gather and qsa_tail_store's copy,
+ * so the key width, the group size and the rotary width are the pool's and the rest is open (the
+ * real sequence count comes off cu_seqlens at issue). */
+static const RadConstraint cQsaWorkPoolTail[] = {
+    C_EQ("n", 128), C_EQ("ratio", 4), C_GE("rotary_dim", 2), C_LE("rotary_dim", 128),
+    C_DIV("rotary_dim", 2), C_IN("mode", "gptj imrope_gptj"), C_GE("ring", 4), C_GE("seqs", 1),
+    C_GE("work", 1), C_IN("dtype", "bf16"),
 };
 /* One wave scores a row against 16 keys with the 16 heads as the WMMA's rows; the grid's key axis
  * is 64 keys a workgroup and 16 bits wide. */
@@ -10190,6 +10241,26 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   ROW(cIdxPoolGated), NOTUNE,
   nullptr, nullptr, r4d_rad_idx_pool_gated, nullptr, nullptr, nullptr,
   nullptr },
+
+/* K-24: the three above joined -- qsa_work's gather, this pool and the tail's store -- so a decode
+ * step is one launch where it was three. One workgroup an item of the work list, four from 16
+ * items up. Nothing rounded differently: the same gather, the same shared arithmetic and the same
+ * row copy, hence the same bytes. It declares that chain (r4d_fuse_qsa_work_pool_tail), so a caller
+ * runs the three unfused ops beside it and memcmps the result -- over the row's own tail bound,
+ * where the kernel leaves the store to the caller, the chain declines the geometry instead. */
+{ "qsa_work_pool_tail_bf16", "qsa_work_pool_tail", "attn",
+  "the indexer's key side in one launch: gather the blocks this step completes out of `k` and the "
+  "tail state, pool each into its group key, and park the chunk's last `ring` keys in the tail",
+  "n 128, ratio 4, any even rotary_dim up to 128, mode gptj or imrope_gptj; any declared sequence "
+  "maximum (the real count comes off cu_seqlens at issue); `work` is a HOST bound and slots past "
+  "the real count report page -1; the tail is stored here only while a chunk's rows are <= "
+  "ring - ratio + 1",
+  "bf16 keys, an i32 position, cu_seqlens and a block table in; a bf16 tail in and out, an i32 "
+  "page, first-token position and count out, f32 wv/wg/ape and the pool's bf16 cache page",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cQsaWorkPoolTail), NOTUNE,
+  nullptr, nullptr, r4d_rad_qsa_work_pool_tail, nullptr, nullptr, nullptr,
+  r4d_shape_qsa_work_pool_tail, nullptr, r4d_fuse_qsa_work_pool_tail },
 
 /* The Hy4-flash indexer's score: 16 heads of relu(q . key) per group key, one wave a row against 16
  * keys on WMMA (heads as the tile's rows), summed in libref's order. */
