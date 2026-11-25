@@ -269,38 +269,55 @@ static int resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudg
 
     /* ---- the prefill staging region ----------------------------------------------------------
      *
-     * Two layers' share of the experts left off the card, for the prefill stager's ring
-     * (core/place/stager.h). It exists only for experts that do not fit, so it comes out of the
-     * expert share (or, when the cache lends, the cache's). It sits at the top of the activation
-     * arena, which steps smaller than the full plan lend back to the expert slab, so decode keeps
-     * the residency.
+     * Two of the heaviest routed layer's pooled experts, for the prefill stager's ring
+     * (core/place/stager.h): a layer staged ahead takes half of it, and a layer heavier than that
+     * half goes in two parts, the rest at its own first op (M-04). It exists only for experts that
+     * do not fit, so it comes out of the expert share (or, when the cache lends, the cache's). It
+     * sits at the top of the activation arena, which steps smaller than the full plan lend back to
+     * the expert slab, so decode keeps the residency.
      *
-     * The share is what the slab alone leaves off, the most a step can see: KV and arena loans only
-     * add residency. A layer larger than its share stages what fits and streams the rest. */
+     * A layer's pooled size is not the split's share: residency is spread over layers by heat, so a
+     * layer the run routes least is pooled whole while the average layer is not. The ring is sized
+     * for the heaviest routed layer, the most a layer can pool, and bounded, because every byte of
+     * it is a byte of expert residency a prefill step can lose (M-04). If the bound does not fit
+     * the budget, the split's average layer is tried, so a placement still stages a heavy layer in
+     * parts rather than not at all. */
     bool stage_from_experts = false;
     if (layer_max > 0 && b.expert_ceiling > b.experts && cfg.placement != "all_vram" &&
         cfg.placement != "layer_offload") {
         const double f = (double)(b.expert_ceiling - b.experts) / (double)b.expert_ceiling;
-        const int64_t one = ((int64_t)std::ceil(f * (double)layer_max) + RAD_ALIGN_UNIT - 1) /
-                            RAD_ALIGN_UNIT * RAD_ALIGN_UNIT;
-        if (b.lends) {
-            /* Expert residency above its host-pool floor pays first, so the cache keeps its
-             * configured coverage; otherwise the cache pays. Either way the region is lent to the
-             * slab in small steps. */
-            if (b.experts - 2 * one >= b.expert_floor) {
-                b.stage = 2 * one;
+        auto share = [](int64_t bytes) {
+            return (bytes + RAD_ALIGN_UNIT - 1) / RAD_ALIGN_UNIT * RAD_ALIGN_UNIT;
+        };
+        const int64_t kStageBound = kMiB * 1024;   /* the region, ~1 GiB (M-04) */
+        const int64_t bound = kStageBound / 2;
+        const int64_t want[2] = { std::min(share(layer_max), bound),
+                                  std::min(share((int64_t)std::ceil(f * (double)layer_max)),
+                                           bound) };
+        for (int64_t one : want) {
+            if (one <= 0) continue;
+            if (b.lends) {
+                /* Expert residency above its host-pool floor pays first, so the cache keeps its
+                 * configured coverage; otherwise the cache pays. Either way the region is lent to
+                 * the slab in small steps. */
+                if (b.experts - 2 * one >= b.expert_floor) {
+                    b.stage = 2 * one;
+                    b.experts -= b.stage;
+                    stage_from_experts = true;
+                    b.weights = b.statics + b.experts;
+                    break;
+                } else if (b.kv - 2 * one >= kv_one) {
+                    b.stage = 2 * one;
+                    b.kv   -= b.stage;
+                    break;
+                }
+            } else if (2 * one < b.experts) {
+                b.stage    = 2 * one;
                 b.experts -= b.stage;
                 stage_from_experts = true;
-                b.weights = b.statics + b.experts;
-            } else if (b.kv - 2 * one >= kv_one) {
-                b.stage = 2 * one;
-                b.kv   -= b.stage;
+                b.weights  = b.statics + b.experts;
+                break;
             }
-        } else if (2 * one < b.experts) {
-            b.stage    = 2 * one;
-            b.experts -= b.stage;
-            stage_from_experts = true;
-            b.weights  = b.statics + b.experts;
         }
     }
 
