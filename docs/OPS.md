@@ -3999,6 +3999,11 @@ maximum is taken (libref shifts by the maximum of the scores and the sink).
   rope-then-sink (a decode row, a verify's rows, the paged and the selected form, at a scale off 1)
   and holds the launch's stable promise folded too: a verify's rows equal their single-row decode,
   and the forms agree byte for byte.
+- **`kb`** (both ops, a launch axis, 1 or 2, default 2) is the count of LDS key buffers: 2
+  double-buffers the next 16-token chunk, which is already in registers while the current one is
+  multiplied, so its store waits for no barrier; 1 stores the chunk in place, which costs a third
+  barrier a chunk and halves the LDS (a workgroup more a WGP). The bytes are the same under both;
+  `rad-tune` picks it per geometry.
 - **`attn_kv_sink`** is dense attention over separate keys and values (the non-absorbed prefill).
   `cu_q`, `cu_k` hold absolute offsets into `q` and into `k` / `v`; sequence `s` has `m_s` query
   rows and `n_s >= m_s` key rows (otherwise `RAD_E_SHAPE`), query `i` sits at key index

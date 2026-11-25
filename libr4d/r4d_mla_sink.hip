@@ -16,7 +16,8 @@
  * [128 quarter, 128 quarter + 128) and rotary columns [16 quarter, 16 quarter + 16); the four
  * partial dots meet in LDS and every wave adds them in the order 0, 1, 2, 3, so all four hold the
  * same scores. P goes to the value product as bf16 high part plus bf16 remainder. The next chunk's
- * keys are fetched into registers while the current one is multiplied; two barriers a chunk.
+ * keys are fetched into registers while the current one is multiplied; two barriers a chunk, or
+ * three with one key buffer (`kb` 1, K-41: half the LDS for a second workgroup a WGP).
  *
  * The stable law (WP16 perf.md 3.4.1, anchored at the row's first visible key): a row's range
  * [lo, hi) is cut into slots of 64 tokens with a window and of 128 at window 0 and in the selection
@@ -160,14 +161,20 @@ __device__ __forceinline__ float sink_inv(float m, float d, float sink) {
 }
 
 /* FUSED: the fused form (m.fused), its own instance so its accumulator's registers do not touch
- * the other forms' schedule. */
-template <int HG, bool WIDE, bool SEL, bool FUSED>
+ * the other forms' schedule. KB: key buffers in LDS (K-41's `kb` axis). 2 double-buffers the
+ * fetched chunk so its store never waits for the chunk being read; 1 stores in place and costs a
+ * third barrier a chunk, for half the LDS (a second workgroup a WGP). */
+template <int HG, bool WIDE, bool SEL, bool FUSED, int KB = 2>
 __device__ __forceinline__ void mla_sink_rows_body(
     const uint16_t* q, const uint16_t* qrot, const uint16_t* kv, const int* bt, const int* used,
     const int* cu, const int* len, const float* sinks, uint16_t* out, float* scratch, SinkMeta m) {
     constexpr int NT = HG * 128, LOADS = (kPieces + NT - 1) / NT;
     static_assert(LOADS <= 32, "staged mask bits");
-    __shared__ __align__(16) uint16_t keys[2][16 * kPitch];
+    static_assert(KB == 1 || KB == 2, "one key buffer or two");
+    /* The buffer a chunk reads and the one its successor is stored into: the same buffer when
+     * there is only one, hence the mask on the chunk's slot index. */
+    constexpr int KMASK = KB - 1;
+    __shared__ __align__(16) uint16_t keys[KB][16 * kPitch];
     __shared__ __align__(32) float partial[HG * 4][32 * 8];
     __shared__ int visible[2][16];
     __shared__ long rows_at[2][16];
@@ -293,13 +300,16 @@ __device__ __forceinline__ void mla_sink_rows_body(
             staged_ok = ok ? staged_ok | 1u << j : staged_ok & ~(1u << j);
         }
     };
+    /* `b` is the chunk's slot (the one the next chunk reads): the keys go to the buffer slot `b`
+     * maps to, the visibility mask always to slot `b`. */
     auto stash = [&](int b) {
+        const int slot = b & KMASK;
 #pragma unroll
         for (int j = 0; j < LOADS; ++j) {
             const int flat = tid + j * NT;
             if (LOADS * NT > kPieces && flat >= kPieces) continue;
             const int token = flat / (W / 8), piece = flat % (W / 8);
-            *(uint4*)(keys[b] + token * kPitch + piece * 8) = staged[j];
+            *(uint4*)(keys[slot] + token * kPitch + piece * 8) = staged[j];
             if (!piece) visible[b][token] = (int)(staged_ok >> j & 1u);
         }
     };
@@ -377,7 +387,7 @@ __device__ __forceinline__ void mla_sink_rows_body(
         if (more) fetch(buf ^ 1);
         long ahead = -1;
         if (tid < 16 && start + 32 < end) ahead = token_at(start + 32 + tid);
-        const uint16_t* tile = keys[buf];
+        const uint16_t* tile = keys[buf & KMASK];
         v8f dot = { 0 };
 #pragma unroll
         for (int s = 0; s < 8; ++s)
@@ -441,7 +451,11 @@ __device__ __forceinline__ void mla_sink_rows_body(
             value[mt] = mma(v, ph.f, value[mt]);
             value[mt] = mma(v, pl.f, value[mt]);
         }
-        if (more) stash(buf ^ 1);
+        if (more) {
+            /* One buffer: every wave's reads of the chunk are done before it is overwritten. */
+            if constexpr (KB == 1) __syncthreads();
+            stash(buf ^ 1);
+        }
         if (tid < 16) rows_at[buf][tid] = ahead;
         __syncthreads();
         buf ^= 1;
@@ -531,12 +545,13 @@ __device__ __forceinline__ void merge_sink_body(const float* scratch, const floa
 /* CH `r4dchain`: the chained forms (r4d_chain.h) of both kernels of the launch. The bodies keep
  * their early returns (!mine lanes, empty slots); the wrappers bracket them so every block counts
  * once. The sinks, block table and cu_seqlens are scalar loads, which the wait's acquire covers. */
-template <int HG, bool WIDE, bool SEL, bool FUSED, class CH>
+template <int HG, bool WIDE, bool SEL, bool FUSED, class CH, int KB = 2>
 __global__ __launch_bounds__(HG * 128) void mla_sink_rows(
     const uint16_t* q, const uint16_t* qrot, const uint16_t* kv, const int* bt, const int* used,
     const int* cu, const int* len, const float* sinks, uint16_t* out, float* scratch, SinkMeta m) {
     if (CH::on) r4d_chain_wait();
-    mla_sink_rows_body<HG, WIDE, SEL, FUSED>(q, qrot, kv, bt, used, cu, len, sinks, out, scratch, m);
+    mla_sink_rows_body<HG, WIDE, SEL, FUSED, KB>(q, qrot, kv, bt, used, cu, len, sinks, out,
+                                                scratch, m);
     if (CH::on) r4d_chain_done();
 }
 
@@ -602,7 +617,7 @@ int sink_body(const RadArgs* a, RadStream stream) {
     const long heads = r4d_geti_or(a, "heads", 0), bs = r4d_geti_or(a, "block_size", 0),
                window = SEL ? 0 : r4d_geti_or(a, "window", 0);
     const float scale = (float)r4d_getf(a, "scale", 0);
-    const long stable = r4d_geti_or(a, "stable", 0);
+    const long stable = r4d_geti_or(a, "stable", 0), kb = r4d_geti_or(a, "kb", 2);
     heads_view(q, heads, D);
     heads_view(qr, heads, RD);
     heads_view(o, heads, D);
@@ -613,7 +628,7 @@ int sink_body(const RadArgs* a, RadStream stream) {
         return RAD_E_DTYPE;
     const long rows = q.shape[0];
     if (r4d_geti_or(a, "latent_dim", 0) != D || r4d_geti_or(a, "rope_dim", 0) != RD ||
-        stable < 0 || stable > 1 || heads < 8 || heads > 64 || heads % 8 || bs < 1 || bs > 256 || (bs & (bs - 1)) || window < 0 ||
+        stable < 0 || stable > 1 || (kb != 1 && kb != 2) || heads < 8 || heads > 64 || heads % 8 || bs < 1 || bs > 256 || (bs & (bs - 1)) || window < 0 ||
         window > INT_MAX || !std::isfinite(scale) || scale <= 0 || q.rank != 3 || rows < 1 ||
         rows > 65535 || !row_tensor_ok(q, rows, heads, D) || !row_tensor_ok(qr, rows, heads, RD) ||
         !row_tensor_ok(o, rows, heads, D) || kv.rank != 4 || kv.shape[0] < 1 ||
@@ -760,13 +775,15 @@ int sink_body(const RadArgs* a, RadStream stream) {
     auto* op = (uint16_t*)o.data;
     auto* scr = (float*)a->scratch;
     const bool chain = r4d_geti_or(a, "chain", 0) != 0 && rows <= 64;   /* decode heights */
-#define SINK_EMIT3(HG, WD, FU, CH)                                                                 \
-    R4D_EMIT(stream, (mla_sink_rows<HG, WD, SEL, FU, CH>),                                         \
+#define SINK_EMIT4(HG, WD, FU, CH, KB)                                                             \
+    R4D_EMIT(stream, (mla_sink_rows<HG, WD, SEL, FU, CH, KB>),                                     \
              dim3((unsigned)rows, (unsigned)((heads + 16 * HG - 1) / (16 * HG)), (unsigned)splits), \
              dim3(HG * 128), 0, qp, rp, kp, bp, up, cp, lp, sp, op, scr, m)
-#define SINK_EMIT2(HG, WD, FU)                                                                     \
-    (chain ? SINK_EMIT3(HG, WD, FU, r4dchain) : SINK_EMIT3(HG, WD, FU, R4dUnchained))
-#define SINK_EMIT(HG, WD) (fused ? SINK_EMIT2(HG, WD, true) : SINK_EMIT2(HG, WD, false))
+#define SINK_EMIT3(HG, WD, FU, KB)                                                                 \
+    (chain ? SINK_EMIT4(HG, WD, FU, r4dchain, KB) : SINK_EMIT4(HG, WD, FU, R4dUnchained, KB))
+#define SINK_EMIT2(HG, WD, KB) (fused ? SINK_EMIT3(HG, WD, true, KB) : SINK_EMIT3(HG, WD, false, KB))
+/* `kb`: one key buffer (a second workgroup a WGP) or two (a barrier a chunk fewer). */
+#define SINK_EMIT(HG, WD) (kb == 1 ? SINK_EMIT2(HG, WD, 1) : SINK_EMIT2(HG, WD, 2))
     int rc;
     if (hg == 4)
         rc = wide ? SINK_EMIT(4, true) : SINK_EMIT(4, false);
@@ -777,6 +794,7 @@ int sink_body(const RadArgs* a, RadStream stream) {
 #undef SINK_EMIT
 #undef SINK_EMIT2
 #undef SINK_EMIT3
+#undef SINK_EMIT4
     if (rc == RAD_OK && splits > 1)
         rc = chain ? R4D_EMIT(stream, (merge_sink<r4dchain>), dim3((unsigned)rows, (unsigned)heads),
                               dim3(128), 0, (const float*)scr, sp, op, m)

@@ -6413,6 +6413,15 @@ static const RadTunable tAttnSplit[] = {
   { "splits", kSplits, NELEM(kSplits), 0, "split-KV segments per sequence. 0 = libr4d's split law" },
 };
 
+/* mla_attn_paged_sink / mla_attn_sel_sink (r4d_mla_sink.hip): key buffers in LDS. One halves the
+ * LDS (a second workgroup a WGP) and pays a third barrier a chunk; every wave has done with the
+ * chunk before it is overwritten, so the bytes are the two buffers' (tests/r4d_emu/test_mla_sink.cpp
+ * and r4d_selftest walk both). */
+static const int64_t kMlaSinkKb[] = { 2, 1 };
+static const RadTunable tMlaSink[] = {
+  { "kb", kMlaSinkKb, NELEM(kMlaSinkKb), 2, "key buffers in LDS: 2 double-buffers the fetched chunk, 1 stores it in place for 18.7 KiB less" },
+};
+
 /* ------------------------------------------------------------------- all-reduce launch geometry
  *
  * Four independent axes of the handshake: nblocks, nthreads, drain and acq. (`pub` is 1 in every
@@ -7441,7 +7450,7 @@ static const RadKernelInfo kKernels[] = {
   "latent_dim=512, rope_dim=64, heads 8..64 a multiple of 8, block_size a power of two <=256; one page table a "
   "sequence; stable 1 splits at every M (scratch for every row), stable 0 at M<=16 (window) / 32",
   "bf16 Q/rotary/cache/output, f32 sinks, softmax and partials; P as bf16 high plus low part",
-  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cMlaAttnPagedSink), NOTUNE,
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cMlaAttnPagedSink), tMlaSink, NELEM(tMlaSink), nullptr,
   nullptr, nullptr, r4d_rad_mla_attn_paged_sink, r4d_rad_mla_attn_paged_sink_scratch, nullptr,
   nullptr, r4d_shape_mla_attn_paged_sink },
 { "mla_attn_sel_sink_bf16", "mla_attn_sel_sink", "attn",
@@ -7450,7 +7459,7 @@ static const RadKernelInfo kKernels[] = {
   "latent_dim=512, rope_dim=64, heads 8..64 a multiple of 8, block_size a power of two <=256; stable 1 "
   "splits at every M, stable 0 at M<=32",
   "bf16 Q/rotary/cache/output, f32 sinks, softmax and partials; P as bf16 high plus low part",
-  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cMlaAttnSelSink), NOTUNE,
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cMlaAttnSelSink), tMlaSink, NELEM(tMlaSink), nullptr,
   nullptr, nullptr, r4d_rad_mla_attn_sel_sink, r4d_rad_mla_attn_sel_sink_scratch, nullptr,
   nullptr, r4d_shape_mla_attn_sel_sink },
 { "mla_project_bf16", "mla_project", "attn", "per-head absorbed MLA projections",

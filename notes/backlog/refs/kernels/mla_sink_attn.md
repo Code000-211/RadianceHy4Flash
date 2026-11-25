@@ -50,15 +50,17 @@ No gate operand: Hy4's gate acts after the expansion (`gate_mul`).
   … P_lo …` for the wave's 8 column tiles of 16 (latent only, never the rope columns). P as bf16
   high part plus bf16 of the remainder, as `attend_rows` does.
 - Key staging: 16 tokens x 576 bf16 = 1152 pieces of 16 bytes a chunk. `HG 1`: 9 loads a thread
-  (exact). `HG 2`: 5 loads a thread with a guard `flat < 1152`. Double buffer: the next chunk is
-  fetched into registers while the current one is multiplied, stored after the value product, two
-  barriers a chunk.
+  (exact). `HG 2`: 5 loads a thread with a guard `flat < 1152`. The next chunk is fetched into
+  registers while the current one is multiplied and stored after the value product: two barriers a
+  chunk with two key buffers, three with one (the store waits for the chunk's readers, K-41's `kb`
+  axis, default 2).
 - Row pitch in LDS: 584 bf16 (576 + 8 so consecutive rows do not share an LDS bank pattern; any
   multiple of 8 ≥ 576 works).
 
 LDS budget: `keys[2][16*584]` bf16 = 37 376 B; `partial` = 4096 B a group; `visible[2][16]` = 128 B.
 Total 41.6 KiB (`HG 1`), 45.7 KiB (`HG 2`). Under 64 KiB. `HG 4` (53.9 KiB) is possible but needs
-2.25 loads a thread; not planned.
+2.25 loads a thread; not planned. `kb 1` is one `keys[16*584]` buffer, 18 688 B: 22.9 KiB (`HG 1`),
+27.0 KiB (`HG 2`), which is a workgroup more a WGP (128 KiB of LDS); its third barrier is the price.
 
 VGPR estimate a lane: `value` 8 x 8 = 64, query fragments 9 x 4 = 36, staged loads 9 x 4 = 36,
 scores and p 16 to 24, temporaries about 10: about 150 to 170 of 256. If the build spills, fetch
