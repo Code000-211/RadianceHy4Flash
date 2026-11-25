@@ -280,6 +280,54 @@ TEST(a_slot_wait_ends_when_the_hosts_read_of_the_chain_counter_lags_for_good) {
     rad_dev_chain_infer(0);
 }
 
+/* A chained kernel that ran without counting leaves its queue's completion counter short for good,
+ * and the next wait behind it never ends: the queues stand idle and nothing in a stall report said
+ * why (issue #251). The report now carries each queue's chain accounting (aql.cpp, chain_line),
+ * and this is that accounting over a ring lap and a half of chained launches, with the packets
+ * unacquired and acquired: every launch's block is issued once, the counter never runs ahead of
+ * what was issued, the launches all ran (each stored where its own slot said, laps included), and
+ * the line says so. With chaining off a launch is issued no blocks at all. */
+TEST(the_stall_report_gives_a_queues_chain_accounting) {
+    if (std::strcmp(rad::device_backend_name(), "aql") != 0) SKIP("launches chain on the AQL backend only");
+    const unsigned n = 4096 + 2048 + 517;
+    Stream st;
+    DevBuf<unsigned> seen((int64_t)n * sizeof(unsigned), RAD_MEM_DEVICE);
+    REQUIRE(!!seen);
+    std::vector<unsigned> got(n);
+    for (int fenced = 0; fenced < 2; ++fenced) {
+        rad_dev_chain_infer(fenced ? 1 : 2);
+        CHECK_OK(rad_memset_async(seen, 0, (int64_t)n * sizeof(unsigned), st.s));
+        CHECK_OK(rad_stream_sync(st.s));
+        uint64_t i0 = 0, c0 = 0, i1 = 0, c1 = 0;
+        std::string line;
+        REQUIRE_EQ(rad::aql::chain_state(st.s, &i0, &c0, nullptr), RAD_OK);
+        CHECK(c0 <= i0);
+        CHECK_OK(rad::aql::chain_marks(st.s, seen, n));
+        CHECK_OK(rad_stream_sync(st.s));
+        REQUIRE_EQ(rad::aql::chain_state(st.s, &i1, &c1, &line), RAD_OK);
+        CHECK_EQ(i1 - i0, (uint64_t)n);   /* one block a launch */
+        CHECK(c1 <= i1);                  /* the host's read may lag the card, never lead it */
+        CHECK(line.find("chain: issued " + std::to_string(i1) + ", counter reads " + std::to_string(c1)) == 0);
+        CHECK(line.find("last packet") != std::string::npos);
+        CHECK_OK(rad_memcpy_async(got.data(), seen, (int64_t)n * sizeof(unsigned), st.s));
+        CHECK_OK(rad_stream_sync(st.s));
+        unsigned wrong = 0;
+        for (unsigned i = 0; i < n; ++i) wrong += got[i] != i + 1u;
+        CHECK_EQ(wrong, 0u);
+    }
+    /* Chaining off: the same launches run plain and the accounting does not move. */
+    rad_dev_chain_infer(0);
+    uint64_t i0 = 0, c0 = 0, i1 = 0, c1 = 0;
+    CHECK_OK(rad_stream_sync(st.s));
+    REQUIRE_EQ(rad::aql::chain_state(st.s, &i0, &c0, nullptr), RAD_OK);
+    CHECK_OK(rad::aql::chain_marks(st.s, seen, 64));
+    CHECK_OK(rad_stream_sync(st.s));
+    REQUIRE_EQ(rad::aql::chain_state(st.s, &i1, &c1, nullptr), RAD_OK);
+    CHECK_EQ(i1, i0);
+    CHECK_EQ(rad::aql::chain_state(nullptr, &i1, &c1, nullptr), RAD_E_INVAL);
+    CHECK_EQ(rad::aql::chain_state(st.s, nullptr, &c1, nullptr), RAD_E_INVAL);
+}
+
 /* The host writes a launch's arguments and chain record into VRAM through the BAR, and the card's
  * host data path keeps such a write until it is flushed (aql.cpp, host_writes_out). A launch the
  * card starts within a microsecond or two of its doorbell otherwise reads the slot as it was. What
