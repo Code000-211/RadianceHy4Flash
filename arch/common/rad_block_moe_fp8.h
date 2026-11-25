@@ -1343,13 +1343,18 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
      * stages, and the GEMM can write its codes itself (moe_gemm_q_gated): then the [rows * top_k,
      * 2F] plane is written and read by nobody, and the quantiser's launch is the GEMM's own. A
      * block of that row owns one 128-column group of both parts after the rotation, so the parts
-     * are two of a width a block group divides, and its grid is the run map's (its `split`, which
-     * only cuts the pair's runs, has no place there). */
+     * are two of a width a block group divides, and it reads the map its pair does (the run map
+     * at a few rows, the packed one above them, a step's `split` included). */
     bool gu_q = gu == 2 && c.n_ff_exp > 0;
     for (int q = 0; q < ncls && gu_q; ++q) gu_q = wq[q] % 128 == 0 && wq[q] == wq[0];
     gu_q = gu_q && clamped_i8_fused_ok(b, g, down_eff, gq_exp.fuse_clamped_i8, down_rot,
                                        c.swiglu_step != 0) &&
            rad_op_declared(b, ncls == 4 ? "moe_gemm_q_gated_mod4" : "moe_gemm_q_gated");
+    /* The fused row's epilogue costs a block a barrier and its group's staging, which a pass
+     * inside the decode band (r4d_moe_decode_band, r4d_moe.hip: 2T <= 3 n_expert) is too small
+     * to pay back, and there the pair's own tuned decode grid is the faster form. So the fused
+     * row is declared above that band alone, T at the top of the block's range. */
+    gu_q = gu_q && 2 * c.rows * c.top_k > 3 * n_reg;
     gu_q8 = gu_q;
     /* The gate_up output is two parts (gate, up) of the widest class's width. A narrower class
      * fills each part's leading columns and zeros the rest, so the gated quantiser reads one layout
@@ -2039,11 +2044,11 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
             RAD_WTAB(w_gu[2], n4[2]), RAD_WTAB(w_gus[2], n4[2]),
             RAD_WTAB(w_gu[3], n4[3]), RAD_WTAB(w_gus[3], n4[3]),
             gu_q8 ? brows(gq_exp.a.cq(), rows * k) : brows(w.egu, rows * k),
-            gu_q8 ? brows(gq_exp.a.cs(), rows * k) : RAD_NONE,
+            gu_q8 ? brows(gq_exp.a.cs(), rows * k) : sp,
             sp };
-        /* The pair's plane sits where the fused form's `s` would, and `split` after both. */
-        rad_issue(c_, op_gu, o_,
-                  (int)(sizeof o_ / sizeof *o_) - (gu_q8 ? 0 : 1) - (split_on ? 0 : 1), rows);
+        /* The fused form's `s` and the pair's plane share index 8; `split` is then index 9 for
+         * the pair and 10 for the fused form, which is cut off when the step has none. */
+        rad_issue(c_, op_gu, o_, 9 + (gu_q8 ? 1 : 0) + (split_on ? 1 : 0), rows);
     } else {
         /* `split` only where set, so every other step's operand list carries none. */
         const RadOperand o_[] = {
@@ -2053,11 +2058,11 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
             brows(w.sorted, rows * k), brows(w.eoff, n_reg + 1),
             RAD_WTAB(w_gu[1], n_reg / 2), RAD_WTAB(w_gus[1], n_reg / 2),
             gu_q8 ? brows(gq_exp.a.cq(), rows * k) : brows(w.egu, rows * k),
-            gu_q8 ? brows(gq_exp.a.cs(), rows * k) : RAD_NONE,
+            gu_q8 ? brows(gq_exp.a.cs(), rows * k) : sp,
             sp };
-        /* The pair's plane sits where the fused form's `s` would, and `split` after both. */
-        rad_issue(c_, op_gu, o_,
-                  (int)(sizeof o_ / sizeof *o_) - (gu_q8 ? 0 : 1) - (split_on ? 0 : 1), rows);
+        /* As at four classes: index 8 is the pair's plane, `split` 9 for the pair and 10 for the
+         * fused form. */
+        rad_issue(c_, op_gu, o_, 9 + (gu_q8 ? 1 : 0) + (split_on ? 1 : 0), rows);
     }
     if (shared && !sh_first)
         shared_up(c_, T, r0, rows,
