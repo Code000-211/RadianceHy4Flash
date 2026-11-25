@@ -721,8 +721,9 @@ void r4d_moe_gemm_pin_fk(int pin);
 // the launch is not the aligned form). Bit-identical.
 void r4d_moe_gemm_pin_down_tile(int pin);
 // Test hook: pins the gather's form. 0 is the launcher's rule, 1 a column a thread
-// (gather_kernel), 2 a wave a token and sixteen bytes a lane (gather_wide_kernel), refused on a
-// shape it cannot take. Bit-identical.
+// (gather_kernel), 2 a wave a token and sixteen bytes a lane (gather_wide_kernel), 3 sixteen slots
+// with eight columns a lane (gather_kernel16, top_k = 16), each refused on a shape it cannot take.
+// Bit-identical.
 void r4d_moe_gather_pin_form(int form);
 // Test hook: pins the sorted operand's decode kernel. 0 is the launcher's rule
 // (moe_down_dec_kernel on the sorted operand, one part, at most 512 experts, column tiles set by
@@ -897,7 +898,7 @@ int  r4d_ar_rmsnorm_had_quant_i8g(long peer_scratch, long my_scratch, long peer_
 /* ar_rmsnorm_ihc_junction's launches (r4d_ar_ihc_junction.hip): `j` points at the checked operands
  * (r4d_ihc.h's R4dIhcJunction, from r4d_ihc_junction_args). 0 or a negative code. */
 int  r4d_ar_ihc_junction_2rank(long peer_scratch, long my_scratch, long peer_flags, long my_flags,
-                               long seq_ctrs, long slot_stride16, const void* j, long stream,
+                               long seq_ctrs, long slot_stride16, long jparts, const void* j, long stream,
                                int nblocks, int drain, int acq, long stage, int chain, int coded);
 int  r4d_ar_ihc_junction_4rank(long peer_scratch0, long peer_scratch1, long peer_scratch2,
                                long peer_flags0, long peer_flags1, long peer_flags2,

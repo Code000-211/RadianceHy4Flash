@@ -1102,6 +1102,9 @@ int ref_mla_attn_paged_sink_shape(const RadParam* p, int n_p, int operand, RadOp
     o.t_idx({ 2 }, M, -1, (uint32_t)RAD_OPD_F_IDX_CU);
     o.t((uint32_t)RAD_F32, { H });                    /* sinks */
     o.t(dtype, { M, H, L });
+    /* The folded rotary's positions (optional): this description is the geometry without them, so
+     * q_rope arrives rotated. */
+    o.skip();
     return o.finish("mla_attn_paged_sink", operand, out);
 }
 
@@ -1120,6 +1123,7 @@ int ref_mla_attn_sel_sink_shape(const RadParam* p, int n_p, int operand, RadOpdD
     o.t_idx({ M }, 0, B * bs, 0);
     o.t((uint32_t)RAD_F32, { H });
     o.t(dtype, { M, H, L });
+    o.skip();                                         /* the folded rotary's positions */
     return o.finish("mla_attn_sel_sink", operand, out);
 }
 
@@ -1733,7 +1737,7 @@ int ref_gemm_nt_f32_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* o
     if (M < 1 || N < 1 || K < 1) return RAD_E_UNSUPPORTED;
     Opd o;
     o.t(RAD_BF16, { M, K });
-    o.t(RAD_F32, { N, K });
+    o.t(gi(p, n_p, "weight_bf16", 0) ? RAD_BF16 : RAD_F32, { N, K });
     o.t(RAD_F32, { M, N });
     return o.finish("gemm_nt_f32", operand, out);
 }

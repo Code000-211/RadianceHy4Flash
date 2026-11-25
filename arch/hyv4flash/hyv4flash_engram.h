@@ -22,10 +22,18 @@
 
 namespace hyv4flash {
 
-/* RADIANCE_HY4_ENGRAM_AHEAD=0: no read-ahead (an A/B switch for the first prefill pass). */
+/* RADIANCE_HY4_ENGRAM_AHEAD: the read-ahead switch for the first prefill pass. 0 hashes no
+ * ahead ids; any other value hashes them at every placement (the pre-read-ahead-gating A/B
+ * arm); unset hashes them only where a gather reads them (Engram::step). */
 inline bool no_ahead() {
     const char* e = std::getenv("RADIANCE_HY4_ENGRAM_AHEAD");
     return e && *e && std::strcmp(e, "0") == 0;
+}
+
+/* Nonzero for any value but 0: hash the ahead ids even where no gather reads them. */
+inline bool ahead_forced() {
+    const char* e = std::getenv("RADIANCE_HY4_ENGRAM_AHEAD");
+    return e && *e && std::strcmp(e, "0") != 0;
 }
 
 inline double engram_eps() {
@@ -52,7 +60,9 @@ inline double engram_eps() {
  * engram_ids also hashes up to kAheadChunks steps of the prompt that follows it into `ahead`, and
  * the gather hands those ids to libavx's reader thread, which fills its row cache while the chunk
  * runs. With the table on a drive a fresh prompt's chunks otherwise wait on their row reads. No
- * output depends on them; a device gather ignores them. */
+ * output depends on them; a device gather ignores them, so step() hashes them only when the
+ * gather dispatches to the host domain (rad_op_domain) -- disk placement, or a locked RAM copy
+ * a card cannot read zero-copy. */
 struct EngramWire {
     /* The ahead queue's depth in steps: core/sched/batch.cpp's k_ahead_chunks (as kAheadChunks in
      * rad_block_ple.h); a larger offer is clamped to the buffer. */
@@ -355,10 +365,15 @@ struct Engram {
                         brows(w.ids, T), brows(w.mask, T));
         }
         /* The prompt after the last prefill chunk (RadBatch::n_ahead, stored in token_ids past the
-         * step's), hashed by the same launch as a continuation of that sequence. */
-        const int64_t A = P > 0 && !no_ahead() ? std::min<int64_t>(batch->n_ahead,
-                                                                    EngramWire::kAheadChunks * g.max_tok)
-                                               : 0;
+         * step's), hashed by the same launch as a continuation of that sequence. Only the host
+         * gather's reader thread reads those ids, so the hashing runs only when the gather goes to
+         * the host domain (the table on disk, or a RAM copy the card cannot read zero-copy); a
+         * device gather ignores them. ahead_forced() hashes them anyway (the A/B arm). */
+        const int64_t A =
+            P > 0 && !no_ahead() &&
+                    (ahead_forced() || rad_op_domain(c, op_gather) == RAD_DOMAIN_HOST)
+                ? std::min<int64_t>(batch->n_ahead, EngramWire::kAheadChunks * g.max_tok)
+                : 0;
         if (P > 0) {
             RadOperand sp = praw2(sidx + D * pitch, RAD_I32, P, pitch);
             sp.cols = 1;

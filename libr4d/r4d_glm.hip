@@ -14,15 +14,18 @@ namespace {
 // k before their FMAs: at a decode pass's few rows a wave streams its weight row with no other
 // work to hide the load behind, and one step in flight left the router at 150 GB/s. Tail rows and
 // columns read a clamped valid address and are never stored.
-template <int R, int C, int U>
+__device__ __forceinline__ float weight_f32(float v) { return v; }
+__device__ __forceinline__ float weight_f32(uint16_t v) { return bf16_to_f32(v); }
+
+template <int R, int C, int U, class W>
 __device__ __forceinline__ void
-    gemm_nt_f32_tile_body(const uint16_t* x, const float* w, float* y, long xp, long wp, long yp,
+    gemm_nt_f32_tile_body(const uint16_t* x, const W* w, float* y, long xp, long wp, long yp,
                           int m, int n, int k) {
     const int lane = threadIdx.x & 31, c0 = (blockIdx.x * 4 + (threadIdx.x >> 5)) * C,
               r0 = blockIdx.y * R;
     if (c0 >= n) return;
     const uint16_t* xr[R];
-    const float* wc[C];
+    const W* wc[C];
 #pragma unroll
     for (int q = 0; q < R; ++q) xr[q] = x + (long)(r0 + q < m ? r0 + q : m - 1) * xp;
 #pragma unroll
@@ -39,7 +42,7 @@ __device__ __forceinline__ void
 #pragma unroll
         for (int u = 0; u < U; ++u)
 #pragma unroll
-            for (int c = 0; c < C; ++c) weight[u][c] = wc[c][j + 32 * u];
+            for (int c = 0; c < C; ++c) weight[u][c] = weight_f32(wc[c][j + 32 * u]);
 #pragma unroll
         for (int u = 0; u < U; ++u)
 #pragma unroll
@@ -58,7 +61,7 @@ __device__ __forceinline__ void
         for (int q = 0; q < R; ++q) {
             const float v = bf16_to_f32(xr[q][j]);
 #pragma unroll
-            for (int c = 0; c < C; ++c) sum[q][c] = fmaf(v, wc[c][j], sum[q][c]);
+            for (int c = 0; c < C; ++c) sum[q][c] = fmaf(v, weight_f32(wc[c][j]), sum[q][c]);
         }
     }
 #pragma unroll
@@ -79,9 +82,9 @@ __device__ __forceinline__ void
 
 /* CH `r4dchain`: the chained forms of this file's kernels (r4d_chain.h). Each body keeps its early
  * returns; the wrapper brackets it so every block counts once. */
-template <int R, int C, int U, class CH>
+template <int R, int C, int U, class CH, class W>
 __global__ void __launch_bounds__(128)
-    gemm_nt_f32_tile_kernel(const uint16_t* x, const float* w, float* y, long xp, long wp, long yp,
+    gemm_nt_f32_tile_kernel(const uint16_t* x, const W* w, float* y, long xp, long wp, long yp,
                             int m, int n, int k) {
     if (CH::on) r4d_chain_wait();
     gemm_nt_f32_tile_body<R, C, U>(x, w, y, xp, wp, yp, m, n, k);
@@ -91,19 +94,20 @@ template <int R, int C, int U = 1>
 int gemm_f32_tile(RadStream stream, const RadTensor& x, const RadTensor& w, const RadTensor& y,
                   long n, long k, bool chain) {
     const long m = x.shape[0];
-#define R4D_GF32(CH_)                                                                              \
-    R4D_EMIT(stream, (gemm_nt_f32_tile_kernel<R, C, U, CH_>),                                      \
+#define R4D_GF32(CH_, W_)                                                                              \
+    R4D_EMIT(stream, (gemm_nt_f32_tile_kernel<R, C, U, CH_, W_>),                                      \
              dim3((unsigned)((n + 4 * C - 1) / (4 * C)), (unsigned)((m + R - 1) / R)), dim3(128),  \
-             0, (const uint16_t*)x.data, (const float*)w.data, (float*)y.data, x.stride[0],        \
+             0, (const uint16_t*)x.data, (const W_*)w.data, (float*)y.data, x.stride[0],        \
              w.stride[0], y.stride[0], (int)m, (int)n, (int)k)
-    return chain ? R4D_GF32(r4dchain) : R4D_GF32(R4dUnchained);
+    if (w.dtype == RAD_BF16) return chain ? R4D_GF32(r4dchain, uint16_t) : R4D_GF32(R4dUnchained, uint16_t);
+    return chain ? R4D_GF32(r4dchain, float) : R4D_GF32(R4dUnchained, float);
 #undef R4D_GF32
 }
 int gemm_f32_body(const RadArgs* a, RadStream stream) {
     if (!a || a->n_t < 3) return RAD_E_INVAL;
     const auto &x = a->t[0], &w = a->t[1], &y = a->t[2];
     const long n = r4d_geti_or(a, "N", 0), k = r4d_geti_or(a, "K", 0);
-    if (x.dtype != RAD_BF16 || w.dtype != RAD_F32 || y.dtype != RAD_F32) return RAD_E_DTYPE;
+    if (x.dtype != RAD_BF16 || (w.dtype != RAD_F32 && w.dtype != RAD_BF16) || y.dtype != RAD_F32) return RAD_E_DTYPE;
     if (!x.data || !w.data || !y.data) return RAD_E_INVAL;
     if (n < 1 || n > 512 || k < 1 || k > 16384 || x.rank != 2 || w.rank != 2 || y.rank != 2 ||
         x.shape[0] < 1 || x.shape[0] > 65535 || x.shape[1] != k || w.shape[0] != n ||
