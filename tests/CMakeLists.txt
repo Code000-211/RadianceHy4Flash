@@ -761,6 +761,9 @@ if(R4D_EMU_BUILT)
   # r4d_emu_topk: row_topk's one- and two-launch forms and cast_row_topk against the cast then
   # row_topk, byte for byte, and the cast's rounding over every f32 pattern.
   set_tests_properties(r4d_emu_topk PROPERTIES LABELS "r4d_emu" TIMEOUT ${RAD_TEST_TIMEOUT})
+  # r4d_emu_mla_sink: about 130 s, twice the other sink tests' budget, because every form is run
+  # at both key-buffer counts (`kb` 2 and 1) and the stable forms and the byte rules on top.
+  set_tests_properties(r4d_emu_mla_sink PROPERTIES LABELS "r4d_emu" TIMEOUT 300)
   set_tests_properties(r4d_emu_lora r4d_emu_kda r4d_emu_hy4 r4d_emu_mla_kv PROPERTIES
                        ENVIRONMENT "RADIANCE_HOME=${CMAKE_BINARY_DIR}/radiance_home")
   # A seeded random sweep, mostly prefill shapes on the WMMA kernel, which the emulator runs at
