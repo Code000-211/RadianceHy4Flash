@@ -528,25 +528,10 @@ void Engine::depth_step_note(const RadBatch* b, const StepOut& so) {
     /* A block drafter's step runs one query pass whatever its rows verify: one "round". */
     const int n = depth_block_ ? block_rows_ : serial_rows_;
     const int rounds = depth_block_ ? (block_rows_ > 0 ? 1 : 0) : serial_done_;
-    /* The link this step paid (D-11): rank 0's expert bytes read across the link since the last
-     * note -- the routed experts that were not resident, which the GEMM reads from their tier on
-     * the step's critical path (HeatStats::stream_bytes, place/heat.h). A price, never a residency
-     * decision, so the counters' snapshot is the right read; the counters move on every note, so
-     * the delta is this step's alone for a step that is fed. */
-    double  link_us = 0.0;
-    int     routed_rows = 0;
-    if (depth_online_on_ && !ranks_.empty()) {
-        const HeatStats hs = ranks_[0]->heat.stats();
-        const uint64_t add = hs.stream_bytes >= depth_heat_bytes_ ? hs.stream_bytes - depth_heat_bytes_ : 0;
-        depth_heat_bytes_ = hs.stream_bytes;
-        link_us = (double)add / (depth_cfg_.link_bw_gbs * 1e3);      /* bytes / (GB/s * 1000) = us */
-        routed_rows = draft_depth_routed_rows((int)b->n_tok, n, rounds);
-    }
     if (depth_online_on_ && pure && n >= 1 && rounds >= 1 && tokens > 0 &&
         depth_note_step_ == b->step - 1 && depth_note_rows_ == n) {
         const double ms = std::chrono::duration<double, std::milli>(now - depth_note_t_).count();
-        draft_depth_online_step(depth_cfg_, &depth_online_, n, (int)b->n_tok, rounds, ms, tokens,
-                                link_us, routed_rows);
+        draft_depth_online_step(depth_cfg_, &depth_online_, n, (int)b->n_tok, rounds, ms, tokens);
     }
     depth_note_t_ = now;
     depth_note_step_ = pure ? b->step : -2;
@@ -578,10 +563,9 @@ void Engine::depth_load_log(const char* when) const {
     std::string t;
     for (int n = 1; n <= DraftDepthCfg::kLoadSeqs; ++n) {
         if (o.reg[n].n < 64 && o.lam[n].n < 32) continue;
-        t += fmt("%s%d seq: %.3f tok/ms, row %.3f ms (+%.3f link), round %.3f ms, tiles +%.2f/%.2f/%.2f/%.2f ms "
+        t += fmt("%s%d seq: %.3f tok/ms, row %.3f ms, round %.3f ms, tiles +%.2f/%.2f/%.2f/%.2f ms "
                  "(%lld steps)", t.empty() ? "" : "; ", n, depth_cfg_.load_lam[n],
-                 depth_cfg_.load_row_ms[n], depth_cfg_.load_link_ms[n], depth_cfg_.load_round_ms[n],
-                 depth_cfg_.load_jump_ms[n][0],
+                 depth_cfg_.load_row_ms[n], depth_cfg_.load_round_ms[n], depth_cfg_.load_jump_ms[n][0],
                  depth_cfg_.load_jump_ms[n][1], depth_cfg_.load_jump_ms[n][2],
                  depth_cfg_.load_jump_ms[n][3], (long long)o.reg[n].n);
     }
