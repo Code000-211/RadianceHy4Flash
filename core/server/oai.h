@@ -14,6 +14,7 @@
 #include "rad_core.h"
 #include "sink.h"
 
+#include <chrono>
 #include <cstdint>
 #include <map>
 #include <memory>
@@ -142,6 +143,12 @@ struct OaiRequest {
     std::string last_user;
     std::string peer;             /* the handler sets it from the transport; "" in-process */
     int64_t     t_received_ns = -1;   /* HttpRequest::t_received_ns, for timings' ttft and total */
+    /* Request prep phase times, steady_clock ns: this request's own share of parsing its body,
+     * rendering the chat template, tokenising the prompt, compiling its grammar and being
+     * submitted to the scheduler. -1 where the path has no such phase (/v1/completions renders
+     * no template). Set by the request parsers and serve(); logged by record(). */
+    int64_t     prep_parse_ns = -1, prep_render_ns = -1, prep_encode_ns = -1,
+                prep_grammar_ns = -1, prep_submit_ns = -1;
     bool parse_tools = false;
     /* The reply parser this request's render produced. Per request, not per server: it binds the
      * model's format to the tools this call sent, so concurrent requests may need different
@@ -171,6 +178,19 @@ struct OaiRequest {
 
     int  n_choices() const { return (int)prompts.size() * n; }
 };
+
+/* The clock the request prep phase times are taken on: the same steady_clock as HttpRequest's
+ * t_received_ns and the sinks' stamps, so a prep delta shares their time base. One definition,
+ * for the parsers (oai.cpp) and serve() (server.cpp). */
+inline int64_t prep_now_ns() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+/* The prep phases of `r` as the tail of the `req ... done` log line: " parse=1.23ms render=-
+ * encode=.. grammar=.. submit=..", ms with two decimals, '-' for a phase the path did not run
+ * (-1). Starts with a space. */
+std::string format_prep_phases(const OaiRequest& r);
 
 /* What the server needs to know about itself to validate a request. */
 struct OaiLimits {

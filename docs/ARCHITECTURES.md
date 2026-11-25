@@ -3390,7 +3390,9 @@ per layer
   ihc_pre (hc_attn), rmsnorm (attn_norm)
   q_a, rmsnorm, q_nope / q_rope; kv_a, rmsnorm on the latent, rope (gptj) on q_rope -- under
   `rope_rows`, its row-form name -- and on the key,
-  kv_store of the row [latent | key] as one KV head of (512 + 64) / 2; attn_gate
+  kv_store of the row [latent | key] as one KV head of (512 + 64) / 2; attn_gate (a decode step's
+  query rotary is folded into the sink instead: its stable instance's optional `rope_pos`, one
+  launch a layer less; `RADIANCE_HY4_FOLD_QROPE=0` issues the `rope_rows` launch as well)
   [sparse] index_key, rmsnorm, qsa_work, idx_pool_gated into the indexer cache, qsa_tail_store;
            selecting: index_query_nope / _rope, rope_rows, index_head, idx_score,
            qsa_select(own 1)
@@ -3471,15 +3473,21 @@ ihc_pre (hc_head), rmsnorm (output_norm), gather_rows, logits_gemm
   (`RADIANCE_HY4_FUSE_QPROJ`, `r4d_selftest`'s `gemm_iqr_dual` case comparing them at 6144/2048,
   3072/1024 and 12288/4096, the last the one pair where both parts take four waves a tile; a pass
   wider than one row stays two launches, as does a pair on an engine whose library carries no such
-  row). The 128-group rotated quantisers
+  row). The same row carries q_a and the gate at a decode step (K-03): they read the attention
+  input's one set of codes (the gate is fed from q_a), and the gate's product is not read until
+  `mla_expand_gate`, so the pair is one launch fewer a layer -- q_a's 1024 columns the eight-wave
+  part, the gate's 4096 / 8192 (its kind's heads * v) the four-wave one -- under
+  `RADIANCE_HY4_FUSE_QA_GATE` (`r4d_selftest`'s dual case at 1024/4096 and 1024/8192, K 3072, the
+  attention input's), and two launches again where the two encodings are a form or a trellis run
+  apart. The 128-group rotated quantisers
   (`had_quant_act_i8g`, `rmsnorm_had_quant_i8g`, the experts' `had_quant_act_fp8`) run their
   chained forms (`chained` 1, `Geom::chain_q8`), since every GEMM around them chains. Launches of a
   recorded gpu-mini decode pass: bf16 132 -> 129, int8 170 -> 148, three fewer again with the q
   pair in one launch (a layer's, 3 layers). Switches (default on):
   `RADIANCE_HY4_SHARE_CODES`, `RADIANCE_HY4_FUSED_QUANT`, `RADIANCE_HY4_ROUTER_FUSE`,
-  `RADIANCE_HY4_CHAIN_Q8`, `RADIANCE_HY4_FUSE_QPROJ`. Not fused: the attention norm and the
-  feed-forward norm are the junction's (`rmsnorm_ihc_junction`), and o_proj's input comes out of
-  `mla_expand_gate`.
+  `RADIANCE_HY4_CHAIN_Q8`, `RADIANCE_HY4_FUSE_QPROJ`, `RADIANCE_HY4_FUSE_QA_GATE`. Not fused: the
+  attention norm and the feed-forward norm are the junction's (`rmsnorm_ihc_junction`), and o_proj's
+  input comes out of `mla_expand_gate`.
   `ffn_latent_out`'s is the one fused producer that is not a norm or a gate: the routed MoE gather
   (`moe_gather_inv_i8g`, K-19) writes the sum's rotated int8 codes and scales in the launch that
   sums it, so that linear declares no `had_quant_act_i8g`. It needs the slot table, no shared arm
@@ -3487,6 +3495,20 @@ ihc_pre (hc_head), rmsnorm (output_norm), gather_rows, logits_gemm
   (`latent % 256 == 0`), a latent its weight's scale group divides (128 or 256), and a write that
   does not fold the gather in (a fold writes no codes); else the plain gather serves and the linear
   quantises for itself. `RADIANCE_HY4_FUSE_GATHER_Q8=0` turns it off.
+- **The shared expert beside the routed GEMMs** (P-01). The shared expert is the plugin's own gated
+  MLP (MoeFP8 runs with no shared arm), so MoeFP8's interleave never reached it and its gate and down
+  projection were ordered launches behind `latent_out`. `MoeFP8::step` takes a `side` (SideOps) and
+  asks for its three stages where it issues its own shared arm's: gate_up behind the routed gate_up
+  (behind the router from `kSharedFirstRows` routed rows on a trellis gate_up), the gate behind the
+  routed quantiser, down behind the routed down. Where the gated fold (K-23, `gemm_nt_q_gated`)
+  serves the step's rows, the first stage is the fold and the second issues nothing: two launches
+  where the pair's arm is three. A recorded pass then leaves each unordered beside the routed launch
+  in front of it. The arm's buffers are `rad_buf_concurrent`, the code pair the gate (or the fold)
+  writes included. Taken where neither
+  shared linear quantises for itself (its codes fed, or bf16), which is the device configuration;
+  the pipelined prefill's pieces keep the old order. Byte-identical: the same launches on the same
+  operands, and the junction's add is unchanged. `RADIANCE_HY4_SHARED_SIDE=0` restores the old
+  order (default on).
 - **The Engram table on disk** (`ngram-placement: disk`). The ids and the gathered rows are
   host-domain buffers (as `rad_block_ple.h`'s), so libavx's host gather reads and writes them in the
   host arena; a device gather (vram, ram) reads and writes them over the link. A prefill chunk's

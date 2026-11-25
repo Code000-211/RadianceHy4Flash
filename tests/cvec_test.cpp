@@ -14,6 +14,7 @@
 
 #include "cvec.h"
 
+#include <algorithm>
 #include <cmath>
 #include <filesystem>
 #include <fstream>
@@ -25,7 +26,8 @@ namespace {
 /* A minimal GGUF writer, just enough for a control vector: the header, a string/int KV table, one
  * F32 one-dimensional tensor per direction, and the data blob at the file's alignment. */
 struct GgufWriter {
-    struct T { std::string name; std::vector<float> data; };
+    /* `k` > 1 writes the tensor as [n, k] (k directions of n), the per-layer basis form. */
+    struct T { std::string name; std::vector<float> data; int64_t k = 1; };
     std::vector<std::pair<std::string, std::string>> strs;
     std::vector<std::pair<std::string, int32_t>> ints;
     std::vector<T> tensors;
@@ -65,8 +67,9 @@ struct GgufWriter {
         std::string dir;
         for (const T& t : tensors) {
             str(dir, t.name);
-            u32(dir, 1);                        /* n_dims */
-            u64(dir, (uint64_t) t.data.size()); /* ne[0] */
+            u32(dir, t.k > 1 ? 2 : 1);          /* n_dims */
+            u64(dir, (uint64_t) t.data.size() / (uint64_t) t.k); /* ne[0] */
+            if (t.k > 1) u64(dir, (uint64_t) t.k);               /* ne[1] */
             u32(dir, 0);                        /* ggml type 0 = F32 */
             const uint64_t padded = t.data.size() * 4;
             u64(dir, off);
@@ -309,6 +312,104 @@ TEST(a_layer_at_the_models_own_count_is_refused) {
                           R"({"mode":"project","scale":1.0,"layer_range":[4,48]})");
     CHECK(b.rc < 0);
     CHECK(b.err.find("runs past") != std::string::npos);
+}
+
+/* A basis of `k` orthonormal rows of `n` per layer, each layer's rows the unit axes at a layer
+ * offset, so the rows of a layer are exactly orthogonal. */
+GgufWriter make_basis(int64_t n, int layers, int64_t k, bool per_stream) {
+    GgufWriter w;
+    w.strs.push_back({ "general.architecture", "controlvector" });
+    w.strs.push_back({ "controlvector.model_hint", "qwen4exp" });
+    w.ints.push_back({ "controlvector.layer_count", (int32_t) layers });
+    if (per_stream) w.ints.push_back({ "controlvector.per_stream", 1 });
+    for (int l = 1; l <= layers; ++l) {
+        std::vector<float> d((size_t) (n * k), 0.0f);
+        for (int64_t j = 0; j < k; ++j) d[(size_t) (j * n + (l + j) % n)] = 2.0f;  /* norm 2 */
+        GgufWriter::T t{ "direction." + std::to_string(l), std::move(d), k };
+        w.tensors.push_back(std::move(t));
+    }
+    return w;
+}
+
+/* A [n, k] tensor is k directions for its layer: the loader keeps them in order, each unit, at
+ * ((l*rank)+j)*n, and the layer's strength is the package scale (each component removed whole),
+ * not the first row's norm. The layout is part of the cache identity. */
+TEST(a_rank_k_basis_loads_in_order_with_the_package_scale) {
+    const int64_t n = 64, k = 8;
+    const Loaded f = load(make_basis(n, 6, k, true), n, 8, "basis-ps.gguf",
+                          R"({"mode":"project","scale":1.0,"layer_range":[1,6]})");
+    CHECK_OK(f.rc);
+    CHECK_EQ(f.cv.rank, k);
+    CHECK_EQ(f.cv.per_stream, (int64_t) 1);
+    CHECK_EQ(f.cv.dir.size(), (size_t) (8 * k * n));
+    for (int l = 1; l <= 6; ++l) {
+        CHECK_NEAR(f.cv.scales[(size_t) l], 1.0f, 1e-6);
+        for (int64_t j = 0; j < k; ++j)
+            CHECK_NEAR(f.cv.dir[(size_t) ((l * k + j) * n + (l + j) % n)], 1.0f, 1e-6);
+    }
+    const RadControlVector v = rad::control_vector_view(f.cv, f.cv.dir.data());
+    CHECK_EQ(v.rank, k);
+    CHECK_EQ(v.per_stream, (int64_t) 1);
+
+    /* The same rows, not marked per-stream: a different operator, so a different salt. */
+    const Loaded g = load(make_basis(n, 6, k, false), n, 8, "basis-shared.gguf",
+                          R"({"mode":"project","scale":1.0,"layer_range":[1,6]})");
+    CHECK_OK(g.rc);
+    CHECK_EQ(g.cv.per_stream, (int64_t) 0);
+    CHECK(rad::control_vector_salt(f.cv) != rad::control_vector_salt(g.cv));
+
+    /* A rank-1 file keeps the original view: rank 1, shared, strength from the file's norm. */
+    const Loaded one = load(make_vector(n, 6), n, 8, "rank1.gguf");
+    CHECK_OK(one.rc);
+    CHECK_EQ(one.cv.rank, (int64_t) 1);
+    CHECK_EQ(one.cv.per_stream, (int64_t) 0);
+    CHECK_EQ(rad::control_vector_view(one.cv, one.cv.dir.data()).rank, (int64_t) 1);
+}
+
+/* A per-stream package's rows of different streams are different vectors, not a basis: only one
+ * stream's rows are chained, so only they are held to orthogonality. Rows that agree across
+ * streams draw no warning; rows of one stream that agree do. */
+TEST(orthogonality_is_checked_within_a_stream_only) {
+    const int64_t n = 64, k = 8;
+    GgufWriter same = make_basis(n, 4, k, true);
+    for (auto& t : same.tensors) {
+        std::fill(t.data.begin(), t.data.end(), 0.0f);
+        /* Group 0: every stream along axis 0; group 1: every stream along axis 1. */
+        for (int64_t j = 0; j < k; ++j) t.data[(size_t) (j * n + (j < 4 ? 0 : 1))] = 1.0f;
+    }
+    Loaded a;
+    const std::string w1 = stderr_of([&] { a = load(same, n, 8, "ps-cross.gguf"); });
+    CHECK_OK(a.rc);
+    CHECK(w1.find("not orthogonal") == std::string::npos);
+
+    GgufWriter bad = same;
+    for (auto& t : bad.tensors) t.data[(size_t) (4 * n + 0)] = 1.0f;   /* stream 0, group 1 */
+    Loaded b;
+    const std::string w2 = stderr_of([&] { b = load(bad, n, 8, "ps-same.gguf"); });
+    CHECK_OK(b.rc);
+    CHECK(w2.find("not orthogonal") != std::string::npos);
+}
+
+/* What a basis file may not be: per-stream with a row count no multiple of the four streams,
+ * layers of different counts, or more rows than any arch declares hooks for. */
+TEST(a_malformed_basis_is_refused) {
+    const Loaded odd = load(make_basis(64, 4, 6, true), 64, 8, "basis-odd.gguf");
+    CHECK(odd.rc < 0);
+    CHECK(odd.err.find("per_stream") != std::string::npos);
+
+    GgufWriter mixed = make_basis(64, 4, 4, false);
+    mixed.tensors[2].data.resize(64 * 2);
+    mixed.tensors[2].k = 2;
+    mixed.tensors[2].data[5] = 1.0f;
+    mixed.tensors[2].data[64 + 9] = 1.0f;
+    const Loaded m = load(mixed, 64, 8, "basis-mixed.gguf");
+    CHECK(m.rc < 0);
+    CHECK(m.err.find("same count") != std::string::npos);
+
+    const Loaded big = load(make_basis(64, 4, rad::kControlVectorMaxRank + 4, false), 64, 8,
+                            "basis-big.gguf");
+    CHECK(big.rc < 0);
+    CHECK(big.err.find("at most") != std::string::npos);
 }
 
 RAD_TEST_MAIN()

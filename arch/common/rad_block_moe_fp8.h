@@ -565,7 +565,13 @@ struct MoeFP8 {
     int  declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
                  const Wire& wire, const Src& src, bool fold = false, bool add_out = true,
                  int ar_in = kArNone, bool ar_out_ = false);
-    void step(RadCtx* c, const RadBatch* batch) const;
+    /* `side`: an independent chain's ops, issued behind this block's ordered launches (SideOps,
+     * rad_arch.h), for a caller whose shared expert is its own (Config::n_ff_shared 0). The pass
+     * asks for stage k where it issues its own shared arm's stage k (pass()): 0 behind the routed
+     * gate_up (behind the router where `sh_first` would put it), 1 behind the routed quantiser,
+     * 2 behind the routed down (in front of it on an `sh_dn_first` step). A step of more than one
+     * pass asks nothing; the caller issues whatever is left once the block returns. */
+    void step(RadCtx* c, const RadBatch* batch, const SideOps* side = nullptr) const;
     /* A checkpoint inside the step (RadBatch::ckpt_cut): its token on the card, for the routed
      * GEMMs' `split` operand, while step() issues a step that is one pass; null otherwise. Each
      * expert's rows before the checkpoint are then a run of their own, as a step ending there
@@ -573,10 +579,11 @@ struct MoeFP8 {
     mutable const int32_t* split_tok = nullptr;
     /* The block over the first `T` rows of its buffers, for passes that need fewer rows than the
      * batch (the MTP head's history pass reads its output only at drafting rows). */
-    void step_rows(RadCtx* c, int64_t T) const;
+    void step_rows(RadCtx* c, int64_t T, const SideOps* side = nullptr) const;
     /* One pass of at most `c.rows` tokens. `own_ar` false: the caller issues the pass's
-     * all-reduce itself (issue_ar), as GdnFP8::step describes. */
-    void pass(RadCtx* c, int64_t T, int64_t r0, int64_t rows, bool own_ar = true) const;
+     * all-reduce itself (issue_ar), as GdnFP8::step describes. `side`: as step(). */
+    void pass(RadCtx* c, int64_t T, int64_t r0, int64_t rows, bool own_ar = true,
+              const SideOps* side = nullptr) const;
     /* The heat engine's handoff, after a step's last pass (step() says what it reports). */
     void route_report(RadCtx* c) const;
     bool issues_ar(int64_t T, int64_t rows) const {
@@ -1947,7 +1954,8 @@ inline void MoeFP8::shared_up(RadCtx* c_, int64_t T, int64_t r0, int64_t rows,
  *
  * The expert buffers are addressed from zero, not `r0`: they are a pass tall and `sorted_tok` is
  * pass-relative. Only step-tall operands (residual stream, normed input) carry the offset. */
-inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool own_ar) const {
+inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool own_ar,
+                         const SideOps* side) const {
     /* `ne` is this rank's expert count, `ne_all` the model's: logits and top-k are model-wide,
      * everything after the scatter is this rank's slice. */
     const int64_t ne = c.n_expert, ne_all = c.n_expert_all, k = c.top_k;
@@ -2055,12 +2063,15 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
      * in turn. Flash-Next's 16- and 32-row verify passes on two R9700: 22.1 -> 21.9 ms and
      * 31.6 -> 30.95 ms. Below, the arm fits inside the routed GEMM's time and stays beside it. */
     const bool sh_first = shared && gu_trellis && rows * k >= kSharedFirstRows;
+    /* A caller's shared arm (`side`) takes the same three places as this block's own. */
+    const bool side_first = side && gu_trellis && rows * k >= kSharedFirstRows;
     /* The routed GEMMs' `split` (split_tok), on a pass that is the whole step. */
     const bool split_on = split_tok && r0 == 0 && rows == T;
     const RadOperand sp = split_on ? praw(split_tok, RAD_I32, 1) : RAD_NONE;
     if (sh_first)
         shared_up(c_, T, r0, rows,
                   (rfused && router_fused_gate) || (sfused && sigmoid_scatter_gate));
+    if (side_first) side->at(0);
     /* Apply the previous layer's prefetch prediction: substitute the copied experts into the
      * tables. */
     (void)rad_expert_prefetch_step(c_, layer);
@@ -2094,8 +2105,10 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
     if (shared && !sh_first)
         shared_up(c_, T, r0, rows,
                   (rfused && router_fused_gate) || (sfused && sigmoid_scatter_gate));
+    if (side && !side_first) side->at(0);
     gq_exp.step(c_, w.egu, rows * k, 0, rows * k);
     if (shared && !(op_sh_gated && rows <= sh_gated_rows)) gq_sh.step(c_, w.sgu, T, r0, rows);
+    if (side) side->at(1);
     /* The shared arm's down projection in front of the routed down GEMM on a step of
      * [sh_down_first_lo, sh_down_first_hi] rows. Behind it (below) the two still run together,
      * but the card launches the arm only once every block of the routed GEMM is on it; at a
@@ -2109,6 +2122,8 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
      * coupling, chain 1 / 2 / 3 (two / three / four rows): -0.28% / -0.21% / -0.25% a step. */
     const bool sh_dn_first = shared && T >= sh_down_first_lo && T <= sh_down_first_hi;
     if (sh_dn_first) sh_down.step(c_, w.sff, w.sout, T, r0, rows);
+    const bool side_dn_first = side && T >= sh_down_first_lo && T <= sh_down_first_hi;
+    if (side_dn_first) side->at(2);
     if (c.expert_bf16)
         RAD_ISSUE_N(c_, op_dn, rows, brows(w.eff.x, rows * k), RAD_WTAB(w_dn[0], ne),
                     brows(w.sorted, rows * k), brows(w.eoff, ne + 1), brows(w.edn, rows * k));
@@ -2149,6 +2164,7 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
                     brows(w.sorted, rows * k), poff, brows(w.edn, rows * k));
     }
     if (shared && !sh_dn_first) sh_down.step(c_, w.sff, w.sout, T, r0, rows);
+    if (side && !side_dn_first) side->at(2);
     /* The calibration tap reads the GEMMs' operands and writes nothing they touch, so it does not
      * change the model's output. */
     if (op_gram_gu && !calib_done) {
@@ -2270,13 +2286,14 @@ inline void MoeFP8::calib_experts_pass(RadCtx* c_, int64_t slots) const {
     calib_dne.add(staging);
 }
 
-inline void MoeFP8::step(RadCtx* c_, const RadBatch* batch) const {
+inline void MoeFP8::step(RadCtx* c_, const RadBatch* batch, const SideOps* side) const {
     const int64_t T = batch->n_tok, ck = batch->ckpt_cut;
     const bool cut = ck > 0 && ck < T && batch->ckpt_cu;
     if (cut && T > c.rows) {
         /* A checkpoint inside a step wider than a pass: the passes start again at the checkpoint
          * (as HyperConn::read_pieces does), so the rows before it are passed as a chunk ending
-         * there passes them, and the rows after it as the next chunk would. */
+         * there passes them, and the rows after it as the next chunk would. More than one pass:
+         * `side` is asked nothing (step()). */
         for (int64_t a = 0; a < T; a = ck > a ? ck : T) {
             const int64_t b = ck > a ? ck : T;
             for (int64_t r0 = a; r0 < b; r0 += c.rows)
@@ -2288,14 +2305,16 @@ inline void MoeFP8::step(RadCtx* c_, const RadBatch* batch) const {
     /* One pass over the whole step: `split` gives the rows before the checkpoint runs of their
      * own (split_tok). */
     split_tok = cut ? batch->ckpt_cu + 1 : nullptr;
-    step_rows(c_, T);
+    step_rows(c_, T, side);
     split_tok = nullptr;
 }
 
-inline void MoeFP8::step_rows(RadCtx* c_, int64_t T) const {
+inline void MoeFP8::step_rows(RadCtx* c_, int64_t T, const SideOps* side) const {
+    /* `side` only where the step is one pass (step()). */
+    const SideOps* one = T <= c.rows ? side : nullptr;
     for (int64_t r0 = 0; r0 < T; r0 += c.rows) {
         const int64_t n = (T - r0 < c.rows) ? (T - r0) : c.rows;
-        pass(c_, T, r0, n);
+        pass(c_, T, r0, n, true, one);
     }
     route_report(c_);
 }
