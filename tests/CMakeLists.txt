@@ -761,7 +761,7 @@ if(R4D_EMU_BUILT)
   # r4d_emu_topk: row_topk's one- and two-launch forms and cast_row_topk against the cast then
   # row_topk, byte for byte, and the cast's rounding over every f32 pattern.
   set_tests_properties(r4d_emu_topk PROPERTIES LABELS "r4d_emu" TIMEOUT ${RAD_TEST_TIMEOUT})
-  # r4d_emu_mla_sink: about 283 s, because every form runs at both key-buffer counts (`kb` 2 and 1)
+  # r4d_emu_mla_sink: about 165 s, because every form runs at both key-buffer counts (`kb` 2 and 1)
   # and the stable law and the byte rules on top. Five times the shared budget, derived from it so a
   # Debug or sanitised build scales too.
   math(EXPR RAD_TIMEOUT_MLA_SINK "${RAD_TEST_TIMEOUT} * 5")
