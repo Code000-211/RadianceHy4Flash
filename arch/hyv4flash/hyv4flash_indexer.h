@@ -32,6 +32,15 @@
 
 namespace hyv4flash {
 
+/* P-09: where a snapshot layer's `qsa_select` writes its selection. On a single-span step of a
+ * group that does not stream, the selection goes straight into the layer's snapshot window and
+ * the attention reads it from there: no post-copy (`len` always stays on the wire, the attention
+ * reads it there and the drafter never taps it). */
+struct SelOut {
+    rad_buf sel = 0, nsel = 0;   /* the snapshot plane's window for this layer */
+    int64_t first = 0;           /* the plane row the window starts at (layer base + step row) */
+};
+
 /* The planes every sparse layer's indexer shares. */
 struct IndexWire {
     rad_buf tk = 0;       /* [T, D] token keys */
@@ -325,7 +334,8 @@ struct Indexer {
 
     /* The key side, every step; the query side and the selection on a selecting step. Issued after
      * the attention's front (it reads q_resid, `qa`). */
-    bool step(RadCtx* c, const RadBatch* batch, const StepPlan& p, const RadBatch* queries, QueryRows rows) const {
+    bool step(RadCtx* c, const RadBatch* batch, const StepPlan& p, const RadBatch* queries, QueryRows rows,
+              const SelOut* sel_out = nullptr) const {
         const auto* ib = kv_batch(batch, index);
         const auto* tb = kv_batch(batch, tail);
         const auto* ab = kv_batch(batch, attn);
@@ -413,9 +423,16 @@ struct Indexer {
                         praw2(ib->block_table, RAD_I32, S, ib->block_table_pitch), qcu,
                         brows(w.nc, S), score);
         }
+        /* P-09: on a snapshot layer of a single-span step of a group that does not stream the
+         * selection is written straight into the layer's snapshot window (the attention reads it
+         * from there); the wire keeps `len`, which both paths write the same way. */
+        const RadOperand o_sel = sel_out ? brow_slice(sel_out->sel, sel_out->first, M, s.ix_group_topk)
+                                         : brows(w.sel, M);
+        const RadOperand o_nsel = sel_out ? brow_slice(sel_out->nsel, sel_out->first, M, 1)
+                                          : brows(w.nsel, M);
         RAD_ISSUE_N(c, op_select, M, score,
                     praw2(ab->block_table, RAD_I32, S, ab->block_table_pitch), brows(w.nc, S), qpos,
-                    qcu, brows(w.sel, M), brows(w.nsel, M), brows(w.len, M));
+                    qcu, o_sel, o_nsel, brows(w.len, M));
         if (op_tap_select) {
             /* The identity table is refilled each step; the select over it writes `len` again
              * with the same values (the lengths do not depend on the table). */

@@ -15,7 +15,8 @@ against an installed radiance, and is found and ranked by what it declares, neve
 (libr4d only when given a HIP compiler) and requires the same result.
 
 §1-§9 cover kernel libraries, §10 a library for a new card, §11 and §12 architectures and
-quantisers, and §13 building, installing and the search path.
+quantisers, §13 building, installing and the search path, and §14 rebuilding one kernel of a
+library without the library.
 
 ---
 
@@ -510,3 +511,141 @@ matching nothing is warned about by name. Separate entries with commas or colons
 `$RADIANCE_KERNELS` follow this one rule, and an empty `$RADIANCE_KERNELS` counts as unset. A kernel library the list does not
 name is not loaded, so name every library you want, including the host library (`libavx`) and the
 reference (`libref`). With no list every library found loads, a reference library (§1) last.
+
+---
+
+## 14. One kernel at a time: an override of a library
+
+A kernel library is many translation units behind one row table, and work on one kernel changes
+one of them. `rad_add_kernel_override` builds that unit alone into a file that serves the whole
+library with the unit replaced, so neither the other units nor anything else is rebuilt:
+
+```cmake
+rad_add_kernel_override(mylib_override BASE mylib HIP_SOURCES mygemm.hip)
+```
+
+`BASE` is the library's target, or the path of a built `.so` of it. The result carries the
+library's file name and lands in a home of its own, `<build>/override_home/kernels/` (`HOME`
+changes it). Put that home ahead of the library's on the search path (§13) and it shadows the
+library; no `kernels:` list changes and no configuration names it:
+
+```sh
+RADIANCE_HOME=build/override_home:build/radiance_home radiance --config radiance.yaml
+```
+
+For libr4d the units are named at configure time (`libr4d/CMakeLists.txt`):
+
+```sh
+cmake -B build -DR4D_OVERRIDE_UNITS=r4d_gemm_iqr     # several: "a;b"
+cmake --build build --target libr4d_override         # compiles that unit and nothing else of libr4d
+```
+
+A lane run (`notes/backlog/CARDS.md` §1.1) takes the home as one of its `ENV=VAL` pairs:
+
+```sh
+scripts/backlog/lane.sh local 'scripts/backlog/run.sh k1 nospec.yaml c1,c8 \
+    RADIANCE_HOME=$RAD_REPO/build/override_home:$RAD_REPO/build/radiance_home'
+```
+
+`-DR4D_OVERRIDE_BASE=/path/to/libr4d.so` builds over a libr4d built elsewhere (an installation, a
+lane's baseline tree) instead of this tree's, so a tree that works on one kernel never compiles the
+other units.
+
+What the engine sees is the library: the same plugin name (so the tuning cache's rows apply), the
+same schemas, the same rows in the same order with the same constraints and priorities, the same
+per-row answers for `rad_kernel_concurrent`, `_collective`, `_chain` and `_reference`, and so the
+same selection. A row's hook (`launch`, `scratch`, `init`, ...) that the library takes from a
+symbol the override's units define is the units' instead; every other hook is the library's own
+code, in the library's own file, which the override loads as its dependency. Whatever a unit takes
+from the rest of the library (shared state, helpers of other units) resolves there. The version
+reads `<the library's>+override`, and at open the override prints the rows it serves itself:
+
+```
+rad-override: <override_home>/kernels/mylib.so serves 1 of the 3 rows of <home>/kernels/mylib.so with its own hooks: mygemm_m64
+```
+
+It refuses to open when that count is zero, and the library it shadows is not loaded in its place:
+a run over an override that changes nothing would be the library's numbers under another build's
+name.
+
+What an override is not:
+
+- **Not a change to the declaration.** Rows, constraints, priorities, layouts, shapes and fusion
+  claims are the library's as built. A change to one of those is a rebuild of the library (for
+  libr4d, its host sources: no device unit recompiles).
+- **Not a header change.** A header other units include changes them too. Name every unit that
+  includes it, or rebuild the library; an override of one of them alone runs the new unit beside
+  old copies of the same inline code.
+- **Not a second copy of the library's other units.** A call from one of the library's other units
+  into a function an overridden unit defines reaches the override's definition when the override
+  brought the library in (the reference is preemptible, as in a library linked with nothing
+  special) and the library's own when the library was loaded first or binds its references itself
+  (`-Bsymbolic`, hidden visibility). The rows' hooks are replaced either way.
+
+`tests/kernel_override_test.cpp` holds an override to these on the host, against a library linked
+both ways.
+
+### 14.1 Reloading an override under a running server
+
+A server running over an override takes a rebuild of it without a restart and without reloading
+its model. Rebuild the override in place, then ask:
+
+```sh
+cmake --build build --target libr4d_override
+curl -X POST http://127.0.0.1:<port>/admin/kernels/reload
+```
+
+The route is the fleet's, guarded as `/admin/fleet` is (the local operator, or the api key). It
+reloads every loaded override at once. The override loads the file as it now stands on disk under a
+name of its own beside it (the name starts with a dot and does not end in `.so`, and is removed once
+read), reads its rows, and puts their hooks into the rows it serves, which every engine points to.
+The library under the override is not loaded again: the rebuilt units resolve into the one already
+mapped, with its state. The answer names what was taken:
+
+```json
+{"reloaded":[{"library":"<name>","file":"<the override's file>","rows":<rows given new hooks>}],"engines":<engines in the process>}
+```
+
+and the override prints `rad-override: <file> reloaded: <k> of the <n> rows of <library> take new
+hooks: <their names>`. A file that changed under the same name has to be a new file: a linker's output,
+`mv` or `install` give one, while `cp` over it rewrites the file the server has mapped.
+
+**What waits.** The rows are one table for every engine in the process, so every serving engine is
+held at a step boundary at once, with nothing of it in flight (the hold a live restore's moves use),
+while the reload is checked and committed; a parked engine is checked and updated where it rests. A
+request in flight waits for the step in flight to end and for the reload, then runs on: every step
+runs one build, the steps before the reload the old one and the steps after it the new one. Each engine then
+takes every issue plan's launch from its row again and drops its recorded passes, which are
+recorded anew. The route waits up to ten minutes for the engines to come to rest, and answers 503
+if they have not (the outcome then goes to the log).
+
+**What is refused.** A refusal answers 409 with the reason, and every engine runs on as it was:
+
+- no loaded kernel library is an override;
+- the file has not changed since its hooks were loaded;
+- the file does not load (a build cut short, a symbol the library under it lacks), was built against
+  another ABI, is an override of another library, defines no hook of any row, or declares a row
+  differently (only hooks are reloaded; a row-table change is a rebuild of the library);
+- a rebuild with no device code for the card the set was checked against;
+- under an engine that resolved the row, a rebuilt hook whose answer declare used: `init` and
+  `fini` (the instance holds what the running `init` made), `layout`, `relayout`, `unrelayout`
+  and `opd_shape` (the weights lie as the running ones asked), `replaces` (the fusion was chosen at
+  declare); and a rebuilt `scratch` that sizes an instance's scratch differently from the running
+  one, since the arena was sized from it. `launch` is reloaded, `scratch` when its answers are the
+  same, and `tune_valid` (asked only while selecting) always;
+- a model loading, restoring or leaving, or a live restore still moving weights onto its cards: ask
+  again once it is done;
+- an engine running the kernel oracle (`RADIANCE_OP_ORACLE`, `RADIANCE_OP_REPEAT`), which keeps
+  launches of its own.
+
+**What stays.** Every rebuilt file a reload loads stays mapped until the process ends, a refused one
+too: a launch already issued may still run its code, and the device layer keys a kernel by its host
+stub's address and a code object by its bundle's (`core/device/aql.cpp`), so an image unmapped and
+another mapped at the same address would run the old device code under the new name. Each reload
+therefore costs the size of the override's file in memory. A call from one of the library's other
+units into a function a rebuilt unit defines keeps reaching the build it reached when the server
+started (see the last point above): a reload replaces the rows' hooks, not the library's bindings.
+
+`tests/kernel_reload_test.cpp` holds the reload to these through the registry, against a library
+linked both ways, and `tests/kernel_reload_e2e_test.cpp` through a running server on the host
+backend, with a request in flight across the reload.

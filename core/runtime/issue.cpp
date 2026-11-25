@@ -1150,8 +1150,20 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
 
     /* In a staged pass a collective holds the card's link; the stager's copy lists yield meanwhile
      * (see rad_link_hold). Taken after every wait this op's operands put on the stream, so nothing
-     * between hold and release can wait on a weight stuck behind a yielding list. */
-    const bool hold = staging_ && p.collective && dom == RAD_DOMAIN_DEVICE;
+     * between hold and release can wait on a weight stuck behind a yielding list.
+     *
+     * Lane 0 only. The gate is one word a card whose parity is the hold (rad_link_hold), so a
+     * card's holds must not overlap in time, and issue order guarantees that on one stream only.
+     * A pipelined prefill runs lane 1's junction reduce beside lane 0's arm, which has a
+     * collective of its own (Hy4-flash's router projection, an all_gather), and both rows end
+     * their hold in the kernel (RAD_LINK_ENDED). When lane 0's hold barrier ran while lane 1's
+     * reduce was still in flight, the word went even, the gather read it even and left it alone,
+     * the reduce then decremented it, and the gate stayed odd with nothing holding: every
+     * yielding list on the card stopped and the step with it (issue #2: four ranks, the first
+     * 8192-row step, whose 4096-row pieces' reduce is still running when the gather starts).
+     * Lane 1's collectives therefore take no hold and get no gate; the lists share the link with
+     * them. */
+    const bool hold = staging_ && p.collective && dom == RAD_DOMAIN_DEVICE && lane_ == 0;
     const RadArgs* la = &ip.args;
     RadArgs gate_args;
     if (hold) {

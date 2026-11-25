@@ -3,12 +3,15 @@
  * on the host SIMT emulator, each held to libref's op (libref/ref_hy4.cpp) on the same bytes.
  * ihc_post, mla_kv_split and Engram's ids, mask and window compare byte for byte; the others within
  * the bound their kernels state (one bf16 ulp of a differently ordered or fused sum). Row padding of
- * a pitched operand must come back untouched. Needs libref (RADIANCE_HOME), as test_kda. */
+ * a pitched operand must come back untouched. idx_score's per-row and row-tiled forms
+ * (r4d_idx_score_bf16.hip) compare with each other byte for byte. Needs libref (RADIANCE_HOME), as
+ * test_kda. */
 #include "rad_abi.h"
 #include "rad_plugin.h"
 #include "r4d_plugin.h"
 #include "ref_host.h"
 #include "../hy4_dfly_cases.h"
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -192,6 +195,92 @@ static void check(const char* op, RadLaunchFn kernel, const std::string& what, s
 }
 
 static const double kUlp = 0.0079;   /* one bf16 ulp, relative */
+
+extern "C" void r4d_idx_score_pin_form(int form);
+/* idx_score, each form pinned: the per-row form (1) and the row-tiled form (2) give the same bytes
+ * (the same WMMA chain over the same fragments), and each is within 1e-4 of the row's largest
+ * |score| of libref's (the products sum in another order) with -inf exactly where libref has it.
+ * The fixtures cross the tiled form's 16-row and 128-key tiles: sequences that share a tile, a
+ * one-row sequence, one with no live group, M not a multiple of 16, columns past the table, pages
+ * absent or outside the cache, signed and zero gates, the paged and the flat key layout. */
+static void idx_score_forms() {
+    struct G { std::vector<int> qn, nc; int BT, SC, pages; bool paged; };
+    const int64_t H = 16, n = 128;
+    for (const G& g : { G{ { 5, 1, 70 }, { 250, 13, 300 }, 300, 290, 400, true },
+                        G{ { 1, 37, 1, 3 }, { 9, 40, 0, 50 }, 48, 70, 120, false } }) {
+        ++g_cases;
+        Rng rng((uint32_t)(g.BT + g.SC));
+        const int64_t S = (int64_t)g.qn.size();
+        std::vector<int32_t> cu = { 0 };
+        for (int q : g.qn) cu.push_back(cu.back() + q);
+        const int64_t M = cu.back();
+        std::vector<uint16_t> q((size_t)(M * H * n)), gate((size_t)(M * H)), key((size_t)(g.pages * n));
+        for (auto& v : q) v = f2b(rng.n() * 0.5f);
+        for (auto& v : gate) v = f2b(rng.r(10) == 0 ? 0.0f : rng.n());
+        for (auto& v : key) v = f2b(rng.n() * 0.5f);
+        std::vector<int32_t> bt((size_t)(S * g.BT)), nc(g.nc.begin(), g.nc.end());
+        for (int64_t i = 0; i < (int64_t)bt.size(); ++i)
+            bt[(size_t)i] = i % 23 == 7 ? -1 : i % 41 == 5 ? g.pages + 2 : (int32_t)((i * 37) % g.pages);
+        auto tens = [](void* p, uint32_t dt, std::vector<int64_t> sh) {
+            RadTensor t{};
+            t.data = p; t.dtype = dt; t.rank = (uint32_t)sh.size();
+            int64_t st = 1;
+            for (int i = (int)sh.size() - 1; i >= 0; --i) { t.shape[i] = sh[(size_t)i]; t.stride[i] = st; st *= sh[(size_t)i]; }
+            return t;
+        };
+        std::vector<RadParam> p = { pi("M", M), pi("n", n), pi("heads", H), pi("blocks", g.BT),
+                                    pi("seqs", S), ps("dtype", "bf16") };
+        auto launch = [&](RadLaunchFn fn, std::vector<float>& out) {
+            out.assign((size_t)(M * g.SC), 7.0f);
+            std::vector<RadTensor> t = {
+                tens(q.data(), RAD_BF16, { M, H, n }), tens(gate.data(), RAD_BF16, { M, H }),
+                g.paged ? tens(key.data(), RAD_BF16, { g.pages, 1, 4, n / 4 })
+                        : tens(key.data(), RAD_BF16, { g.pages, n }),
+                tens(bt.data(), RAD_I32, { S, g.BT }), tens(cu.data(), RAD_I32, { S + 1 }),
+                tens(nc.data(), RAD_I32, { S }), tens(out.data(), RAD_F32, { M, g.SC }) };
+            RadArgs a{};
+            a.t = t.data(); a.n_t = (int)t.size(); a.p = p.data(); a.n_p = (int)p.size(); a.world_size = 1;
+            return fn(&a, nullptr);
+        };
+        char w[120];
+        std::snprintf(w, sizeof w, "idx_score M %lld, %d columns, %s keys: per-row = row-tiled, both ~ libref",
+                      (long long)M, g.SC, g.paged ? "paged" : "flat");
+        const RadKernelInfo* ref = libref_op("idx_score");
+        if (!ref) { std::printf("FAIL %s: libref's idx_score not loadable (set RADIANCE_HOME)\n", w); ++g_fails; continue; }
+        std::vector<float> want, row, tile;
+        const int rr = launch(ref->launch, want);
+        r4d_idx_score_pin_form(1);
+        const int r1 = launch(r4d_rad_idx_score, row);
+        r4d_idx_score_pin_form(2);
+        const int r2 = launch(r4d_rad_idx_score, tile);
+        r4d_idx_score_pin_form(0);
+        if (rr != RAD_OK || r1 != RAD_OK || r2 != RAD_OK) {
+            std::printf("FAIL %s: libref rc=%d per-row rc=%d tiled rc=%d\n", w, rr, r1, r2);
+            ++g_fails;
+            continue;
+        }
+        int64_t bad = 0, fin = 0, inf = 0;
+        for (int64_t m = 0; m < M; ++m) {
+            double mx = 0;
+            for (int64_t b = 0; b < g.SC; ++b)
+                if (std::isfinite(want[(size_t)(m * g.SC + b)])) mx = std::max(mx, (double)std::fabs(want[(size_t)(m * g.SC + b)]));
+            for (int64_t b = 0; b < g.SC; ++b) {
+                const float x = row[(size_t)(m * g.SC + b)], y = want[(size_t)(m * g.SC + b)];
+                if (std::isinf(x) || std::isinf(y)) { bad += x != y; inf += std::isinf(y); continue; }
+                ++fin;
+                bad += std::fabs((double)x - y) > 1e-4 * (mx > 0 ? mx : 1.0);
+            }
+        }
+        const bool same = std::memcmp(row.data(), tile.data(), row.size() * 4) == 0;
+        if (bad || !same || !fin || !inf) {
+            std::printf("FAIL %s: %lld of %lld out of bound, forms %s (%lld -inf)\n", w, (long long)bad,
+                        (long long)(fin + inf), same ? "equal" : "DIFFER", (long long)inf);
+            ++g_fails;
+        } else {
+            std::printf("ok   %s (%lld finite, %lld -inf)\n", w, (long long)fin, (long long)inf);
+        }
+    }
+}
 
 static void ihc_pre() {
     struct G { int64_t hc, n, M, pad; bool post; };
@@ -685,6 +774,7 @@ int main() {
     engram_ids();
     engram_norm_gate();
     dfly_sel();
+    idx_score_forms();
     std::printf("%d case(s), %d failure(s)\n", g_cases, g_fails);
     return g_fails ? 1 : 0;
 }

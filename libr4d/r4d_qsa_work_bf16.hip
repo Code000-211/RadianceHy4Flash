@@ -41,20 +41,36 @@ constexpr int kMaxSeq  = 256;
     int32_t* __restrict__ nc, int n, int ratio, int ring, int seqs, int max_work, int k_ld,     \
     int s_slot, int s_row, int sidx_ld, int bt_ld, int g_ld,                                    \
     const int32_t* __restrict__ rope, int rplane, int bstep
-__device__ __forceinline__ void qsa_work_body(QSA_WORK_PARAMS) {
+
+/* The step metadata the body finds before it touches a key: which sequence owns this work item,
+ * where its block goes and the position it rotates at. All of it is uploaded by the host -- `pos`,
+ * `cu`, `sidx`, `bt` and `rope` are input operands, and no op of a pass writes an input -- so a
+ * chained workgroup reads it in front of its wait and the poll hides the search's dependent round
+ * trips: cu, pos, then sidx, then the block table (K-29). The body reads nothing here itself, so
+ * the two forms find the same values. */
+struct QsaWorkMeta {
+    int nc;         /* the sequence's complete blocks; -1 for a workgroup that writes none */
+    int s;          /* the sequence owning work item w, -1 past the real count */
+    int j;          /* the block index within that sequence */
+    int t0, p0;     /* the sequence's first token, and its first position */
+    int si;         /* its committed tail slot, -1 when it has no state */
+    int page;       /* the block's key page, -1 when it has none */
+    int bpos[3];    /* the block's rotary position, its rope ? 3 : 1 components */
+};
+
+__device__ __forceinline__ QsaWorkMeta qsa_work_meta(QSA_WORK_PARAMS) {
 
     const int w = (int)blockIdx.x;
+    QsaWorkMeta m = { -1, -1, 0, 0, 0, -1, -1, { 0, 0, 0 } };
     /* Complete blocks per sequence (needed by the scorer and the selection), written by the first
      * `seqs` workgroups instead of a separate launch. */
-    if (w < seqs && threadIdx.x == 0) {
+    if (w < seqs) {
         const int t1 = cu[w + 1];
-        nc[w] = t1 > cu[w] ? (pos[t1 - 1] + 1) / ratio : 0;
+        m.nc = t1 > cu[w] ? (pos[t1 - 1] + 1) / ratio : 0;
     }
-    if (w >= max_work) return;
 
     /* The sequence owning work item w, by a running count recomputed in every workgroup (seqs is
      * small; a prefix would need a second launch). */
-    int s = -1, j = 0;
     int run = 0;
     for (int i = 0; i < seqs && i < kMaxSeq; ++i) {
         const int t0 = cu[i], t1 = cu[i + 1];
@@ -66,42 +82,50 @@ __device__ __forceinline__ void qsa_work_body(QSA_WORK_PARAMS) {
         const int lo = p0 / ratio;                                  /* ceil((p0-ratio+1)/ratio) */
         const int hi = (p1 + 1) / ratio - 1;                        /* floor((p1-ratio+1)/ratio) */
         const int cnt = hi >= lo ? hi - lo + 1 : 0;
-        if (w < run + cnt) { s = i; j = w - run + lo; break; }
+        if (w < run + cnt) { m.s = i; m.j = w - run + lo; break; }
         run += cnt;
     }
-    if (s < 0) {
-        /* Past the real count: page = -1 makes the host's bound safe. */
-        if (threadIdx.x == 0) {
-            page[w] = -1;
-            for (int c = 0; c < (rope ? 3 : 1); ++c) bpos[(size_t)w * bstep + c] = 0;
-        }
-        return;
-    }
+    if (m.s < 0) return m;   /* past the real count: page = -1 makes the host's bound safe */
 
-    const int b  = j;                       /* the block index within the sequence */
-    const int t0 = cu[s];
-    const int p0 = pos[t0];
+    m.t0 = cu[m.s];
+    m.p0 = pos[m.t0];
     /* Column 0 is the committed slot; -1 marks a sequence with no state, whose blocks cannot be
      * built (page -1, no gather). */
-    const int si = sidx[(size_t)s * sidx_ld];
+    m.si = sidx[(size_t)m.s * sidx_ld];
+    m.page = m.si < 0 ? -1 : bt[(size_t)m.s * bt_ld + m.j];
+    if (!rope) {
+        m.bpos[0] = m.j * ratio;
+    } else {
+        /* Rotary position of the block's first token, three components side by side, items bstep
+         * apart. A first token in this step reads its own components. One from an earlier step is
+         * text (only a decode row or a prompt's last chunk leaves a block open, and a prompt ends
+         * in text), so it rotates at its index plus the shift carried by this step's first row of
+         * the sequence. */
+        const int f = m.j * ratio;
+        for (int c = 0; c < 3; ++c)
+            m.bpos[c] = f >= m.p0 ? rope[(size_t)c * rplane + m.t0 + (f - m.p0)]
+                                  : f + (rope[m.t0] - m.p0);
+    }
+    return m;
+}
 
+__device__ __forceinline__ void qsa_work_body(QSA_WORK_PARAMS, const QsaWorkMeta& m) {
+
+    const int w = (int)blockIdx.x;
+    if (m.nc >= 0 && threadIdx.x == 0) nc[w] = m.nc;
+    if (w >= max_work) return;
+
+    const int b = m.j;     /* the block index within the sequence */
     if (threadIdx.x == 0) {
-        page[w] = si < 0 ? -1 : bt[(size_t)s * bt_ld + b];
+        page[w] = m.page;
         if (!rope) {
-            bpos[(size_t)w * bstep] = b * ratio;
+            bpos[(size_t)w * bstep] = m.bpos[0];
         } else {
-            /* Rotary position of the block's first token, three components side by side, items
-             * bstep apart. A first token in this step reads its own components. One from an
-             * earlier step is text (only a decode row or a prompt's last chunk leaves a block open,
-             * and a prompt ends in text), so it rotates at its index plus the shift carried by
-             * this step's first row of the sequence. */
-            const int f = b * ratio;
-            for (int c = 0; c < 3; ++c)
-                bpos[(size_t)w * bstep + c] =
-                    f >= p0 ? rope[(size_t)c * rplane + t0 + (f - p0)] : f + (rope[t0] - p0);
+            for (int c = 0; c < 3; ++c) bpos[(size_t)w * bstep + c] = m.bpos[c];
         }
     }
-    if (si < 0) return;
+    if (m.si < 0) return;   /* also past the real count, whose page is -1 */
+    const int t0 = m.t0, p0 = m.p0, si = m.si;
 
     /* The block's raw keys, each from this step or from the tail. */
     for (int i = 0; i < ratio; ++i) {
@@ -119,9 +143,15 @@ __device__ __forceinline__ void qsa_work_body(QSA_WORK_PARAMS) {
 template <class CH>
 __global__ __launch_bounds__(kThreads)
 void qsa_work_kernel(QSA_WORK_PARAMS) {
-    if (CH::on) r4d_chain_wait();
+    /* K-29: the step's metadata in front of the wait, which then hides its round trips (see
+     * QsaWorkMeta). Nothing the body reads after the acquire is a scalar load, which is what the
+     * vector-cache wait wants: tests/chain_scalar_audit.py reports none behind it. */
+    const QsaWorkMeta m = qsa_work_meta(k, pos, cu, state, sidx, bt, stage, page, bpos, nc, n, ratio,
+                                        ring, seqs, max_work, k_ld, s_slot, s_row, sidx_ld, bt_ld,
+                                        g_ld, rope, rplane, bstep);
+    if (CH::on) r4d_chain_wait_vec();
     qsa_work_body(k, pos, cu, state, sidx, bt, stage, page, bpos, nc, n, ratio, ring, seqs,
-                  max_work, k_ld, s_slot, s_row, sidx_ld, bt_ld, g_ld, rope, rplane, bstep);
+                  max_work, k_ld, s_slot, s_row, sidx_ld, bt_ld, g_ld, rope, rplane, bstep, m);
     if (CH::on) r4d_chain_done();
 }
 #undef QSA_WORK_PARAMS

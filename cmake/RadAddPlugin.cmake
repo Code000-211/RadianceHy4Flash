@@ -136,6 +136,112 @@ function(rad_add_plugin name kind)
   endif()
 endfunction()
 
+# The override's own source, beside this file in the tree and in an installation. CACHE INTERNAL
+# because this file is included in whatever scope reaches it first, and the function below is
+# called from another.
+set(RAD_KERNEL_OVERRIDE_SOURCE "${CMAKE_CURRENT_LIST_DIR}/rad_kernel_override.cpp" CACHE INTERNAL
+    "the source of a kernel-library override (rad_add_kernel_override)")
+
+# A kernel library made of another one with a few of its translation units rebuilt: the units
+# given here and nothing else are compiled, and every other row is the base library's own
+# (cmake/rad_kernel_override.cpp, docs/PLUGIN.md §14). For working on one kernel without rebuilding
+# the library around it.
+#
+#   rad_add_kernel_override(<target> BASE <kernel-library target | path to its .so>
+#                           [SOURCES ...] [HIP_SOURCES ...] [GPU_TARGETS ...] [INCLUDES ...]
+#                           [LIBS ...] [HOME <dir>] [CUID_NAME <name>])
+#
+# The result carries the base's file name and lands in <HOME>/kernels (default
+# ${CMAKE_BINARY_DIR}/override_home), a home of its own: put it ahead of the base's on the search
+# path (RADIANCE_HOME=<HOME>:<the base's home>) and it shadows the base, with no configuration
+# naming it. It is never installed. A running server takes a rebuild of it without a restart
+# (POST /admin/kernels/reload, docs/PLUGIN.md §14.1).
+#
+# The units are compiled as the base compiles them: give the same INCLUDES and GPU_TARGETS, and set
+# on the target what the base's target sets (a language standard, say). Source-file properties need
+# no repeating when the base is built in the same directory. A device unit's compilation unit ID is
+# the one rad_add_plugin gives it in the base (CUID_NAME, default the base's file name without
+# .so), so its code object is the one the base would carry.
+function(rad_add_kernel_override name)
+  cmake_parse_arguments(P "" "BASE;HOME;CUID_NAME" "SOURCES;HIP_SOURCES;LIBS;INCLUDES;GPU_TARGETS"
+                        ${ARGN})
+  if(NOT P_BASE)
+    message(FATAL_ERROR "rad_add_kernel_override(${name}): BASE names the kernel library to "
+                        "override, a target or the path of its .so.")
+  endif()
+  if(NOT P_SOURCES AND NOT P_HIP_SOURCES)
+    message(FATAL_ERROR "rad_add_kernel_override(${name}): no SOURCES or HIP_SOURCES, so there is "
+                        "nothing to override ${P_BASE} with.")
+  endif()
+  if(TARGET ${P_BASE})
+    get_target_property(_rad_stem ${P_BASE} OUTPUT_NAME)
+    if(NOT _rad_stem)
+      set(_rad_stem "${P_BASE}")
+    endif()
+    set(_rad_base_file "$<TARGET_FILE:${P_BASE}>")
+  else()
+    get_filename_component(_rad_base_file "${P_BASE}" ABSOLUTE)
+    if(NOT EXISTS "${_rad_base_file}")
+      message(FATAL_ERROR "rad_add_kernel_override(${name}): BASE ${P_BASE} is neither a target "
+                          "nor an existing file.")
+    endif()
+    get_filename_component(_rad_stem "${_rad_base_file}" NAME_WE)
+  endif()
+  if(NOT P_HOME)
+    set(P_HOME "${CMAKE_BINARY_DIR}/override_home")
+  endif()
+  if(NOT P_CUID_NAME)
+    set(P_CUID_NAME "${_rad_stem}")
+  endif()
+
+  set(srcs ${RAD_KERNEL_OVERRIDE_SOURCE} ${P_SOURCES})
+  if(P_HIP_SOURCES AND NOT RAD_HIP_FOUND)
+    message(FATAL_ERROR "rad_add_kernel_override(${name}) was given HIP_SOURCES but this radiance "
+                        "has no device build (RAD_HIP_FOUND is OFF).")
+  endif()
+  if(P_HIP_SOURCES)
+    get_property(_rad_langs GLOBAL PROPERTY ENABLED_LANGUAGES)
+    if(NOT "HIP" IN_LIST _rad_langs)
+      message(FATAL_ERROR
+        "rad_add_kernel_override(${name}) was given HIP_SOURCES but the HIP language is not "
+        "enabled in this project. Add `enable_language(HIP)` after project().")
+    endif()
+    set_source_files_properties(${P_HIP_SOURCES} PROPERTIES LANGUAGE HIP)
+    # The base's ID for the unit, as rad_add_plugin derives it. A source the base's rad_add_plugin
+    # call in this directory already gave one keeps it.
+    foreach(src ${P_HIP_SOURCES})
+      get_source_file_property(_rad_opts "${src}" COMPILE_OPTIONS)
+      if(NOT _rad_opts MATCHES "-cuid=")
+        get_filename_component(_rad_abs "${src}" ABSOLUTE)
+        file(RELATIVE_PATH _rad_rel "${CMAKE_CURRENT_SOURCE_DIR}" "${_rad_abs}")
+        string(SHA256 _rad_cuid "${P_CUID_NAME}/${_rad_rel}")
+        string(SUBSTRING "${_rad_cuid}" 0 16 _rad_cuid)
+        set_property(SOURCE "${src}" APPEND PROPERTY COMPILE_OPTIONS "-cuid=${_rad_cuid}")
+      endif()
+    endforeach()
+    list(APPEND srcs ${P_HIP_SOURCES})
+  endif()
+
+  add_library(${name} MODULE ${srcs})
+  target_link_libraries(${name} PRIVATE radiance::abi ${CMAKE_DL_LIBS} ${P_LIBS})
+  target_include_directories(${name} PRIVATE ${P_INCLUDES})
+  target_compile_definitions(${name} PRIVATE "RAD_OVERRIDE_BASE=\"${_rad_base_file}\"")
+  # The base as a dependency under its path, whether or not a unit refers to it: what the units
+  # take from the rest of the base resolves there, and the loader maps the same file the override
+  # then opens. Given to the linker as a file, since a MODULE library cannot be linked as a target.
+  target_link_options(${name} PRIVATE "LINKER:--no-as-needed" "${_rad_base_file}")
+  if(TARGET ${P_BASE})
+    add_dependencies(${name} ${P_BASE})
+  endif()
+  file(MAKE_DIRECTORY ${P_HOME}/kernels)
+  set_target_properties(${name} PROPERTIES
+    PREFIX "" OUTPUT_NAME "${_rad_stem}"
+    LIBRARY_OUTPUT_DIRECTORY ${P_HOME}/kernels)
+  if(P_HIP_SOURCES)
+    rad_hipify(${name} ${P_GPU_TARGETS})
+  endif()
+endfunction()
+
 # Repeatable device code on LLVM 24. ROCm 10.1's clang (AMD clang 24) is not deterministic: the
 # post-RA VOPD pairing pass (GCNVOPDUtils.cpp) caches each load's transitive load dependencies, a
 # fusion adds edges behind that cache, and which entries are cached follows the iteration order of

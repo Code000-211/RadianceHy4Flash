@@ -1554,6 +1554,15 @@ int Engine::declare() {
             return RAD_E_INVAL;
         }
     }
+    if (cvec_.loaded() && cvec_.rank > 1 && plugins_.arch_plugin != "hyv4flash") {
+        /* Only hyv4flash declares k chained projections (PLAN §14). Another arch would declare one
+         * and silently steer 1 of k directions, with the basis scale, and say nothing. */
+        RAD_ERR("--control-vector %s: it carries %lld directions per layer, and the '%s' plugin "
+                "projects one direction per layer", cfg_.control_vector.c_str(),
+                (long long) cvec_.rank, plugins_.arch_plugin.c_str());
+        cvec_ = ControlVector{};
+        return RAD_E_UNSUPPORTED;
+    }
     if (cvec_.loaded()) {
         cvec_views_.assign(ranks_.size(), RadControlVector{});
         cvec_salt_ = control_vector_salt(cvec_);
@@ -1561,10 +1570,16 @@ int Engine::declare() {
          * request that could carry the field. */
         const bool default_on = cfg_.control_vector == "on";
         cvec_default_.store(default_on);
-        RAD_INFO("control vectors: %s: %lld directions of %lld, layers %d..%d, scale %.3f -- "
+        /* n_dirs counts tensors, which is the direction count only for a rank-1 file. */
+        const std::string rank_note =
+            cvec_.rank > 1 ? " (rank " + std::to_string(cvec_.rank) + ", " +
+                                  std::to_string(cvec_.n_dirs * cvec_.rank) + " total)"
+                            : "";
+        RAD_INFO("control vectors: %s: %lld directions of %lld%s, layers %d..%d, scale %.3f -- "
                  "default %s%s",
                  cvec_.path.c_str(), (long long) cvec_.n_dirs,
-                 (long long) cvec_.n_embd, cvec_.first, cvec_.last, (double) cvec_.user_scale,
+                 (long long) cvec_.n_embd, rank_note.c_str(),
+                 cvec_.first, cvec_.last, (double) cvec_.user_scale,
                  default_on ? "ON" : "off",
                  default_on ? " (--control-vector on; a request can still say false)"
                             : " until a request asks for it (the dashboard's switch, or a request's "
@@ -1969,6 +1984,12 @@ int Engine::plan() {
             f.queue_scratch = rad_dev_resident_scratch_bytes(&props);
             f.capacity = props.vram_bytes;
             f.free     = props.vram_free;
+            /* And what of the memory `free` excludes is device code: the code objects this card has
+             * loaded, each one whole from its module at its kernel's first launch (module_load in
+             * core/device/aql.cpp). The receipt prints it beside `already held`, so a lane can say
+             * what a build carrying only the kernel forms this model runs would give back (M-14).
+             * A backend that loads no device code says so, and the line stays out of its receipt. */
+            dev_code_resident(r->device, &f.code_bytes, &f.code_modules);
             /* Unified memory: the pinned host pool is the same RAM as the card, so the
              * budget charges it against the one ledger. */
             f.unified     = props.unified != 0;
@@ -4326,6 +4347,30 @@ int Engine::load_weights() {
                  cfg_.tp > 1 ? " (summed over ranks, which map the same file: the resident bytes "
                                "are that divided by --tp)" : "",
                  humanb(mapped_kept).c_str());
+
+    /* ---- M-01: the host pool's mirror of the resident units --------------------------------
+     * The mover sized each class's pool to every unit the host-pool budget had room for, so the
+     * resident units it holds slots for have no host copy yet. They get one here, once, on each
+     * rank's mover stream: after this a demotion of such a unit is an address change and its next
+     * promotion keeps the slot, so the bytes are never copied off the card again. Nothing else may
+     * be in flight (the sweep above synced every rank's stream), and the bytes never change. */
+    {
+        const auto mt0 = std::chrono::steady_clock::now();
+        int64_t mirrored = 0;
+        int64_t mirror_bytes = 0;
+        for (auto& r : ranks_) {
+            if (r->mover.mirror_slots() <= 0) continue;
+            RAD_TRY(rad_dev_set(r->device));
+            RAD_TRY(r->mover.fill_mirrors());
+            mirrored += r->mover.mirror_slots();
+            mirror_bytes += r->mover.mirror_bytes();
+        }
+        if (mirrored > 0)
+            RAD_INFO("load: %lld pool slot(s) mirror a resident unit (%s), copied once off the "
+                     "card in %.1f s: their demotions are address changes",
+                     (long long)mirrored, humanb(mirror_bytes).c_str(),
+                     std::chrono::duration<double>(std::chrono::steady_clock::now() - mt0).count());
+    }
     return RAD_OK;
 }
 
