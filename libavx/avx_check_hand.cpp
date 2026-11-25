@@ -2393,6 +2393,15 @@ void video_cases(std::vector<Hand>& hs) {
              .pi("M", M).pi("head_dim", 64).pi("n_head", 2).pi("n_head_kv", 1)
              .pf("theta", 10000.0).pf("scale", 2.0).ps("mode", "neox");
             hs.push_back(std::move(r));
+            /* The latent sinks' folded rotary (mla_attn_*_sink's `rope_pos`): a narrow gptj head,
+             * no rotary_dim (the head's own width), whole-number integer positions. */
+            Hand s(("rope of a folded query fragment, head_dim 8, gptj" + sfx).c_str(), "rope",
+                   norm_tol);
+            s.dense(dt, { 3, 2 * 8 }, hfill(481), true)
+             .idx({ 41, 42, 43 })
+             .pi("M", 3).pi("head_dim", 8).pi("n_head", 2).pi("n_head_kv", 0)
+             .pf("theta", 10000.0).pf("scale", 1.0).ps("mode", "gptj");
+            hs.push_back(std::move(s));
         }
 
         /* ---- the DiT's norm: three entries (one empty), [shift | scale] at a 6n pitch ------- */
@@ -5068,6 +5077,33 @@ static void hy4_cases(std::vector<Hand>& hs) {
         hs.push_back(std::move(h));
     }
 
+    {
+        /* `advance` 0: a decode step hashes against the window and leaves it as it was, so the
+         * Engram layers that share one history all read the window the step opened with and only
+         * the last of them commits to it. The window [2, 1] and the row's own token 3 (through an
+         * identity map) pin the ids by hand: heads 2 over two orders, mix_1 = 3 ^ 2 = 1 at head 0
+         * (7) and mix_2 = 1 ^ 8 = 9 at head 1 (offset 100). */
+        const int64_t M = 1, heads = 2, ngram = 3, W = 2, map = 4;
+        static const int64_t mult[3] = { 1, 2, 4 }, vsz[2] = { 7, 11 }, off[2] = { 0, 100 };
+        Hand h("advance 0: the window is read, not committed", "engram_ids", 0.0);
+        h.idx({ 3 })
+         .dense(RAD_I32, { 1, W }, [](int64_t i) { return i == 0 ? 2.0f : 1.0f; }, false)
+         .idx({ 0, 1 })
+         .idx({ 5 })
+         .dense(RAD_I32, { map }, [](int64_t i) { return (float)i; })
+         .raw(RAD_I64, { 3 }, mult)
+         .raw(RAD_I64, { 2 }, vsz)
+         .raw(RAD_I64, { 2 }, off)
+         .idx({ 1 })
+         .none()
+         .dense(RAD_I32, { M, heads }, [](int64_t) { return -5.0f; }, true)
+         .dense(RAD_I32, { M }, sent, true)
+         .pi("M", M).pi("heads", heads).pi("ngram", ngram).pi("pad", 0).pi("map_size", map)
+         .pi("advance", 0)
+         .expect(10, { 1, 109 });
+        hs.push_back(std::move(h));
+    }
+
     /* ---- iHC ---------------------------------------------------------------------------- */
     for (const bool post : { true, false }) {
         /* h is a column slice of a wider plane; base far below zero saturates a gate at hc_eps. */
@@ -5093,6 +5129,25 @@ static void hy4_cases(std::vector<Hand>& hs) {
          .dense(RAD_BF16, { M, hc * n }, hfill(433), true)
          .pi("M", M).pi("n", n).pi("hc", hc).ps("dtype", "bf16");
         hs.push_back(std::move(h));
+    }
+
+    /* ---- hc_project: the control vector, one shared direction and a per-stream table -------- */
+    for (const bool per_stream : { false, true }) {
+        for (const uint32_t dt : { (uint32_t)RAD_F32, (uint32_t)RAD_BF16 }) {
+            /* Row 1's switch is 0: it must come back as it went in. */
+            const int64_t M = 3, n = 37, hc = 4;
+            Hand h(per_stream ? (dt == RAD_F32 ? "a per-stream table, f32 streams"
+                                               : "a per-stream table, bf16 streams")
+                              : (dt == RAD_F32 ? "one shared direction, f32 streams"
+                                               : "one shared direction, bf16 streams"),
+                   "hc_project", dt == RAD_F32 ? 1e-5 : 6e-3);
+            h.dense(dt, { M, hc * n }, hfill(451), true)
+             .dense(RAD_F32, { per_stream ? hc : 1, n }, hfill(452, 0.2f))
+             .dense(RAD_I32, { M }, [](int64_t i) { return i == 1 ? 0.0f : 1.0f; })
+             .pi("M", M).pi("n", n).pi("hc", hc).pi("vsep", per_stream ? n : 0).pf("scale", 1.0)
+             .ps("dtype", dt == RAD_F32 ? "f32" : "bf16");
+            hs.push_back(std::move(h));
+        }
     }
 
     /* ---- gate_mul: saturated gates -------------------------------------------------------- */
@@ -5189,6 +5244,44 @@ static void hy4_cases(std::vector<Hand>& hs) {
          .dense(RAD_F32, { M, H, L }, sent, true)
          .pi("M", M).pi("heads", H).pi("latent_dim", L).pi("rope_dim", R).pi("blocks", B)
          .pi("block_size", bs).pf("scale", 0.2).ps("dtype", "f32");
+        hs.push_back(std::move(h));
+    }
+    {
+        /* The query's rotary folded into the sink (its optional `rope_pos`, the 9th operand): both
+         * backends turn the projection's columns with the same angle as `rope` and round each pair
+         * once, so a folded launch is a `rope` launch followed by the sink. */
+        const int64_t H = 2, L = 32, R = 8, bs = 4, blocks = 5, M = 3;
+        Hand h("the query's rotary folded in (gptj)", "mla_attn_paged_sink", 1e-5);
+        h.dense(RAD_F32, { M, H, L }, hfill(481))
+         .dense(RAD_F32, { M, H, R }, hfill(482))
+         .dense(RAD_F32, { 10, 1, bs, L + R }, hfill(483))
+         .dense(RAD_I32, { 1, blocks }, [](int64_t i) { return (float)((i * 3 + 1) % 10); })
+         .idx({ 9 })
+         .idx({ 0, M })
+         .dense(RAD_F32, { H }, [](int64_t i) { return 0.5f * (float)i; })
+         .dense(RAD_F32, { M, H, L }, sent, true)
+         .idx({ 41, 41, 41 })
+         .pi("M", M).pi("heads", H).pi("latent_dim", L).pi("rope_dim", R).pi("block_size", bs)
+         .pi("window", 0).pi("stable", 1).pf("scale", 0.1767766952966369).ps("dtype", "f32")
+         .pf("rope_theta", 10000.0).pf("rope_scale", 1.0).ps("rope_mode", "gptj");
+        hs.push_back(std::move(h));
+    }
+    {
+        /* The same fold with imrope's three position planes on the selection form. */
+        const int64_t H = 2, L = 24, R = 8, bs = 4, B = 3, M = 3;
+        Hand h("the query's rotary folded in (three imrope planes)", "mla_attn_sel_sink", 1e-5);
+        h.dense(RAD_F32, { M, H, L }, hfill(491))
+         .dense(RAD_F32, { M, H, R }, hfill(492))
+         .dense(RAD_F32, { 6, 1, bs, L + R }, hfill(493))
+         .dense(RAD_I32, { M, B }, [](int64_t i) { return (float)((i * 5 + 2) % 6); })
+         .idx({ 8, 9, 10 })
+         .dense(RAD_F32, { H }, [](int64_t i) { return 2.0f - 3.0f * (float)i; })
+         .dense(RAD_F32, { M, H, L }, sent, true)
+         .dense(RAD_I32, { 3, M }, [](int64_t i) { return 100.0f + 13.0f * (float)i; })
+         .pi("M", M).pi("heads", H).pi("latent_dim", L).pi("rope_dim", R).pi("blocks", B)
+         .pi("block_size", bs).pi("stable", 1).pf("scale", 0.2).ps("dtype", "f32")
+         .pf("rope_theta", 10000.0).pf("rope_scale", 1.0).ps("rope_mode", "imrope_gptj")
+         .ps("rope_sections", "2 1 1");
         hs.push_back(std::move(h));
     }
     {

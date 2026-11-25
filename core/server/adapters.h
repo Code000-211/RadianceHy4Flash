@@ -93,6 +93,19 @@ inline SchedMetrics bridge_metrics(const rad::SchedMetrics& m) {
     o.kv_resident_blocks = m.kv_resident_blocks;
     o.kv_stream_misses = m.kv_stream_misses;
     o.kv_stream_bytes_in = m.kv_stream_bytes_in;
+    /* The loan's pieces, and the name of the group they are counted in, so a reader of /stats need
+     * not map an index onto the `kv` array that only /metrics carries. */
+    if (m.kv_spare.group >= 0) {
+        o.kv_loan.group         = m.kv_spare.group < m.n_kv_groups ? m.kv[m.kv_spare.group].name : "";
+        o.kv_loan.block_tokens  = m.kv_spare.block_tokens;
+        o.kv_loan.block_bytes   = m.kv_spare.block_bytes;
+        o.kv_loan.held          = m.kv_spare.held;
+        o.kv_loan.held_top      = m.kv_spare.held_top;
+        o.kv_loan.buffer_blocks = m.kv_spare.buffer_blocks;
+        o.kv_loan.live          = m.kv_spare.live;
+        o.kv_loan.spare_tokens  = m.kv_spare.spare_tokens;
+        o.kv_loan.loan_tokens   = m.kv_spare.loan_tokens;
+    }
 
     /* vLLM's gpu_prefix_cache_hit_rate means attention caching. The linear-checkpoint hit
      * rate has a different granularity (spec §7.3) and is reported separately, not averaged

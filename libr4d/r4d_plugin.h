@@ -579,6 +579,7 @@ int r4d_rad_gemm_mxfp4a8_gemv(const RadArgs*, RadStream);
  * plane more (r4d_layout.cpp, m2xfp4). */
 int r4d_rad_dequant_w4      (const RadArgs*, RadStream);
 int r4d_rad_rowtopk         (const RadArgs*, RadStream);
+int r4d_rad_cast_rowtopk    (const RadArgs*, RadStream);
 int64_t r4d_rad_rowtopk_scratch(const RadArgs*);
 int r4d_rad_rowtopk_merge   (const RadArgs*, RadStream);
 int r4d_rad_logit_rerank_i8 (const RadArgs*, RadStream);
@@ -710,6 +711,7 @@ int r4d_rad_kv_store_streamed(const RadArgs*, RadStream);
 int r4d_rad_qsa_tail_store  (const RadArgs*, RadStream);
 int r4d_rad_qsa_work        (const RadArgs*, RadStream);
 int r4d_rad_idx_pool_gated  (const RadArgs*, RadStream);
+int r4d_rad_qsa_work_pool_tail(const RadArgs*, RadStream);   /* K-24: work + pool + the tail rows */
 int r4d_rad_idx_pool_gated_fp8(const RadArgs*, RadStream);
 int r4d_rad_idx_pool_gated_i8(const RadArgs*, RadStream);
 int r4d_rad_idx_score       (const RadArgs*, RadStream);
@@ -1110,6 +1112,7 @@ int r4d_shape_qsa_select         (const RadParam*, int, int operand, RadOpdDesc*
 int r4d_shape_kv_resolve         (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_qsa_tail_store     (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_qsa_work           (const RadParam*, int, int operand, RadOpdDesc*);
+int r4d_shape_qsa_work_pool_tail (const RadParam*, int, int operand, RadOpdDesc*);
 
 int r4d_shape_dflash_conv    (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_dflash_select  (const RadParam*, int, int operand, RadOpdDesc*);
@@ -1145,6 +1148,7 @@ int r4d_fuse_qkv_norm_rope_kv_store(const RadParam*, int, uint64_t, int, RadFuse
 int r4d_fuse_add_rmsnorm(const RadParam*, int, uint64_t, int, RadFuseStep*);
 int r4d_fuse_mla_expand_gate(const RadParam*, int, uint64_t, int, RadFuseStep*);
 int r4d_fuse_mla_expand_gate_had_quant_i8g(const RadParam*, int, uint64_t, int, RadFuseStep*);
+int r4d_fuse_qsa_work_pool_tail (const RadParam*, int, uint64_t, int, RadFuseStep*);
 int r4d_fuse_qk_norm_rope_gate_kv_store_streamed(const RadParam*, int, uint64_t, int,
                                                  RadFuseStep*);
 int r4d_fuse_ar_rmsnorm_quant_fp8(const RadParam*, int, uint64_t, int, RadFuseStep*);

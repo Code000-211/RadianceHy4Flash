@@ -145,6 +145,38 @@ TEST(oai_seeds_sampling_from_the_deployment_default) {
     CHECK_NEAR(r3.sp.top_p, 0.95f, 1e-6);
 }
 
+TEST(oai_times_the_request_prep_phases) {
+    Fixture f;
+    OaiRequest c;
+    ApiError e;
+    CHECK_OK(parse_chat_request(R"({"messages":[{"role":"user","content":"hi"}]})",
+                                f.odeps(), f.limits(), &c, &e));
+    CHECK(c.prep_parse_ns >= 0);
+    CHECK(c.prep_render_ns >= 0);
+    CHECK(c.prep_encode_ns >= 0);
+    CHECK(c.prep_grammar_ns >= 0);
+    CHECK_EQ(c.prep_submit_ns, -1);        /* only serve() sets it, at submit */
+
+    OaiRequest p;
+    CHECK_OK(parse_completion_request(R"({"prompt":"ab"})", f.odeps(), f.limits(), &p, &e));
+    CHECK(p.prep_parse_ns >= 0);
+    CHECK_EQ(p.prep_render_ns, -1);        /* a completion renders no template */
+    CHECK(p.prep_encode_ns >= 0);
+    CHECK(p.prep_grammar_ns >= 0);
+    CHECK_EQ(p.prep_submit_ns, -1);
+
+    /* The log fragment: ms where timed, '-' where the path has no such phase. */
+    const std::string line = format_prep_phases(p);
+    CHECK(line.find(" render=-") != std::string::npos);
+    CHECK(line.find(" submit=-") != std::string::npos);
+    CHECK(line.find(" parse=") != std::string::npos && line.find(" parse=-") == std::string::npos);
+    OaiRequest fixed;
+    fixed.prep_parse_ns = 1500000;
+    fixed.prep_submit_ns = 0;
+    CHECK(format_prep_phases(fixed) ==
+          " parse=1.50ms render=- encode=- grammar=- submit=0.00ms");
+}
+
 TEST(oai_parses_a_completion_prompt_in_every_shape) {
     Fixture f;
     OaiLimits lim = f.limits();
@@ -2297,8 +2329,6 @@ TEST(a_dropped_stream_cancels_at_the_scheduler) {
     q.method = "POST";
     q.path = "/v1/chat/completions";
     q.body = R"({"messages":[{"role":"user","content":"hi"}],"stream":true})";
-    std::atomic<bool> gone{false};
-    q.closed = [&gone] { return gone.load(); };
 
     HttpResponse r = f.srv->router().dispatch(q);
     CHECK_EQ(r.status, 200);
@@ -2309,11 +2339,10 @@ TEST(a_dropped_stream_cancels_at_the_scheduler) {
     CHECK(!f.sched.saw_cancel());
     CHECK_EQ(f.srv->in_flight(), 1LL);
 
-    /* The peer goes away. The transport notices on its next pull and tears the provider down. */
-    gone.store(true);
-    std::string c;
-    bool more = r.next(c);
-    CHECK(!more);
+    /* The peer goes away. The transport notices -- its own peer check runs before every chunk it
+     * writes, and the write to a closed socket fails there -- and reports it as on_close. The
+     * provider above does not probe the socket itself, so this is where the drop reaches the
+     * server. */
     r.on_close(false);
 
     CHECK(f.sched.saw_cancel());

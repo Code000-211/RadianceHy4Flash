@@ -10,10 +10,52 @@
 #include "cpp-httplib/httplib.h"
 
 #include <arpa/inet.h>
+#include <dlfcn.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <unistd.h>
+
+#include <atomic>
+#include <chrono>
+#include <thread>
+
+/* ---------------------------------------------------------------- counting the drain's polls */
+
+/* A syscall cannot be counted from the test that makes it, so this binary defines poll() and
+ * send(). While a test has armed the count, a poll that waits for POLLOUT counts as one poll and a
+ * send as one write; the drain makes one poll per turn of its loop, and hands at most one chunk to
+ * the socket per turn, so the two counters differ only by the turns that wrote nothing -- a write
+ * that repeats the wait its loop just made shows up as one more poll than write. Armed or not, both
+ * calls go to the libc ones that would have had them. */
+namespace {
+std::atomic<bool> g_count_polls{false};
+std::atomic<int>  g_pollout_polls{0};
+std::atomic<int>  g_sends{0};
+}  /* namespace */
+
+extern "C" int poll(struct pollfd *fds, nfds_t nfds, int timeout) {
+    using PollFn = int (*)(struct pollfd *, nfds_t, int);
+    static const PollFn real = reinterpret_cast<PollFn>(::dlsym(RTLD_NEXT, "poll"));
+    if (g_count_polls.load(std::memory_order_relaxed)) {
+        for (nfds_t i = 0; i < nfds; ++i)
+            if (fds[i].events & POLLOUT) {
+                g_pollout_polls.fetch_add(1, std::memory_order_relaxed);
+                break;
+            }
+    }
+    return real(fds, nfds, timeout);
+}
+
+extern "C" ssize_t send(int fd, const void *buf, size_t n, int flags) {
+    using SendFn = ssize_t (*)(int, const void *, size_t, int);
+    static const SendFn real = reinterpret_cast<SendFn>(::dlsym(RTLD_NEXT, "send"));
+    if (g_count_polls.load(std::memory_order_relaxed)) {
+        g_sends.fetch_add(1, std::memory_order_relaxed);
+    }
+    return real(fd, buf, n, flags);
+}
 
 /* A loopback connection that gives up on a read after `timeout_s`, or -1. */
 static int dial(int port, int timeout_s) {
@@ -633,6 +675,62 @@ TEST(a_keep_alive_connection_serves_a_stream_and_what_follows) {
     const Reply c = read_reply(fd);
     CHECK_EQ(c.status, 200);
     CHECK(json::accept(c.body));
+}
+
+namespace {
+
+/* Reads off `fd` until `body` holds `needle`, false if the peer left first. */
+bool read_until(int fd, std::string &body, const std::string &needle) {
+    char buf[4096];
+    while (body.find(needle) == std::string::npos) {
+        const ssize_t got = ::recv(fd, buf, sizeof buf, 0);
+        if (got <= 0) return false;
+        body.append(buf, (size_t)got);
+    }
+    return true;
+}
+
+}  /* namespace */
+
+/* A chunk costs one wait for a writable socket, not two: the drain waits for writability and then
+ * writes the chunk, and the write repeated the wait it had been told the answer to a moment before.
+ * The scheduler is in manual mode, so a token is produced when the test says so, one a turn of the
+ * drain's loop -- the stream a served one is. What is counted is the polls for writability against
+ * the writes they led to: each chunk costs its turn of the loop and, without the trust, the poll
+ * its write made as well. */
+TEST(a_streamed_chunk_waits_for_writability_once) {
+    LiveServer s(4, 1);
+    REQUIRE(s.srv->port() > 0);
+    s.sched.manual = true;
+    const int fd = s.open(post("/v1/completions", R"({"prompt":"hi","stream":true})"));
+    REQUIRE(fd >= 0);
+    REQUIRE(eventually([&] { return s.sched.sink(0) != nullptr; }));
+
+    g_pollout_polls.store(0);
+    g_sends.store(0);
+    g_count_polls.store(true);
+    /* A token every millisecond: the drain takes one per turn of its loop, so the stream is the
+     * sixteen chunks a served stream is, and the wait it makes for each is far too short to time
+     * out and turn the loop over on its own. */
+    for (int i = 0; i < 16; ++i) {
+        s.sched.push(0, "a");
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    s.sched.finish(0, Finish::Stop);
+    std::string body;
+    REQUIRE(read_until(fd, body, "[DONE]"));
+    g_count_polls.store(false);
+    const int polls = g_pollout_polls.load();
+    const int sends = g_sends.load();
+    fprintf(stderr, "    writability polls %d, writes %d\n", polls, sends);
+    /* A chunk costs its turn of the drain's loop and, before, the poll its write made as well. The
+     * turns that hand nothing over and the writes that end the body are the constant, so the polls
+     * stay under twice the writes with the write trusting the wait (measured 29 to 35 polls against
+     * 15 to 19 writes) and over it without the trust (50 to 53 against the same writes). */
+    CHECK(polls <= 2 * sends + 4);
+    CHECK(sends > 1);
+    CHECK(has(body, "data: [DONE]\n\n"));
+    ::close(fd);
 }
 
 /* A body sent chunked (no Content-Length) is read whole, and one past --max-body-mib is a 413

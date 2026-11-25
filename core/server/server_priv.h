@@ -50,7 +50,6 @@ struct Server::Generation {
 struct Server::StreamState {
     OaiRequest              r;
     std::vector<Generation> gens;
-    std::function<bool()>   peer_closed;
     bool opened = false;
     bool done_sent = false;
     bool released = false;

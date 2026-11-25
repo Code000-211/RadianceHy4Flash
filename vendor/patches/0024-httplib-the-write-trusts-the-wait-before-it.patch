@@ -1,0 +1,130 @@
+diff --git a/httplib.cpp b/httplib.cpp
+index 62c172f5..56ec270d 100644
+--- a/httplib.cpp
++++ b/httplib.cpp
+@@ -1997,6 +1997,10 @@ public:
+   // question that was answered a moment ago. Consumed by that read.
+   void set_readable_hint() { readable_hint_ = true; }
+ 
++  // The caller has just seen this socket writable. See Stream::set_writable_hint().
++  // LOCAL CHANGE (radiance): consumed by the next write().
++  void set_writable_hint() override { writable_hint_ = true; }
++
+ private:
+   bool ensure_readable();
+ 
+@@ -2016,6 +2020,7 @@ private:
+   size_t read_buff_off_ = 0;
+   size_t read_buff_content_size_ = 0;
+   bool readable_hint_ = false;
++  bool writable_hint_ = false;
+ 
+   static const size_t read_buff_size_ = 1024l * 4;
+ };
+@@ -4146,7 +4151,11 @@ bool write_content_with_progress(Stream &strm,
+     if (!strm.wait_writable() || !strm.is_peer_alive()) {
+       error = Error::Write;
+       return false;
+-    } else if (!content_provider(offset, end_offset - offset, data_sink)) {
++    }
++    // LOCAL CHANGE (radiance): the wait above answered this; the provider's
++    // write of this chunk does not ask again.
++    strm.set_writable_hint();
++    if (!content_provider(offset, end_offset - offset, data_sink)) {
+       error = Error::Canceled;
+       return false;
+     } else if (!ok) {
+@@ -4215,7 +4224,11 @@ write_content_without_length(Stream &strm,
+   while (data_available && !is_shutting_down()) {
+     if (!strm.wait_writable() || !strm.is_peer_alive()) {
+       return false;
+-    } else if (!content_provider(offset, 0, data_sink)) {
++    }
++    // LOCAL CHANGE (radiance): the wait above answered this; the provider's
++    // write of this chunk does not ask again.
++    strm.set_writable_hint();
++    if (!content_provider(offset, 0, data_sink)) {
+       return false;
+     } else if (!ok) {
+       return false;
+@@ -4384,7 +4397,11 @@ write_content_chunked(Stream &strm, const ContentProvider &content_provider,
+     if (!strm.wait_writable() || !strm.is_peer_alive()) {
+       error = Error::Write;
+       return false;
+-    } else if (!content_provider(offset, 0, data_sink)) {
++    }
++    // LOCAL CHANGE (radiance): the wait above answered this; the chunk's write
++    // does not poll the socket again for the same answer.
++    strm.set_writable_hint();
++    if (!content_provider(offset, 0, data_sink)) {
+       error = Error::Canceled;
+       return false;
+     } else if (!ok) {
+@@ -5896,6 +5913,10 @@ public:
+   // See SocketStream::set_readable_hint().
+   void set_readable_hint() { readable_hint_ = true; }
+ 
++  // See Stream::set_writable_hint(). LOCAL CHANGE (radiance): consumed by the
++  // next write().
++  void set_writable_hint() override { writable_hint_ = true; }
++
+   // The error from the last read() or write() that failed in the TLS layer,
+   // with code Success if none did
+   const tls::TlsError &tls_error() const { return tls_error_; }
+@@ -5913,6 +5934,7 @@ private:
+   std::chrono::time_point<std::chrono::steady_clock> start_time_;
+   std::function<bool()> read_interrupted_;
+   bool readable_hint_ = false;
++  bool writable_hint_ = false;
+   tls::TlsError tls_error_;
+ };
+ 
+@@ -7949,7 +7971,15 @@ ssize_t SocketStream::read(char *ptr, size_t size) {
+ }
+ 
+ ssize_t SocketStream::write(const char *ptr, size_t size) {
+-  if (!wait_writable()) { return -1; }
++  // LOCAL CHANGE (radiance): the response loop that wrote this chunk waited for
++  // the socket to be writable and then said so, so that wait is not repeated
++  // here. The hint is consumed either way: a send may fill the socket, and the
++  // next write has to look again.
++  if (writable_hint_) {
++    writable_hint_ = false;
++  } else if (!wait_writable()) {
++    return -1;
++  }
+ 
+   // Winsock's send() takes an int length, even on 64-bit Windows
+ #ifdef _WIN32
+@@ -8515,7 +8545,12 @@ ssize_t SSLSocketStream::read(char *ptr, size_t size) {
+ }
+ 
+ ssize_t SSLSocketStream::write(const char *ptr, size_t size) {
+-  if (wait_writable()) {
++  // LOCAL CHANGE (radiance): as SocketStream::write() -- the response loop that
++  // wrote this chunk has just waited for writability, so it is not waited for
++  // again here. Consumed either way.
++  const bool writable = writable_hint_ ? (writable_hint_ = false, true)
++                                       : wait_writable();
++  if (writable) {
+     auto handle_size =
+         std::min<size_t>(size, (std::numeric_limits<int>::max)());
+ 
+diff --git a/httplib.h b/httplib.h
+index 489d1ef0..45f4adc1 100644
+--- a/httplib.h
++++ b/httplib.h
+@@ -2024,6 +2024,13 @@ public:
+   virtual bool wait_writable() const = 0;
+   virtual bool is_peer_alive() const { return wait_writable(); }
+ 
++  // The caller has just seen this stream writable -- the content loops wait
++  // before each chunk and then write it. Lets that write skip its own wait,
++  // which would ask the kernel a question that was answered a moment ago.
++  // Consumed by that write. LOCAL CHANGE (radiance): the response loops below
++  // set it, SocketStream::write() and SSLSocketStream::write() consume it.
++  virtual void set_writable_hint() {}
++
+   virtual ssize_t read(char *ptr, size_t size) = 0;
+   virtual ssize_t write(const char *ptr, size_t size) = 0;
+   virtual void get_remote_ip_and_port(std::string &ip, int &port) const = 0;

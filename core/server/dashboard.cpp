@@ -338,6 +338,25 @@ HttpResponse Server::handle_stats(const HttpRequest&) {
         o["kv_bytes_used"]   = (double)m.kv_bytes_used;
         o["kv_bytes_total"]  = (double)m.kv_bytes_total;
         o["kv_bytes_carved"] = (double)m.kv_bytes_carved;
+        /* Why `used` falls short of the carve that was not lent: the loan stops at the highest
+         * held block, so a block released under one is free and still unlendable. `held_top -
+         * held` is that fragmentation in blocks of the binding group; `live - held_top -
+         * buffer_blocks` is headroom the arbiter has not lent yet. Blocks, not bytes: the group
+         * that lends least decides, and a block is `block_tokens` long. */
+        if (!m.kv_loan.group.empty()) {
+            const SchedMetrics::KvLoan& s = m.kv_loan;
+            o["kv_loan"] = json{
+                { "group",         s.group },
+                { "block_tokens",  s.block_tokens },
+                { "block_bytes",   s.block_bytes },
+                { "held",          s.held },
+                { "held_top",      s.held_top },
+                { "buffer_blocks", s.buffer_blocks },
+                { "live",          s.live },
+                { "spare_tokens",  s.spare_tokens },
+                { "loan_tokens",   s.loan_tokens },
+            };
+        }
         o["kv_tokens_max"]   = m.kv_tokens_max;
         o["prefix_hit_rate"] = m.prefix_hit_rate;
         /* Leading indicator beside the lagging hit rate: past ~75% kv utilisation the cache
