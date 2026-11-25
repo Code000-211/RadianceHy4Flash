@@ -847,6 +847,49 @@ static void run_case(const RadKernelInfo* r, std::vector<RadTensor>& ts,
     ok(r->name, rc == expect && he == hipSuccess, d);
 }
 
+/* One launch of `r` on the operands the caller built, quiet: unlike run_case it writes no row of
+ * its own, so a case can run a row more than once under one `ok`. It allocates nothing, so an
+ * operand the caller left absent (null data) stays absent, and it synchronises, so a launch failure
+ * is attributed here and not to whatever runs next. */
+static bool run_once(const RadKernelInfo* r, std::vector<RadTensor>& ts,
+                     const std::vector<RadParam>& ps) {
+    RadArgs a;
+    std::memset(&a, 0, sizeof(a));
+    a.t = ts.data(); a.n_t = (int)ts.size();
+    a.p = ps.data(); a.n_p = (int)ps.size();
+    a.world_size = 1;
+
+    if (r->scratch) {
+        const int64_t need = r->scratch(&a);
+        if (need < 0) return false;
+        if (need > 0) { a.scratch = dalloc((size_t)need); a.scratch_bytes = need; }
+    }
+
+    const int rc = r->launch(&a, nullptr);
+    return rc == RAD_OK && (hipError_t)st_stream_sync(nullptr) == hipSuccess;
+}
+
+/* A row's chained form against its plain one, byte for byte (K-29). `reset` puts the outputs back
+ * to the caller's sentinel values and `dump` reads them out, so neither launch starts from the
+ * other's answer. No engine record reaches r4d_selftest, so r4d_chain.h's wait returns at once and
+ * what the chained form does around it -- the metadata it reads in front of the wait -- is the
+ * whole difference between the two launches. `plain` comes back with the plain launch's bytes, for
+ * the caller to hold against its own oracle. */
+template <class Reset, class Dump>
+static bool chain_same_bytes(const RadKernelInfo* r, std::vector<RadTensor>& ts,
+                             const std::vector<RadParam>& ps, Reset reset, Dump dump,
+                             std::vector<uint8_t>& plain) {
+    std::vector<uint8_t> chained;
+    for (int form = 0; form < 2; ++form) {
+        reset();
+        std::vector<RadParam> p = ps;
+        if (form) p.push_back(PI("chain", 1));
+        if (!run_once(r, ts, p)) return false;
+        (form ? chained : plain) = dump();
+    }
+    return plain == chained;
+}
+
 static const RadKernelInfo* find(const Plugin& pl, const char* name) {
     for (int k = 0; k < pl.kernel_count(); ++k)
         if (!std::strcmp(pl.kernel_at(k)->name, name)) return pl.kernel_at(k);
@@ -5018,7 +5061,7 @@ static void kv_store_i8_case(const Plugin& pl) {
  * sentinel and those slots must still hold it. Slot 0 is a real slot (as in libref and
  * r4d_gdn_conv_w4_h128_bf16.hip) and is used deliberately. */
 static void kv_store_case(const Plugin& pl, const char* name, const char* kv_dtype,
-                          bool latent = false) {
+                          bool latent = false, bool chained = true) {
     if (!sel(name)) return;
     const RadKernelInfo* r = find(pl, name);
     if (!r) { ok(name, false, "row absent"); return; }
@@ -5142,6 +5185,27 @@ static void kv_store_case(const Plugin& pl, const char* name, const char* kv_dty
        bad == 0, first);
     ok((std::string(name) + " leaves a pad slot and every unnamed offset untouched").c_str(),
        pad_touched == 0, pad_touched ? "written: " + first : "");
+
+    /* K-29: the chained form reads the slot map in front of its chain wait (the vector-cache one),
+     * so the wait no longer covers that read; the two launches have to leave the cache -- the pad
+     * sentinel included -- in the same bytes, and neither may leave the sentinel standing. Only the
+     * bf16 row has a chained form; kv_store_fp8 launches the one kernel either way. */
+    if (chained) {
+        std::vector<uint8_t> buf(cbytes);
+        auto reset = [&] { st_memset(d_c, 0x7f, cbytes); };
+        auto dump  = [&] {
+            st_memcpy(buf.data(), d_c, cbytes, hipMemcpyDeviceToHost);
+            return buf;
+        };
+        reset();
+        const std::vector<uint8_t> as_reset = dump();
+        std::vector<uint8_t> plain;
+        const bool same = chain_same_bytes(r, ts, ps, reset, dump, plain);
+        ok((std::string(name) + " chained form == plain bytes").c_str(),
+           same && plain == got && plain != as_reset,
+           "a launch failed, the chained form's cache differs from the plain one, or a launch left "
+           "the sentinel standing");
+    }
 }
 
 /* The anchor state form, end to end.
@@ -10142,6 +10206,83 @@ static void rope_ladder_case(const Plugin& pl) {
         const double rel = dnorm > 0.0 ? std::sqrt(num / dnorm) : 0.0;
         ok(what, rel < 2e-3 && untouched_bad == 0, std::string("ladder=") + tag + " rel_l2=" +
              std::to_string(rel) + " vhead-moved=" + std::to_string(untouched_bad));
+    }
+}
+
+/* rope_bf16's chained form against the plain launch, byte for byte: the chained kernel reads the
+ * step's position in front of its chain wait (K-29), so every byte of the row has to come out the
+ * same. Every width the body has: a plain neox one, the multi-component (imrope) one, whose position
+ * is the three-component table rope_pos reads component by component, and a two-section axial one,
+ * whose table has two rows and no third one to read. */
+static void rope_chain_case(const Plugin& pl) {
+    const char* what = "rope's chained form against the plain launch, byte for byte";
+    const RadKernelInfo* r = find(pl, "rope_bf16");
+    if (!r) { ok(what, false, "row absent"); return; }
+
+    const int64_t hd = 64, rot = 64, n_head = 3, nkv = 1;
+    const int64_t row = (n_head + 2 * nkv) * hd;
+    const float theta = 10000.0f;
+    struct C { int64_t M; int comps; const char* mode; const char* sections; };
+    const C cs[] = { { 6, 1, "neox", nullptr },
+                     { 6, 3, "imrope_gptj", "11 11 10" },
+                     { 5, 2, "axial", "16 16" },
+                     { 1, 1, "neox", nullptr } };
+
+    for (const C& c : cs) {
+        const std::string what_c = fmt("%s: M %lld, %s (%d component%s)", what, (long long)c.M,
+                                       c.mode, c.comps, c.comps == 1 ? "" : "s");
+        std::vector<uint16_t> x((size_t)(c.M * row));
+        for (size_t i = 0; i < x.size(); ++i) {
+            float v = (float)(((i * 7) % 23) - 11) / 13.0f;
+            if (i % 11 == 0) v *= 3.0f;
+            x[i] = h_to_bf16(v);
+        }
+        /* The position of row m is its own in every component, so a wrong component shows. */
+        std::vector<int32_t> pos((size_t)(c.M * c.comps));
+        for (int64_t m = 0; m < c.M; ++m) {
+            pos[(size_t)m] = (int32_t)(3 + 5 * m);
+            if (c.comps > 1) pos[(size_t)(c.M + m)] = (int32_t)(100 + 7 * m);
+            if (c.comps > 2) pos[(size_t)(2 * c.M + m)] = (int32_t)(900 + 11 * m);
+        }
+        void* d_x[2];
+        for (int k = 0; k < 2; ++k) d_x[k] = dalloc(x.size() * 2);
+        void* d_pos = dalloc(pos.size() * 4);
+        if (!d_x[0] || !d_x[1] || !d_pos) { ok(what_c.c_str(), false, "hipMalloc failed"); continue; }
+        st_memcpy(d_pos, pos.data(), pos.size() * 4, hipMemcpyHostToDevice);
+
+        const RadTensor pt = c.comps > 1 ? T(d_pos, RAD_I32, { c.comps, c.M })
+                                         : T(d_pos, RAD_I32, { c.M });
+        /* The input, kept aside: the loop below replaces `x` with the plain launch's output, and the
+         * chained launch must start from the same rows, not from rows already turned once. */
+        const std::vector<uint16_t> in = x;
+        int64_t diff = -1;
+        for (int chain = 0; chain < 2; ++chain) {
+            st_memcpy(d_x[chain], in.data(), in.size() * 2, hipMemcpyHostToDevice);
+            std::vector<RadTensor> ts = { T(d_x[chain], RAD_BF16, { c.M, row }), pt };
+            std::vector<RadParam> ps = { PI("M", c.M), PI("head_dim", hd), PI("n_head", n_head),
+                                         PI("n_head_kv", nkv), PF("theta", (double)theta),
+                                         PF("scale", 1.0), PS("mode", c.mode),
+                                         PI("rotary_dim", rot) };
+            if (c.sections) ps.push_back(PS("sections", c.sections));
+            if (chain) ps.push_back(PI("chain", 1));
+            const int rc = [&] {
+                RadArgs a;
+                std::memset(&a, 0, sizeof a);
+                a.t = ts.data(); a.n_t = (int)ts.size();
+                a.p = ps.data(); a.n_p = (int)ps.size();
+                if (r->launch(&a, (RadStream)nullptr) != RAD_OK) return RAD_E_STATE;
+                return st_stream_sync(nullptr) == hipSuccess ? RAD_OK : RAD_E_STATE;
+            }();
+            if (rc != RAD_OK) { diff = -1; break; }
+            std::vector<uint16_t> got(in.size());
+            st_memcpy(got.data(), d_x[chain], got.size() * 2, hipMemcpyDeviceToHost);
+            if (!chain) { x = got; continue; }
+            diff = 0;
+            for (size_t i = 0; i < got.size(); ++i) diff += got[i] != x[i];
+        }
+        if (diff < 0) { ok(what_c.c_str(), false, "launch failed"); continue; }
+        /* `x` now holds the plain launch's bytes; the chained run had to reproduce them. */
+        ok(what_c.c_str(), diff == 0, "bytes differing: " + std::to_string(diff));
     }
 }
 
@@ -21045,10 +21186,13 @@ static SinkOps sink_ops(bool sel, int64_t heads, const std::vector<int64_t>& qle
     }
     return o;
 }
-/* The output bytes (margins included) of one device launch of `row` at pin form `form`. */
+/* The output bytes (margins included) of one device launch of `row` at pin form `form`, chained
+ * when `chain` (K-29 reads the sink's prologue in front of the chain wait). */
 static bool sink_device(const Plugin& pl, const RadKernelInfo* row, SinkOps& o, int form,
-                        std::vector<uint8_t>& got) {
+                        std::vector<uint8_t>& got, bool chain = false) {
     auto* pin = (void (*)(int))dlsym(pl.h, "r4d_mla_sink_pin_form");
+    std::vector<RadParam> ps(o.ps);
+    if (chain) ps.push_back(PI("chain", 1));
     std::vector<void*> mem(o.host.size(), nullptr);
     std::vector<RadTensor> dev(o.host.size());
     for (size_t i = 0; i < o.host.size(); ++i) {
@@ -21061,8 +21205,8 @@ static bool sink_device(const Plugin& pl, const RadKernelInfo* row, SinkOps& o, 
     RadArgs a{};
     a.t = dev.data();
     a.n_t = (int)dev.size();
-    a.p = o.ps.data();
-    a.n_p = (int)o.ps.size();
+    a.p = ps.data();
+    a.n_p = (int)ps.size();
     a.world_size = 1;
     const int64_t need = row->scratch ? row->scratch(&a) : 0;
     if (need < 0) return false;
@@ -21233,6 +21377,21 @@ static void mla_sink_bytes(const Plugin& pl, int64_t heads, std::vector<int64_t>
         for (int64_t rr = 0; eq && rr < ot.shape[0]; ++rr)
             eq = row_bytes(g, s.host[(size_t)s.out], rr) == row_bytes(base, ot, rr);
         ok(fmt("%s paged == sel", label.c_str()).c_str(), eq);
+    }
+    /* K-29: the chained form reads the step's metadata in front of its chain wait, and no engine
+     * record reaches r4d_selftest, so the wait returns at once and only the bracket differs. Every
+     * byte -- the guards too -- has to be the plain launch's, in both forms. */
+    {
+        std::vector<uint8_t> g;
+        const bool ran = sink_device(pl, paged, all, 0, g, true);
+        ok(fmt("%s chained form == plain bytes", label.c_str()).c_str(), ran && g == base);
+    }
+    if (!window) {
+        SinkOps s = sink_ops(true, heads, qlen, ctx, 0, bs, 0, 1, stable);
+        std::vector<uint8_t> plain, g;
+        const bool ran = sink_device(pl, selr, s, 0, plain) && sink_device(pl, selr, s, 0, g, true);
+        ok(fmt("%s chained selection form == plain bytes", label.c_str()).c_str(),
+           ran && g == plain);
     }
 }
 
@@ -27432,9 +27591,44 @@ static void qsa_work_case(const Plugin& pl) {
     std::printf("        M-RoPE: [work, 3] positions %s (%ld from committed text); one column at "
                 "pitch 3 %s\n", mc_ok ? "ok" : "NO", mc_text, col_ok ? "ok" : "NO");
 
+    /* K-29: the chained form reads the step's metadata -- `cu`, `pos`, the state slots, the tail
+     * pool's index and the rotary planes -- ahead of its chain wait, and that wait is the
+     * vector-cache one. No engine record reaches r4d_selftest, so the wait returns at once and the
+     * move is the whole difference between the launches: the keys, pages, positions and
+     * completed-block counts have to be the plain launch's bytes, and the sentinel must not stand
+     * anywhere. The planes are in, as in the M-RoPE section above. */
+    std::vector<uint16_t> key0((size_t)(W_ * ratio * n));
+    for (auto& x : key0) x = h_to_bf16(-6.5f);
+    std::vector<int32_t> page0((size_t)W_, -4242), nc0((size_t)seqs, -4242);
+    std::vector<uint8_t> snap((size_t)(W_ * ratio * n) * 2 + (size_t)W_ * 4 + (size_t)W_ * 3 * 4 +
+                              (size_t)seqs * 4);
+    auto reset = [&] {
+        st_memcpy(d_st, key0.data(), key0.size() * 2, hipMemcpyHostToDevice);
+        st_memcpy(d_pg, page0.data(), page0.size() * 4, hipMemcpyHostToDevice);
+        st_memcpy(d_b3, sentinel.data(), sentinel.size() * 4, hipMemcpyHostToDevice);
+        st_memcpy(d_nc, nc0.data(), nc0.size() * 4, hipMemcpyHostToDevice);
+    };
+    auto dump = [&] {
+        uint8_t* o = snap.data();
+        st_memcpy(o, d_st, (size_t)(W_ * ratio * n) * 2, hipMemcpyDeviceToHost);
+        o += (size_t)(W_ * ratio * n) * 2;
+        st_memcpy(o, d_pg, (size_t)W_ * 4, hipMemcpyDeviceToHost);
+        o += (size_t)W_ * 4;
+        st_memcpy(o, d_b3, (size_t)W_ * 3 * 4, hipMemcpyDeviceToHost);
+        o += (size_t)W_ * 3 * 4;
+        st_memcpy(o, d_nc, (size_t)seqs * 4, hipMemcpyDeviceToHost);
+        return snap;
+    };
+    reset();
+    const std::vector<uint8_t> as_reset = dump();
+    std::vector<uint8_t> plain;
+    const bool chain_ok = chain_same_bytes(r, tr, ps, reset, dump, plain) && plain != as_reset;
+    std::printf("        chained form == plain bytes %s\n", chain_ok ? "ok" : "NO");
+
     /* `from_tail` requires a straddling block, `ring_differs` that ring and ratio rows differ. */
     const bool pass = page_ok && pos_ok && key_ok && pad_ok && nc_ok && from_tail > 0 &&
-                      ring_differs > 0 && !want.empty() && mc_ok && mc_text > 0 && col_ok;
+                      ring_differs > 0 && !want.empty() && mc_ok && mc_text > 0 && col_ok &&
+                      chain_ok;
     std::printf("        %zu blocks (%ld keys from the tail, %ld at a row the old modulus would "
                 "have missed), page %s, pos %s, keys %s, padding %s, nc %s\n", want.size(),
                 from_tail, ring_differs, page_ok ? "ok" : "NO", pos_ok ? "ok" : "NO",
@@ -27545,13 +27739,33 @@ static void qsa_tail_store_case(const Plugin& pl) {
     }
     const bool match = got[0] == want;
     const bool det = got[0] == got[1];
-    const bool pass = match && det && other_ok && kept == kept_want && kept_want > 0;
+
+    /* K-29: the chained form reads the block's metadata -- its sequence, the step's first
+     * position, the pool's row -- in front of its chain wait. No engine record reaches
+     * r4d_selftest, so the wait returns at once and the move is the whole difference: the pool has
+     * to come back as the plain passes left it, the rows past the batch's slots and the six
+     * unnamed slots included, and the launch must not leave the prefilled pool standing. */
+    std::vector<uint8_t> buf(pre.size() * 2);
+    auto reset = [&] { st_memcpy(d_tl, pre.data(), pre.size() * 2, hipMemcpyHostToDevice); };
+    auto dump  = [&] {
+        st_memcpy(buf.data(), d_tl, buf.size(), hipMemcpyDeviceToHost);
+        return buf;
+    };
+    reset();
+    const std::vector<uint8_t> as_reset = dump();
+    std::vector<uint8_t> plain;
+    const bool chain_ok = chain_same_bytes(r, ts, ps, reset, dump, plain) &&
+                          plain == std::vector<uint8_t>((uint8_t*)got[0].data(),
+                                                        (uint8_t*)got[0].data() + buf.size()) &&
+                          plain != as_reset;
+
+    const bool pass = match && det && other_ok && kept == kept_want && kept_want > 0 && chain_ok;
     std::printf("        rows %s, untouched %ld of %lld (want %ld), unnamed slots %s, "
-                "two runs identical %s\n", match ? "ok" : "DIFFER", kept,
+                "two runs identical %s, chained form %s\n", match ? "ok" : "DIFFER", kept,
                 (long long)(slots * ring), kept_want, other_ok ? "ok" : "WRITTEN",
-                det ? "ok" : "NO");
+                det ? "ok" : "NO", chain_ok ? "ok" : "NO");
     ok(what, pass, std::string("match=") + (match ? "1" : "0") + " det=" + (det ? "1" : "0") +
-                   " other=" + (other_ok ? "1" : "0") +
+                   " other=" + (other_ok ? "1" : "0") + " chain=" + (chain_ok ? "1" : "0") +
                    " kept=" + std::to_string(kept) + "/" + std::to_string(kept_want));
 }
 
@@ -29527,6 +29741,28 @@ static void idx_score_run(const Plugin& pl, const char* what, const std::vector<
         same = rc == RAD_OK && std::memcmp(o2.data(), dev.data(), dev.size() * 4) == 0;
     }
     ok(fmt("%s: the per-row and row-tiled forms give the same bytes", what).c_str(), same);
+
+    /* K-29: the chained form reads the row's sequence and its column's page -- `cu`, `nc`, `bt` --
+     * in front of its chain wait, which is then the vector-cache one. No engine record reaches
+     * r4d_selftest, so the wait returns at once and that move is the whole difference between the
+     * launches: the scores have to be the plain launch's bytes, and the 9.0f they were seeded with
+     * must not stand anywhere. */
+    std::vector<uint8_t> buf(dev.size() * 4);
+    std::vector<float> seed(dev.size(), 9.0f);
+    auto reset = [&] { st_memcpy(d_o, seed.data(), seed.size() * 4, hipMemcpyHostToDevice); };
+    auto dump  = [&] {
+        st_memcpy(buf.data(), d_o, buf.size(), hipMemcpyDeviceToHost);
+        return buf;
+    };
+    reset();
+    const std::vector<uint8_t> as_reset = dump();
+    std::vector<uint8_t> plain;
+    const bool chain_ok =
+        chain_same_bytes(r, ts, ps, reset, dump, plain) &&
+        plain == std::vector<uint8_t>((const uint8_t*)dev.data(),
+                                      (const uint8_t*)dev.data() + buf.size()) &&
+        plain != as_reset;
+    ok(fmt("%s: the chained form gives the same bytes", what).c_str(), chain_ok);
 
     if (!extra) return;
     /* Every row alone (M 1, its own sequence's table) gives the full launch's bytes; and a second
@@ -36203,7 +36439,7 @@ static void device_phase(const Plugin& pl) {
     /* --- the paged cache's write side --- */
     kv_store_case(pl, "kv_store_bf16", "bf16");
     kv_store_case(pl, "kv_store_bf16", "bf16", true);
-    kv_store_case(pl, "kv_store_fp8",  "fp8_e4m3");
+    kv_store_case(pl, "kv_store_fp8",  "fp8_e4m3", false, false);
     kv_store_i8_case(pl);
 
     /* --- attention --- */
@@ -38442,6 +38678,11 @@ static void device_phase(const Plugin& pl) {
     if (sel("rope_bf16")) {
         if (!g_case) std::printf("\nthe rotary ladder, against an f32 mirror of the kernel at each width\n");
         rope_ladder_case(pl);
+    }
+
+    if (sel("rope_bf16")) {
+        if (!g_case) std::printf("\nthe rotary's chained form, against the plain launch\n");
+        rope_chain_case(pl);
     }
 
     if (sel("grid_embed_sf_bf16")) {
