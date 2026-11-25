@@ -172,8 +172,15 @@ TEST(iq8r_container_reads_the_trunks_rotated_codes_everywhere) {
             }
             CHECK_EQ(gu, 47);
             CHECK_EQ(dn, 47);
-            /* q|k|v, o, the dense pair twice, the shared pair 47 times. */
-            CHECK_EQ(count_op(b, "gemm_nt_q"), 49 * 4 + 2 * 2 + 47 * 2);
+            /* q|k|v, o, the dense pair twice, the shared gate|up 47 times. The shared down is a
+             * runtime-LoRA target module kind, the plain bf16 view site
+             * (LinearFP8::plain_bf16_view): a gemm_nt over the gated product's bf16 plane. */
+            CHECK_EQ(count_op(b, "gemm_nt_q"), 49 * 4 + 2 * 2 + 47);
+            int sh_view = 0;
+            for (const auto& o : b.ops)
+                sh_view += o.op == "gemm_nt" && !o.w.empty() && o.w[0] <= b.weights.size() &&
+                           b.weights[o.w[0] - 1].name.find("ffn_down_shexp") != std::string::npos;
+            CHECK_EQ(sh_view, 47);
             CHECK_EQ(count_op(b, "gated_had_quant_i8g"), 2 + 47 + 47);
             CHECK_EQ(count_op(b, "had_quant_act_i8g"), 49);
             for (const char* op : { "gated_quant_fp8", "quant_act_fp8", "rmsnorm_quant_fp8",
