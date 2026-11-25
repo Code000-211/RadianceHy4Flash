@@ -463,7 +463,7 @@ struct HcProject {
         return rad_decl_buffer(b, name, &d);
     }
 
-    /* `layer`'s projection `k` of `rank`, when the vector steers it. Called for every layer and
+    /* `layer`'s projection `k` (a direction group: one row, or hc rows per stream), when the vector steers it. Called for every layer and
      * every direction; the unsteered ones (outside the file, outside the range, or no vector at
      * all) declare nothing. Directions of a layer are chained on the same stream, so with an
      * orthonormal basis the layer removes its whole k-dimensional subspace. */
@@ -472,8 +472,17 @@ struct HcProject {
                 int64_t k = 0) {
         if (!b || !mask || !stream || !cv || !cv->dir || hc_streams <= 1) return RAD_OK;
         if (layer <= 0 || layer >= cv->n_layers || layer >= g.n_layer) return RAD_OK;
+        /* `rank` is the rows a layer carries. A per-stream package holds hc of them per group, so
+         * it has rank / hc groups, and a row count that is no multiple of hc is no such package. */
         const int64_t rank = cv->rank > 0 ? cv->rank : 1;
-        if (k < 0 || k >= rank) return RAD_OK;
+        const int64_t per = cv->per_stream ? hc_streams : 1;
+        if (rank % per != 0) {
+            fprintf(stderr, "radiance: %s: a per-stream control vector of %lld rows a layer does "
+                            "not split into %lld streams\n",
+                    name, (long long) rank, (long long) hc_streams);
+            return RAD_E_INVAL;
+        }
+        if (k < 0 || k >= rank / per) return RAD_OK;
         const float scale = cv->scales ? cv->scales[(size_t) layer] : 0.0f;
         if (scale == 0.0f) return RAD_OK;
 
@@ -485,7 +494,7 @@ struct HcProject {
          * group, so group k's table is hc rows long and stream s reads row s. A single-direction
          * package is one row shared by every stream (vsep 0, the pre-45 behaviour). */
         ps  = cv->per_stream ? 1 : 0;
-        dir = cv->dir + (size_t) ((layer * rank) + (k * (ps ? hc : 1))) * (size_t) n;
+        dir = cv->dir + (size_t) ((layer * rank) + (k * per)) * (size_t) n;
 
         op = rw(b, RAD_OP(b, "hc_project",
                    RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", n), RAD_INT("hc", hc),

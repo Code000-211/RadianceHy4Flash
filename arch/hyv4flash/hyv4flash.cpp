@@ -1085,7 +1085,15 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         m.proj_rank = ctx->cvec->rank > 0 ? ctx->cvec->rank : 1;
         /* A per-stream package carries one direction per stream inside each group, so the number
          * of chained projections is the group count, not the row count. */
-        if (ctx->cvec->per_stream && m.proj_rank % 4 == 0) m.proj_rank /= 4;
+        if (ctx->cvec->per_stream) {
+            if (m.proj_rank % s.hc != 0) {
+                fprintf(stderr, "radiance: a per-stream control vector of %lld rows a layer does "
+                                "not split into this model's %lld streams\n",
+                        (long long) m.proj_rank, (long long) s.hc);
+                return RAD_E_INVAL;
+            }
+            m.proj_rank /= s.hc;
+        }
         if (m.proj_rank > kMaxCvecRank) {
             fprintf(stderr, "radiance: control vector declares %lld directions per layer; "
                             "steering the first %lld\n",

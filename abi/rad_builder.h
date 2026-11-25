@@ -336,9 +336,10 @@ typedef struct RadControlVector {
      * single-direction package every 2.2 release wrote; 0 is treated as 1 so a package built
      * against the older struct steers exactly as it did. Trailing and zero-defaulted. */
     int64_t      rank;
-    /* 1: `dir` is per-stream, [n_layers, rank, hc, n_embd] where rank counts direction GROUPS and
-     * each group holds one direction per hyper-connection stream, so stream s of group k is at
-     * (((l*rank)+k)*hc + s)*n_embd and a kernel must project stream s against its own vector. 0:
+    /* 1: `dir` is per-stream: `rank` still counts the rows of a layer, and they form rank / hc
+     * GROUPS of one direction per hyper-connection stream ([n_layers, rank/hc, hc, n_embd]), so
+     * stream s of group k is at ((l*rank) + k*hc + s)*n_embd and a kernel must project stream s
+     * against its own vector. 0:
      * one direction per group, applied to every stream (the pre-45 behaviour). The four streams of
      * this architecture carry the refusal signal differently (cosines 0.1-0.6), which is why the
      * published refusal vector is per-stream. Trailing and zero-defaulted. */
