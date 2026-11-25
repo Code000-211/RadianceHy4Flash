@@ -24166,7 +24166,7 @@ static void moefuse_perf(const Plugin& pl, int64_t rows, int iters) {
 /* pad: x's pitch past K. 5 stages x a value at a time in the staged prefill form; 0 at a K that is
  * a multiple of 8 stages it 16 bytes at a time, as the router's contiguous rows do. In the verify
  * form (17-63 rows at N 512+, 32-63 at N 256-511) an even pitch and K stage 4 bytes at a time,
- * an odd one 2 bytes. */
+ * an odd one 2 bytes; above 56 rows only the 2-byte staging takes it. */
 static void f32_forms(const Plugin& pl, int64_t M, int64_t N, int64_t K, int iters, bool timed,
                       int64_t pad = 5) {
     const RadKernelInfo* r = find(pl, "gemm_nt_f32_bf16");
@@ -39155,7 +39155,8 @@ static void device_phase(const Plugin& pl) {
         /* The verify form (x staged transposed: 17-63 rows from N 512, 32-63 at N 256-511) at the
          * router's widths a rank, K 3072, x's rows contiguous and padded, each side of its bounds
          * (N 128 and 255, N 256 at 31 rows and N 511 at 17 stay on 8x1); and short of a whole
-         * stage and step, N no multiple of 4. */
+         * stage and step, N no multiple of 4. Above 56 rows x's contiguous rows (4-byte staging)
+         * keep 8x1 and a pitch K+5 (2-byte staging) does not: N 512 at 56 and 57 rows, both. */
         f32_forms(pl, 32, 128, 3072, 0, false, 0);
         f32_forms(pl, 32, 255, 3072, 0, false, 0);
         f32_forms(pl, 31, 256, 3072, 0, false, 0);
@@ -39163,6 +39164,9 @@ static void device_phase(const Plugin& pl) {
         f32_forms(pl, 17, 511, 3072, 0, false, 8);
         f32_forms(pl, 17, 512, 3072, 0, false, 8);
         f32_forms(pl, 63, 259, 1000, 0, false, 0);
+        f32_forms(pl, 56, 512, 3072, 0, false, 0);
+        f32_forms(pl, 57, 512, 3072, 0, false, 0);
+        f32_forms(pl, 57, 512, 3072, 0, false);
     }
     if (sel("dsa_score_fp8")) {
         dsa_score_check(pl, 1, 17);

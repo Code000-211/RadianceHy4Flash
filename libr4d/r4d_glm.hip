@@ -343,10 +343,14 @@ int gemm_f32_lds(RadStream stream, const RadTensor& x, const RadTensor& w, const
     return v8 ? R4D_GF32L(8, float) : R4D_GF32L(1, float);
 #undef R4D_GF32L
 }
+/* The verify form stages x 4 bytes at a time when x, its pitch and K allow it, else 2 bytes. */
+bool gemm_f32_xt_v2(const RadTensor& x, long k) {
+    return ((uintptr_t)x.data & 3) == 0 && x.stride[0] % 2 == 0 && k % 2 == 0;
+}
 int gemm_f32_xt(RadStream stream, const RadTensor& x, const RadTensor& w, const RadTensor& y,
                 long n, long k, bool chain) {
     const long m = x.shape[0];
-    const bool v2 = ((uintptr_t)x.data & 3) == 0 && x.stride[0] % 2 == 0 && k % 2 == 0;
+    const bool v2 = gemm_f32_xt_v2(x, k);
 #define R4D_GF32X(VX_, CH_, W_)                                                                        \
     R4D_EMIT(stream, (gemm_nt_f32_xt_kernel<VX_, CH_, W_>),                                            \
              dim3((unsigned)((n + 3) / 4), (unsigned)((m + 7) / 8)), dim3(128), 0,                     \
@@ -390,13 +394,18 @@ int gemm_f32_body(const RadArgs* a, RadStream stream) {
      * values of x and a weight from memory. It holds 16 waves a SIMD (8 KiB of LDS). At N 128 it
      * was 2-21 % slower than 8x1 at every verify height (gfx1201, K 3072), and at N 256 about 3 %
      * slower at 17 and 24 rows, faster from 32; at N 512 it was faster at every height. So it takes
-     * N 512 (the widest the entry takes) from 17 rows and N 256-511 from 32; the rest keeps 8x1. */
+     * N 512 (the widest the entry takes) from 17 rows and N 256-511 from 32; the rest keeps 8x1.
+     * With x staged 4 bytes at a time (x's rows contiguous, as the served router's are) it was
+     * 11-12 % faster at N 512 up to 56 rows but no faster from 57, the eighth group of 8 rows
+     * (+0.5 % at 60 and 63 rows, its runs spread to 3 % slower than 8x1's); staged 2 bytes at a time
+     * it stayed 8-10 % faster there. So above 56 rows the 4-byte staging keeps 8x1. */
     const long rows = x.shape[0];
     const bool ch = r4d_geti_or(a, "chain", 0) != 0 && rows <= 64;   /* decode heights */
     if (n <= 8) return gemm_f32_tile<4, 1>(stream, x, w, y, n, k, ch);
     if (rows <= 16 || (rows < 64 && n < 128)) return gemm_f32_tile<2, 2, 16>(stream, x, w, y, n, k, ch);
-    constexpr long xt_wide_n = 512, xt_n = 256, xt_rows = 32;   /* the verify form's bounds */
-    if (rows < 64 && (n >= xt_wide_n || (n >= xt_n && rows >= xt_rows)))
+    constexpr long xt_wide_n = 512, xt_n = 256, xt_rows = 32, xt_v2_rows = 56;   /* the verify form's bounds */
+    if (rows < 64 && (n >= xt_wide_n || (n >= xt_n && rows >= xt_rows)) &&
+        (rows <= xt_v2_rows || !gemm_f32_xt_v2(x, k)))
         return gemm_f32_xt(stream, x, w, y, n, k, ch);
     if (rows < 64) return gemm_f32_tile<8, 1, 8>(stream, x, w, y, n, k, ch);
     const long lds_rows = n >= 512 ? 256 : n >= 256 ? 384 : 768;   /* where staging x pays */

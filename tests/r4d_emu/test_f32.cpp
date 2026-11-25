@@ -12,7 +12,8 @@
  * 128 and 255 stay on 8x1, N 256 from 32 rows, N 511 stays on 8x1 at 17 and 31, N 512 does not),
  * K one stage, short of a step and past whole stages, M no multiple of 8, N no multiple of 4
  * (waves with no column), and x's pitch even (4-byte staging) and odd, and an odd K (2-byte
- * staging).
+ * staging). Above 56 rows the 4-byte staging keeps 8x1 (N 512 at 56 and 57 rows, N 256 at 63) and
+ * the 2-byte staging does not (N 512 at 57 rows, pitch odd).
  *
  * R4D_EMU_F32_DUMP=<file> runs a grid instead (M 1..4096, N 128/256/512, K 3072, f32 and bf16
  * weights; R4D_EMU_F32_DUMP_M=<m> one M of it, R4D_EMU_F32_DUMP_PAD=<p> x's pitch K + p, default 0)
@@ -262,7 +263,7 @@ int main() {
         const char* only = std::getenv("R4D_EMU_F32_DUMP_M");
         const char* pad = std::getenv("R4D_EMU_F32_DUMP_PAD");
         const int xp = 3072 + (pad ? std::atoi(pad) : 0);
-        for (int M : { 1, 4, 16, 17, 24, 32, 40, 48, 63, 64, 128, 256, 300, 1024, 2048, 4096 }) {
+        for (int M : { 1, 4, 16, 17, 24, 32, 40, 48, 56, 57, 63, 64, 128, 256, 300, 1024, 2048, 4096 }) {
             if (only && std::atoi(only) != M) continue;
             for (int N : { 128, 256, 512 }) {
                 std::mt19937 grid_rng(1000003u * (unsigned)M + (unsigned)N);
@@ -283,7 +284,9 @@ int main() {
     // from 32 rows: N 128 and 255 (8x1) at 17, 32 and 63 rows, N 256 at 17 and 31 (8x1) and at 32
     // and 63, N 511 (8x1) and 512 at 17 and 31 (16 and 64 are the 2x2 and 8x4 controls), K one
     // stage, past whole stages, short of a step and under one step, N no multiple of 4, x's pitch
-    // even and odd and K odd; N 127 stays on 2x2.
+    // even and odd and K odd; N 127 stays on 2x2. Above 56 rows an even pitch and K keep 8x1: N 512
+    // at 56 (verify form) and 57 rows (8x1) with x contiguous, N 256 at 63 rows padded even (8x1),
+    // and N 512 at 57 rows with the pitch odd (verify form).
     const GemmCase shapes[] = {
         { 1, 288, 512, 517 },    { 2, 288, 129, 134 },    { 3, 36, 129, 134 },
         { 8, 288, 129, 134 },    { 33, 32, 512, 517 },    { 70, 36, 129, 134 },
@@ -302,6 +305,8 @@ int main() {
         { 20, 512, 256, 258 },   { 48, 264, 4098, 4098 }, { 63, 512, 1000, 1005 },
         { 30, 512, 513, 513 },   { 24, 130, 600, 602 },   { 33, 203, 24, 24 },
         { 16, 256, 3072, 3072 }, { 64, 256, 3072, 3072 }, { 40, 127, 3072, 3072 },
+        { 56, 512, 3072, 3072 }, { 57, 512, 3072, 3072 }, { 63, 256, 3072, 3080 },
+        { 57, 512, 3072, 3077 },
     };
     for (const GemmCase& sh : shapes) {
         ++cases;
