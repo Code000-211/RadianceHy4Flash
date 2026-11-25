@@ -102,10 +102,12 @@ struct GatedMlp {
         down.fed_codes = nullptr;
         return RAD_OK;
     }
+    /* Whether the fold serves rows [r0, r0 + n) (op_gated, gated_rows). */
+    bool folds(int64_t n) const { return op_gated && n > 0 && n <= gated_rows; }
     /* gate_up, the gate and its quantiser over rows [r0, r0 + n): the fold where it serves these
      * rows, the pair otherwise. */
     void gate(RadCtx* c, const ActFP8& in, int64_t T, int64_t r0, int64_t n) const {
-        if (op_gated && n > 0 && n <= gated_rows) {
+        if (folds(n)) {
             const ActFP8 a = gate_up.with_codes(in);
             gate_up.quantise(c, a, T, r0, n);   /* nothing when the codes are fed */
             RAD_ISSUE_N(c, op_gated, n, brow_slice(a.q8, r0, n, gate_up.K),
@@ -123,6 +125,38 @@ struct GatedMlp {
         gate(c, in, T, 0, T);
         down.step(c, ff, y, T);
     }
+    /* Stage `k` of step() (SharedSide issues them apart): 0 the fold where it serves the T rows,
+     * gate_up otherwise; 1 the gate, nothing after the fold; 2 down. The three in turn issue what
+     * step() issues, launch for launch. */
+    void stage(RadCtx* c, rad_buf x, rad_buf y, int64_t T, int k) const {
+        ActFP8 in{};
+        in.x = x;
+        if (k == 0) {
+            if (folds(T)) gate(c, in, T, 0, T);
+            else gate_up.step(c, in, gu, T, 0, T);
+        } else if (k == 1) {
+            if (!folds(T)) act.step(c, gu, T, 0, T);
+        } else {
+            down.step(c, ff, y, T);
+        }
+    }
+    /* Whether the arm writes only buffers of its own: neither linear quantises for itself, which
+     * would write a width's shared code pair (Codes) that another linear in between may use. Fed
+     * (or bf16) gate_up -- the fold's quantiser then issues nothing -- and a down fed by the
+     * gate's codes (gfuse, which the fold writes too) or bf16. */
+    bool writes_own_only() const {
+        return (!gate_up.q8 || gate_up.fed) && (!down.q8 || down.fed);
+    }
+    /* Every buffer the arm writes (gate_up's product, the gate's code planes -- the fold's too --
+     * its product, the output, and gate_up's input codes where it quantises them): excluded from
+     * sharing when it is issued ahead of its declared place (SharedSide). */
+    int mark_concurrent(RadBuilder* b, rad_buf y) const {
+        const rad_buf gq8 = gate_up.fed ? 0 : gate_up.q8, gs8 = gate_up.fed ? 0 : gate_up.s8;
+        for (rad_buf v : { gu, y, ff.x, ff.q, ff.s, ff.q8, ff.s8, act.a.x, act.a.q, act.a.s,
+                           act.a.q8, act.a.s8, gq8, gs8 })
+            if (v) RAD_ARCH_TRY(rad_buf_concurrent(b, v));
+        return RAD_OK;
+    }
     /* Rows [r0, r0 + n): the pipelined prefill runs the arm a piece at a time. */
     void step(RadCtx* c, rad_buf x, rad_buf y, int64_t T, int64_t r0, int64_t n) const {
         ActFP8 in{};
@@ -130,6 +164,30 @@ struct GatedMlp {
         gate(c, in, T, r0, n);
         down.step(c, ff, y, T, r0, n);
     }
+};
+
+/* P-01: a MoE layer's shared expert issued beside the routed GEMMs, stage by stage where MoeFP8
+ * issues its own (MoeFP8::step's `side`), rather than after latent_out. Byte-identical: the same
+ * ops on the same operands; the join and the junction are unchanged. Off:
+ * RADIANCE_HY4_SHARED_SIDE=0 (today's order, and no buffer marked). */
+inline bool shared_side_on() {
+    const char* e = std::getenv("RADIANCE_HY4_SHARED_SIDE");
+    return !(e && *e && std::strcmp(e, "0") == 0);
+}
+
+/* The shared arm's stages for MoeFP8's `side` (SideOps): through stage k at at(k), whatever is
+ * left at flush(). */
+struct SharedSide {
+    RadCtx*         c = nullptr;
+    const GatedMlp* m = nullptr;
+    rad_buf         x = 0, y = 0;
+    int64_t         T = 0;
+    int             next = 0;
+    void upto(int k) {
+        while (next <= k && next < 3) m->stage(c, x, y, T, next++);
+    }
+    void flush() { upto(2); }
+    static void at(void* u, int k) { ((SharedSide*)u)->upto(k); }
 };
 
 /* The routed arm's activation codes (MoeWire::declare). */
@@ -209,6 +267,9 @@ struct Ffn {
     Lin lat_in{}, lat_out{};
     MoeFP8 moe{};
     GatedMlp shared{};
+    /* The shared arm rides MoeFP8's pass (SharedSide, shared_side_on): its buffers are marked
+     * concurrent at declare. */
+    bool shared_side = false;
     rad_op op_join = 0, op_ar = 0;
     rad_weight post_gain = 0;
     rad_op op_post_norm = 0;
@@ -404,6 +465,11 @@ struct Ffn {
                                         nm.f("blk.%d.ffn_down_shexp", l),
                                         nm.ckpt("%s.shared_experts", mp), s.n_ff_shared_r, xf,
                                         w.sout, w.sgu, w.sff, &lat_in, in_codes));
+            /* Issued inside MoeFP8's pass, ahead of their declared place behind latent_out, the
+             * arm's buffers are excluded from sharing (SideOps' rule). It reads x's codes (or x),
+             * which nothing in the routed span writes, and writes only its own buffers. */
+            shared_side = shared_side_on() && shared.writes_own_only();
+            if (shared_side) RAD_ARCH_TRY(shared.mark_concurrent(b, w.sout));
             op_join = mk(b, "add",
                          { RAD_RANGE("M", 1, T), RAD_INT("n", s.n_embd), RAD_STR("dtype", "bf16") },
                          {}, { w.routed, w.sout }, { w.routed });
@@ -491,14 +557,27 @@ struct Ffn {
         } else {
             lat_in.step(c, act(xf), w.lat.x, T);
             t_routed_in.step(c, brows(w.lat.x, T), T);
-            moe.step(c, batch);
+            if (shared_side) {
+                /* The shared arm behind the router's and the routed GEMMs' launches (P-01). */
+                SharedSide sd;
+                sd.c = c;
+                sd.m = &shared;
+                sd.x = xf;
+                sd.y = w.sout;
+                sd.T = T;
+                const SideOps so{ SharedSide::at, &sd };
+                moe.step(c, batch, &so);
+                sd.flush();
+            } else {
+                moe.step(c, batch);
+            }
             t_logits.step(c, brows(w.moe.logits, T), T);
             t_ids.step(c, brows(w.moe.ids, T), T);
             t_w.step(c, brows(w.moe.ew, T), T);
             t_experts_out.step(c, brows(w.lat.x, T), T);
             lat_out.step(c, w.lat, w.routed, T);
             t_routed_out.step(c, brows(w.routed, T), T);
-            shared.step(c, xf, w.sout, T);
+            if (!shared_side) shared.step(c, xf, w.sout, T);
             t_shared.step(c, brows(w.sout, T), T);
             if (fused_tail) return true;
             RAD_ISSUE_N(c, op_join, T, brows(w.routed, T), brows(w.sout, T), brows(w.routed, T));
