@@ -3,8 +3,6 @@
 #include "r4d_chain.h"
 #include "r4d_common.h"
 #include "r4d_emit.h"
-#include "r4d_fwht.h"
-#include "r4d_keyed.h"
 #include "r4d_moe_sort.h"
 #include <climits>
 #include <cmath>
@@ -19,10 +17,12 @@ namespace {
 __device__ __forceinline__ float weight_f32(float v) { return v; }
 __device__ __forceinline__ float weight_f32(uint16_t v) { return bf16_to_f32(v); }
 
-// One wave's R x C tile of the sums, from the same k order and butterfly the unfused GEMM uses: the
-// layout that feeds this function (which wave, how many columns a block) does not enter its
-// arithmetic, so a fused caller's tile is bit for bit the tile gemm_nt_f32 writes. `c0` names a live
-// column tile (c0 < n). No early return and no store, so the caller can go on after it.
+// One wave's R x C tile of the sums: the k loop and the butterfly, with no early return and no
+// store. It is a function of its own because of what the compiler makes of it (K-10's lane run,
+// notes/backlog/measurements/K-10.md): written inline in the body below, the eight-row form with
+// a stored-bf16 weight -- the served routers' form at verify heights, 17 to 63 rows -- ran 2.8 to
+// 3.6 times longer than with an f32 weight (60 to 140 us against 22 to 48 at N 512, K 3072, on a
+// R9700); split out like this the two weights cost the same. The bytes are the same either way.
 template <int R, int C, int U, class W>
 __device__ __forceinline__ void
     gemm_nt_f32_tile_sums(const uint16_t* x, const W* w, float (&sum)[R][C], long xp, long wp,
@@ -464,16 +464,16 @@ __global__ void __launch_bounds__(128)
 // gate with 1, in one workgroup. Rows wrap over the NW waves; each leaves its slots in the sort's
 // LDS list instead of re-reading `ids`. A slot carries the expert its row wrote, including the
 // expert 0 of a row with fewer finite ranks than top_k, so every output equals the three launches'.
-// INV also writes the inverse, as moe_scatter_inv does. The workgroup is exactly NW waves; the
-// router's own GEMM ends by calling the same body.
-template <int OWN, uint32_t NW, bool INV>
-__device__ __forceinline__ void
-    router_sigmoid_scatter_fill(r4d_moesort::ScatterLds<NW>& sl, const float* logits,
-                                const float* bias, int* ids, float* weights, int32_t* sorted,
-                                int32_t* off, int32_t* cnt, uint16_t* gate, int32_t* inv, long lp,
-                                long bp, long ip, long wp, long gp, int m, int ne, int n_local,
-                                int k, int norm, float factor, int base,
-                                r4d_moesort::Protect prot) {
+// INV also writes the inverse, as moe_scatter_inv does.
+template <int OWN, uint32_t NW, bool INV, class CH>
+__global__ void __launch_bounds__(NW * 32)
+    router_sigmoid_scatter_kernel(const float* logits, const float* bias, int* ids, float* weights,
+                                  int32_t* sorted, int32_t* off, int32_t* cnt, uint16_t* gate,
+                                  int32_t* inv, long lp, long bp, long ip, long wp, long gp, int m,
+                                  int ne, int n_local, int k, int norm, float factor, int base,
+                                  r4d_moesort::Protect prot) {
+    if (CH::on) r4d_chain_wait();
+    __shared__ r4d_moesort::ScatterLds<NW> sl;
     const int lane = threadIdx.x & 31, wave = threadIdx.x >> 5;
     for (int e = threadIdx.x; e < n_local; e += (int)(NW * 32)) sl.cnt[e] = 0;
     for (int r = wave; r < m; r += (int)NW) {
@@ -488,150 +488,6 @@ __device__ __forceinline__ void
     lds_barrier();
     r4d_moesort::scatter_small_place<NW, INV>(sorted, off, cnt, (uint32_t)(m * k),
                                               (uint32_t)n_local, sl, inv);
-}
-template <int OWN, uint32_t NW, bool INV, class CH>
-__global__ void __launch_bounds__(NW * 32)
-    router_sigmoid_scatter_kernel(const float* logits, const float* bias, int* ids, float* weights,
-                                  int32_t* sorted, int32_t* off, int32_t* cnt, uint16_t* gate,
-                                  int32_t* inv, long lp, long bp, long ip, long wp, long gp, int m,
-                                  int ne, int n_local, int k, int norm, float factor, int base,
-                                  r4d_moesort::Protect prot) {
-    if (CH::on) r4d_chain_wait();
-    __shared__ r4d_moesort::ScatterLds<NW> sl;
-    router_sigmoid_scatter_fill<OWN, NW, INV>(sl, logits, bias, ids, weights, sorted, off, cnt,
-                                              gate, inv, lp, bp, ip, wp, gp, m, ne, n_local, k,
-                                              norm, factor, base, prot);
-    if (CH::on) r4d_chain_done();
-}
-// The latent's rotated quantiser -- had_quant_act_fp8 (E4M3) or had_quant_act_i8g (int8) -- in the
-// wave slots this grid is not using: `rows * nkb` (row, group) tasks strided over every block's
-// waves, a wave a group and four columns a lane. Each task is quant_act_fp8_body's `rot` arm term for
-// term: the same four consecutive columns a lane (one dword load, one dword store, two
-// v_cvt_pk_fp8_f32), the same r4d_fwht_wave<128> in registers, the same scale over the wave's own
-// max, the same round-to-nearest int8 or clamped E4M3. `sub` 2 is IQ8R's 256-wide group: a wave
-// takes both of a group's 128-blocks, rotates each on its own and scales them together (int8 only).
-//
-// Nothing of this launch reads the codes, so any block may fill them; the launch's end orders them
-// against the routed GEMMs that follow, which is why the block that ranks can run it too. It touches
-// no shared memory and calls no barrier, so it sits between the arrival's barrier and the fill.
-__device__ __forceinline__ void router_quant_plane(const uint16_t* __restrict__ x,
-                                                   uint8_t* __restrict__ q, float* __restrict__ s,
-                                                   long xp, long qp, long sp, int m, int kw, int nkb,
-                                                   int sub, int i8) {
-    const int lane = threadIdx.x & 31;
-    const int nw = (int)(blockDim.x >> 5);
-    const int slot = ((int)blockIdx.y * (int)gridDim.x + (int)blockIdx.x) * nw + (int)(threadIdx.x >> 5);
-    const int slots = (int)(gridDim.x * gridDim.y) * nw;
-    const float top = i8 ? (1.0f / 127.0f) : (1.0f / 448.0f);
-    for (int t = slot; t < m * nkb; t += slots) {
-        const int row = t / nkb, kb = t - row * nkb;
-        const long xrow = (long)row * xp, qrow = (long)row * qp;
-        float v[2][4], mx = 0.0f;
-        for (int h = 0; h < sub; ++h) {
-            const int h0 = (kb * sub + h) * 128 + lane * 4;
-#pragma unroll
-            for (int j = 0; j < 4; ++j) {
-                const int c = h0 + j;
-                v[h][j] = c < kw ? bf16_to_f32(x[xrow + c]) : 0.0f;
-            }
-            r4d_fwht_wave<128>(v[h], lane);
-#pragma unroll
-            for (int j = 0; j < 4; ++j) mx = fmaxf(mx, fabsf(v[h][j]));
-        }
-        mx = r4d_wave_max(mx);
-        const float sc = mx > 0.0f ? mx * top : 1.0f;
-        if (!lane) s[(long)row * sp + kb] = sc;
-        const float inv = 1.0f / sc;
-        for (int h = 0; h < sub; ++h) {
-            const int h0 = (kb * sub + h) * 128 + lane * 4;
-            int pk = 0;
-            if (i8) {
-                uint32_t b = 0;
-#pragma unroll
-                for (int j = 0; j < 4; ++j) {
-                    const int c = (int)rintf(fminf(fmaxf(v[h][j] * inv, -127.0f), 127.0f));
-                    b |= ((uint32_t)c & 0xFFu) << (8 * j);
-                }
-                pk = (int)b;
-            } else {
-                pk = __builtin_amdgcn_cvt_pk_fp8_f32(fminf(fmaxf(v[h][0] * inv, -448.0f), 448.0f),
-                                                     fminf(fmaxf(v[h][1] * inv, -448.0f), 448.0f),
-                                                     pk, false);
-                pk = __builtin_amdgcn_cvt_pk_fp8_f32(fminf(fmaxf(v[h][2] * inv, -448.0f), 448.0f),
-                                                     fminf(fmaxf(v[h][3] * inv, -448.0f), 448.0f),
-                                                     pk, true);
-            }
-            if (h0 < kw) *(uint32_t*)(q + qrow + h0) = (uint32_t)pk;
-        }
-    }
-}
-// The router's GEMM, the sigmoid selection over its logits, the sort over its ids and the fill of an
-// ungated shared gate, in one launch: a block computes its share of the GEMM (gemm_nt_f32's tile
-// body, its wave's C columns by R rows) and publishes an arrival; the block whose arrival completes
-// the grid ranks the pass's rows and sorts them. Where the latent's own rotated codes are not fed,
-// the same launch fills them too (router_quant_plane above), so the pass's quantiser launch goes
-// away with the pair's.
-//
-// Every byte is the two launches': gemm_nt_f32_tile_sums is gemm_nt_f32's own tile, and its per-lane
-// k order and butterfly do not depend on which wave computes it or how many columns a block takes,
-// so each tile here is bit for bit the one the unfused GEMM writes; the ranking block then reads
-// those logits back and runs router_sigmoid_topk_scatter_kernel's body. M is a decode or verify
-// pass's height (the caller bounds it) and the sort's bound applies as there.
-template <int R, int C, int U, int OWN, uint32_t NW, bool INV, class W, class CH>
-__global__ void __launch_bounds__(NW * 32)
-    router_gemm_sigmoid_scatter_kernel(const uint16_t* x, const W* w, const float* bias,
-                                       float* logits, int* ids, float* weights, int32_t* sorted,
-                                       int32_t* off, int32_t* cnt, uint16_t* gate, int32_t* inv,
-                                       unsigned int* ctr, const uint16_t* hq_x, uint8_t* hq_q,
-                                       float* hq_s, long xp, long wp, long yp, long bp, long ip,
-                                       long wq, long gp, long hxp, long hqp, long hsp, int m, int n,
-                                       int n_local, int k, int kw, int hq_kw, int hq_kb,
-                                       int hq_sub, int hq_i8, int norm,
-                                       float factor, int base, r4d_moesort::Protect prot) {
-    if (CH::on) r4d_chain_wait();
-    const int lane = threadIdx.x & 31, wave = threadIdx.x >> 5;
-    const int c0 = ((int)blockIdx.x * (int)NW + wave) * C, r0 = (int)blockIdx.y * R;
-    if (c0 < n) {
-        float sum[R][C];
-        gemm_nt_f32_tile_sums<R, C, U, W>(x, w, sum, xp, wp, m, n, kw, c0, r0);
-        if (!lane) {
-#pragma unroll
-            for (int q = 0; q < R; ++q)
-                if (r0 + q < m) {
-#pragma unroll
-                    for (int c = 0; c < C; ++c)
-                        if (c0 + c < n) logits[(long)(r0 + q) * yp + c0 + c] = sum[q][c];
-                }
-        }
-    }
-    // The block's stores are made visible device-wide before its arrival is published: a per-thread
-    // fence, then the barrier, then one lane's fetch_add (as r4d_moe.hip's fused router and
-    // r4d_gemm_fp8a8.hip's split counter do it -- the other order leaves the fence unordered with
-    // respect to the arrival). The block whose arrival completes the grid resets the counter for
-    // the next launch, acquires the other blocks' logits and ranks.
-    __threadfence();
-    __syncthreads();
-    __shared__ r4d_moesort::ScatterLds<NW> sl;
-    __shared__ unsigned int s_arrived;
-    if (!threadIdx.x)
-        s_arrived = __hip_atomic_fetch_add(ctr, 1u, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT);
-    __syncthreads();
-    const bool last = s_arrived + 1u == gridDim.x * gridDim.y;
-    // The latent's codes, in the wave slots this block's share of the GEMM left it. `hq_x` is the
-    // activation they are of: the router's own `x`, or the latent of a block whose router reads a
-    // wider state (the launcher passes `x` again where they are the same).
-    if (hq_kb > 0)
-        router_quant_plane(hq_x, hq_q, hq_s, hxp, hqp, hsp, m, hq_kw, hq_kb, hq_sub, hq_i8);
-    if (!last) {
-        if (CH::on) r4d_chain_done();
-        return;
-    }
-    if (!threadIdx.x)
-        __hip_atomic_store(ctr, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-    __threadfence();
-    router_sigmoid_scatter_fill<OWN, NW, INV>(sl, logits, bias, ids, weights, sorted, off, cnt, gate,
-                                              inv, yp, bp, ip, wq, gp, m, n, n_local, k, norm,
-                                              factor, base, prot);
     if (CH::on) r4d_chain_done();
 }
 int router_body(const RadArgs* a, RadStream stream) {
@@ -757,162 +613,6 @@ int router_scatter_body(const RadArgs* a, RadStream stream) {
 #undef R4D_RSS
 #undef R4D_RSS_I
 #undef R4D_RSS_C
-}
-/* The router's GEMM, its sigmoid selection, the sort over its ids and the fill of an ungated shared
- * gate, in one launch (router_gemm_sigmoid_scatter_kernel). Two launches of the three a pass issues
- * go away with it: the router's `gemm_nt_f32` and `router_sigmoid_topk_scatter`. The bytes are those
- * two launches': a block's tile is gemm_nt_f32's own tile body, and the ranking block reads the
- * logits back and runs router_sigmoid_topk_scatter's body, so `logits`, `ids`, `weights`, `sorted`,
- * `off`, `cnt`, the gate and the inverse are the same bytes. Decode band only: M up to
- * kRouterGemmRows and M * top_k inside the single-workgroup sort, as the select's row bounds; a
- * larger pass keeps its pair rather than being served at another cost. */
-constexpr long kRouterGemmRows = 64;
-int router_sgemm_body(const RadArgs* a, RadStream stream) {
-    if (!a || a->n_t < 9) return RAD_E_INVAL;
-    const auto &x = a->t[0], &rw = a->t[1], &bias = a->t[2], &lg = a->t[3], &ids = a->t[4],
-               &wk = a->t[5];
-    const RadTensor *sorted = &a->t[6], *off = &a->t[7], *cnt = &a->t[8];
-    const RadTensor* gate = a->n_t > 9 ? r4d_opt(a, 9) : nullptr;
-    const RadTensor* inv = a->n_t > 10 ? r4d_opt(a, 10) : nullptr;
-    const RadTensor* hq_q = a->n_t > 11 ? r4d_opt(a, 11) : nullptr;
-    const RadTensor* hq_s = a->n_t > 12 ? r4d_opt(a, 12) : nullptr;
-    const RadTensor* hq_x = a->n_t > 13 ? r4d_opt(a, 13) : nullptr;
-    const long ne = r4d_geti_or(a, "n_expert", 0), k = r4d_geti_or(a, "top_k", 0);
-    const long nl = r4d_geti_or(a, "n_local", ne), base = r4d_geti_or(a, "expert_base", 0);
-    const float factor = (float)r4d_getf(a, "route_scale", 0);
-    if (x.dtype != RAD_BF16 || (rw.dtype != RAD_F32 && rw.dtype != RAD_BF16) ||
-        bias.dtype != RAD_F32 || lg.dtype != RAD_F32 || ids.dtype != RAD_I32 ||
-        wk.dtype != RAD_F32 || sorted->dtype != RAD_I32 || off->dtype != RAD_I32 ||
-        cnt->dtype != RAD_I32 || (gate && gate->dtype != RAD_BF16) ||
-        (inv && inv->dtype != RAD_I32))
-        return RAD_E_DTYPE;
-    if (!x.data || !rw.data || !bias.data || !lg.data || !ids.data || !wk.data || !sorted->data ||
-        !off->data || !cnt->data)
-        return RAD_E_INVAL;
-    if (x.rank != 2 || rw.rank != 2 || bias.rank != 1 || lg.rank != 2 || ids.rank != 2 ||
-        wk.rank != 2)
-        return RAD_E_SHAPE;
-    const long m = x.shape[0], kw = x.shape[1];
-    if (m < 1 || m > kRouterGemmRows || kw < 1 || ne < 1 || ne > 512 || rw.shape[0] != ne ||
-        rw.shape[1] != kw || lg.shape[0] != m || lg.shape[1] != ne || bias.shape[0] != ne ||
-        ids.shape[0] != m || ids.shape[1] != k || wk.shape[0] != m || wk.shape[1] != k || k < 1 ||
-        k > 32 || k > ne || !std::isfinite(factor) || factor <= 0 || x.stride[1] != 1 ||
-        rw.stride[1] != 1 || lg.stride[1] != 1 || ids.stride[1] != 1 || wk.stride[1] != 1 ||
-        x.stride[0] < kw || rw.stride[0] < kw || lg.stride[0] < ne || ids.stride[0] < k ||
-        wk.stride[0] < k || bias.stride[0] < 1)
-        return RAD_E_SHAPE;
-    const long T = m * k;
-    if (T > (long)r4d_moesort::kScatterSmall || nl < 1 || nl > ne || base < 0 || base + nl > ne ||
-        !r4d_contig(sorted) || !r4d_contig(off) || !r4d_contig(cnt) || r4d_numel(sorted) < T ||
-        r4d_numel(off) < nl + 1 || r4d_numel(cnt) < nl ||
-        (inv && (!r4d_contig(inv) || r4d_numel(inv) < T)))
-        return RAD_E_SHAPE;
-    long long grows = 0;
-    const long long gp = gate ? r4d_rows_pitch(gate, 1, &grows) : 0;
-    if (gate && (gp < 1 || grows < m)) return RAD_E_SHAPE;
-    r4d_moesort::Protect prot;
-    const int prc = r4d_moesort::protect_of(a, nl, &prot);
-    if (prc != RAD_OK) return prc;
-    const int norm = (int)(r4d_geti_or(a, "norm", 0) != 0);
-    // The latent's codes, when the pass has none to feed the routed arm: had_quant_act_fp8's (E4M3)
-    // or had_quant_act_i8g's (int8) mapping over the same `x`, `group` wide, a 256-wide group being
-    // the int8 quantiser's alone. The plane is the two buffers and the group together or neither.
-    // `hq_x` is the activation the codes are of where that is not the router's `x`: Hy4-flash's
-    // router reads the 3072-wide state while its experts run in the 1536-wide latent. Absent, the
-    // codes are of `x`.
-    const long hqg = r4d_geti_or(a, "hq_group", 0);
-    if ((hq_q != nullptr) != (hqg > 0) || (hq_s != nullptr) != (hqg > 0) || (hq_x && !hq_q))
-        return RAD_E_INVAL;
-    const RadTensor& qx = hq_x ? *hq_x : x;
-    const long kq = hq_q ? (long)qx.shape[1] : 0;
-    if (hq_q) {
-        if (hq_q->dtype != RAD_I8 && hq_q->dtype != RAD_F8E4M3) return RAD_E_DTYPE;
-        if (hq_s->dtype != RAD_F32 || qx.dtype != RAD_BF16) return RAD_E_DTYPE;
-        if (!qx.data || qx.rank != 2 || qx.shape[0] != m || kq < 1 || qx.stride[1] != 1 ||
-            qx.stride[0] < kq)
-            return RAD_E_SHAPE;
-        if ((hqg != 128 && hqg != 256) || (hqg == 256 && hq_q->dtype != RAD_I8) || kq % hqg)
-            return RAD_E_SHAPE;
-        if (!hq_q->data || !hq_s->data || hq_q->rank != 2 || hq_s->rank != 2 ||
-            hq_q->shape[0] < m || hq_q->shape[1] < kq || hq_q->stride[1] != 1 ||
-            hq_q->stride[0] < kq || hq_s->shape[0] < m || hq_s->shape[1] < kq / hqg ||
-            !r4d_contig(hq_s))
-            return RAD_E_SHAPE;
-    }
-    const int hq_kb = hq_q ? (int)(kq / hqg) : 0;
-    const int hq_sub = hq_q ? (int)(hqg / 128) : 0;
-    const int hq_i8 = hq_q && hq_q->dtype == RAD_I8;
-    // One counter per (stream, logits) as gemm_fp8a8's split_ctr: the launch leaves it zero, and two
-    // launches sharing a block on one stream are ordered by what they write. Without it there is no
-    // fused form (the pair the plugin would have issued instead is its own choice).
-    unsigned int* const ctr =
-        r4d::keyed_block(r4d::Keyed::RouterScatter, stream, (const void*)lg.data,
-                         sizeof(unsigned int));
-    if (!ctr) return RAD_E_INVAL;
-    // A wave a row up to 32 rows, as the selection's own launch; `chain` is the pair's form at these
-    // heights (both of the rows this replaces are in kChained).
-    const int nw = m <= 8 ? 8 : m <= 16 ? 16 : 32;
-    const bool ch = r4d_geti_or(a, "chain", 0) != 0;
-#define R4D_RSG_E(R, C, U, OWN, NW, INV, W, CH)                                                    \
-    R4D_EMIT(stream, (router_gemm_sigmoid_scatter_kernel<R, C, U, OWN, NW, INV, W, CH>),           \
-             dim3((unsigned)((ne + (long)(NW) * (C) - 1) / ((long)(NW) * (C))),                    \
-                  (unsigned)((m + (R) - 1) / (R))),                                               \
-             dim3((NW) * 32), 0, (const uint16_t*)x.data, (const W*)rw.data,                       \
-             (const float*)bias.data, (float*)lg.data, (int*)ids.data, (float*)wk.data,            \
-             (int32_t*)sorted->data, (int32_t*)off->data, (int32_t*)cnt->data,                     \
-             gate ? (uint16_t*)gate->data : (uint16_t*)nullptr,                                    \
-             inv ? (int32_t*)inv->data : (int32_t*)nullptr, ctr, (const uint16_t*)qx.data,         \
-             hq_q ? (uint8_t*)hq_q->data : (uint8_t*)nullptr,                                      \
-             hq_s ? (float*)hq_s->data : (float*)nullptr, (long)x.stride[0],                      \
-             (long)rw.stride[0], (long)lg.stride[0], (long)bias.stride[0], (long)ids.stride[0],    \
-             (long)wk.stride[0], (long)gp, (long)qx.stride[0],                                     \
-             hq_q ? (long)hq_q->stride[0] : 0, hq_s ? (long)hq_s->stride[0] : 0, (int)m, (int)ne,  \
-             (int)nl, (int)k, (int)kw, (int)kq, hq_kb, hq_sub, hq_i8, norm, factor, (int)base,     \
-             prot)
-    // The router's weight is stored bf16 on the arms that read it that way (K-11): both widen to
-    // f32 in registers and accumulate the same chain.
-#define R4D_RSG_C(R, C, U, OWN, NW, INV, W)                                                        \
-    do {                                                                                           \
-        if (ch) return R4D_RSG_E(R, C, U, OWN, NW, INV, W, r4dchain);                              \
-        return R4D_RSG_E(R, C, U, OWN, NW, INV, W, R4dUnchained);                                  \
-    } while (0)
-#define R4D_RSG_I(R, C, U, OWN, NW, INV)                                                           \
-    do {                                                                                           \
-        if (rw.dtype == RAD_BF16) R4D_RSG_C(R, C, U, OWN, NW, INV, uint16_t);                      \
-        R4D_RSG_C(R, C, U, OWN, NW, INV, float);                                                   \
-    } while (0)
-#define R4D_RSG(R, C, U, OWN, NW)                                                                  \
-    do {                                                                                           \
-        if (inv) R4D_RSG_I(R, C, U, OWN, NW, true);                                                \
-        R4D_RSG_I(R, C, U, OWN, NW, false);                                                        \
-    } while (0)
-    // Two rows by two columns to 16 rows -- the form gemm_nt_f32's law picks there --, eight rows by
-    // one column above, the form that law picks between 17 and 63 rows at a projection 128 columns
-    // or wider (narrower, it keeps two-by-two-to-16 there). The MoE block asks for this row only
-    // inside its band (kMoeSigmoidFusedRows): on a R9700 the 1024 thread block it needs above 16
-    // rows was 2-3x the pair's time at 32 and 64 rows in the selftest's `--perfmoefuse` rows, and at
-    // 16 rows, on a pass that folds no plane, level with it (21.3 against 21.2 us). Which form runs
-    // costs nothing either way: any form computes the same bytes, because the k order and the
-    // butterfly are the tile's sums' (`gemm_nt_f32_tile_sums`), not the layout's, so the ranking
-    // block's rows are the pair's whatever form each ran.
-    if (m <= 16) {
-        if (nw == 8) {
-            if (ne <= 9 * 32) R4D_RSG(2, 2, 16, 9, 8u);
-            R4D_RSG(2, 2, 16, 16, 8u);
-        }
-        if (ne <= 9 * 32) R4D_RSG(2, 2, 16, 9, 16u);
-        R4D_RSG(2, 2, 16, 16, 16u);
-    }
-    if (ne <= 9 * 32) R4D_RSG(8, 1, 8, 9, 32u);
-    R4D_RSG(8, 1, 8, 16, 32u);
-    // Every form above returns from inside the macro chain; naming the outcome here saves the
-    // compiler from having to prove the chain total, and would report a form's absence as the
-    // refusal it would be.
-    return RAD_E_INVAL;
-#undef R4D_RSG
-#undef R4D_RSG_I
-#undef R4D_RSG_C
-#undef R4D_RSG_E
 }
 template <class CH>
 __global__ void swiglu_clamped_kernel(const uint16_t* gu, uint16_t* y, long gp, long yp, int n,
@@ -1044,7 +744,4 @@ extern "C" int r4d_rad_router_sigmoid_topk(const RadArgs* a, RadStream stream) {
 }
 extern "C" int r4d_rad_router_sigmoid_topk_scatter(const RadArgs* a, RadStream stream) {
     return router_scatter_body(a, stream);
-}
-extern "C" int r4d_rad_router_gemm_sigmoid_scatter(const RadArgs* a, RadStream stream) {
-    return router_sgemm_body(a, stream);
 }

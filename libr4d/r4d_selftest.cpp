@@ -23585,7 +23585,7 @@ static void mhcpre_perf(const Plugin& pl, int64_t rows, int iters) {
                                       T(d_out, RAD_BF16, { rows, W }) };
     std::vector<RadTensor> a_pre_p = a_pre, a_all_p = a_all, a_post_p = a_post;
     a_pre_p[0] = a_all_p[0] = a_post_p[1] = thp;
-    auto args = [](const std::vector<RadTensor>& t, const std::vector<RadParam>& p) {
+    auto args = [](std::vector<RadTensor>& t, std::vector<RadParam>& p) {
         RadArgs a{};
         a.t = t.data(); a.n_t = (int)t.size(); a.p = p.data(); a.n_p = (int)p.size();
         a.world_size = 1;
@@ -23903,159 +23903,6 @@ static void moefuse_router(const Plugin& pl, int64_t rows, int mode, int iters,
               same);
 }
 
-/* router_gemm_sigmoid_scatter against gemm_nt_f32 + router_sigmoid_topk_scatter (+ had_quant_act_fp8
- * or had_quant_act_i8g) at the router's own shape: the logits the projection and the selection share,
- * the six routing buffers, the gate, the inverse and the latent's codes and scales, byte for byte
- * over their tails too. `hq` 0 leaves the quantiser out (a pass whose routed arm is fed codes), 128
- * or 256 sets the codes' group, and `i8` picks int8 (`had_quant_act_i8g`) over E4M3; `wb` 1 makes the
- * weight bf16. `hqK` above 0 gives the codes an activation of their own, `hqK` wide, beside the
- * router's `x` (Hy4-flash: the router reads the 3072-wide state, the experts the 1536-wide latent).
- * Timed, the launches back to back against the one. */
-static void moefuse_router_gemm(const Plugin& pl, int64_t rows, int64_t K, int hq, bool i8, int wb,
-                                int iters, int64_t hqK = 0) {
-    const bool check = iters < 0;
-    if (iters == 0) iters = 200;
-    const char* what = "router_gemm_sigmoid_scatter_f32";
-    const RadKernelInfo* fr = find(pl, what);
-    const RadKernelInfo* gm = find(pl, "gemm_nt_f32_bf16");
-    const RadKernelInfo* sc = find(pl, "router_sigmoid_topk_scatter_f32");
-    const RadKernelInfo* qt = hq ? find(pl, i8 ? "had_quant_act_i8g" : "had_quant_act_fp8") : nullptr;
-    if (!fr || !gm || !sc || (hq && !qt)) { ok(what, false, "a row is absent"); return; }
-    const int64_t Kq = hq && hqK > 0 ? hqK : K;
-    const int64_t ne = 288, k = 8, slots = rows * k, ng = hq ? Kq / hq : 0;
-    if (rows < 1 || slots > 1024) {
-        std::printf("  router gemm at M=%lld: past the sort's one workgroup (M <= 128); the separate "
-                    "launches serve\n", (long long)rows);
-        return;
-    }
-    std::vector<uint16_t> xv((size_t)(rows * K));
-    for (size_t i = 0; i < xv.size(); ++i) {
-        const int u = (int)(st_mix32((uint32_t)i * 5u + 3u + (uint32_t)rows) % 2001) - 1000;
-        xv[i] = h_to_bf16((float)u / 900.0f);
-    }
-    std::vector<float> wv((size_t)(ne * K));
-    std::vector<uint16_t> wb16((size_t)(ne * K));
-    for (size_t i = 0; i < wv.size(); ++i) {
-        const int u = (int)(st_mix32((uint32_t)i * 11u + 7u + (uint32_t)K) % 2001) - 1000;
-        wv[i] = (float)u / 16000.0f;
-        wb16[i] = h_to_bf16(wv[i]);
-    }
-    std::vector<float> bv((size_t)ne);
-    for (size_t i = 0; i < bv.size(); ++i) {
-        const int u = (int)(st_mix32((uint32_t)i * 3u + 101u) % 2001) - 1000;
-        bv[i] = (float)u / 2000.0f;
-    }
-    /* logits, ids, weights, sorted, offsets, counts, gate, inverse, codes, scales: 64-byte tails */
-    const size_t sz[10] = { (size_t)(rows * ne) * 4 + 64, (size_t)slots * 4 + 64,
-                            (size_t)slots * 4 + 64,    (size_t)slots * 4 + 64,
-                            (size_t)(ne + 1) * 4 + 64, (size_t)ne * 4 + 64,
-                            (size_t)rows * 2 + 64,     (size_t)slots * 4 + 64,
-                            (size_t)(rows * Kq) + 64,  (size_t)(rows * ng) * 4 + 64 };
-    const int n_out = hq ? 10 : 8;
-    void* d_x = dalloc((size_t)(rows * K) * 2);
-    /* the codes' own activation, when it is not the router's */
-    std::vector<uint16_t> hxv((size_t)(hq && hqK > 0 ? rows * Kq : 0));
-    for (size_t i = 0; i < hxv.size(); ++i) {
-        const int u = (int)(st_mix32((uint32_t)i * 13u + 29u + (uint32_t)rows) % 2001) - 1000;
-        hxv[i] = h_to_bf16((float)u / 700.0f);
-    }
-    void* d_hx = hxv.empty() ? nullptr : dalloc(hxv.size() * 2);
-    if (!hxv.empty() && !d_hx) { ok(what, false, "allocation failed"); return; }
-    if (d_hx) st_memcpy(d_hx, hxv.data(), hxv.size() * 2, hipMemcpyHostToDevice);
-    void* d_w = dalloc((size_t)(ne * K) * (wb ? 2 : 4));
-    void* d_b = dalloc((size_t)ne * 4);
-    void* o[2][10];
-    for (int f = 0; f < 2; ++f) for (int j = 0; j < n_out; ++j) o[f][j] = dalloc(sz[j]);
-    if (!d_x || !d_w || !d_b) { ok(what, false, "allocation failed"); return; }
-    for (int f = 0; f < 2; ++f) for (int j = 0; j < n_out; ++j)
-        if (!o[f][j]) { ok(what, false, "allocation failed"); return; }
-    st_memcpy(d_x, xv.data(), xv.size() * 2, hipMemcpyHostToDevice);
-    if (wb) st_memcpy(d_w, wb16.data(), wb16.size() * 2, hipMemcpyHostToDevice);
-    else st_memcpy(d_w, wv.data(), wv.size() * 4, hipMemcpyHostToDevice);
-    st_memcpy(d_b, bv.data(), bv.size() * 4, hipMemcpyHostToDevice);
-    const uint32_t qdt = i8 ? RAD_I8 : RAD_F8E4M3, wdt = wb ? RAD_BF16 : RAD_F32;
-    /* both runs' routing buffers, the same shapes; the chain writes the logits with its own GEMM
-     * and the codes with its own quantiser, while the fused row writes all of them */
-    auto outs = [&](int f) {
-        std::vector<RadTensor> t = { T(o[f][0], RAD_F32, { rows, ne }),
-                                     T(o[f][1], RAD_I32, { rows, k }),
-                                     T(o[f][2], RAD_F32, { rows, k }),
-                                     T(o[f][3], RAD_I32, { slots }),
-                                     T(o[f][4], RAD_I32, { ne + 1 }),
-                                     T(o[f][5], RAD_I32, { ne }),
-                                     T(o[f][6], RAD_BF16, { rows, 1 }),
-                                     T(o[f][7], RAD_I32, { slots }) };
-        if (hq) {
-            t.push_back(T(o[f][8], qdt, { rows, Kq }));
-            t.push_back(T(o[f][9], RAD_F32, { rows, ng }));
-        }
-        return t;
-    };
-    const std::vector<RadTensor> ch = outs(0), fu_full = outs(1);
-    const RadTensor x = T(d_x, RAD_BF16, { rows, K }), wt = T(d_w, wdt, { ne, K });
-    const std::vector<RadTensor> t_gemm = { x, wt, ch[0] };
-    const std::vector<RadTensor> t_sel = { ch[0], T(d_b, RAD_F32, { ne }), ch[1], ch[2], ch[3],
-                                           ch[4], ch[5], ch[6], ch[7] };
-    const RadTensor hx = d_hx ? T(d_hx, RAD_BF16, { rows, Kq }) : x;
-    std::vector<RadTensor> t_qt = { hx };
-    if (hq) { t_qt.push_back(ch[8]); t_qt.push_back(ch[9]); }
-    std::vector<RadTensor> fu = { x, wt, T(d_b, RAD_F32, { ne }) };
-    for (const RadTensor& t : fu_full) fu.push_back(t);
-    if (d_hx) fu.push_back(hx);   /* operand 13, behind the codes and the scales */
-    std::vector<RadParam> p_gemm = { PI("M", rows), PI("N", ne), PI("K", K), PS("dtype", "bf16"),
-                                     PI("weight_bf16", wb) };
-    std::vector<RadParam> p_sel = { PI("M", rows), PI("n_expert", ne), PI("n_local", ne),
-                                    PI("top_k", k), PI("norm", 1), PF("route_scale", 2.5),
-                                    PS("dtype", "f32"), PI("expert_base", 0) };
-    std::vector<RadParam> p_qt = { PI("M", rows), PI("n", Kq), PI("group", hq),
-                                   PS("dtype", "bf16") };
-    std::vector<RadParam> p_fu = { PI("M", rows), PI("K", K), PI("n_expert", ne),
-                                   PI("n_local", ne), PI("top_k", k), PI("weight_bf16", wb),
-                                   PI("norm", 1), PF("route_scale", 2.5), PS("dtype", "f32"),
-                                   PI("expert_base", 0), PI("hq_group", hq),
-                                   PS("hq_dtype", i8 ? "i8" : "f8e4m3"), PI("hq_K", Kq) };
-    auto args = [](const std::vector<RadTensor>& t, const std::vector<RadParam>& p) {
-        RadArgs a{};
-        a.t = t.data(); a.n_t = (int)t.size(); a.p = p.data(); a.n_p = (int)p.size(); a.world_size = 1;
-        return a;
-    };
-    RadArgs a_gemm = args(t_gemm, p_gemm), a_sel = args(t_sel, p_sel), a_qt = args(t_qt, p_qt);
-    RadArgs a_fu = args(fu, p_fu);
-    auto chain = [&]() {
-        int rc = gm->launch(&a_gemm, nullptr);
-        if (rc == RAD_OK) rc = sc->launch(&a_sel, nullptr);
-        if (rc == RAD_OK && hq) rc = qt->launch(&a_qt, nullptr);
-        return rc;
-    };
-    auto fused = [&]() { return fr->launch(&a_fu, nullptr); };
-    for (int f = 0; f < 2; ++f) for (int j = 0; j < n_out; ++j) st_memset(o[f][j], 0xa5, sz[j]);
-    const int orc = chain(), nrc = fused();
-    const bool ran = orc == RAD_OK && nrc == RAD_OK && st_stream_sync(nullptr) == hipSuccess;
-    bool same = ran;
-    int first = -1;
-    for (int j = 0; j < n_out && ran; ++j)
-        if (fetch_bytes(o[0][j], sz[j]) != fetch_bytes(o[1][j], sz[j])) { same = false; if (first < 0) first = j; }
-    static const char* const kOut[10] = { "logits", "ids", "weights", "sorted", "offsets", "counts",
-                                          "gate", "inverse", "codes", "scales" };
-    const std::string name = fmt("%s at M=%lld K=%lld%s%s%s%s", what, (long long)rows, (long long)K,
-                                 wb ? ", bf16 weight" : "",
-                                 d_hx ? fmt(", codes of a %lld-wide latent", (long long)Kq).c_str() : "",
-                                 hq ? fmt(", group %d", hq).c_str() : "",
-                                 hq ? (i8 ? ", int8" : ", E4M3") : ", no plane");
-    if (check) {
-        ok(fmt("%s: byte-identical to the projection, the selection%s", name.c_str(),
-               hq ? " and the quantiser" : "").c_str(), same,
-           !ran ? fmt("rc %d / %d", orc, nrc) : same ? "" : fmt("%s differ", kOut[first]));
-        return;
-    }
-    if (!ran) { std::printf("--perfmoefuse: router gemm launch failed (rc %d / %d)\n", orc, nrc); return; }
-    const double us_old = st_time_us([&](int) { chain(); }, iters, nullptr);
-    const double us_new = st_time_us([&](int) { fused(); }, iters, nullptr);
-    fuse_line(fmt("gemm%s + router + quant%s", wb ? " (bf16 w)" : "",
-                  d_hx ? fmt(" (K %lld, latent %lld)", (long long)K, (long long)Kq).c_str() : "").c_str(),
-              us_old, us_new, same);
-}
-
 /* moe_scatter_inv and moe_gather_inv against moe_scatter and moe_gather at GLM's shape (288 experts,
  * top 8, 4096 wide, f32 routing weights, the ungated shared arm folded in): the sort's three outputs,
  * the inverse against the table built from `sorted`, and the gathered rows, byte for byte. Each row
@@ -24298,13 +24145,6 @@ static void moefuse_perf(const Plugin& pl, int64_t rows, int iters) {
                            : "warm (back to back, mean)", iters);
     moefuse_router(pl, rows, 0, iters);
     moefuse_router(pl, rows, 0, iters, true);
-    moefuse_router_gemm(pl, rows, 4096, 0, false, 0, iters);
-    moefuse_router_gemm(pl, rows, 4096, 128, false, 0, iters);
-    moefuse_router_gemm(pl, rows, 4096, 256, true, 0, iters);
-    /* Hy4-flash's shape: a bf16 projection of the 3072-wide state, int8 codes of the 1536-wide
-     * latent (and the bare pass at that width). */
-    moefuse_router_gemm(pl, rows, 3072, 0, false, 1, iters);
-    moefuse_router_gemm(pl, rows, 3072, 128, true, 1, iters, 1536);
     moefuse_gather(pl, rows, false, iters);
     /* the quantising gather: the sixteen-slot form at `rows`, the wide one at 40 (M > 32 with bf16
      * weights), each form pinned at 40, and f32 routing weights (which offer only the sixteen) */
@@ -24423,6 +24263,25 @@ static void f32_forms(const Plugin& pl, int64_t M, int64_t N, int64_t K, int ite
         }, iters, nullptr);
         std::printf("  %-8s %9.1f us  %7.1f GB/s  %6.2f TFLOP/s\n", "rule", us,
                     bytes / (us * 1e3), flop / (us * 1e6));
+        ts[1].data = d_w;
+        /* The same shape with the weight stored bf16, as the served routers hold it: the W =
+         * uint16_t instantiation of the same tile forms, half the weight bytes a copy. */
+        std::vector<uint16_t> pw(w.size());
+        for (size_t i = 0; i < w.size(); ++i) pw[i] = h_to_bf16(w[i]);
+        for (int c = 0; c < copies; ++c)
+            st_memcpy((uint8_t*)d_w + (size_t)c * (wbytes / 2), pw.data(), wbytes / 2,
+                      hipMemcpyHostToDevice);
+        ts[1].dtype = RAD_BF16;
+        ps.push_back(PI("weight_bf16", 1));
+        a.p = ps.data();
+        a.n_p = (int)ps.size();
+        if (r->launch(&a, nullptr) == RAD_OK && st_stream_sync(nullptr) == hipSuccess) {
+            const double us16 = st_time_us([&](int i) {
+                ts[1].data = (uint8_t*)d_w + (size_t)(i % copies) * (wbytes / 2);
+                r->launch(&a, nullptr);
+            }, iters, nullptr);
+            std::printf("  %-8s %9.1f us  (bf16 weight)\n", "rule16", us16);
+        }
         ts[1].data = d_w;
     }
 }
@@ -39217,27 +39076,6 @@ static void device_phase(const Plugin& pl) {
         for (int64_t rows : { 1, 6, 8, 24, 33, 48, 128 })
             for (int mode : { 0, 1, 2 }) moefuse_router(pl, rows, mode, -1);
         for (int64_t rows : { 1, 48, 128 }) moefuse_router(pl, rows, 2, -1, true);
-    }
-    if (sel("router_gemm_sigmoid_scatter_f32")) {
-        /* K-10's fusion oracle: the projection, the selection and the latent's quantiser against
-         * the one launch, over the arch's fused band (up to 64 rows) and past it, f32 and bf16
-         * weights, with and without the codes, both int8 groups and E4M3. */
-        for (int64_t rows : { 1, 6, 16, 17, 48, 64 })
-            for (int64_t K : { 512, 1536, 4096 })
-                for (int wb : { 0, 1 }) {
-                    moefuse_router_gemm(pl, rows, K, 0, false, wb, -1);
-                    moefuse_router_gemm(pl, rows, K, 128, false, wb, -1);
-                    moefuse_router_gemm(pl, rows, K, 128, true, wb, -1);
-                    moefuse_router_gemm(pl, rows, K, 256, true, wb, -1);
-                }
-        /* Hy4-flash's shape: the router reads the 3072-wide state and the codes are the 1536-wide
-         * latent's, a second input of the same launch. */
-        for (int64_t rows : { 1, 8, 16, 17, 64 })
-            for (int wb : { 0, 1 }) {
-                moefuse_router_gemm(pl, rows, 3072, 128, true, wb, -1, 1536);
-                moefuse_router_gemm(pl, rows, 3072, 128, false, wb, -1, 1536);
-                moefuse_router_gemm(pl, rows, 3072, 256, true, wb, -1, 1536);
-            }
     }
     if (sel("moe_gather_inv_i8g")) {
         /* both groups an IQ8R trunk or an ordinary one takes, both weight dtypes (bf16 offers the

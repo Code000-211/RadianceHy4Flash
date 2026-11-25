@@ -921,8 +921,6 @@ int r4d_rad_router_sigmoid_group_topk(const RadArgs*, RadStream);
 int r4d_shape_router_sigmoid_group_topk(const RadParam*, int, int, RadOpdDesc*);
 int r4d_shape_router_sigmoid_topk(const RadParam*, int, int, RadOpdDesc*);
 int r4d_rad_router_sigmoid_topk_scatter(const RadArgs*, RadStream);
-int r4d_shape_router_gemm_sigmoid_scatter(const RadParam*, int, int, RadOpdDesc*);
-int r4d_rad_router_gemm_sigmoid_scatter(const RadArgs*, RadStream);
 int r4d_rad_moe_scatter_inv(const RadArgs*, RadStream);
 int r4d_shape_moe_scatter_inv(const RadParam*, int, int, RadOpdDesc*);
 int r4d_rad_moe_gather_inv(const RadArgs*, RadStream);
@@ -1137,7 +1135,6 @@ int r4d_fuse_gated_quant_fp8     (const RadParam*, int, uint64_t, int, RadFuseSt
 int r4d_fuse_swiglu_clamped_had_quant_i8g(const RadParam*, int, uint64_t, int, RadFuseStep*);
 int r4d_fuse_swiglu_clamped_quant_fp8(const RadParam*, int, uint64_t, int, RadFuseStep*);
 int r4d_fuse_router_sigmoid_topk_scatter(const RadParam*, int, uint64_t, int, RadFuseStep*);
-int r4d_fuse_router_gemm_sigmoid_scatter(const RadParam*, int, uint64_t, int, RadFuseStep*);
 int r4d_fuse_gate_quant_fp8      (const RadParam*, int, uint64_t, int, RadFuseStep*);
 int r4d_fuse_gemm_nt_q_gated     (const RadParam*, int, uint64_t, int, RadFuseStep*);
 int r4d_fuse_gemm_nt_q_gated_mx  (const RadParam*, int, uint64_t, int, RadFuseStep*);

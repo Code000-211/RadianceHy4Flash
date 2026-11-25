@@ -1612,12 +1612,10 @@ TEST(the_moe_gather_reads_the_sorts_inverse_table) {
         std::vector<std::string> undecl;
         int invg;    /* per MoE layer: moe_gather_inv (1) or moe_gather (0) */
         int writers; /* ops that write the inverse table: the fused selection and the separate
-                      * scatter above it (the block declares both, each for a size of pass), and
-                      * K-10's fused projection, which carries the selection's writes at a decode
-                      * height */
+                      * scatter above it (the block declares both, each for a size of pass) */
     };
     const Case cases[] = {
-        { "the fused selection", {}, 1, 6 },
+        { "the fused selection", {}, 1, 4 },
         { "the separate sort", { "router_sigmoid_topk_scatter" }, 1, 2 },
         { "no device rows", { "router_sigmoid_topk_scatter", "moe_scatter_inv", "moe_gather_inv" },
           0, 0 },
@@ -1674,13 +1672,6 @@ void int8_trunk_encs(RadBuilder* b) {
                                       { "ffn_latent_in", enc_i8(true) },
                                       { "ffn_latent_out", enc_i8(true) },
                                       { "output.weight", enc_i8(false) } });
-}
-/* The same with the routed experts rotated int8 (`rot`), so the block quantises its own input and
- * the router's launch can carry that quantiser (K-10). */
-void int8_experts_encs(RadBuilder* b) {
-    int8_trunk_encs(b);
-    b->encs.insert(b->encs.begin(), { { "ffn_gate_up_exps", enc_i8(true) },
-                                      { "ffn_down_exps", enc_i8(true) } });
 }
 /* The same on a CPU engine: no device-only fused rows. */
 void int8_trunk_encs_host(RadBuilder* b) {
@@ -1796,141 +1787,6 @@ TEST(quantised_trunk_linears_share_one_quantiser_an_input) {
         every_weight_read(d.b);
         /* Every fed GEMM's codes are written before it in each step kind. */
         steps_clean_at(d.b, 0, 1);
-    }
-}
-
-/* A library that serves neither the router's projection nor its selection fused. */
-void no_router_gemm_fuse_encs(RadBuilder* b) {
-    int8_trunk_encs(b);
-    b->undeclared.insert("router_gemm_sigmoid_scatter");
-}
-
-/* K-10: the router's projection and the selection it feeds are one launch where a library serves
- * it (MoeFP8's op_sigmoid_gemm), so at a decode height neither the projection's own GEMM nor the
- * selection's row is issued; the wider passes -- and a library without the row -- keep the pair.
- * The row is declared once per MoE layer whatever the height, at this model's own widths.
- * `hq` is the latent's rotated group, which the same launch fills too: the row writes the codes the
- * latent's quantiser would have written and no quantiser is issued for it (`hq_issued`), while a
- * pass the row declines (prefill here) keeps that launch. The rotated-experts trunk is the one whose
- * block quantises its own input (`rot`), so it is where the third plane has anything to fold. */
-TEST(the_router_projection_joins_its_selection_where_a_library_serves_it) {
-    struct Run { const char* what; int dq, pq, world; bool plain, off;
-                 int fused, scatter, topk; int hq; bool rotexp; int64_t latent = 0; };
-    /* Two MoE layers of the mini model (the third is dense). 96 rows stay inside the selection's
-     * own bound (top_k * rows <= 1024 at a declared 256) and past the fused row's band. `plain` is
-     * the bf16 trunk, for the ranks the mini's quantised experts do not split over; `off` is a
-     * library that does not serve the fused row at all. */
-    const Run runs[] = {
-        { "decode 1 row", 1, 0, 1, false, false, 2, 0, 0, 0, false },
-        { "decode 6 rows", 6, 0, 1, false, false, 2, 0, 0, 0, false },
-        /* The band's ends, which `--perfmoefuse` set: a bare pass stops at 8 rows (at 16 the fused
-         * row was level with the pair), a pass folding the latent's codes reaches 16, and above that
-         * both keep the pair -- where the row's wider form was 3.5x the pair's time. All but the
-         * first are prefill heights because the indexer's table is one entry a sequence, and one
-         * sequence of n tokens is the same pass height as n decode rows. The ninth row holds the
-         * bare cap from below as well as above: a cap anywhere in 9 to 15 would fuse there and the
-         * pair would not be issued, and it puts the folded row (band 16) at a second height. */
-        { "decode 8 rows", 8, 0, 1, false, false, 2, 0, 0, 0, false },
-        { "prefill 9 rows", 0, 9, 1, false, false, 0, 2, 0, 0, false },
-        { "prefill 9 rows, rotated experts", 0, 9, 1, false, false, 2, 0, 0, 128, true },
-        { "prefill 16 rows", 0, 16, 1, false, false, 0, 2, 0, 0, false },
-        { "prefill 17 rows", 0, 17, 1, false, false, 0, 2, 0, 0, false },
-        { "prefill 32 rows", 0, 32, 1, false, false, 0, 2, 0, 0, false },
-        { "prefill 16 rows, rotated experts", 0, 16, 1, false, false, 2, 0, 0, 128, true },
-        { "prefill 17 rows, rotated experts", 0, 17, 1, false, false, 0, 2, 0, 128, true },
-        { "TP2 decode", 4, 0, 2, true, false, 2, 0, 0, 0, false },
-        { "prefill 96 rows", 0, 96, 1, false, false, 0, 2, 0, 0, false },
-        { "decode, rotated experts", 1, 0, 1, false, false, 2, 0, 0, 128, true },
-        { "prefill, rotated experts", 0, 96, 1, false, false, 0, 2, 0, 128, true },
-        { "decode, no library row", 1, 0, 1, false, true, 0, 2, 0, 0, false },
-        /* The served shape: the router reads the state (n_embd wide) and the experts a latent of
-         * another width, so the row's `x` is the router's input and the codes it folds are of a
-         * second input, the latent. (The first lane run refused this: the row had been handed the
-         * latent as the projection's input.) */
-        { "decode, a 256-wide latent", 1, 0, 1, false, false, 2, 0, 0, 0, false, 256 },
-        { "decode, rotated experts, a 256-wide latent", 1, 0, 1, false, false, 2, 0, 0, 128, true,
-          256 },
-        { "prefill 16 rows, rotated experts, a 256-wide latent", 0, 16, 1, false, false, 2, 0, 0,
-          128, true, 256 },
-    };
-    for (const Run& r : runs) {
-        fprintf(stderr, "run %s\n", r.what);
-        Declared d(r.off ? no_router_gemm_fuse_encs
-                         : (r.plain ? bf16_encs : (r.rotexp ? int8_experts_encs : int8_trunk_encs)),
-                  r.world, 0, false, 128, r.latent);
-        REQUIRE_EQ(d.rc, RAD_OK);
-        const RecOp* o = find_op(d.b, "router_gemm_sigmoid_scatter");
-        if (r.off) {
-            CHECK(o == nullptr);
-        } else {
-            REQUIRE(o != nullptr);
-            CHECK_EQ(count_op(d.b, "router_gemm_sigmoid_scatter"), 2);
-            CHECK_EQ(pint(o, "K"), 128);             /* the router's input: n_embd */
-            /* The projection reads the router's own input, not the latent; the latent is a second
-             * read only where its codes are folded, at its own width. */
-            const rad_buf lat = buf_named(d.b, "moe.latent");
-            REQUIRE(lat != 0);
-            REQUIRE(!o->reads.empty());
-            CHECK_EQ((int)o->reads.size(), r.hq ? 2 : 1);
-            CHECK(o->reads[0] != lat);
-            if (r.hq) CHECK_EQ(o->reads[1], lat);
-            CHECK_EQ(pint(o, "hq_K"), r.latent ? r.latent : 128);
-            CHECK_EQ(pint(o, "n_expert"), 4);
-            CHECK_EQ(pint(o, "top_k"), 2);
-            CHECK_EQ(pint(o, "weight_bf16"), 1);     /* the mini's router weight is bf16 */
-            CHECK_EQ(pint(o, "norm"), 1);
-            CHECK(pflt(o, "route_scale") > 3.99 && pflt(o, "route_scale") < 4.0);
-            CHECK_EQ(pstr(o, "dtype"), std::string("f32"));
-            CHECK_EQ((int)o->w.size(), 2);            /* the projection and the correction */
-            /* The latent's codes ride in it where the pass has none to feed the routed arm. */
-            CHECK_EQ(pint(o, "hq_group"), r.hq);
-            CHECK_EQ(pstr(o, "hq_dtype"), std::string(r.hq ? "i8" : "f8e4m3"));
-            CHECK_EQ((int)o->writes.size(), r.hq ? 9 : 7);    /* the codes and scales are the last */
-        }
-        /* The projection's own GEMM is the one writing the router's logits. */
-        const rad_buf lg = buf_named(d.b, "moe.router_logits");
-        REQUIRE(lg != 0);
-        std::vector<rad_op> proj;
-        for (size_t i = 0; i < d.b.ops.size(); ++i) {
-            const RecOp& p = d.b.ops[i];
-            bool writes_lg = false;
-            for (rad_buf w : p.writes) writes_lg |= w == lg;
-            if (p.op == "gemm_nt_f32" && writes_lg) proj.push_back((rad_op)(i + 1));
-        }
-        CHECK_EQ((int)proj.size(), 2);
-        auto k = kit(d.b, std::vector<int>((size_t)r.dq, 1),
-                     r.pq ? std::vector<int>{ r.pq } : std::vector<int>{});
-        RadCtx c{ .b = &d.b, .batch = &k->b };
-        hyv4flash::step(&c, &k->b);
-        CHECK(c.step_fail.empty());
-        CHECK_LINT(d.b, &c);
-        CHECK_EQ(count_issued(d.b, c, "router_gemm_sigmoid_scatter"), r.fused);
-        CHECK_EQ(count_issued(d.b, c, "router_sigmoid_topk_scatter"), r.scatter);
-        CHECK_EQ(count_issued(d.b, c, "router_sigmoid_topk"), r.topk);
-        int issued_proj = 0;
-        for (const auto& issue : c.issues)
-            for (rad_op h : proj) issued_proj += issue.op == h;
-        CHECK_EQ(issued_proj, r.fused ? 0 : 2);
-        /* The latent's quantiser: the one writing a buffer the fused row writes. Where the row runs,
-         * it is the row's third plane and nothing else is launched for those codes. */
-        if (r.hq) {
-            std::vector<rad_op> hq;
-            for (const RecOp& q : d.b.ops) {
-                if (q.op != "had_quant_act_i8g" && q.op != "had_quant_act_fp8") continue;
-                for (rad_buf wv : q.writes)
-                    if (std::find(o->writes.begin(), o->writes.end(), wv) != o->writes.end()) {
-                        hq.push_back((rad_op)(&q - d.b.ops.data() + 1));
-                        break;
-                    }
-            }
-            CHECK_EQ((int)hq.size(), 2);              /* one a MoE layer, the same pair of buffers */
-            int hq_issued = 0;
-            for (const auto& issue : c.issues)
-                for (rad_op h : hq) hq_issued += issue.op == h;
-            CHECK_EQ(hq_issued, r.fused ? 0 : 2);
-        }
-        every_weight_read(d.b);
-        steps_clean_at(d.b, 0, r.world);
     }
 }
 
