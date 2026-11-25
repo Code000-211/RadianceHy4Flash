@@ -1426,6 +1426,49 @@ TEST(each_rank_declares_its_share_and_reduces_twice_a_layer) {
         }
 }
 
+/* P-02: the routing counts are the model's routing table (rad_route_table): an i32 PERSIST row a
+ * layer at the model's expert count on every rank, each MoE layer's router writing and reporting
+ * its own row. The core then copies nothing a report, and no wide prefill chunk can alias a
+ * transient histogram (qwen4exp_fp8's note). */
+TEST(the_routing_counts_are_the_models_routing_table) {
+    for (int world : { 1, 2 })
+        for (int rank = 0; rank < world; ++rank) {
+            Declared d(bf16_encs, world, rank, true);
+            REQUIRE_EQ(d.rc, RAD_OK);
+            RadBuilder& b = d.b;
+            const rad_buf tab = buf_named(b, "moe.expert_counts");
+            REQUIRE(tab != 0);
+            CHECK_EQ(b.route_table, tab);
+            const RecBuf& t = b.bufs[(size_t)tab - 1];
+            CHECK_EQ(t.d.kind, RAD_BUF_PERSIST);
+            CHECK_EQ(t.d.dtype, (uint32_t)RAD_I32);
+            CHECK_EQ(t.d.rank, 2u);
+            CHECK_EQ(t.d.shape[0], 3);   /* mini4: a row for each of the three layers */
+            CHECK_EQ(t.d.shape[1], 8);   /* the model's experts, whatever share this rank holds */
+            int writers = 0;   /* the routers write the table's rows through the declared buffer */
+            for (const auto& o : b.ops)
+                if (in(o.writes, tab)) ++writers;
+            CHECK(writers > 0);
+            const std::vector<int> dq[2] = { { 1, 1, 1 }, {} }, pq[2] = { {}, { 12 } };
+            for (int i = 0; i < 2; ++i) {   /* a decode step and a fresh prefill */
+                auto k = kit(b, dq[i], pq[i], 0);
+                k->b.positions_h = k->pos.data();
+                RadCtx c{ .b = &b, .batch = &k->b, .rank = rank, .world = world };
+                hyv4flash::step(&c, &k->b);
+                CHECK_LINT(b, &c);
+                CHECK(c.step_fail.empty());
+                CHECK(c.routed_layers == std::vector<int>({ 1, 2 }));   /* layer 0 is dense */
+                for (const auto& cp : c.copies) CHECK(cp.second != tab);   /* nothing is copied into it */
+                REQUIRE_EQ(c.routed_counts.size(), c.routed_layers.size());
+                for (size_t j = 0; j < c.routed_counts.size(); ++j) {
+                    CHECK_EQ(c.routed_counts[j].first, tab);
+                    CHECK_EQ(c.routed_counts[j].second,
+                             (int64_t)c.routed_layers[j] * 8 * (int64_t)sizeof(int32_t));
+                }
+            }
+        }
+}
+
 /* The taps the harness compares are the replicated values at every world; a rank's partial sums
  * (the gate logits of its heads, the arms' outputs) are tapped at one rank only, o_proj after its
  * reduction. */
@@ -1845,6 +1888,294 @@ TEST(the_fold_follows_the_gate_ups_own_row_share) {
             steps_clean_at(b, rank, world);
         }
     }
+}
+
+/* ---- P-01 (#71): the shared expert beside the routed GEMMs (MoeFP8's `side`, SharedSide). */
+namespace {
+
+rad_buf buf_h(const RadBuilder& b, const char* name) {
+    const RecBuf* r = find_b(b, name);
+    return r ? (rad_buf)(r - b.bufs.data() + 1) : 0;
+}
+bool names_w(const RadBuilder& b, const RecOp& o, const std::string& name) {
+    for (rad_weight w : o.w)
+        if (w && w <= b.weights.size() && b.weights[w - 1].name == name) return true;
+    return false;
+}
+bool has_buf(const std::vector<rad_buf>& v, rad_buf h) {
+    return h && std::find(v.begin(), v.end(), h) != v.end();
+}
+
+/* Where one MoE layer's launches sit in a pass: the routed gate_up, its quantiser, the routed
+ * down, the gather, latent_out, and the shared arm's gate_up (or the fold, which names the same
+ * weight), gate and down. -1 when absent: no gate behind the fold (K-23), which writes the codes
+ * down reads and no gate_up product. */
+struct MoeOrder {
+    int rgu = -1, rq = -1, rdn = -1, gather = -1, lat_out = -1, sgu = -1, sact = -1, sdn = -1;
+};
+MoeOrder moe_order(const RadBuilder& b, const RadCtx& c, int l) {
+    MoeOrder m;
+    char lin[64], lout[64], sgu[64], sdn[64];
+    std::snprintf(lin, sizeof lin, "blk.%d.ffn_latent_in.weight", l);
+    std::snprintf(lout, sizeof lout, "blk.%d.ffn_latent_out.weight", l);
+    std::snprintf(sgu, sizeof sgu, "blk.%d.ffn_gate_up_shexp.weight", l);
+    std::snprintf(sdn, sizeof sdn, "blk.%d.ffn_down_shexp.weight", l);
+    const rad_buf egu = buf_h(b, "moe.expert_gate_up"), edn = buf_h(b, "moe.expert_down"),
+                  sgu_b = buf_h(b, "moe.shared_gate_up");
+    int start = -1;
+    for (int i = 0; i < (int)c.issues.size(); ++i) {
+        const RecOp* o = b.op_of(c.issues[(size_t)i].op);
+        if (!o) continue;
+        if (start < 0) {
+            if (names_w(b, *o, lin)) start = i;
+            continue;
+        }
+        if (m.rgu < 0 && has_buf(o->writes, egu)) m.rgu = i;
+        else if (m.rgu >= 0 && m.rq < 0 && has_buf(o->reads, egu)) m.rq = i;
+        if (m.rdn < 0 && has_buf(o->writes, edn)) m.rdn = i;
+        else if (m.rdn >= 0 && m.gather < 0 && has_buf(o->reads, edn)) m.gather = i;
+        if (m.sgu < 0 && names_w(b, *o, sgu)) m.sgu = i;
+        else if (m.sgu >= 0 && m.sact < 0 && has_buf(o->reads, sgu_b)) m.sact = i;
+        if (m.sdn < 0 && names_w(b, *o, sdn)) m.sdn = i;
+        if (m.lat_out < 0 && names_w(b, *o, lout)) m.lat_out = i;
+        if (m.lat_out >= 0 && m.sdn >= 0) break;
+    }
+    return m;
+}
+
+/* The side's places in one MoE layer's pass (SharedSide): stage 0 -- the fold where it serves the
+ * rows, gate_up otherwise -- behind the routed gate_up (in front of it where MoeFP8 puts its own
+ * first stage, `first`); the gate behind the routed quantiser, none after the fold (stage 1 then
+ * issues nothing); down behind the routed down; all before the gather. */
+void side_order(const MoeOrder& m, bool fold, bool first = false) {
+    REQUIRE(m.rgu >= 0 && m.rq > m.rgu && m.rdn > m.rq && m.gather > m.rdn);
+    REQUIRE(m.sgu >= 0 && m.sdn > m.sgu);
+    if (first) CHECK(m.sgu < m.rgu);
+    else CHECK(m.sgu > m.rgu && m.sgu < m.rq);
+    if (fold) {
+        CHECK_EQ(m.sact, -1);
+    } else {
+        REQUIRE(m.sact > m.sgu && m.sdn > m.sact);
+        CHECK(m.sact > m.rq && m.sact < m.rdn);
+    }
+    CHECK(m.sdn > m.rdn && m.sdn < m.gather);
+}
+
+/* One launch as its op, rows, lane and operands (names, offsets, extents): two steps issuing the
+ * same launches in another order give the same sorted list. */
+std::vector<std::string> launches(const RadBuilder& b, const RadCtx& c) {
+    std::vector<std::string> v;
+    for (const RecIssue& r : c.issues) {
+        const RecOp* o = b.op_of(r.op);
+        std::string s = o ? o->op : "<null>";
+        s += "|" + std::to_string(r.n) + "|" + std::to_string(r.lane);
+        for (const RadOperand& d : r.opd) {
+            s += "|" + std::to_string(d.kind) + ":" + std::to_string(d.offset) + ":" +
+                 std::to_string(d.rows) + ":" + std::to_string(d.cols) + ":";
+            if (d.kind == RAD_OPK_BUF && d.handle && d.handle <= b.bufs.size())
+                s += b.bufs[d.handle - 1].name;
+            else if ((d.kind == RAD_OPK_WEIGHT || d.kind == RAD_OPK_WTAB) && d.handle &&
+                     d.handle <= b.weights.size())
+                s += b.weights[d.handle - 1].name;
+        }
+        v.push_back(s);
+    }
+    std::sort(v.begin(), v.end());
+    return v;
+}
+
+}  // namespace
+
+/* With the side on, each MoE layer's shared arm is issued inside MoeFP8's pass where MoeFP8 puts
+ * its own: gate_up behind the routed gate_up, the gate behind the routed quantiser, down behind
+ * the routed down, all before the gather and latent_out; its written buffers are concurrent. Off
+ * (RADIANCE_HY4_SHARED_SIDE=0), or where a shared linear quantises for itself (a CPU engine: no
+ * gated_had_quant_i8g), the arm follows latent_out as before and only the pipeline's marks stand.
+ * Either way the same launches with the same operands (order only), every step kind lint clean,
+ * at one, two and four ranks. */
+TEST(the_shared_expert_rides_the_routed_pass) {
+    struct Run { const char* what; void (*encs)(RadBuilder*); bool off, on; std::vector<int> worlds; };
+    const Run runs[] = {
+        { "bf16", bf16_encs, false, true, { 1, 2, 4 } },
+        { "int8 device", int8_trunk_encs, false, true, { 1 } },
+        { "int8 host", int8_trunk_encs_host, false, false, { 1 } },
+        { "bf16, side off", bf16_encs, true, false, { 1, 2, 4 } },
+    };
+    struct Case { std::vector<int> dq, pq; int32_t ctx; };
+    const Case cases[] = { { { 1, 1, 1 }, {}, 0 }, { {}, { 12 }, 0 }, { {}, { 40 }, 0 },
+                           { { 1 }, { 10 }, 0 }, { {}, { 16 }, 16 } };
+    for (const Run& r : runs)
+        for (int world : r.worlds)
+            for (int rank = 0; rank < world; ++rank) {
+                fprintf(stderr, "run %s, rank %d of %d\n", r.what, rank, world);
+                if (r.off) setenv("RADIANCE_HY4_SHARED_SIDE", "0", 1);
+                Declared d(r.encs, world, rank, world > 1);   /* four ranks need the wide heads */
+                unsetenv("RADIANCE_HY4_SHARED_SIDE");
+                REQUIRE_EQ(d.rc, RAD_OK);
+                RadBuilder& b = d.b;
+                const rad_buf sgu = buf_h(b, "moe.shared_gate_up");
+                REQUIRE(sgu != 0);
+                CHECK_EQ(has_buf(b.concurrent, sgu), r.on);
+                if (r.on) {
+                    CHECK(has_buf(b.concurrent, buf_h(b, "moe.shared_out")));
+                    const rad_buf gq = buf_h(b, "trunk_codes.gated.128.128.q8");
+                    if (gq) CHECK(has_buf(b.concurrent, gq));
+                }
+                for (const Case& cs : cases) {
+                    auto k = kit(b, cs.dq, cs.pq, cs.ctx);
+                    k->b.positions_h = k->pos.data();
+                    auto v = run_passes(b, hyv4flash::step, { k.get() }, rank, world);
+                    CHECK_PASSES(b, v);
+                    REQUIRE(!v.empty());
+                    for (int l : { 1, 2 }) {
+                        const MoeOrder m = moe_order(b, *v[0], l);
+                        REQUIRE(m.rgu >= 0 && m.rq > m.rgu && m.rdn > m.rq && m.gather > m.rdn &&
+                                m.lat_out > m.gather);
+                        REQUIRE(m.sgu >= 0 && m.sact > m.sgu && m.sdn > m.sact);
+                        if (r.on) side_order(m, false);
+                        else CHECK(m.sgu > m.lat_out);
+                    }
+                }
+            }
+    /* Order only: the side on and off issue the same launches, operand for operand, on every
+     * step kind and rank. */
+    struct Got { std::vector<std::vector<std::string>> sorted, order; };
+    /* The steps of a declare, run before the next declare (the step serves the last model). */
+    auto steps_of = [&](bool side, int world, int rank) {
+        if (!side) setenv("RADIANCE_HY4_SHARED_SIDE", "0", 1);
+        Declared d(bf16_encs, world, rank, world > 1);
+        unsetenv("RADIANCE_HY4_SHARED_SIDE");
+        Got g;
+        CHECK_EQ(d.rc, RAD_OK);
+        if (d.rc != RAD_OK) return g;
+        for (const Case& cs : cases) {
+            auto k = kit(d.b, cs.dq, cs.pq, cs.ctx);
+            k->b.positions_h = k->pos.data();
+            auto v = run_passes(d.b, hyv4flash::step, { k.get() }, rank, world);
+            for (const auto& c : v) {
+                g.sorted.push_back(launches(d.b, *c));
+                g.order.push_back(issued_ops(d.b, *c));
+            }
+        }
+        return g;
+    };
+    for (int world : { 1, 2, 4 })
+        for (int rank = 0; rank < world; ++rank) {
+            const Got on = steps_of(true, world, rank), off = steps_of(false, world, rank);
+            REQUIRE_EQ(on.sorted.size(), off.sorted.size());
+            int moved = 0;
+            for (size_t p = 0; p < on.sorted.size(); ++p) {
+                CHECK(on.sorted[p] == off.sorted[p]);
+                moved += on.order[p] != off.order[p];
+            }
+            /* ...in another order: every step kind's trunk pass. */
+            CHECK_EQ(moved, (int)(sizeof cases / sizeof cases[0]));
+        }
+}
+
+/* Behind a trellis routed gate_up from MoeFP8::kSharedFirstRows routed rows, MoeFP8 issues its own
+ * shared arm's first stage behind the router, in front of that GEMM (compute-bound there); the
+ * side's stage 0 goes there too, and below that height behind the GEMM. The gate and down keep
+ * their places. */
+TEST(the_shared_sides_first_stage_moves_with_moefp8s_own) {
+    auto iqr = [](RadBuilder* b) {
+        bf16_encs(b);
+        b->encs[0].second = b->encs[1].second = enc_trellis(RAD_U4, true);
+    };
+    Declared d(+iqr, 1, 0);
+    REQUIRE_EQ(d.rc, RAD_OK);
+    /* top_k 2: 12 rows are 24 routed rows, 64 are 128. */
+    for (int rows : { 12, 64 }) {
+        auto k = kit(d.b, {}, { rows }, 0);
+        k->b.positions_h = k->pos.data();
+        auto v = run_passes(d.b, hyv4flash::step, { k.get() }, 0, 1);
+        CHECK_PASSES(d.b, v);
+        REQUIRE(!v.empty());
+        for (int l : { 1, 2 }) {
+            const MoeOrder m = moe_order(d.b, *v[0], l);
+            side_order(m, false, rows * 2 >= 100);
+        }
+    }
+}
+
+/* K-23 under the side: where the shared gate_up is an IQR trellis fed by the latent linear's
+ * rotated int8 codes and its down is rotated int8, the arm's gate_up and gate are one launch for
+ * the rows the fold serves (M <= 16): the side's stage 0 issues the fold, stage 1 nothing, stage 2
+ * down -- two launches where the pair's arm is three. The fold writes the gate's code pair (concurrent with
+ * the rest of the arm's buffers) and quantises nothing (its input codes are fed), so the arm still
+ * writes only its own buffers and rides the pass. Past 16 rows the pair runs as three stages. On
+ * and off (RADIANCE_HY4_SHARED_SIDE=0) issue the same launches with the same operands, in another
+ * order, at decode, verify and prefill heights, and every step kind is lint clean. */
+void iqr_side_encs(RadBuilder* b) {
+    iqr_ffn_encs(b);
+    b->encs.insert(b->encs.begin(), { { "ffn_latent_in", enc_i8(true) } });
+}
+TEST(the_shared_side_issues_the_fold_as_its_first_stage) {
+    struct Case { std::vector<int> dq, pq; int32_t ctx; bool fold; };
+    /* three decode rows; one decode beside a 10-row verify; a 12-row prefill; 40 rows (the pair). */
+    const Case cases[] = { { { 1 }, {}, 0, true }, { { 1, 1, 1 }, {}, 0, true },
+                           { { 1 }, { 10 }, 0, true }, { {}, { 12 }, 0, true },
+                           { {}, { 16 }, 16, true }, { {}, { 40 }, 0, false } };
+    struct Got { std::vector<std::vector<std::string>> sorted, order; };
+    /* REQUIRE returns from the lambda: it fills `g` rather than returning it. */
+    auto run = [&](bool side, Got& g) {
+        MetaKV mk = mini_meta(false, 128, 256);
+        RadBuilder b;
+        iqr_side_encs(&b);
+        RadBuildCtx ctx = build_ctx();
+        G3Env g3env;
+        if (!side) setenv("RADIANCE_HY4_SHARED_SIDE", "0", 1);
+        const int rc = hyv4flash::declare(&b, mk.meta(), &ctx);
+        unsetenv("RADIANCE_HY4_SHARED_SIDE");
+        REQUIRE_EQ(rc, RAD_OK);
+        CHECK_EQ(count_op(b, "gemm_nt_q_gated"), 3);   /* layer 0's MLP and two shared experts */
+        const rad_buf sgu = buf_h(b, "moe.shared_gate_up");
+        REQUIRE(sgu != 0);
+        CHECK_EQ(has_buf(b.concurrent, sgu), side);
+        /* The shared experts' folds (layers 1 and 2) write only buffers the side marked. */
+        for (int i = 1; side && i < 3; ++i) {
+            const RecOp* f = find_op(b, "gemm_nt_q_gated", i);
+            REQUIRE(f != nullptr);
+            for (rad_buf w : f->writes) CHECK(has_buf(b.concurrent, w));
+        }
+        for (const Case& cs : cases) {
+            auto k = kit(b, cs.dq, cs.pq, cs.ctx);
+            k->b.positions_h = k->pos.data();
+            auto v = run_passes(b, hyv4flash::step, { k.get() }, 0, 1);
+            CHECK_PASSES(b, v);
+            REQUIRE(!v.empty());
+            const RadCtx& c = *v[0];
+            if (cs.fold) {
+                CHECK_EQ(count_issued(b, c, "gemm_nt_q_gated"), 3);
+                CHECK_EQ(count_issued(b, c, "gated_had_quant_i8g"), 0);
+            }
+            for (int l : { 1, 2 }) {
+                const MoeOrder m = moe_order(b, c, l);
+                REQUIRE(m.sgu >= 0);
+                const RecOp* o = b.op_of(c.issues[(size_t)m.sgu].op);
+                REQUIRE(o != nullptr);
+                CHECK_EQ(o->op == "gemm_nt_q_gated", cs.fold);
+                if (side) side_order(m, cs.fold);
+                else CHECK(m.sgu > m.lat_out);
+            }
+            for (const auto& p : v) {
+                g.sorted.push_back(launches(b, *p));
+                g.order.push_back(issued_ops(b, *p));
+            }
+        }
+        every_weight_read(b);
+        steps_clean_at(b, 0, 1);
+    };
+    Got on, off;
+    run(true, on);
+    run(false, off);
+    REQUIRE_EQ(on.sorted.size(), off.sorted.size());
+    int moved = 0;
+    for (size_t p = 0; p < on.sorted.size(); ++p) {
+        CHECK(on.sorted[p] == off.sorted[p]);
+        moved += on.order[p] != off.order[p];
+    }
+    CHECK_EQ(moved, (int)(sizeof cases / sizeof cases[0]));
 }
 
 /* K-02 (P-14's switch): q_nope and q_rope read one q residual's codes, so where both are one IQR
@@ -2553,7 +2884,9 @@ TEST(an_engine_step_with_dfly2_is_lint_clean_and_the_query_pass_touches_no_trunk
         CHECK_EQ(std::count(q.begin(), q.end(), std::string("dfly_sel")), 1);
         CHECK_EQ(std::count(q.begin(), q.end(), std::string("mla_attn_sel_sink")), 1);
         CHECK_EQ(std::count(q.begin(), q.end(), std::string("logits_gemm")), depth);
-        CHECK_EQ(std::count(q.begin(), q.end(), std::string("row_topk")), depth);
+        /* the f32 logits' top-k in one op where a library serves it (D-04) */
+        CHECK_EQ(std::count(q.begin(), q.end(), std::string("cast_row_topk")), depth);
+        CHECK_EQ(std::count(q.begin(), q.end(), std::string("row_topk")), 0);
         const auto& df = d.df();
         size_t store = SIZE_MAX, attn = SIZE_MAX;
         for (size_t i = 0; i < ps[2]->issues.size(); ++i) {
@@ -2567,6 +2900,66 @@ TEST(an_engine_step_with_dfly2_is_lint_clean_and_the_query_pass_touches_no_trunk
         int snap = 0;
         for (const auto& is : ps[0]->issues) snap += is.op == df.snap[0].op_sel;
         CHECK_EQ(snap, 1);
+    }
+}
+
+/* D-04: each chain round's top-k reads the f32 logits through cast_row_topk, which rounds them as
+ * `cast` does (the same bytes, one op); without a library that declares it, or with one that
+ * refuses it, the round keeps the pair, `cast` into logits_bf16 then row_topk. Whole and sharded. */
+void no_cast_topk(RadBuilder* b) { bf16_encs(b); b->undeclared.insert("cast_row_topk"); }
+void refused_cast_topk(RadBuilder* b) { bf16_encs(b); b->refuse.insert("cast_row_topk"); }
+TEST(dfly2_takes_cast_row_topk_where_served_and_the_cast_pair_otherwise) {
+    const int depth = 5;
+    for (int world : { 1, 2 }) for (int form = 0; form < 3; ++form) {
+        DeclDfly d(depth, dfly_meta(), world, 0,
+                   form == 0 ? bf16_encs : form == 1 ? no_cast_topk : refused_cast_topk);
+        REQUIRE_EQ(d.rc, RAD_OK);
+        RadBuilder& b = d.b;
+        const auto& df = d.df();
+        const bool fused = form == 0;
+        for (const auto& S : df.steps) {
+            CHECK_EQ(S.op_ctopk != 0, fused);
+            CHECK_EQ(S.op_lcast != 0, !fused);
+            CHECK_EQ(S.op_topk != 0, !fused);
+            const RecOp* o = b.op_of(fused ? S.op_ctopk : S.op_topk);
+            REQUIRE(o);
+            CHECK_EQ(pstr(o, "dtype"), std::string(fused ? "f32" : "bf16"));
+            CHECK_EQ(pint(o, "N"), 320 / world);
+            REQUIRE_EQ(o->reads.size(), (size_t)1);
+            CHECK_EQ(b.bufs[o->reads[0] - 1].name.find(fused ? "dfly.logits" : "logits_bf16") !=
+                         std::string::npos, true);
+            CHECK_EQ(o->writes.size(), (size_t)(world > 1 ? 3 : 2));
+            if (world > 1) CHECK_EQ(pint(o, "vocab_off"), 0);
+        }
+        if (world > 1) continue;   /* the passes below are the whole-vocabulary engine's */
+        auto trunk = kit(b, std::vector<int>(2, depth + 1), {});
+        trunk->b.positions_h = trunk->pos.data();
+        auto ctxp = context_pass(b, *trunk);
+        Query qp(b, 2, depth + 1, depth);
+        auto ps = run_passes(b, hyv4flash::step, { trunk.get(), ctxp.get(), qp.k.get() });
+        for (const auto& c : ps) {
+            if (!c->step_fail.empty()) fprintf(stderr, "%s\n", c->step_fail.c_str());
+            CHECK(c->step_fail.empty());
+        }
+        CHECK_LINT(b, ps[0].get(), ps[1].get(), ps[2].get());
+        const auto q = issued_ops(b, *ps[2]);
+        auto count = [&](const char* op) { return (int64_t)std::count(q.begin(), q.end(), std::string(op)); };
+        CHECK_EQ(count("cast_row_topk"), fused ? depth : 0);
+        CHECK_EQ(count("row_topk"), fused ? 0 : depth);
+        CHECK_EQ(count("cast") >= (fused ? 0 : depth), true);
+        /* each round: the head, then (the cast and) the top-k */
+        for (const auto& S : df.steps) {
+            size_t at_head = SIZE_MAX, at_cast = SIZE_MAX, at_top = SIZE_MAX;
+            const auto& is = ps[2]->issues;
+            for (size_t i = 0; i < is.size(); ++i) {
+                if (is[i].op == S.op_head && at_head == SIZE_MAX) at_head = i;
+                if (S.op_lcast && is[i].op == S.op_lcast && at_cast == SIZE_MAX) at_cast = i;
+                if (is[i].op == (fused ? S.op_ctopk : S.op_topk) && at_top == SIZE_MAX) at_top = i;
+            }
+            REQUIRE(at_head != SIZE_MAX && at_top != SIZE_MAX);
+            CHECK(at_head < at_top);
+            if (!fused) { REQUIRE(at_cast != SIZE_MAX); CHECK(at_head < at_cast && at_cast < at_top); }
+        }
     }
 }
 
@@ -2617,7 +3010,7 @@ TEST(dfly2_serves_a_short_block_of_four_rows) {
                     return (int64_t)std::count(q.begin(), q.end(), std::string(op));
                 };
                 CHECK_EQ(count("logits_gemm"), rounds);
-                CHECK_EQ(count("row_topk"), rounds);
+                CHECK_EQ(count("cast_row_topk"), rounds);
                 CHECK_EQ(count("mtp_couple_propose"), coupled ? rounds : 0);
                 /* each anchor and each round's row found at this block's stride */
                 int row0 = 0, row0_lo = 0, rowk = 0, rowk_lo = 0;
@@ -2706,7 +3099,7 @@ TEST(dfly2_coupled_draws_each_chain_step_from_its_shortlist_law) {
                 const auto& S = df.steps[(size_t)k];
                 size_t at_top = SIZE_MAX, at_c = SIZE_MAX, at_tok = SIZE_MAX, at_merge = SIZE_MAX;
                 for (size_t i = 0; i < is.size(); ++i) {
-                    if (is[i].op == S.op_topk) at_top = i;
+                    if (is[i].op == (S.op_ctopk ? S.op_ctopk : S.op_topk)) at_top = i;
                     if (is[i].op == S.op_merge && S.op_merge) at_merge = i;
                     if (is[i].op == S.op_couple) at_c = i;
                     if (is[i].op == S.op_tok) at_tok = i;
@@ -3031,7 +3424,7 @@ TEST(dfly2_at_tp_splits_heads_and_width_and_merges_the_vocabulary_shards) {
                 CHECK_EQ(pint(b.op_of(L.p_gu.op), "N"), 2 * ff / world);
                 CHECK_EQ(pint(b.op_of(L.p_down.op), "K"), ff / world);
                 CHECK_EQ(pint(b.op_of(df.steps[0].op_head), "n_vocab"), 320 / world);
-                CHECK_EQ(pint(b.op_of(df.steps[0].op_topk), "vocab_off"), 320 / world * rank);
+                CHECK_EQ(pint(b.op_of(df.steps[0].op_ctopk), "vocab_off"), 320 / world * rank);
                 /* The correction's three linears are this rank's width too, and its down's partial
                  * sum is reduced exactly before the residual and the proposal law read it. */
                 CHECK_EQ(pint(b.op_of(df.c_g.op), "N"), df.E / world);
@@ -3080,7 +3473,7 @@ TEST(dfly2_at_tp_splits_heads_and_width_and_merges_the_vocabulary_shards) {
                         add = add || op == st.op_add;
                     }
                     if (op == df.c_d.op || op == df.op_ar_c || add) chain.push_back(i);
-                    if (op == df.steps[0].op_topk) ++tk;
+                    if (op == df.steps[0].op_ctopk) ++tk;
                     if (op == L.p_out.op) i_out = i;
                     if (op == df.op_ar_o) i_ar = i;
                     if (op == L.op_post || (op == L.op_add1 && i_post == SIZE_MAX)) i_post = std::min(i_post, i);

@@ -1304,7 +1304,7 @@ TEST(op_vocabulary) {
         "qsa_score", "qsa_select", "qsa_tail_store", "qsa_work", "kv_resolve", "dflash_conv",
         "router_topk", "moe_scatter", "router_topk_scatter", "router_gemm_topk_scatter",
         "moe_gemm", "moe_gemm_q", "moe_gemm_q_mod4", "moe_gather",
-        "row_topk",
+        "row_topk", "cast_row_topk",
         "row_topk_merge", "pair_argmax", "logit_rerank",
         "gdn_conv_prep", "gdn_conv_update", "gdn_kkt_solve", "gdn_chunk_scan",
         "gdn_recurrent_update", "gdn_conv_recurrent_update", "gdn_gated_rmsnorm",
@@ -5297,6 +5297,44 @@ TEST(op_row_topk) {
     CHECK_EQ(idx.iat(1), 2LL);
     CHECK_EQ(val.at(0), 3.0f);
     CHECK_EQ(val.at(1), 3.0f);
+}
+
+/* cast_row_topk is cast f32 -> bf16 then row_topk: values that differ in f32 but round to one bf16
+ * tie, and the tie goes to the lower column; a value at a rounding midpoint goes to the even
+ * neighbour; and with `vocab_off` and `pairs` it is the pair's bytes for random rows too. */
+TEST(op_cast_row_topk_is_the_cast_then_row_topk) {
+    {
+        /* 1.0 + 2^-10 and 1.0 + 2^-9 both round to 1.0 in bf16 (7 fraction bits): a tie at 1.0
+         * between columns 1 and 3 that f32 would break the other way; 1.0 + 3*2^-8 (bf16 midpoint
+         * between 1+2^-7 and 1+2^-6) rounds to the even 1+2^-6. */
+        T x(RAD_F32, {1, 8});
+        x.f({ 0.5f, 1.0f + 0x1p-10f, -2.0f, 1.0f + 0x1p-9f, 1.0f + 3 * 0x1p-8f, 0.25f, -0.0f, 0.0f });
+        T idx(RAD_I32, {1, 3}), val(RAD_F32, {1, 3});
+        A a; a.t(x).t(idx).t(val).i("M", 1).i("N", 8).i("R", 3).s("dtype", "f32");
+        CHECK_OK(run("cast_row_topk", a));
+        CHECK_EQ(idx.iat(0), 4LL);
+        CHECK_EQ(val.at(0), 1.0f + 0x1p-6f);
+        CHECK_EQ(idx.iat(1), 1LL);
+        CHECK_EQ(val.at(1), 1.0f);
+        CHECK_EQ(idx.iat(2), 3LL);
+        CHECK_EQ(val.at(2), 1.0f);
+    }
+    const int64_t M = 3, N = 64, R = 8;
+    T x(RAD_F32, {M, N}), xb(RAD_BF16, {M, N});
+    std::vector<float> v((size_t)(M * N));
+    uint32_t s = 7;
+    for (auto& e : v) { s = s * 1664525u + 1013904223u; e = (float)((int)(s >> 20) % 41 - 20) * 0.0625f + (float)(s & 0xffu) * 0x1p-14f; }
+    x.f(v);
+    xb.f(v);                                  /* a bf16 store rounds as `cast` does */
+    T i1(RAD_I32, {M, R}), v1(RAD_F32, {M, R}), p1(RAD_F32, {M, R, 2});
+    T i2(RAD_I32, {M, R}), v2(RAD_F32, {M, R}), p2(RAD_F32, {M, R, 2});
+    A a; a.t(x).t(i1).t(v1).t(p1).i("M", M).i("N", N).i("R", R).i("vocab_off", 64).s("dtype", "f32");
+    A b; b.t(xb).t(i2).t(v2).t(p2).i("M", M).i("N", N).i("R", R).i("vocab_off", 64).s("dtype", "bf16");
+    CHECK_OK(run("cast_row_topk", a));
+    CHECK_OK(run("row_topk", b));
+    CHECK(i1.mem == i2.mem);
+    CHECK(v1.mem == v2.mem);
+    CHECK(p1.mem == p2.mem);
 }
 
 /* ================================================================== gated delta net */
@@ -10762,6 +10800,7 @@ std::vector<Geo> geometries() {
                                      .s("dtype", "fp8a8")),
         G("moe_gather", "M", 3, a.i("M", R).i("n", 8).i("top_k", 2).s("dtype", "f32")),
         G("row_topk", "M", 3, a.i("M", R).i("N", 20).i("R", 4).s("dtype", "f32")),
+        G("cast_row_topk", "M", 3, a.i("M", R).i("N", 24).i("R", 4).s("dtype", "f32")),
         G("row_topk_merge", "M", 3, a.i("M", R).i("R", 4).i("world_size", 2).s("dtype", "f32")),
         G("pair_argmax", "M", 3, a.i("M", R).i("n", 4).s("dtype", "f32")),
         G("logit_rerank", "M", 3, a.i("M", R).i("R", 4).i("n_vocab", 20).i("n_embd", 8)
