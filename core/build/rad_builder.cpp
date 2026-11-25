@@ -52,6 +52,8 @@ std::vector<const Program::Miss*> Program::device_holes(bool host_backend) const
     std::vector<const Miss*> out;
     for (const Miss& m : misses) {
         if (m.domain == RAD_DOMAIN_HOST) continue;
+        /* Dropped for a fallback the plugin declared: never issued, so no request lands in it. */
+        if (m.index > 0 && (size_t)m.index < ops.size() && ops[(size_t)m.index].dropped) continue;
         const bool host_kernel = no_host.count(std::make_pair(m.index, m.span)) == 0;
         /* An instance with no weight has nothing the planner places, so nothing moves it. */
         const bool weightless = m.index > 0 && (size_t)m.index < ops.size() &&
@@ -60,6 +62,18 @@ std::vector<const Program::Miss*> Program::device_holes(bool host_backend) const
         out.push_back(&m);
     }
     return out;
+}
+
+size_t Program::dead_ops() const {
+    size_t n = 0;
+    for (size_t i = 1; i < ops.size(); ++i) {
+        if (ops[i].dropped) continue;
+        bool any = false;
+        for (const Band& bd : ops[i].bands)
+            for (int d = 0; d < RAD_N_DOMAINS && !any; ++d) if (bd.dom[d]) any = true;
+        if (!any) ++n;
+    }
+    return n;
 }
 
 const char* bld_access_name(int a) {
@@ -635,6 +649,7 @@ void Builder::fill_tune_instances() {
 
 rad_op Builder::decl_op(const char* opname, const RadParam* p, int n_p,
                         const rad_weight* w, int n_w) {
+    last_decl_ = 0;
     if (finished_) return err(RAD_E_STATE, "decl_op('%s') after declare finished", opname ? opname : "");
     if (!opname || !*opname) return err(RAD_E_INVAL, "decl_op: null op name");
     if (n_p < 0 || n_w < 0) return err(RAD_E_INVAL, "decl_op('%s'): negative count", opname);
@@ -770,6 +785,7 @@ rad_op Builder::decl_op(const char* opname, const RadParam* p, int n_p,
          * lines up. */
         oi.weights.clear();
         oi.weight_opd.clear();
+        last_decl_ = prog_.ops.size();
         prog_.ops.push_back(std::move(oi));
         op_bufs_.emplace_back();
         return RAD_NULL_HANDLE;
@@ -829,6 +845,7 @@ rad_op Builder::decl_op(const char* opname, const RadParam* p, int n_p,
     for (const Band& b : oi.bands)
         if (!b.dom[RAD_DOMAIN_DEVICE] && !b.dom[RAD_DOMAIN_HOST]) resolved = false;
 
+    last_decl_ = prog_.ops.size();
     prog_.ops.push_back(std::move(oi));
     op_bufs_.emplace_back();
 
@@ -841,6 +858,14 @@ rad_op Builder::decl_op(const char* opname, const RadParam* p, int n_p,
 int Builder::op_declared(const char* op) const {
     if (kvstream_op_gated(prog_.ctx, op)) return 0; /* kvstream_op_gated */
     return op && reg_.schema(op) ? 1 : 0;
+}
+
+int Builder::op_dropped() {
+    if (finished_ || last_decl_ == 0 || last_decl_ >= prog_.ops.size()) return RAD_E_STATE;
+    OpInfo& o = prog_.ops[last_decl_];
+    if (op_resolved((rad_op)last_decl_)) return RAD_E_STATE;   /* a resolved op is issued */
+    o.dropped = true;
+    return RAD_OK;
 }
 
 int Builder::op_resolved(rad_op h) const {
@@ -2801,6 +2826,11 @@ int rad_op_resolved(RadBuilder* b, rad_op h) {
 int rad_op_declared(RadBuilder* b, const char* op) {
     if (!b) return 0;
     return B(b)->op_declared(op);
+}
+
+int rad_op_dropped(RadBuilder* b) {
+    if (!b) return RAD_E_INVAL;
+    return B(b)->op_dropped();
 }
 
 int rad_op_reads(RadBuilder* b, rad_op h, const rad_buf* bufs, int n) {

@@ -288,6 +288,9 @@ struct OpInfo {
      * follow): recorded unresolved and never handed to the plugin, so it is never issued and the
      * reference-kernel gate does not count it. */
     bool                  lora_declined = false;
+    /* Unresolved, and the plugin declared its fallback in its place (rad_op_dropped): never issued,
+     * so neither a hole nor a dead op, and the reference-kernel gate does not count it. */
+    bool                  dropped = false;
 };
 
 struct KVGroupInfo {
@@ -526,6 +529,10 @@ public:
      * there; attention over a VRAM cache is the case that matters. Shared by the engine's startup
      * refusal and the tools that count holes. */
     std::vector<const Miss*> device_holes(bool host_backend) const;
+    /* Ops resolved in no domain at all, the dropped ones (OpInfo::dropped) left out: nothing
+     * serves them anywhere, so nothing has checked the planned encoding of the weights they take.
+     * rad-convert refuses a program with any and picks the KV cache width by this count. */
+    size_t dead_ops() const;
 
     /* One per kernel instantiation that rad-tune would benchmark (spec §15). `info` is the
      * kernel's row, so the tuner can read the RadTunable axes, their legal values and the validity
