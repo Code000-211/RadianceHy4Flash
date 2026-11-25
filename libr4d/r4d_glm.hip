@@ -196,16 +196,16 @@ __global__ void __launch_bounds__(128)
  * stage's FMAs run. Lane l still folds k = l, l+32, ... ascending with fmaf, then the same
  * butterfly: byte-identical to every tile form. Tail lanes (j >= K) skip the FMA; loads past K read
  * a clamped address whose value is never used. Rows past M read a clamped row and are not stored;
- * waves past N stage and wait, and store nothing. */
+ * waves past N stage and wait, and store nothing. Like the tile form (K-10), the k loop and the
+ * butterfly are a function of their own, gemm_nt_f32_xt_sums, with no early return and no store;
+ * the store is the caller's. */
 template <int VX, class W>
 __device__ __forceinline__ void
-    gemm_nt_f32_xt_body(const uint16_t* x, const W* w, float* y, long xp, long wp, long yp,
-                        int m, int n, int k) {
+    gemm_nt_f32_xt_sums(const uint16_t* x, const W* w, float (&sum)[8], long xp, long wp, int m,
+                        int n, int k, int c0, int r0) {
     constexpr int R = 8, KC = 256, S = KC / 32;
     __shared__ r4d_u32x4 xs[2][KC];   /* [buffer][k of the stage]: rows 0-7, two to a word */
-    const int lane = threadIdx.x & 31, t = threadIdx.x,
-              c0 = __builtin_amdgcn_readfirstlane(blockIdx.x * 4 + (threadIdx.x >> 5)),
-              r0 = blockIdx.y * R;
+    const int lane = threadIdx.x & 31, t = threadIdx.x;
     const bool live = c0 < n;
     const W* wc = w + (long)(live ? c0 : n - 1) * wp;
     const uint16_t* xr[R];
@@ -243,7 +243,6 @@ __device__ __forceinline__ void
         xs[b][2 * t] = lo;
         xs[b][2 * t + 1] = hi;
     };
-    float sum[R];
 #pragma unroll
     for (int q = 0; q < R; ++q) sum[q] = 0;
     auto step = [&](int b, int s, float wf) {
@@ -279,14 +278,23 @@ __device__ __forceinline__ void
             __syncthreads();
         }
     }
-    if (!live) return;
 #pragma unroll
     for (int q = 0; q < R; ++q)
 #pragma unroll
         for (int mask = 16; mask; mask >>= 1) sum[q] += __shfl_xor(sum[q], mask, 32);
-    if (lane) return;
+}
+template <int VX, class W>
+__device__ __forceinline__ void
+    gemm_nt_f32_xt_body(const uint16_t* x, const W* w, float* y, long xp, long wp, long yp,
+                        int m, int n, int k) {
+    const int lane = threadIdx.x & 31,
+              c0 = __builtin_amdgcn_readfirstlane(blockIdx.x * 4 + (threadIdx.x >> 5)),
+              r0 = blockIdx.y * 8;
+    float sum[8];
+    gemm_nt_f32_xt_sums<VX, W>(x, w, sum, xp, wp, m, n, k, c0, r0);
+    if (c0 >= n || lane) return;
 #pragma unroll
-    for (int q = 0; q < R; ++q)
+    for (int q = 0; q < 8; ++q)
         if (r0 + q < m) y[(long)(r0 + q) * yp + c0] = sum[q];
 }
 template <int VX, class CH, class W>
