@@ -907,7 +907,8 @@ extern "C" int r4d_fuse_ar_rmsnorm_quant_fp8(const RadParam* p, int n_p, uint64_
 }
 
 /* ==========================================================================================
- * rmsnorm_ihc_junction -- [add] -> rmsnorm -> ihc_post -> [engram_gate] -> [ihc_pre -> rmsnorm].
+ * rmsnorm_ihc_junction -- [add] -> rmsnorm -> ihc_post -> [engram_gate] -> ihc_pre -> rmsnorm ->
+ * [codes]; with `tail` 0 the chain stops behind ihc_post.
  * (kernel: libr4d/r4d_ihc_bf16.hip, ihc_junction_kernel over r4d_ihc.h's junction_row)
  *
  * Operands: [0] a (inout)  [1] b?  [2] w_post  [3] post (inout)  [4] h (inout)  [5] fn?  [6] scale?
@@ -951,9 +952,34 @@ int fuse_ihc_junction(const RadParam* p, int n_p, uint64_t present, int step, Ra
         }
         --k;
     }
-    /* P-07: the Engram's gate is one more step, so every step behind it shifts by one. */
+    /* P-07: the Engram's gate is one step of the chain, between ihc_post and ihc_pre. The steps
+     * behind ihc_post are named here, so the form inserts the gate in front of them without a
+     * shifted `k` (a shift made step 3 the gate again and dropped ihc_pre). */
     const bool eg = tail && pi(p, n_p, "engram", 0) != 0;
-    if (eg && k > 2) --k;
+    auto ihc_pre = [&]() -> int {
+        const RadParam* ie = rad_param_find(p, n_p, "ihc_eps");
+        const RadParam* he = rad_param_find(p, n_p, "hc_eps");
+        if (!ie || !he) return RAD_E_UNSUPPORTED;
+        const bool post = rows == 2 * hc;
+        Step s(out, "ihc_pre");
+        s.mirror(p, n_p, "M").mirror(p, n_p, "n").mirror(p, n_p, "hc").mirror(p, n_p, "rows")
+         .pf64("eps", ie->dval).mirror(p, n_p, "hc_eps");
+        if (post) s.mirror(p, n_p, "post_mag");
+        s.mirror(p, n_p, "dtype");
+        return s.wire({ 4, 5, 6, 7, x, post ? 3 : RAD_FUSE_NONE });   /* h, fn, scale, base, x, post */
+    };
+    auto next_norm = [&]() -> int {
+        Step s(out, "rmsnorm");
+        s.mirror(p, n_p, "M").mirror(p, n_p, "n").mirror(p, n_p, "eps").mirror(p, n_p, "dtype");
+        return s.wire({ x, 8, 9 });                         /* x, w_next, xn */
+    };
+    auto codes = [&]() -> int {
+        /* G-3b: the codes of the next block's input norm, had_quant_act_i8g over xn */
+        if (!RAD_FUSE_HAS(present, 12) || !RAD_FUSE_HAS(present, 13)) return RAD_E_NOTFOUND;
+        Step s(out, "had_quant_act_i8g");
+        s.mirror(p, n_p, "M").mirror(p, n_p, "n").pint("group", R4D_FP8_BLOCK).mirror(p, n_p, "dtype");
+        return s.wire({ 9, 12, 13 });                       /* xn, xq, xs */
+    };
     switch (k) {
     case 0: {
         Step s(out, "rmsnorm");
@@ -967,43 +993,31 @@ int fuse_ihc_junction(const RadParam* p, int n_p, uint64_t present, int step, Ra
     }
     case 2: {
         if (!tail) return RAD_E_NOTFOUND;
+        if (!eg) return ihc_pre();
         /* P-07: the Engram's gate over the h ihc_post wrote, before ihc_pre reads it. */
-        if (pi(p, n_p, "engram", 0)) {
-            const RadParam* ee = rad_param_find(p, n_p, "eg_eps");
-            if (!ee || rows != 2 * hc) return RAD_E_UNSUPPORTED;
-            if (!RAD_FUSE_HAS(present, 14) || !RAD_FUSE_HAS(present, 15) ||
-                !RAD_FUSE_HAS(present, 16) || !RAD_FUSE_HAS(present, 17) ||
-                !RAD_FUSE_HAS(present, 18) || !RAD_FUSE_HAS(present, 19) ||
-                !RAD_FUSE_HAS(present, 20))
-                return RAD_E_NOTFOUND;
-            Step s(out, "engram_gate");
-            s.mirror(p, n_p, "M").mirror(p, n_p, "n").mirror(p, n_p, "hc").pf64("eps", ee->dval)
-             .mirror(p, n_p, "dtype");
-            return s.wire({ 14, 15, 16, 17, 18, 19, 20, 4 });   /* .., eg_w_branch, h */
-        }
-        const RadParam* ie = rad_param_find(p, n_p, "ihc_eps");
-        const RadParam* he = rad_param_find(p, n_p, "hc_eps");
-        if (!ie || !he) return RAD_E_UNSUPPORTED;
-        const bool post = rows == 2 * hc;
-        Step s(out, "ihc_pre");
-        s.mirror(p, n_p, "M").mirror(p, n_p, "n").mirror(p, n_p, "hc").mirror(p, n_p, "rows")
-         .pf64("eps", ie->dval).mirror(p, n_p, "hc_eps");
-        if (post) s.mirror(p, n_p, "post_mag");
-        s.mirror(p, n_p, "dtype");
-        return s.wire({ 4, 5, 6, 7, x, post ? 3 : RAD_FUSE_NONE });   /* h, fn, scale, base, x, post */
+        const RadParam* ee = rad_param_find(p, n_p, "eg_eps");
+        if (!ee || rows != 2 * hc) return RAD_E_UNSUPPORTED;
+        if (!RAD_FUSE_HAS(present, 14) || !RAD_FUSE_HAS(present, 15) ||
+            !RAD_FUSE_HAS(present, 16) || !RAD_FUSE_HAS(present, 17) ||
+            !RAD_FUSE_HAS(present, 18) || !RAD_FUSE_HAS(present, 19) ||
+            !RAD_FUSE_HAS(present, 20))
+            return RAD_E_NOTFOUND;
+        Step s(out, "engram_gate");
+        s.mirror(p, n_p, "M").mirror(p, n_p, "n").mirror(p, n_p, "hc").pf64("eps", ee->dval)
+         .mirror(p, n_p, "dtype");
+        return s.wire({ 14, 15, 16, 17, 18, 19, 20, 4 });   /* .., eg_w_branch, h */
     }
     case 3: {
         if (!tail) return RAD_E_NOTFOUND;
-        Step s(out, "rmsnorm");
-        s.mirror(p, n_p, "M").mirror(p, n_p, "n").mirror(p, n_p, "eps").mirror(p, n_p, "dtype");
-        return s.wire({ x, 8, 9 });                         /* x, w_next, xn */
+        return eg ? ihc_pre() : next_norm();
     }
     case 4: {
-        /* G-3b: the codes of the next block's input norm, had_quant_act_i8g over xn */
-        if (!tail || !RAD_FUSE_HAS(present, 12) || !RAD_FUSE_HAS(present, 13)) return RAD_E_NOTFOUND;
-        Step s(out, "had_quant_act_i8g");
-        s.mirror(p, n_p, "M").mirror(p, n_p, "n").pint("group", R4D_FP8_BLOCK).mirror(p, n_p, "dtype");
-        return s.wire({ 9, 12, 13 });                       /* xn, xq, xs */
+        if (!tail) return RAD_E_NOTFOUND;
+        return eg ? next_norm() : codes();
+    }
+    case 5: {
+        if (!tail || !eg) return RAD_E_NOTFOUND;
+        return codes();
     }
     default:
         return RAD_E_NOTFOUND;

@@ -49,7 +49,10 @@ set(RAD_TESTS_WITH_LEGACY chatparse_test chatparse_gemma4_test)
 # r4d_ar_links_test checks libr4d's header-only link reader, so it needs only the include path.
 # relayout_iqr_test holds the IQR relayout to the stored form r4d_iqr.h describes, so it also
 # compiles r4d_iqr_layout.cpp.
-set(RAD_TESTS_WITH_R4D_HOST relayout_parity_test r4d_ar_links_test relayout_iqr_test)
+# r4d_fuse_chain_test walks the chain libr4d's `replaces` hook publishes for the iHC junction (the
+# file rad-check and the graph dump read), so it also compiles r4d_fuse.cpp.
+set(RAD_TESTS_WITH_R4D_HOST relayout_parity_test r4d_ar_links_test relayout_iqr_test
+    r4d_fuse_chain_test)
 # Their relayouts' vector loops, at every CPU level (libr4d/r4d_hsimd.h), built for these tests
 # whether or not libr4d itself is.
 include(${CMAKE_SOURCE_DIR}/cmake/RadSimdLevels.cmake)
@@ -238,6 +241,9 @@ foreach(t ${RAD_TESTS})
     endif()
     if(n STREQUAL relayout_iqr_test)
       target_sources(${n} PRIVATE ${CMAKE_SOURCE_DIR}/libr4d/r4d_iqr_layout.cpp)
+    endif()
+    if(n STREQUAL r4d_fuse_chain_test)
+      target_sources(${n} PRIVATE ${CMAKE_SOURCE_DIR}/libr4d/r4d_fuse.cpp)
     endif()
   elseif(n IN_LIST RAD_TESTS_WITH_PACK)
     add_executable(${n} ${t} ${CMAKE_SOURCE_DIR}/arch/minimaxh3/rad_ref2va_pack.cpp)
