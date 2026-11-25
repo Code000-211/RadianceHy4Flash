@@ -839,6 +839,7 @@ int     dev_vram_used(int device, int64_t* out) {
 }
 int     tape_begin()           { return dev()->tape_begin ? dev()->tape_begin() : RAD_E_UNSUPPORTED; }
 int     tape_mark()            { return dev()->tape_mark ? dev()->tape_mark() : RAD_E_UNSUPPORTED; }
+void    pass_stamp(bool on)    { if (dev()->pass_stamp) dev()->pass_stamp(on ? 1 : 0); }
 void    tape_pause(bool on)    { if (dev()->tape_pause) dev()->tape_pause(on ? 1 : 0); }
 RadTape tape_end(bool keep)    { return dev()->tape_end ? dev()->tape_end(keep ? 1 : 0) : nullptr; }
 int     tape_len(RadTape t)    { return dev()->tape_len ? dev()->tape_len(t) : RAD_E_UNSUPPORTED; }

@@ -183,6 +183,62 @@ TEST(a_chained_kernel_sees_a_shared_value_the_launch_in_front_wrote) {
     rad_dev_chain_infer(0);
 }
 
+/* RADIANCE_AQL_STAMP on a live-issued pass: pass_stamp brackets the pass, every card-0 dispatch in
+ * it leaves one line in the stamp file with the times its completion signal took, and a pass
+ * outside a bracket leaves none. The switch is read once, on the first stamp call of the process,
+ * so this case sets it before any other does (device_test plays no tape). */
+TEST(a_live_issued_pass_leaves_one_stamp_line_a_dispatch) {
+    if (std::strcmp(rad::device_backend_name(), "aql") != 0) SKIP("stamps are an AQL backend feature");
+    const std::string path = radtest::tmpdir() + "/live-stamps.csv";
+    std::remove(path.c_str());
+    setenv("RADIANCE_AQL_STAMP", "1", 1);
+    setenv("RADIANCE_AQL_STAMP_OUT", path.c_str(), 1);
+    const unsigned pairs = 8, blocks = 4;
+    Stream st;
+    DevBuf<unsigned> x(64 * sizeof(unsigned), RAD_MEM_DEVICE);
+    DevBuf<unsigned> seen((int64_t)pairs * blocks * sizeof(unsigned), RAD_MEM_DEVICE);
+    REQUIRE(x && seen);
+    CHECK_OK(rad_memset_async(x, 0, 64 * sizeof(unsigned), st.s));
+    CHECK_OK(rad_stream_sync(st.s));
+    rad::pass_stamp(true);
+    CHECK_OK(rad::aql::chain_probe(st.s, x, seen, pairs, blocks));
+    rad::pass_stamp(false);
+    CHECK_OK(rad_stream_sync(st.s));
+    /* Outside a bracket: not stamped. */
+    CHECK_OK(rad::aql::chain_probe(st.s, x, seen, pairs, blocks));
+    CHECK_OK(rad_stream_sync(st.s));
+    /* The next bracket reads what the first one's dispatches finished. */
+    rad::pass_stamp(true);
+    rad::pass_stamp(false);
+    FILE* f = std::fopen(path.c_str(), "r");
+    REQUIRE(f != nullptr);
+    char line[512];
+    REQUIRE(std::fgets(line, sizeof line, f) != nullptr);
+    CHECK_EQ(std::string(line),
+             std::string("pass,seq,queue,kernel,ordered,chained,start_ns,end_ns,play,records\n"));
+    int rows = 0;
+    unsigned records = 0;
+    while (std::fgets(line, sizeof line, f)) {
+        unsigned long long pass = 0, a = 0, b = 0;
+        int seq = -1;
+        unsigned q = 0, play = 9, rec = 0;
+        char kern[256];
+        int ord = 0, chn = 0;
+        REQUIRE_EQ(std::sscanf(line, "%llu,%d,%u,%255[^,],%d,%d,%llu,%llu,%u,%u", &pass, &seq, &q,
+                               kern, &ord, &chn, &a, &b, &play, &rec), 10);
+        CHECK(pass > (1ull << 40));       /* a live pass is numbered apart from the played ones */
+        CHECK_EQ(seq, rows);
+        CHECK(a > 0 && b >= a);
+        CHECK_EQ(play, 0u);
+        records = rec;
+        ++rows;
+    }
+    std::fclose(f);
+    CHECK(rows >= (int)pairs);
+    CHECK_EQ(records, (unsigned)rows);   /* the one bracketed pass, whole */
+    std::remove(path.c_str());
+}
+
 /* A chained launch reads its own arguments and its chain record from a slot of the argument ring
  * that the host wrote and that another launch read a lap of the ring ago; the L2 still holds what
  * that launch read. Only a system-scope acquire of the packet processor's makes the card forget

@@ -85,6 +85,11 @@ int aql_vmem_device_of(const void* addr, int* dev);
 
 namespace {
 void stamp_hold(hsa_signal_t h, bool on);
+/* Inside a sampled live-issued pass (a_pass_stamp): dispatch() hands each card-0 dispatch to
+ * live_stamp. False for every thread unless RADIANCE_AQL_STAMP is set. */
+thread_local bool t_live_on = false;
+void live_stamp(uint32_t queue, uint64_t kernel, hsa_kernel_dispatch_packet_t* p, bool ordered,
+                bool chained);
 }
 
 namespace aql {
@@ -1575,6 +1580,9 @@ int dispatch(Stream* s, const KernelRec* k, dim3 g, dim3 b, void** args, size_t 
                         !(s->peer_inflight && card_shared(s)));
     /* Without the bit, a kernel that acquires for itself takes none from the packet processor,
      * unless the ring or the host asked for this one. */
+    /* After `keep`, which a completion signal would change: the stamp times the dispatch as the
+     * unstamped pass runs it. Before the header, which lets the packet complete. */
+    if (t_live_on && s->ord == 0) live_stamp(s->id, k->object, p, keep, chain);
     publish(s, idx,
             header(HSA_PACKET_TYPE_KERNEL_DISPATCH,
                    bare && !keep && !asked ? HSA_FENCE_SCOPE_NONE : acq, rel, keep),
@@ -2619,6 +2627,7 @@ struct Stamps {
     bool         out_failed = false;
     bool         full_told = false;
     uint64_t     passes = 0;         /* begun on card 0 */
+    uint64_t     live_passes = 0;    /* live-issued passes stamped (a_pass_stamp) */
     const Tape*  tape = nullptr;     /* the pass being stamped, if one is */
     uint32_t     play = 0;
     std::vector<hsa_signal_t> free;
@@ -2804,6 +2813,111 @@ struct StampRun {
         st.rows.insert(st.rows.end(), rows.begin(), rows.end());
     }
 };
+
+/* The live-issued passes (prefill, mixed, a decode pass issued before its tape exists): the same
+ * stamps for a pass the runtime issues dispatch by dispatch. Ctx brackets each such pass with
+ * pass_stamp(1) / pass_stamp(0); the Nth bracket on a thread is stamped, its card-0 dispatches
+ * each carrying a completion signal exactly as a played dispatch does (the barrier bit and the
+ * chain are decided without it, see dispatch()). Nothing waits: the signals are read later by
+ * stamps_read, in issue order, like the played ones. A live pass is numbered from kLivePass, apart
+ * from the played passes, and its `records` column is its dispatch count on card 0; a pass whose
+ * signals ran out has fewer lines than that, which stampgaps.py counts as partial. */
+constexpr uint64_t kLivePass = 1ull << 40;
+constexpr size_t kLiveBatch = 64;
+
+struct LiveStamp {
+    uint64_t count = 0;              /* brackets this thread has opened */
+    uint64_t pass = 0;
+    uint32_t seq = 0;                /* card-0 dispatches so far in the pass */
+    bool     dry = false;            /* no signal left: the rest of the pass is not stamped */
+    std::vector<hsa_signal_t> sig;
+    size_t   used = 0;
+    std::vector<StampRow> rows;
+
+    void refill() {
+        Stamps& st = stamps();
+        std::lock_guard<std::mutex> lk(st.mu);
+        while (sig.size() - used < kLiveBatch) {
+            hsa_signal_t h{};
+            if (!st.free.empty()) {
+                h = st.free.back();
+                st.free.pop_back();
+            } else if (st.made < kStampSignals &&
+                       hsa_amd_signal_create(1, 0, nullptr, HSA_AMD_SIGNAL_AMD_GPU_ONLY, &h) ==
+                           HSA_STATUS_SUCCESS) {
+                ++st.made;
+            } else {
+                break;
+            }
+            hsa_signal_silent_store_relaxed(h, 1);
+            sig.push_back(h);
+        }
+    }
+};
+thread_local LiveStamp t_live;
+
+void live_stamp(uint32_t queue, uint64_t kernel, hsa_kernel_dispatch_packet_t* p, bool ordered,
+                bool chained) {
+    LiveStamp& l = t_live;
+    const uint32_t seq = l.seq++;
+    if (l.dry) return;
+    StampRow w;
+    if (p->completion_signal.handle) {          /* a ride: stamped from its signal */
+        w.h = p->completion_signal;
+        stamp_hold(w.h, true);
+    } else {
+        if (l.used == l.sig.size()) l.refill();
+        if (l.used == l.sig.size()) {
+            l.dry = true;
+            Stamps& st = stamps();
+            std::lock_guard<std::mutex> lk(st.mu);
+            if (!st.full_told) {
+                st.full_told = true;
+                RAD_WARN("device: RADIANCE_AQL_STAMP: %zu signals are in flight, pass %" PRIu64
+                         " and any pass that finds them so are stamped in part", st.made, l.pass);
+            }
+            return;
+        }
+        w.h = l.sig[l.used++];
+        w.own = true;
+        p->completion_signal = w.h;
+    }
+    w.ordered = ordered;
+    w.chained = chained;
+    w.queue = queue;
+    w.seq = (int)seq;
+    w.pass = l.pass;
+    w.kernel = kernel;
+    l.rows.push_back(w);
+}
+
+void a_pass_stamp(int on) {
+    LiveStamp& l = t_live;
+    Stamps& st = stamps();
+    if (!st.every) return;
+    if (on) {
+        if (t_live_on || ++l.count % (uint64_t)st.every != 0) return;
+        {
+            std::lock_guard<std::mutex> lk(st.mu);
+            stamps_read(st, false);
+            l.pass = kLivePass + ++st.live_passes;
+        }
+        l.seq = 0;
+        l.dry = false;
+        l.used = 0;
+        l.rows.clear();
+        t_live_on = true;
+        return;
+    }
+    if (!t_live_on) return;
+    t_live_on = false;
+    for (StampRow& w : l.rows) w.records = l.seq;
+    std::lock_guard<std::mutex> lk(st.mu);
+    st.free.insert(st.free.end(), l.sig.begin() + (std::ptrdiff_t)l.used, l.sig.end());
+    st.rows.insert(st.rows.end(), l.rows.begin(), l.rows.end());
+    l.sig.clear();
+    l.rows.clear();
+}
 
 int a_tape_play(RadTape rt, int from, int to) {
     Tape* t = tape_of(rt);
@@ -5085,6 +5199,7 @@ const DeviceBackend* aql_backend_if_present(void) {
         g_aql.tape_begin = a_tape_begin;
         g_aql.tape_mark = a_tape_mark;
         g_aql.tape_pause = a_tape_pause;
+        g_aql.pass_stamp = a_pass_stamp;
         g_aql.tape_end = a_tape_end;
         g_aql.tape_len = a_tape_len;
         g_aql.tape_play = a_tape_play;

@@ -287,6 +287,10 @@ struct DeviceBackend {
      * consecutive dispatches; see Ctx::haz_mark. */
     int     (*tape_record)(RadTape t, int i, int* kind, uint32_t* queue);
     int     (*tape_set_overlap)(RadTape t, int i, int on);
+    /* `pass_stamp(1)` / `pass_stamp(0)` bracket one live-issued pass on the calling thread, so
+     * RADIANCE_AQL_STAMP can time its dispatches as it times a played one. Null on a backend
+     * without stamps; a no-op while the switch is off. */
+    void    (*pass_stamp)(int on);
 
 
     /* ---- elastic memory: an address range of fixed size whose backing comes and goes.
@@ -438,6 +442,7 @@ int     tape_diff(RadTape a, RadTape b, std::string* why);
 void    tape_destroy(RadTape t);
 int     tape_record(RadTape t, int i, int* kind, uint32_t* queue);
 int     tape_set_overlap(RadTape t, int i, bool on);
+void    pass_stamp(bool on);
 
 /* The current backend's DeviceBackend::peer_access. */
 int     dev_peer_access(int self, int peer);

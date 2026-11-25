@@ -650,6 +650,7 @@ private:
     int      run_pass(const RadBatch* b);
     int      record_pass(const RadBatch* b, uint64_t key, PassTape* out);
     int      play_pass(PassTape& t);
+    void     live_step(const RadBatch* b);
     void     tape_cut();                        /* while recording: close the current play step */
     /* While recording: `st` becomes a host step that re-runs at every play. Closes the current
      * play step, appends `st` on this lane, and runs `run` with the device tape paused. */
