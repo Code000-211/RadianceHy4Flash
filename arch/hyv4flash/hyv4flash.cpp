@@ -1390,7 +1390,7 @@ static void step(RadCtx* c, const RadBatch* batch) {
                 queries = &compact;
             }
         }
-        if (!l.attn.front(c, batch, queries, rows)) return;
+        if (!l.attn.front(c, batch, queries, rows, lp)) return;
         m.calib.after_front(c, (int)i, l.attn, T);
         /* A pass on a streamed group's ring attends through the selection at every context
          * (hyv4flash_attn.h); every sparse layer of a pass agrees, the view being the pass's. */

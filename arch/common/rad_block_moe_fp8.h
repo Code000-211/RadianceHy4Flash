@@ -1652,8 +1652,7 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
         /* An IQR gate_up between the rotated int8 trunk's fed pairs folds SwiGLU and the rotating
          * quantiser into its epilogue, to 16 rows: one launch a layer less than the pair, which
          * stays declared for longer steps, other encodings and a clamped product. */
-        if (sh_limit <= 0 && sh_gate_up.iqr && w.h.q8_fed && w.h.q8_rot && w.sff.q8_fed &&
-            w.sff.q8_rot)
+        if (sh_limit <= 0 && gated_fold_iqr_ok(sh_gate_up, w.h, w.sff, true))
             op_sh_gated = decl_gated_fold_iqr(
                 b, c.rows, sh_gate_up.N, sh_gate_up.K, sh_gate_up.w, sh_gate_up.ws,
                 { w.h.q8, w.h.s8 },

@@ -4326,6 +4326,30 @@ int Engine::load_weights() {
                  cfg_.tp > 1 ? " (summed over ranks, which map the same file: the resident bytes "
                                "are that divided by --tp)" : "",
                  humanb(mapped_kept).c_str());
+
+    /* ---- M-01: the host pool's mirror of the resident units --------------------------------
+     * The mover sized each class's pool to every unit the host-pool budget had room for, so the
+     * resident units it holds slots for have no host copy yet. They get one here, once, on each
+     * rank's mover stream: after this a demotion of such a unit is an address change and its next
+     * promotion keeps the slot, so the bytes are never copied off the card again. Nothing else may
+     * be in flight (the sweep above synced every rank's stream), and the bytes never change. */
+    {
+        const auto mt0 = std::chrono::steady_clock::now();
+        int64_t mirrored = 0;
+        int64_t mirror_bytes = 0;
+        for (auto& r : ranks_) {
+            if (r->mover.mirror_slots() <= 0) continue;
+            RAD_TRY(rad_dev_set(r->device));
+            RAD_TRY(r->mover.fill_mirrors());
+            mirrored += r->mover.mirror_slots();
+            mirror_bytes += r->mover.mirror_bytes();
+        }
+        if (mirrored > 0)
+            RAD_INFO("load: %lld pool slot(s) mirror a resident unit (%s), copied once off the "
+                     "card in %.1f s: their demotions are address changes",
+                     (long long)mirrored, humanb(mirror_bytes).c_str(),
+                     std::chrono::duration<double>(std::chrono::steady_clock::now() - mt0).count());
+    }
     return RAD_OK;
 }
 
