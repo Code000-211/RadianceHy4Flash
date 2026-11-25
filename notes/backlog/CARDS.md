@@ -88,7 +88,11 @@ scripts/backlog/lane.sh --env iks-A               # what a lane exports: port, m
   phases).
   `greedy` is the merge bar's first clause: three prompts and a 5.7K arrival at temperature 0 with
   `ignore_eos` off, each as `gen` / `chars` / `sha256` of the text itself, so two arms' JSON compare byte for
-  byte (S-01b).
+  byte (S-01b). `stress` is sustained concurrent load (issue #251): `RAD_STRESS_WAVES` waves (40) of eight
+  requests at once, `RAD_STRESS_CHARS` characters of context each (39,500: ~12K tokens) decoded for
+  `RAD_STRESS_NTOK` tokens (96), a fresh wave and then the same eight prompts again; it counts failed requests
+  and a server that stops (`ok` / `err` / `server_dead`) instead of raising, so a run that hangs still writes
+  its JSON. Run it on one iks lane at a time: two lanes under it leave the host 3 GiB of memory.
   Both `idle` and `long8` read the experts' side of the same views, because that is what the freed VRAM is for:
   `expert_units` and `slab_mib` are the residency and the lent VRAM the experts hold, `lend_mib` the most
   the KV pool lets them borrow, and `routed` / `routed_res` the demand's hit rate. It prints each phase as JSON and writes
