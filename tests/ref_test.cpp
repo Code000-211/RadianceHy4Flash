@@ -6764,6 +6764,37 @@ TEST(hc_project_removes_the_direction_per_stream_and_skips_off_rows) {
     CHECK_EQ(h.at(7), 5.0f);
 }
 
+/* With `vsep` = n the direction is a per-stream table [hc, n]: stream s is projected against row s,
+ * not row 0. vsep 0 keeps one direction for every stream (the case above), and any other vsep is
+ * refused rather than read as some stride. */
+TEST(hc_project_per_stream_table_projects_each_stream_against_its_own_row) {
+    /* One row, hc 2, n 2. Stream 0's direction is (1,0), stream 1's is (0,1). */
+    T h(RAD_F32, {1, 4}); h.f({ 3.0f, 4.0f, 5.0f, 6.0f });
+    T v(RAD_F32, {2, 2}); v.f({ 1.0f, 0.0f, 0.0f, 1.0f });
+    T on(RAD_I32, {1});   on.n({ 1 });
+    A a; a.t(h).t(v).t(on).i("M", 1).i("n", 2).i("hc", 2).i("vsep", 2).d("scale", 1.0)
+          .s("dtype", "f32");
+    CHECK_OK(run("hc_project", a));
+    CHECK_NEAR(h.at(0), 0.0f, 1e-6);   /* stream 0 loses its x */
+    CHECK_NEAR(h.at(1), 4.0f, 1e-6);
+    CHECK_NEAR(h.at(2), 5.0f, 1e-6);   /* stream 1 loses its y, not its x */
+    CHECK_NEAR(h.at(3), 0.0f, 1e-6);
+
+    /* The same table read with vsep 0 is row 0 for both streams. */
+    T h0(RAD_F32, {1, 4}); h0.f({ 3.0f, 4.0f, 5.0f, 6.0f });
+    A b; b.t(h0).t(v).t(on).i("M", 1).i("n", 2).i("hc", 2).i("vsep", 0).d("scale", 1.0)
+          .s("dtype", "f32");
+    CHECK_OK(run("hc_project", b));
+    CHECK_NEAR(h0.at(2), 0.0f, 1e-6);
+    CHECK_NEAR(h0.at(3), 6.0f, 1e-6);
+
+    /* A stride that is neither layout is refused. */
+    T h1(RAD_F32, {1, 4}); h1.f({ 3.0f, 4.0f, 5.0f, 6.0f });
+    A c; c.t(h1).t(v).t(on).i("M", 1).i("n", 2).i("hc", 2).i("vsep", 1).d("scale", 1.0)
+          .s("dtype", "f32");
+    CHECK(run("hc_project", c) != RAD_OK);
+}
+
 /* With `group`, hc_read also emits x as block-scaled fp8 taken over the stored (narrowed) x: byte
  * for byte what quant_act_fp8 produces from the stored x. `rotate` adds the Hadamard-rotated twin
  * beside it and leaves the plain pair as it is. */

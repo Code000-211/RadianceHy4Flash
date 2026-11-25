@@ -7,6 +7,7 @@
 #include "../arch/hyv4flash/hyv4flash.cpp"
 
 #include <cstdlib>
+#include <memory>
 
 using namespace rad_fake;
 
@@ -3578,6 +3579,60 @@ TEST(the_four_rank_junction_twin_takes_the_launch_bound_heights) {
     REQUIRE_EQ(off.rc, RAD_OK);
     CHECK_EQ(count_op(off.b, "ar_rmsnorm_ihc_junction"), 0);
     CHECK(count_op(off.b, "all_reduce") > 0);
+}
+
+/* A per-stream control vector: rank counts the rows of a layer, rank / hc of them are groups of
+ * one direction per stream, and each group is one chained hc_project with vsep = n_embd on every
+ * steered layer. Without a vector the graph carries no projection and no switch buffer at all, so
+ * a deployment that does not ask for one runs the graph it ran before. */
+TEST(a_per_stream_control_vector_declares_one_projection_per_group) {
+    const int64_t E = 128, hc = 2, groups = 2, rank = groups * hc, layers = 3;
+    std::vector<float> dir((size_t) (layers * rank * E), 0.0f);
+    float scales[3] = { 0.0f, 1.0f, 1.0f };
+    RadControlVector cv{ dir.data(), scales, E, layers, rank, 1 };
+
+    auto declared = [&](const RadControlVector* v, int* rc) {
+        MetaKV mk = mini_meta();
+        auto b = std::make_unique<RadBuilder>();
+        bf16_encs(b.get());
+        RadBuildCtx ctx = build_ctx();
+        ctx.cvec = v;
+        G3Env g3env;
+        stderr_of([&] { *rc = hyv4flash::declare(b.get(), mk.meta(), &ctx); });
+        return b;
+    };
+    int rc = 0;
+    auto b = declared(&cv, &rc);
+    REQUIRE_EQ(rc, RAD_OK);
+    CHECK_EQ(count_op(*b, "hc_project"), (int) ((layers - 1) * groups));
+    for (const RecOp& o : b->ops) {
+        if (o.op != "hc_project") continue;
+        bool vsep = false;
+        for (const RecParam& p : o.p)
+            if (p.key == "vsep") { vsep = true; CHECK_EQ(p.ival, (long long) E); }
+        CHECK(vsep);
+    }
+
+    /* The shared single direction: one projection a layer, vsep 0. */
+    RadControlVector one{ dir.data(), scales, E, layers, 1, 0 };
+    auto b1 = declared(&one, &rc);
+    REQUIRE_EQ(rc, RAD_OK);
+    CHECK_EQ(count_op(*b1, "hc_project"), (int) (layers - 1));
+    for (const RecOp& o : b1->ops)
+        if (o.op == "hc_project")
+            for (const RecParam& p : o.p)
+                if (p.key == "vsep") CHECK_EQ(p.ival, 0LL);
+
+    /* Rows that do not split into the model's streams are refused, not misread. */
+    RadControlVector odd{ dir.data(), scales, E, layers, 3, 1 };
+    auto b2 = declared(&odd, &rc);
+    CHECK(rc != RAD_OK);
+
+    /* No vector: no projection and no switch. */
+    auto b0 = declared(nullptr, &rc);
+    REQUIRE_EQ(rc, RAD_OK);
+    CHECK_EQ(count_op(*b0, "hc_project"), 0);
+    for (const RecBuf& x : b0->bufs) CHECK(x.name.find("projection_on") == std::string::npos);
 }
 
 RAD_TEST_MAIN()

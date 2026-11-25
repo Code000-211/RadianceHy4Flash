@@ -126,8 +126,8 @@ static const RadParamSpec pHcWrite[] = { P_INT("M"), P_INT("n"), P_INT("hc"), P_
 /* The control vector's projection (libref/ref_hc.cpp, core/cvec.h): one unit direction per layer and a
  * per-row switch. `v` is f32 whatever the stream's dtype is, because the engine uploads the table
  * in f32; `on` is an int32 row mask (core derive.cpp's `projection_on_rows`). */
-static const RadParamSpec pHcProject[] = { P_INT("M"), P_INT("n"), P_INT("hc"), P_F64("scale"),
-                                           P_STR("dtype") };
+static const RadParamSpec pHcProject[] = { P_INT("M"), P_INT("n"), P_INT("hc"), P_INTO("vsep"),
+                                           P_F64("scale"), P_STR("dtype") };
 static const RadOperandSpec oHcProject[] = { INOUT("h"), OPD("v"), OPD("on") };
 static const RadOperandSpec oHcEnter[] = { OPD("x"), OUT("h") };
 static const RadOperandSpec oHcWrite[] = { OPD("y"), OPD("inj"), INOUT("h") };

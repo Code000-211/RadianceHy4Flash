@@ -1554,6 +1554,15 @@ int Engine::declare() {
             return RAD_E_INVAL;
         }
     }
+    if (cvec_.loaded() && cvec_.rank > 1 && plugins_.arch_plugin != "hyv4flash") {
+        /* Only hyv4flash declares k chained projections (PLAN §14). Another arch would declare one
+         * and silently steer 1 of k directions, with the basis scale, and say nothing. */
+        RAD_ERR("--control-vector %s: it carries %lld directions per layer, and the '%s' plugin "
+                "projects one direction per layer", cfg_.control_vector.c_str(),
+                (long long) cvec_.rank, plugins_.arch_plugin.c_str());
+        cvec_ = ControlVector{};
+        return RAD_E_UNSUPPORTED;
+    }
     if (cvec_.loaded()) {
         cvec_views_.assign(ranks_.size(), RadControlVector{});
         cvec_salt_ = control_vector_salt(cvec_);
@@ -1561,10 +1570,16 @@ int Engine::declare() {
          * request that could carry the field. */
         const bool default_on = cfg_.control_vector == "on";
         cvec_default_.store(default_on);
-        RAD_INFO("control vectors: %s: %lld directions of %lld, layers %d..%d, scale %.3f -- "
+        /* n_dirs counts tensors, which is the direction count only for a rank-1 file. */
+        const std::string rank_note =
+            cvec_.rank > 1 ? " (rank " + std::to_string(cvec_.rank) + ", " +
+                                  std::to_string(cvec_.n_dirs * cvec_.rank) + " total)"
+                            : "";
+        RAD_INFO("control vectors: %s: %lld directions of %lld%s, layers %d..%d, scale %.3f -- "
                  "default %s%s",
                  cvec_.path.c_str(), (long long) cvec_.n_dirs,
-                 (long long) cvec_.n_embd, cvec_.first, cvec_.last, (double) cvec_.user_scale,
+                 (long long) cvec_.n_embd, rank_note.c_str(),
+                 cvec_.first, cvec_.last, (double) cvec_.user_scale,
                  default_on ? "ON" : "off",
                  default_on ? " (--control-vector on; a request can still say false)"
                             : " until a request asks for it (the dashboard's switch, or a request's "
