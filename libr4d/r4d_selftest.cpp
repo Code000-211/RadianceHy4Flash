@@ -24264,6 +24264,25 @@ static void f32_forms(const Plugin& pl, int64_t M, int64_t N, int64_t K, int ite
         std::printf("  %-8s %9.1f us  %7.1f GB/s  %6.2f TFLOP/s\n", "rule", us,
                     bytes / (us * 1e3), flop / (us * 1e6));
         ts[1].data = d_w;
+        /* The same shape with the weight stored bf16, as the served routers hold it: the W =
+         * uint16_t instantiation of the same tile forms, half the weight bytes a copy. */
+        std::vector<uint16_t> pw(w.size());
+        for (size_t i = 0; i < w.size(); ++i) pw[i] = h_to_bf16(w[i]);
+        for (int c = 0; c < copies; ++c)
+            st_memcpy((uint8_t*)d_w + (size_t)c * (wbytes / 2), pw.data(), wbytes / 2,
+                      hipMemcpyHostToDevice);
+        ts[1].dtype = RAD_BF16;
+        ps.push_back(PI("weight_bf16", 1));
+        a.p = ps.data();
+        a.n_p = (int)ps.size();
+        if (r->launch(&a, nullptr) == RAD_OK && st_stream_sync(nullptr) == hipSuccess) {
+            const double us16 = st_time_us([&](int i) {
+                ts[1].data = (uint8_t*)d_w + (size_t)(i % copies) * (wbytes / 2);
+                r->launch(&a, nullptr);
+            }, iters, nullptr);
+            std::printf("  %-8s %9.1f us  (bf16 weight)\n", "rule16", us16);
+        }
+        ts[1].data = d_w;
     }
 }
 
