@@ -499,6 +499,32 @@ public:
      * held blocks). Also decays the buffer's shortfall term, so call it once per arbiter tick. */
     int64_t spare_tokens();
 
+    /* What spare_tokens() is made of, for the group that lends least: the group whose distance to
+     * the top bounds the loan, and in its blocks where that distance ends (`held_top`), what the
+     * pool holds under it (`held`), the buffer it keeps (`buffer_blocks`) and the live mark as it
+     * stands (`live`). `spare_tokens` is the same number spare_tokens() returns, and
+     * `loan_tokens` the loan set through set_loan. It reports, it does not decay the shortfall
+     * peak, so it is safe to call from /stats every tick.
+     *
+     * The two gaps say why the loan stops where it does: `live - held_top - buffer_blocks` is room
+     * the arbiter has not lent yet, and `held_top - held` is free blocks no loan can reach,
+     * because the loan never crosses a held one. A compaction that moved the held blocks down
+     * to `held` would recover the second. `group` is -1 when nothing can lend (no paged FULL
+     * group, or rank 1, which tracks no held blocks). Rank 0 only. */
+    struct SpareSplit {
+        int32_t group         = -1;
+        int64_t block_tokens  = 0;   /* block size of `group`, the unit of the counts below */
+        int64_t block_bytes   = 0;   /* and its bytes, so a count can be read as VRAM */
+        int64_t n_blocks      = 0;
+        int64_t held          = 0;
+        int64_t held_top      = 0;
+        int64_t buffer_blocks = 0;
+        int64_t live          = 0;
+        int64_t spare_tokens  = 0;
+        int64_t loan_tokens   = 0;
+    };
+    SpareSplit spare_split() const;
+
     /* Lends `tokens` from the top, or takes back what a smaller number no longer covers. Lending
      * past a held block is refused (RAD_E_STATE). Taking back always succeeds here; the caller
      * must have moved the slab out of those blocks first. */

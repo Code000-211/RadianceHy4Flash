@@ -3891,6 +3891,61 @@ TEST(an_idle_cache_lends_all_but_its_buffer) {
     CHECK_EQ(e.kv.free_blocks(G_FULL), all - 1);
 }
 
+/* spare_tokens() is one number, so a reader cannot tell a pool packed to its top from one whose
+ * free blocks sit under a held one: both lend nothing there. These name the pieces -- where the
+ * loan stops, what the pool holds under it and what the buffer keeps -- so a measurement can.
+ * The gap `held_top - held` is what a compaction that moved the held blocks down would recover. */
+TEST(the_spare_a_loan_reaches_is_reported_piece_by_piece) {
+    Lender e;
+    CHECK_OK(e.build());
+    const int64_t all = e.kv.total_blocks(G_FULL);
+    const int64_t bs  = e.bs();
+
+    /* Idle: nothing held, so the loan reaches all but the buffer. */
+    const KVManager::SpareSplit idle = e.kv.spare_split();
+    CHECK_EQ(idle.group, (int32_t)G_FULL);
+    CHECK_EQ(idle.block_tokens, bs);
+    CHECK_EQ(idle.block_bytes, e.kv.plan(G_FULL)->bytes_per_block);
+    CHECK_EQ(idle.n_blocks, all);
+    CHECK_EQ(idle.held, 0);
+    CHECK_EQ(idle.held_top, 0);
+    CHECK(idle.buffer_blocks > 0);          /* the chunk floor, kept so a request needs no recall */
+    CHECK_EQ(idle.live, all);
+    CHECK_EQ(idle.spare_tokens, (all - idle.buffer_blocks) * bs);
+    CHECK_EQ(idle.loan_tokens, 0);
+
+    /* Hold the low half: the mark is just past the highest held block (rounded up to a bucket of
+     * the held histogram), and the spare is everything above it less the buffer. */
+    std::vector<int32_t> got;
+    for (int64_t i = 0; i < all / 2; ++i) {
+        int32_t b = -1;
+        CHECK_OK(e.kv.reserve_block(G_FULL, &b));
+        got.push_back(b);
+    }
+    const KVManager::SpareSplit half = e.kv.spare_split();
+    CHECK_EQ(half.held, (int64_t)got.size());
+    CHECK(half.held_top >= half.held);
+    CHECK_EQ(half.held_top, e.kv.held_top_blocks(G_FULL));
+    CHECK_EQ(half.spare_tokens, (all - half.held_top - half.buffer_blocks) * bs);
+
+    /* A block released under the top is a hole: unheld, and still unlendable, because the loan
+     * may not reach past the block above it. The split says so where one number cannot. */
+    e.kv.release_block(G_FULL, got[0]);
+    const KVManager::SpareSplit hole = e.kv.spare_split();
+    CHECK_EQ(hole.held, half.held - 1);
+    CHECK_EQ(hole.held_top, half.held_top);
+    CHECK(hole.held_top - hole.held > 0);
+    CHECK_EQ(hole.spare_tokens, half.spare_tokens);
+    CHECK_EQ(e.kv.spare_tokens(), half.spare_tokens);
+
+    /* The loan the arbiter set is reported beside it, so /stats can read both marks at once. */
+    CHECK_OK(e.kv.set_loan(hole.spare_tokens));
+    const KVManager::SpareSplit lent = e.kv.spare_split();
+    CHECK_EQ(lent.loan_tokens, hole.spare_tokens);
+    CHECK_EQ(lent.live, all - hole.spare_tokens / bs);
+    CHECK_EQ(e.kv.live_blocks(G_FULL), lent.live);
+}
+
 TEST(a_block_something_holds_is_never_lent) {
     Lender e;
     CHECK_OK(e.build());

@@ -978,19 +978,37 @@ int KVManager::grow_for(int32_t g, int64_t blocks, bool* waiting_for_fleet) {
 }
 
 int64_t KVManager::spare_tokens() {
+    /* Decay the shortfall peak by 1/8 a tick (a half-life of about half a second), so one large
+     * admission does not pin its size of buffer for the life of the process. */
+    for (size_t i = 0; i < short_peak_.size(); ++i) short_peak_[i] -= short_peak_[i] / 8;
+    return spare_split().spare_tokens;
+}
+
+KVManager::SpareSplit KVManager::spare_split() const {
+    SpareSplit o;
+    o.loan_tokens = loan_;
     int64_t spare = -1;
     for (size_t i = 0; i < plans_.size(); ++i) {
-        /* Decay the shortfall peak by 1/8 a tick (a half-life of about half a second), so one
-         * large admission does not pin its size of buffer for the life of the process. */
-        if (i < short_peak_.size()) short_peak_[i] -= short_peak_[i] / 8;
         if (!lendable(plans_[i].index)) continue;
         const KVGroupPlan& p = plans_[i];
-        int64_t keep = held_top(i) + buf_blocks(i);
+        const int64_t top = held_top(i);
+        int64_t keep = top + buf_blocks(i);
         if (keep > p.n_blocks) keep = p.n_blocks;
         const int64_t t = (p.n_blocks - keep) * p.block_size;
-        if (spare < 0 || t < spare) spare = t;
+        if (spare >= 0 && t >= spare) continue;
+        spare = t;
+        o.group         = p.index;
+        o.block_tokens  = p.block_size;
+        o.block_bytes   = p.bytes_per_block;
+        o.n_blocks      = p.n_blocks;
+        o.held          = held_blocks(p.index);
+        o.held_top      = top;
+        o.buffer_blocks = buf_blocks(i);
+        o.live          = live_[i];
+        o.spare_tokens  = t;
     }
-    return spare > 0 ? spare : 0;
+    if (spare < 0) o.spare_tokens = 0;
+    return o;
 }
 
 int KVManager::set_loan(int64_t tokens) {

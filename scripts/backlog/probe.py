@@ -199,6 +199,7 @@ def view(at):
             "to_host": mv.get("to_host"), "promoted": mv.get("promoted"), "dropped": mv.get("dropped"),
             "held_back": mv.get("held_back"), "restores": st.get("restores"),
             "pool_mib": round((p.get("bytes_used") or 0) / 2**20, 1),
+            "kv_loan": t.get("kv_loan") or {},
             "stored": [{k: s.get(k) for k in ("tokens", "idle_s", "on_device", "on_host", "resume_tokens")}
                        for s in o.get("sessions", [])]}
 def hits(fn):
@@ -253,6 +254,22 @@ def idle(chars):
     for x in v: print(json.dumps(x), flush=True)
     time.sleep(2)
     return o
+def loan_frag(v):
+    """The KV loan's headroom in MiB, from the /stats `kv_loan` object (M-15): `holes_mib` is free
+    blocks under the highest held one, which the loan may not cross and a compaction would recover;
+    `buffer_mib` is what the cache keeps in hand; `headroom_mib` is what the arbiter has not lent
+    yet. The blocks are the binding group's, so `block_bytes` turns them into VRAM."""
+    l = (v or {}).get("kv_loan") or {}
+    mib = (l.get("block_bytes") or 0) / 2**20
+    held, top = l.get("held") or 0, l.get("held_top") or 0
+    buf, live = l.get("buffer_blocks") or 0, l.get("live") or 0
+    return {"group": l.get("group"), "held": held, "held_top": top,
+            "holes_mib": round((top - held) * mib, 1),
+            "buffer_mib": round(buf * mib, 1),
+            "headroom_mib": round(max(0, live - top - buf) * mib, 1),
+            "live_mib": round(live * mib, 1),
+            "spare_tokens": l.get("spare_tokens"), "loan_tokens": l.get("loan_tokens")}
+
 def live(n, ntok=256):
     """M-11: the loan at N live sequences -- the item's own point, "73-129 units at 1-4 live
     sequences". Starts N decoders, reads /stats while they all decode (the loan ticks every 100 ms
@@ -305,6 +322,7 @@ def long8(chars, gen=32):
          "kv_mib": {x["at"]: x["kv_mib"] for x in v}, "host_mib": {x["at"]: x["host_mib"] for x in v},
          "expert_vram_units": {x["at"]: (x["expert_units"] or {}).get("vram") for x in v},
          "slab_mib": {x["at"]: x["slab_mib"] for x in v}, "lend_mib": {x["at"]: x["lend_mib"] for x in v},
+         "loan": {x["at"]: loan_frag(x) for x in v},
          "views": v, "waves": [a, r]}
     print(json.dumps({k: x for k, x in o.items() if k not in ("views", "waves")}), flush=True)
     for x in v: print(json.dumps(x), flush=True)
