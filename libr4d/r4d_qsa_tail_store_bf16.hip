@@ -36,29 +36,48 @@ constexpr int kThreads = 256;
     const int32_t* __restrict__ cu, const int32_t* __restrict__ sidx,                           \
     uint16_t* __restrict__ state, int T, int n, int ring, int seqs, int slots, int k_ld,        \
     int s_slot, int s_row, int sidx_ld
-__device__ __forceinline__ void qsa_tail_store_body(QSA_TAIL_STORE_PARAMS) {
 
+/* The step metadata the body reads before it touches a key: which sequence the token is in, its
+ * tail slot and the row it lands on. All of it is uploaded by the host (`pos`, `cu`, `sidx` are
+ * input operands, and no op of a pass writes an input), so a chained launch reads it in front of
+ * its wait, which then hides the scan's dependent round trips (K-29). The body reads nothing here
+ * itself, so both forms copy the same rows. */
+struct QsaTailMeta {
+    size_t dst;   /* the row this token's key copies to; `on` says whether it copies at all */
+    bool on;
+};
+
+__device__ __forceinline__ QsaTailMeta qsa_tail_store_meta(QSA_TAIL_STORE_PARAMS) {
+
+    QsaTailMeta m = { 0, false };
     const int t = (int)blockIdx.x;
-    if (t >= T) return;
+    if (t >= T) return m;
 
     /* This token's sequence, by a linear scan in every thread (cheaper than LDS plus a barrier). */
     int s = -1;
     for (int i = 0; i < seqs; ++i)
         if (t >= cu[i] && t < cu[i + 1]) { s = i; break; }
-    if (s < 0) return;
+    if (s < 0) return m;
 
     /* Only the last `ring` tokens of this sequence's chunk -- see the header. */
-    if (t < cu[s + 1] - ring) return;
+    if (t < cu[s + 1] - ring) return m;
 
     /* Column 0 is the committed slot; -1 marks a sequence with no state. A slot past the
      * state plane's would write past its allocation. */
     const int si = sidx[(size_t)s * sidx_ld];
-    if (si < 0 || si >= slots) return;
+    if (si < 0 || si >= slots) return m;
 
     const int row = pos[t] % ring;
-    const size_t src = (size_t)t * k_ld;
-    const size_t dst = (size_t)si * s_slot + (size_t)row * s_row;
-    for (int d = (int)threadIdx.x; d < n; d += kThreads) state[dst + d] = k[src + d];
+    m.dst = (size_t)si * s_slot + (size_t)row * s_row;
+    m.on = true;
+    return m;
+}
+
+__device__ __forceinline__ void qsa_tail_store_body(QSA_TAIL_STORE_PARAMS, const QsaTailMeta& m) {
+
+    if (!m.on) return;
+    const size_t src = (size_t)blockIdx.x * k_ld;
+    for (int d = (int)threadIdx.x; d < n; d += kThreads) state[m.dst + d] = k[src + d];
 }
 
 /* The kernel around the body, whose blocks and threads return where their work ends: CH `r4dchain`
@@ -66,9 +85,13 @@ __device__ __forceinline__ void qsa_tail_store_body(QSA_TAIL_STORE_PARAMS) {
 template <class CH>
 __global__ __launch_bounds__(kThreads)
 void qsa_tail_store_kernel(QSA_TAIL_STORE_PARAMS) {
+    /* K-29: the step's metadata in front of the wait, which then hides its round trips (see
+     * QsaTailMeta). */
+    const QsaTailMeta m = qsa_tail_store_meta(k, pos, cu, sidx, state, T, n, ring, seqs, slots, k_ld,
+                                              s_slot, s_row, sidx_ld);
     if (CH::on) r4d_chain_wait();
     qsa_tail_store_body(k, pos, cu, sidx, state, T, n, ring, seqs, slots, k_ld, s_slot, s_row,
-                        sidx_ld);
+                        sidx_ld, m);
     if (CH::on) r4d_chain_done();
 }
 #undef QSA_TAIL_STORE_PARAMS
