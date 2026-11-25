@@ -7,6 +7,7 @@
 #include "kvstream/stage.h"
 #include "xp_state.h"
 #include "../device/device.h"
+#include "../plugin/registry.h"
 
 #include <algorithm>
 #include <cstring>
@@ -558,6 +559,67 @@ int Ctx::op_domain(rad_op h) const {
     return (int)op_domain_[h].load(std::memory_order_relaxed);
 }
 
+/* ------------------------------------------------------------------ a reload of rebuilt hooks */
+/* Every instance this program resolved, against the hooks the reload would give its row. The
+ * launch alone is free to change: the weights lie as the row's layout hooks asked at load, an
+ * instance holds what its init made, and the arena was sized from the scratch hook at declare, so
+ * those answers have to stay what they were. */
+int Ctx::hooks_check(const HookReload& r, std::string* why) const {
+    if (r.next.empty()) return RAD_OK;
+    if (oracle_) {
+        *why = fmt("rank %d runs the kernel oracle (RADIANCE_OP_ORACLE / RADIANCE_OP_REPEAT), "
+                   "which keeps launches of its own: reloading hooks under it needs a restart",
+                   rank_);
+        return RAD_E_STATE;
+    }
+    for (size_t i = 1; i < plans_.size(); ++i) {
+        const OpInfo* oi = plans_[i].info;
+        if (!oi) continue;
+        for (const Band& b : oi->bands)
+            for (int d = 0; d < RAD_N_DOMAINS; ++d) {
+                const Resolved& res = b.dom[d];
+                if (!res || !res.row->info) continue;
+                const RadKernelInfo& was = *res.row->info;
+                const RadKernelInfo* now = r.rebuilt(&was);
+                if (!now) continue;
+                if (const char* hook = hook_reload_fixed(was, *now)) {
+                    *why = fmt("rank %d: kernel %s serves op '%s' (%s, %s) and its rebuild defines "
+                               "the %s hook anew, whose answer this engine took at declare; only "
+                               "launch and scratch are reloaded, so this needs a restart",
+                               rank_, was.name, oi->op.c_str(), domain_name(d), b.span.c_str(),
+                               hook);
+                    return RAD_E_STATE;
+                }
+                if (was.scratch == now->scratch) continue;
+                /* Asked as declare asked it (Builder::resolve_bands): the frozen geometry, no
+                 * tensors. */
+                RadArgs a{};
+                a.p          = res.geom.params();
+                a.n_p        = res.geom.n_params();
+                a.rank       = rank_;
+                a.world_size = world_size_;
+                const int64_t before = was.scratch ? was.scratch(&a) : 0;
+                const int64_t after  = now->scratch ? now->scratch(&a) : 0;
+                if (after != before) {
+                    *why = fmt("rank %d: kernel %s serves op '%s' (%s, %s); its rebuild asks %lld "
+                               "bytes of scratch where the running build asks %lld, and the arena "
+                               "was sized at declare, so this needs a restart",
+                               rank_, was.name, oi->op.c_str(), domain_name(d), b.span.c_str(),
+                               (long long)after, (long long)before);
+                    return RAD_E_SCRATCH;
+                }
+            }
+    }
+    return RAD_OK;
+}
+
+void Ctx::hooks_refresh() {
+    for (IssuePlan& ip : issue_table_)
+        if (ip.row && ip.row->info) ip.launch = ip.row->info->launch;
+    for (PassTape& t : tapes_) tape_drop(t);
+    tapes_.clear();
+}
+
 /* ================================================================== routing (spec §5.5) */
 
 int Ctx::bind_routing() {
@@ -1000,7 +1062,7 @@ int Ctx::lane_join(int from, int to) {
  * architecture callback. `agen_b`, `vgen_b` and `sgen_b` are set only on generator passes, which are
  * never recorded (below). `ckpt_cut` and `ckpt_cu`: a pass carrying them is never recorded.
  */
-static_assert(sizeof(void*) != 8 || sizeof(RadBatch) == 496,
+static_assert(sizeof(void*) != 8 || sizeof(RadBatch) == 512,
               "RadBatch changed: check that Ctx::pass_key reads every new field a pass depends on");
 static_assert(sizeof(void*) != 8 || sizeof(RadKVGroupBatch) == 88,
               "RadKVGroupBatch changed: check that Ctx::pass_key reads every new field");
@@ -1009,7 +1071,7 @@ uint64_t Ctx::pass_key(const RadBatch* b) const {
     /* Not recordable: encoder passes are shaped by their media, and passes carrying encoder rows
      * issue the scatter only when they have some (and the second attention over a run read both
      * ways, n_bidi, only on such a pass). */
-    if (b->enc || b->n_mm_rows > 0 || b->n_bidi > 0) return 0;
+    if (b->prefill_tail_h || b->enc || b->n_mm_rows > 0 || b->n_bidi > 0) return 0;
     /* A plugin with no pass-key callback cannot key a launch that splits its KV by the live
      * context, so a prefill or mixed pass of a program holding such a launcher is not recorded.
      * Its decode, verify and draft passes are: their launches get the keyed context bound in
@@ -1030,6 +1092,10 @@ uint64_t Ctx::pass_key(const RadBatch* b) const {
     /* A step with a checkpoint inside it copies from addresses the engine armed for it
      * (Ctx::set_ckpt_snap), which no recording could replay. */
     if (b->ckpt_cut > 0) return 0;
+    /* A layer-sliced pass (S-02) carries a group's carried chunk state across steps (the plugin's
+     * persistent set), which no recorded launch replays: its layers are [layer_lo, layer_hi), not
+     * the whole trunk, and the state it resumes from is not in the batch. */
+    if (b->layer_lo != 0 || b->layer_hi != 0) return 0;
     uint64_t h = 0x9e3779b97f4a7c15ull;
     auto mix = [&](uint64_t v) {
         h ^= v + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);

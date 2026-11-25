@@ -376,6 +376,23 @@ typedef struct RadBatch {
      * ckpt_cut is 0. */
     int32_t        ckpt_cut;
     const int32_t* ckpt_cu;
+    /* ABI 44. Host mirror of the optional prefill_tail[_anchors] derivation.
+     * [rows, decode_rows, cu[n_seq+1], prefill_cu[n_prefill+1], original_row[rows], position[rows],
+     * optional three rotary planes of rows, optional compact ckpt_cu[3]].
+     * A full or empty tail needs only rows. */
+    const int32_t* prefill_tail_h;
+
+    /* ---- appended in ABI 44 (a chunk planned as layer-sliced sub-steps) */
+    /* The trunk layers a prefill chunk's rows run on this pass: [layer_lo, layer_hi), in the
+     * model's own numbering. 0/0 is the whole trunk, the only shape a step had before ABI 44.
+     * The scheduler slices one chunk into m sub-steps (S-02) only on a model whose plugin declares
+     * the persistent set that makes a slice resumable (RadBuildCtx::layer_slices) and reports it
+     * can stop between two layers (RadArchProbe::slice_layers_ok): the chunk's tokens and slots
+     * are the same on every sub-step, its rows sit at the same place in the batch, n_checkpoints
+     * is 0 on every sub-step but the last, and a slice resumes from the previous one's layer_hi.
+     * A plugin that ignores the range (the zero default) runs the whole trunk. */
+    int32_t        layer_lo;
+    int32_t        layer_hi;
 } RadBatch;
 
 /* What a generator pass carries beside the step batch's own fields, which keep their meanings:
@@ -928,6 +945,12 @@ int rad_issue(RadCtx* c, rad_op op, const RadOperand* opd, int n_opd, int64_t n)
  * the second lane's window where the architecture declares one, abi/rad_builder.h). */
 int rad_lane(RadCtx* c, int lane);
 int rad_lane_join(RadCtx* c, int from, int to);
+
+/* The domain this deployment's issue dispatches `op` to: RAD_DOMAIN_DEVICE or RAD_DOMAIN_HOST
+ * (abi/rad_abi.h). The placement planner moves an op to the host after declare, when its weight
+ * operands are all host-placed (core/runtime/ctx.h "the placement seam"), so the plugin can only
+ * ask at run time. A negative status for a handle that was never declared. Additive export. */
+int rad_op_domain(RadCtx* c, rad_op op);
 
 /* Same, with the ranged value taken from the batch. */
 #define RAD_ISSUE(c, op, ...) rad_issue((c), (op), RAD_OPD(__VA_ARGS__), RAD_N_BATCH)

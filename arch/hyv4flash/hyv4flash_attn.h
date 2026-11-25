@@ -48,6 +48,26 @@ struct StepPlan {
     int64_t live = 0;      /* the indexer's live block columns */
 };
 
+/* Consecutive original rows can move in one launch. Query projections read the original
+ * norm/codes and write compact Q. The cache projections still read the whole chunk. */
+struct QueryRows {
+    const int32_t* ids = nullptr;
+    int64_t n = 0;
+    /* Device: the retained prefill queries' bounds rebased to 0 (the prefill_tail derivation's
+     * prefill_cu, located by TailLayout in hyv4flash.cpp). Null on a full pass, whose query
+     * bounds are the key bounds, the trunk's once-a-step rebase (w.cu_p). */
+    const int32_t* pf_cu = nullptr;
+    template<class F> void spans(F f) const {
+        if (!ids) { if (n) f(0, 0, n); return; }
+        for (int64_t i = 0; i < n;) {
+            int64_t end = i + 1;
+            while (end < n && ids[end] == ids[i] + end - i) ++end;
+            f(ids[i], i, end - i);
+            i = end;
+        }
+    }
+};
+
 /* The planes of one attention geometry, shared by its layers. */
 struct AttnWire {
     rad_buf qa = 0;       /* [T, q_lora] q_a's output, normed in place (HF's q_resid) */
@@ -255,6 +275,13 @@ struct Attn {
                                     RAD_SHARD_ROW, grp, { qsrc }, act(w.qa), w.q_nope));
         RAD_ARCH_TRY(q_rope.declare(b, nm, g, nm.f("blk.%d.attn_q_rope", l), H * R, s.q_lora,
                                     RAD_SHARD_ROW, grp, { qsrc }, act(w.qa), w.q_rope));
+        /* K-02 (P-14's switch, RADIANCE_HY4_FUSE_QPROJ=0 keeps the two launches): q_nope and
+         * q_rope over the one set of codes q_a's quantiser writes, in one launch at a decode step's
+         * GEMV, where each of the two is launch and ramp cost. Taken only where the two are one
+         * form and one K (declare_dual refuses the rest) and only at M == 1 (kDualMaxM); a wider
+         * pass keeps both Lins' own launches. */
+        if (dual_fuse_on()) RAD_ARCH_TRY(q_nope.declare_dual(b, q_rope, w.qa,
+                                                             w.q_nope, w.q_rope, T));
         q_nope.fed_codes = q_rope.fed_codes = nullptr;   /* `qcodes` moves with the layer */
 
         /* kv_a's rows are the latent then the shared rotary key (`kv_a_proj_with_mqa`). */
@@ -268,7 +295,10 @@ struct Attn {
         op_kv_norm = decl_rmsnorm(b, T, L, s.eps, kv_gain, w.row, w.row);
         const char* sec = !s.mrope ? nullptr : sliding ? s.mrope_sliding.c_str()
                                                          : s.mrope_sparse.c_str();
-        op_q_rope = decl_rope_gptj(b, T, H, R, theta, w.q_rope, sec);
+        /* K-49: the query rope is the wide one -- H heads of pairs, so the row form drops
+         * `H` times the `sincosf` over a prefill chunk -- and the key rope is one head a row,
+         * where the launch would not take the row form at all (r4d_model_bf16.hip:1538). */
+        op_q_rope = decl_rope_gptj(b, T, H, R, theta, w.q_rope, sec, "rope_rows");
         op_k_rope = decl_rope_gptj(b, T, 1, R, theta, w.row, sec);
         HY4_NEED(op_kv_norm && op_q_rope && op_k_rope, "rmsnorm / rope (gptj)");
         /* The cache row as one KV head of (L + R) / 2, its first half in the K slot and the rest in
@@ -341,6 +371,12 @@ struct Attn {
         RAD_ARCH_TRY(gate.declare(b, nm, g, nm.f("blk.%d.attn_gate", l), a.v_width(), s.n_embd,
                                   RAD_SHARD_ROW, grp, { nm.ckpt("%s.linear_gate.weight", ap) },
                                   act(xa), w.gate));
+        /* K-03: the gate reads q_a's codes and both are GEMVs at a decode step, so where the two
+         * encodings agree one launch carries the pair -- q_a's part is the eight-wave one -- and the
+         * gate's own launch stays the wider passes'. Its product is written at q_a's place, which is
+         * ahead of `mla_expand_gate`, its only reader. */
+        if (qa_gate_fuse_on())
+            RAD_ARCH_TRY(q_a.declare_dual(b, gate, xa, qa_out, w.gate, T));
 
         q_a.fed_codes = kv_a.fed_codes = gate.fed_codes = nullptr;
         RAD_ARCH_TRY(t_in_norm.declare(b, nm, T, "attn_in_norm", l, RAD_BF16, s.n_embd, xa));
@@ -376,15 +412,44 @@ struct Attn {
                       { kv_b }, { in_ }, { out_ });
         };
         op_absorb = proj("absorb", w.q_nope, w.q_lat);
+        /* The rotary the sinks fold (their optional `rope_pos` operand): the stable instance's, so
+         * a decode step needs no separate `rope` launch (`front` then issues none, and the raw
+         * projection columns are what the operand holds). The fast instance keeps the rotated
+         * buffer, since a mixed step issues one `rope` over every row. */
+        const char* rsec = !s.mrope ? nullptr
+                          : sliding ? s.mrope_sliding.c_str() : s.mrope_sparse.c_str();
+        const double rtheta = sliding ? s.theta_sliding : s.theta_sparse;
         /* Decode-class rows: one a stream and its speculation rows. */
         const int64_t DTmax = std::max<int64_t>(1, std::min<int64_t>(T, g.max_logit_rows));
+        auto sink_params = [&](int64_t rows, int stable, bool windowed, int64_t blocks,
+                               int64_t win) {
+            std::vector<RadParam> ps = { RAD_RANGE("M", 1, rows), RAD_INT("heads", H),
+                                         RAD_INT("latent_dim", L), RAD_INT("rope_dim", R) };
+            if (windowed) {
+                ps.push_back(RAD_INT("block_size", bs));
+                ps.push_back(RAD_INT("window", win));
+            } else {
+                ps.push_back(RAD_INT("blocks", blocks));
+                ps.push_back(RAD_INT("block_size", bs));
+            }
+            ps.push_back(RAD_F64("scale", scale));
+            ps.push_back(RAD_STR("dtype", "bf16"));
+            ps.push_back(RAD_INT("stable", stable));
+            if (stable) {
+                ps.push_back(RAD_F64("rope_theta", rtheta));
+                ps.push_back(RAD_F64("rope_scale", 1.0));
+                if (rsec && *rsec) {
+                    ps.push_back(RAD_STR("rope_mode", "imrope_gptj"));
+                    ps.push_back(RAD_STR("rope_sections", rsec));
+                } else {
+                    ps.push_back(RAD_STR("rope_mode", "gptj"));
+                }
+            }
+            return ps;
+        };
         auto paged_op = [&](int64_t rows, int stable, std::initializer_list<rad_buf> in) {
-            return mk(b, "mla_attn_paged_sink",
-                      { RAD_RANGE("M", 1, rows), RAD_INT("heads", H), RAD_INT("latent_dim", L),
-                        RAD_INT("rope_dim", R), RAD_INT("block_size", bs),
-                        RAD_INT("window", window), RAD_F64("scale", scale),
-                        RAD_STR("dtype", "bf16"), RAD_INT("stable", stable) },
-                      { sinks }, in, { w.lat });
+            return mk_list(b, "mla_attn_paged_sink", sink_params(rows, stable, true, 0, window),
+                           { sinks }, in, { w.lat });
         };
         op_paged = paged_op(DTmax, 1, { w.q_lat, w.q_rope });
         op_paged_pf = paged_op(T, 0, { w.q_lat, w.q_rope, w.cu_p });
@@ -407,12 +472,9 @@ struct Attn {
         HY4_NEED(op_paged && op_paged_pf, "mla_attn_paged_sink");
         if (!sliding) {
             auto sel_op = [&](int64_t rows, int stable) {
-                return mk(b, "mla_attn_sel_sink",
-                          { RAD_RANGE("M", 1, rows), RAD_INT("heads", H), RAD_INT("latent_dim", L),
-                            RAD_INT("rope_dim", R), RAD_INT("blocks", s.ix_group_topk),
-                            RAD_INT("block_size", bs), RAD_F64("scale", scale),
-                            RAD_STR("dtype", "bf16"), RAD_INT("stable", stable) },
-                          { sinks }, { w.q_lat, w.q_rope, sel, len }, { w.lat });
+                return mk_list(b, "mla_attn_sel_sink",
+                               sink_params(rows, stable, false, s.ix_group_topk, 0), { sinks },
+                               { w.q_lat, w.q_rope, sel, len }, { w.lat });
             };
             op_sel = sel_op(DTmax, 1);
             op_sel_pf = sel_op(T, 0);
@@ -481,8 +543,18 @@ struct Attn {
         return RAD_OK;
     }
 
+    /* The decode rows' query rotary folded into the sinks' stable instances (their optional
+     * `rope_pos`), so a step with no prefill rows needs no `rope` launch. A step with prefill rows
+     * does not fold: one `rope` rotates every row there, and the fast instances and the
+     * non-absorbed path read the rotated buffer. Off with RADIANCE_HY4_FOLD_QROPE=0, which issues
+     * the `rope` launch back. */
+    bool fold_qrope(const StepPlan& p) const {
+        return p.T == p.DT && fuse_on("RADIANCE_HY4_FOLD_QROPE");
+    }
+
     /* The front: projections, norms, rotary and the cache store. */
-    bool front(RadCtx* c, const RadBatch* batch) const {
+    bool front(RadCtx* c, const RadBatch* batch, const RadBatch* queries, QueryRows rows,
+               const StepPlan& p) const {
         const auto* kb = kv_batch(batch, kv);
         if (!kb || !kb->slot_mapping || !kb->block_table || !kb->seqused) {
             rad_step_fail(c, "hyv4flash: the latent cache's slot mapping, block table and "
@@ -495,19 +567,30 @@ struct Attn {
             v.x = x;
             return v;
         };
-        const RadOperand pos = praw(batch->positions, RAD_I32, T);
         t_in_norm.step(c, brows(xa, T), T);
-        q_a.step(c, act(xa), qa_out, T);
-        if (qfuse)
-            RAD_ISSUE_N(c, op_qa_norm, T, brows(qa_out, T), RAD_NONE, RAD_W(qa_gain),
-                        brows(qcodes.q8, T), brows(qcodes.s8, T), brows(w.qa, T));
-        else
-            RAD_ISSUE_N(c, op_qa_norm, T, brows(qa_out, T), RAD_W(qa_gain), brows(w.qa, T));
-        t_q_resid.step(c, brows(w.qa, T), T);
-        q_nope.step(c, act(w.qa), w.q_nope, T);
-        q_rope.step(c, act(w.qa), w.q_rope, T);
+        const int64_t M = rows.n;
+        /* kv_a can reuse the codes q_a normally makes. Produce their full plane even
+         * when no query survives this chunk. A fused preceding junction already did so
+         * when q_a itself is fed. */
+        const bool full_codes = M < T && kv_a.fed && q_a.op_q && kv_a.q8 == q_a.q8;
+        if (full_codes)
+            RAD_ISSUE_N(c, q_a.op_q, T, brows(xa, T), brows(q_a.q8, T), brows(q_a.s8, T));
+        rows.spans([&](int64_t src, int64_t dst, int64_t count) {
+            q_a.step(c, act(xa), qa_out, T, src, count, dst, full_codes);
+        });
+        if (M) {
+            if (qfuse)
+                RAD_ISSUE_N(c, op_qa_norm, M, brows(qa_out, M), RAD_NONE, RAD_W(qa_gain),
+                            brows(qcodes.q8, M), brows(qcodes.s8, M), brows(w.qa, M));
+            else
+                RAD_ISSUE_N(c, op_qa_norm, M, brows(qa_out, M), RAD_W(qa_gain), brows(w.qa, M));
+            t_q_resid.step(c, brows(w.qa, M), M);
+            q_nope.step(c, act(w.qa), w.q_nope, M);
+            q_rope.step(c, act(w.qa), w.q_rope, M);
+        }
         kv_a.step(c, act(xa), w.row, T);
         const RadOperand rpos = rope_pos_of(s, batch, T);
+        const bool qrope_folded = fold_qrope(p);
         const int64_t half = (L + R) / 2;
         /* The row's front in one launch (byte-identical to the norm, the rotary and the store). */
         const bool fused = op_row_front && !kb->stream;
@@ -518,7 +601,8 @@ struct Attn {
             RAD_ISSUE_N(c, op_kv_norm, T, bcol(w.row, 0, L, T), RAD_W(kv_gain), bcol(w.row, 0, L, T));
             t_kv_latent.step(c, bcol(w.row, 0, L, T), T);
         }
-        RAD_ISSUE_N(c, op_q_rope, T, brows(w.q_rope, T), rpos);
+        if (M && !qrope_folded)
+            RAD_ISSUE_N(c, op_q_rope, M, brows(w.q_rope, M), rope_pos_of(s, queries, M));
         if (!fused) {
             RAD_ISSUE_N(c, op_k_rope, T, bcol(w.row, L, R, T), rpos);
             t_kv_rope.step(c, bcol(w.row, L, R, T), T);
@@ -545,60 +629,82 @@ struct Attn {
                 RAD_ISSUE_N(c, op_store, T, bcol(w.row, 0, half, T), bcol(w.row, half, half, T),
                             praw(kb->slot_mapping, RAD_I32, T), kv_cache(kv, layer));
         }
-        gate.step(c, act(xa), w.gate, T);
-        t_gate.step(c, brows(w.gate, T), T);
+        rows.spans([&](int64_t src, int64_t dst, int64_t count) {
+            gate.step(c, act(xa), w.gate, T, src, count, dst);
+        });
+        t_gate.step(c, brows(w.gate, M), M);
         return true;
     }
 
     /* The absorbed attention over the paged cache: the decode sequences [0, D) (rows [0, DT))
      * with the stable instance, then, when `prefill`, the prefill sequences [D, S) (rows
      * [DT, T)) with the fast one over their bounds rebased to 0 (`w.cu_p`, rebased once a step
-     * by the trunk: Model::op_rebase). */
-    void paged(RadCtx* c, const RadBatch* batch, const StepPlan& p, bool prefill) const {
+     * by the trunk: Model::op_rebase; on the last layer's compact pass, the retained queries'
+     * bounds: query_cu). */
+    void paged(RadCtx* c, const RadBatch* batch, const StepPlan& p, bool prefill,
+               const QueryRows& rows) const {
         const auto* kb = kv_batch(batch, kv);
         const int64_t pitch = kb->block_table_pitch, D = p.D, DT = p.DT, L = s.kv_lora,
                       R = a.qk_rope, H = a.heads;
+        /* The rotary the decode rows fold (the stable instance's `rope_pos`): front() then issues
+         * no `rope` launch, and w.q_rope holds the projection's columns. Absent (RAD_NONE) when
+         * front() did not fold. */
+        const RadOperand rpos = fold_qrope(p) ? rope_pos_of(s, batch, DT) : RAD_NONE;
         if (D > 0 && DT > 0)
             RAD_ISSUE_N(c, op_paged, DT, brows(w.q_lat, DT), brows(w.q_rope, DT),
                         kv_cache(kv, layer), praw2(kb->block_table, RAD_I32, D, pitch),
                         praw(kb->seqused, RAD_I32, D), praw(batch->cu_seqlens, RAD_I32, D + 1),
-                        RAD_W(sinks), brows(w.lat, DT));
+                        RAD_W(sinks), brows(w.lat, DT), rpos);
         const int64_t M = p.T - DT;
         if (!prefill || p.P <= 0 || M <= 0) return;
         RAD_ISSUE_N(c, op_paged_pf, M, brow_slice(w.q_lat, DT, M, H * L),
                     brow_slice(w.q_rope, DT, M, H * R), kv_cache(kv, layer),
                     praw2(kb->block_table + D * pitch, RAD_I32, p.P, pitch),
-                    praw(kb->seqused + D, RAD_I32, p.P), brows(w.cu_p, p.P + 1), RAD_W(sinks),
+                    praw(kb->seqused + D, RAD_I32, p.P), query_cu(rows, p), RAD_W(sinks),
                     brow_slice(w.lat, DT, M, H * L));
     }
 
-    /* The selection form: decode-class rows [0, DT) stable, prefill rows [DT, T) fast. */
-    void selected(RadCtx* c, const StepPlan& p, rad_buf sel, rad_buf len) const {
+    /* The selection form: decode-class rows [0, DT) stable, prefill rows [DT, T) fast.
+     * P-09: `sel0` is the row `sel`'s window starts at (0 on the wire, the layer's base in the
+     * selection snapshot plane when the step wrote its selection straight there). */
+    void selected(RadCtx* c, const RadBatch* batch, const StepPlan& p, rad_buf sel, rad_buf len,
+                  int64_t sel0 = 0) const {
         const int64_t DT = p.DT, M = p.T - DT, L = s.kv_lora, R = a.qk_rope, H = a.heads,
                       K = s.ix_group_topk;
+        /* As paged(): the decode rows' rotary is folded into the stable instance. */
+        const RadOperand rpos = fold_qrope(p) ? rope_pos_of(s, batch, DT) : RAD_NONE;
         if (DT > 0)
             RAD_ISSUE_N(c, op_sel, DT, brows(w.q_lat, DT), brows(w.q_rope, DT),
-                        kv_cache(kv, layer), brows(sel, DT), brows(len, DT), RAD_W(sinks),
-                        brows(w.lat, DT));
+                        kv_cache(kv, layer), brow_slice(sel, sel0, DT, K), brows(len, DT),
+                        RAD_W(sinks), brows(w.lat, DT), rpos);
         if (M > 0)
             RAD_ISSUE_N(c, op_sel_pf, M, brow_slice(w.q_lat, DT, M, H * L),
                         brow_slice(w.q_rope, DT, M, H * R), kv_cache(kv, layer),
-                        brow_slice(sel, DT, M, K), brow_slice(len, DT, M, 1), RAD_W(sinks),
+                        brow_slice(sel, sel0 + DT, M, K), brow_slice(len, DT, M, 1), RAD_W(sinks),
                         brow_slice(w.lat, DT, M, H * L));
     }
 
-    /* The non-absorbed attention over the prefill rows [DT, T), every key this step's. */
-    void dense(RadCtx* c, const RadBatch* batch, const StepPlan& p) const {
+    /* The prefill queries' bounds rebased to 0: the compact pass's own (QueryRows::pf_cu), else
+     * the step's (w.cu_p, which the trunk rebases once a step from the full batch). */
+    RadOperand query_cu(const QueryRows& rows, const StepPlan& p) const {
+        return rows.pf_cu ? praw(rows.pf_cu, RAD_I32, p.P + 1) : brows(w.cu_p, p.P + 1);
+    }
+
+    /* The non-absorbed attention over the prefill query rows [DT, T) (`p` the query plan), every
+     * key this step's (`batch`'s prefill rows, bounded by w.cu_p). */
+    void dense(RadCtx* c, const RadBatch* batch, const QueryRows& rows, const StepPlan& p) const {
         const int64_t T = p.T, DT = p.DT, M = T - DT, L = s.kv_lora, R = a.qk_rope,
                       H = a.heads, N = a.qk_nope, Q = a.qk();
-        (void)batch;
-        RAD_ISSUE_N(c, op_lat_copy, M, bcol_at(w.row, DT, L + R, 0, L, M),
-                    brow_slice(w.latc, DT, M, L));
-        RAD_ISSUE_N(c, op_kvb, M, brow_slice(w.latc, DT, M, L), RAD_W(kv_b),
-                    brow_slice(w.kvb, DT, M, a.kv_width()));
-        RAD_ISSUE_N(c, op_split, M, brow_slice(w.kvb, DT, M, a.kv_width()),
-                    bcol_at(w.row, DT, L + R, L, R, M), brow_slice(w.k, DT, M, H * Q),
-                    brow_slice(w.v, DT, M, H * a.v));
+        int64_t kd, k0;
+        batch_split(batch, &kd, &k0);
+        const int64_t nk = batch->n_tok - k0;
+        RAD_ISSUE_N(c, op_lat_copy, nk, bcol_at(w.row, k0, L + R, 0, L, nk),
+                    brow_slice(w.latc, k0, nk, L));
+        RAD_ISSUE_N(c, op_kvb, nk, brow_slice(w.latc, k0, nk, L), RAD_W(kv_b),
+                    brow_slice(w.kvb, k0, nk, a.kv_width()));
+        RAD_ISSUE_N(c, op_split, nk, brow_slice(w.kvb, k0, nk, a.kv_width()),
+                    bcol_at(w.row, k0, L + R, L, R, nk), brow_slice(w.k, k0, nk, H * Q),
+                    brow_slice(w.v, k0, nk, H * a.v));
         RadOperand qn = brow_slice(w.q_full, DT, M, H * Q), qr = qn;
         qn.cols = N;
         qr.offset += N;
@@ -606,8 +712,8 @@ struct Attn {
         RAD_ISSUE_N(c, op_qn_copy, M, brow_slice(w.q_nope, DT, M, H * N), qn);
         RAD_ISSUE_N(c, op_qr_copy, M, brow_slice(w.q_rope, DT, M, H * R), qr);
         RAD_ISSUE_N(c, op_dense, M, brow_slice(w.q_full, DT, M, H * Q),
-                    brow_slice(w.k, DT, M, H * Q), brow_slice(w.v, DT, M, H * a.v),
-                    brows(w.cu_p, p.P + 1), brows(w.cu_p, p.P + 1), RAD_W(sinks),
+                    brow_slice(w.k, k0, nk, H * Q), brow_slice(w.v, k0, nk, H * a.v),
+                    query_cu(rows, p), brows(w.cu_p, p.P + 1), RAD_W(sinks),
                     brow_slice(w.ao, DT, M, a.v_width()));
     }
 
@@ -628,7 +734,8 @@ struct Attn {
      * behind o_proj; the layer's Junction runs the reduction and the sandwich norm (and
      * tail_taps() the two taps behind them). */
     void core(RadCtx* c, const RadBatch* batch, const StepPlan& p, rad_buf sel, rad_buf len,
-              rad_buf nsel, bool fused_tail = false) const {
+              rad_buf nsel, bool fused_tail, const RadBatch* queries,
+              const QueryRows& rows, int64_t sel0 = 0, int64_t nsel0 = 0) const {
         const int64_t T = p.T;
         const auto* kb = kv_batch(batch, kv);
         auto act = [](rad_buf x) {
@@ -652,12 +759,13 @@ struct Attn {
                                      "has no kv_resolve for its selection");
                     return;
                 }
-                kv_resolve_issue(c, op_resolve, S, brows(sel, T), brows(nsel, T), kv, layer, T);
+                kv_resolve_issue(c, op_resolve, S, brow_slice(sel, sel0, T, s.ix_group_topk),
+                                 brow_slice(nsel, nsel0, T, 1), kv, layer, T);
             }
             if (selecting)
-                selected(c, p, sel, len);
+                selected(c, queries, p, sel, len, sel0);
             else
-                paged(c, batch, p, !p.nonabs);
+                paged(c, queries, p, !p.nonabs, rows);
             if (fused_q)
                 RAD_ISSUE_N(c, op_expand_quant, T, brows(w.lat, T), RAD_W(kv_b), brows(w.gate, T),
                             brows(out.q8, T), brows(out.s8, T));
@@ -668,7 +776,7 @@ struct Attn {
                 RAD_ISSUE_N(c, op_expand, abs_rows, brows(w.lat, abs_rows), RAD_W(kv_b),
                             brows(w.ao, abs_rows));
         }
-        if (p.nonabs && !selecting && p.P > 0) dense(c, batch, p);
+        if (p.nonabs && !selecting && p.T > p.DT) dense(c, batch, rows, p);
         /* the rows the fused expansion has not gated already */
         const int64_t g0 = op_expand_gate ? abs_rows : 0;
         if (g0 < T) {

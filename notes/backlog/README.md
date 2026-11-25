@@ -51,3 +51,10 @@ cheaper (30 % at 256 rows, 41 % at 723, 58 % on the 720-row tail chunk of a 6.7K
 of TTFT on the 6.7K prompt, but at 250-380 rows an expert is routed with p ~ 98 %, so the ring copies 3.7-4 GiB a rank
 (~90 ms) before the step, which 23 ms of saved GEMM does not repay: every resumed turn loses 47-93 ms and a lone
 256-token prompt 89-93 ms, on both lanes, both runs each. Numbers, op table and commands: `closed/M-03b.md`.
+- **K-07 (one descriptor load per `moe_iqr` block):** closed without code. Option (a) — a wide-K decode block taking 2 or
+4 column tiles in turn, byte-identical at every pin — is not faster: the served lane moves `moe_iqr` 46.6 -> 46.4 us a
+launch (c1 15.866 -> 15.795 ms, greedy sha256 identical) and the kernel alone is slower where the grid is what limits
+it (21.7 / 22.2 / 23.1 -> 22.3 / 23.4 / 26.6 us at 16 rows, B = 3/4/5). Deleting half the 17-load searches removes no
+time, so the run search is not the 17 us a layer above the byte floor and (b)'s descriptor list would shorten the same
+prologue; the gap is the tile's own work. `moe_down_dec` already takes G column tiles a block, and its G rule's own
+measurement rejects more of them at low rows. Numbers, tables and commands: `closed/K-07.md`.

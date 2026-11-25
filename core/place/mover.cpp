@@ -126,6 +126,8 @@ int Mover::init(const Program& prog, const Plan& plan, const MoverConfig& cfg, P
     copying_.assign(plan.units.size(), 0);
     pool_layer_.assign(plan.classes.size(), {});
     donors_.assign(plan.classes.size(), DonorRank{});
+    mirror_slots_ = 0;
+    mirror_bytes_ = 0;
     n_layers_ = 0;
     for (const MoveUnit& mu : plan.units) n_layers_ = std::max(n_layers_, mu.layer + 1);
     pools_.clear();
@@ -133,6 +135,11 @@ int Mover::init(const Program& prog, const Plan& plan, const MoverConfig& cfg, P
 
     /* ---- how many slots each class needs, counted before anything is allocated ------------- */
     std::vector<int64_t> n_slab(plan.classes.size(), 0), n_pool(plan.classes.size(), 0);
+    /* The file tier's units, per class: one of them read from the drive is deposited into a free
+     * pool slot of its class, so a class with any keeps handing its slots back (pool_full). */
+    std::vector<int64_t> n_ssd(plan.classes.size(), 0);
+    /* The resident units a mirror slot may hold, per class, in plan order (the pool pass below). */
+    std::vector<std::vector<int32_t>> mirror_cand(plan.classes.size());
     int64_t static_need = 0, pageable_need = 0;
     for (size_t u = 0; u < plan.units.size(); ++u) {
         const MoveUnit& mu = plan.units[u];
@@ -141,10 +148,16 @@ int Mover::init(const Program& prog, const Plan& plan, const MoverConfig& cfg, P
         us.site = mu.site;
         us.klass = mu.slab_class;
         us.bytes = mu.bytes;
+        if (mu.tier == Tier::SSD && mu.slab_class >= 0) n_ssd[(size_t)mu.slab_class]++;
         if (mu.slab_class < 0) continue;
         if (mu.tier == Tier::VRAM && mu.slab_slot >= 0) {
             n_slab[(size_t)mu.slab_class] = std::max(n_slab[(size_t)mu.slab_class],
                                                      (int64_t)mu.slab_slot + 1);
+            /* A resident unit heat may demote is a candidate for a pool slot of its own: with
+             * one its demotion is an address change, without one it is a copy off the card. A
+             * pinned or a static resident is never demoted, so its slot would never be read. */
+            if (mu.movable && !mu.pinned)
+                mirror_cand[(size_t)mu.slab_class].push_back((int32_t)u);
         } else if (mu.tier == Tier::VRAM) {
             us.static_off = align_up(static_need, RAD_ALIGN_UNIT);
             static_need = us.static_off + mu.bytes;
@@ -184,7 +197,6 @@ int Mover::init(const Program& prog, const Plan& plan, const MoverConfig& cfg, P
         total_turn += cp.n_turn;
         cp.slab.init(slab_slots, sc.stride);
         total_slab += slab_slots;
-        total_pool += n_pool[c];
         if (slab_slots > 0) {
             /* Tail padding: a kernel assembling a packed code window from a wide read may read a
              * few bytes past the last slot; without padding that runs off the allocation and
@@ -199,36 +211,6 @@ int Mover::init(const Program& prog, const Plan& plan, const MoverConfig& cfg, P
         }
         for (int64_t s = n_slab[c]; s < slab_slots; ++s) cp.slab.add_free(s);
         total_shadow += shadow + sc.n_stage;
-
-        cp.pool.init(n_pool[c], sc.stride);
-        if (n_pool[c] > 0) {
-            cp.pool_base = reserve(sc.name.c_str(), n_pool[c] * sc.stride, RAD_MEM_HOST_PINNED);
-            if (!cp.pool_base) {
-                RAD_ERR("mover: no pinned host memory for the '%s' pool: %lld slots of %s",
-                        sc.name.c_str(), (long long)n_pool[c], humanb(sc.stride).c_str());
-                return RAD_E_NOMEM;
-            }
-            /* The pool's base as the card addresses it (equal to the host address on a unified
-             * backend). Without one there is no zero-copy tier. */
-            cp.pool_dev = rad_dev_device_ptr(cp.pool_base);
-            /* Warned, not refused: a pool nothing zero-copies out of is not an error. The host
-             * pointer is valid on the device only where the two coincide. A deployment's pool is
-             * RAD_MEM_HOST_MAPPED (core/mem/pools.cpp), so this fires only on the test path. */
-            if (!cp.pool_dev) {
-                RAD_WARN("mover: the '%s' host pool has no device address; a kernel reading it "
-                         "zero-copy would fault", sc.name.c_str());
-                cp.pool_dev = cp.pool_base;
-            }
-        }
-        /* The pool free list starts empty: every pooled unit occupies its slot. The engine primes
-         * off the shadow slots and then alternates, a promotion freeing the pool slot a demotion
-         * needs.
-         *
-         * Nothing is memset; the load phase writes every weight. rad_memset_async on
-         * RAD_MEM_HOST fails on a real card but succeeds on the host backend, so use std::memset
-         * if a host buffer ever needs clearing. The pool's cache cycle takes slots
-         * on demand: a deposit with no free slot relabels the coldest idle unit back to the
-         * file tier, copyless. */
     }
 
     if (static_need > 0) {
@@ -357,6 +339,84 @@ int Mover::init(const Program& prog, const Plan& plan, const MoverConfig& cfg, P
     }
     victims_.assign(plan.classes.size(), VictimRank{});
 
+    /* ---- the pinned pool: the plan's pooled units, and the mirror (M-01) ---------------------
+     *
+     * A class's pool holds a slot for every unit it has room for, not only for the units the plan
+     * put in the pool. What the host-pool budget has left after every pooled unit's slot, the
+     * file tier's staging ring and its read windows is room for mirror slots, and one mirror slot
+     * makes a resident unit's demotion an address change (issue() drops a unit that has one)
+     * instead of a copy off the card and a free slot to find. Before this the pool was sized to
+     * the pooled units and the rest of `--host-pool-mib` was allocated, locked and idle, which is
+     * why raising it changed nothing (notes tp2t1, T5).
+     *
+     * fill_mirrors() writes the resident units' bytes into their slots once, after the load, and
+     * promote_to() keeps the slot, so a mirrored unit is never filled twice and never copied off
+     * the card. A unit past the room is demoted as before; a class with no room keeps none.
+     *
+     * The free list starts empty: every pool slot belongs to a unit. The engine primes off the
+     * shadow slots and then alternates, a promotion keeping the pool slot a demotion returns to.
+     * Nothing is memset; the load phase writes every weight. rad_memset_async on RAD_MEM_HOST
+     * fails on a real card but succeeds on the host backend, so use std::memset if a host buffer
+     * ever needs clearing. The pool's cache cycle takes slots on demand: a deposit with no free
+     * slot relabels the coldest idle unit back to the file tier, copyless. */
+    {
+        /* Every pooled unit's slot first, so the mirror cannot take the room a pool tier needs. */
+        int64_t pooled_bytes = 0;
+        for (size_t c = 0; c < plan.classes.size(); ++c)
+            pooled_bytes += n_pool[c] * plan.classes[c].stride;
+        /* What is left for mirrors, less one alignment unit per pool: reserve() aligns each
+         * block's base up, and a mirror that could not be reserved would fail the placement. */
+        int64_t mirror_room = 0;
+        if (budget_)
+            mirror_room = std::max<int64_t>(budget_->host_pinned().avail() - pooled_bytes -
+                                                (int64_t)(plan.classes.size() + 1) *
+                                                    (int64_t)(RAD_ALIGN_UNIT - 1),
+                                            0);
+        for (size_t c = 0; c < plan.classes.size(); ++c) {
+            const SlabClass& sc = plan.classes[c];
+            ClassPools& cp = pools_[c];
+
+            /* The mirror: as many of the class's demotable residents as fit, in plan order. */
+            int64_t n_mirror = 0;
+            if (sc.stride > 0 && !mirror_cand[c].empty())
+                n_mirror = std::min<int64_t>((int64_t)mirror_cand[c].size(),
+                                             mirror_room / sc.stride);
+            for (int64_t k = 0; k < n_mirror; ++k) {
+                const int32_t u = mirror_cand[c][(size_t)k];
+                unit_[(size_t)u].pool_slot = n_pool[c]++;
+                pool_layer_[c].push_back(plan.units[(size_t)u].layer);
+            }
+            mirror_room -= n_mirror * sc.stride;
+            mirror_slots_ += n_mirror;
+            mirror_bytes_ += n_mirror * sc.stride;
+            /* Every unit of the class that can move has a slot, and nothing of the class is left
+             * in the file tier to be deposited later: then nothing needs a slot handed back, a
+             * promotion keeps its own (promote_to), and no unit of the class ever starves. */
+            cp.pool_full = n_mirror == (int64_t)mirror_cand[c].size() && n_ssd[c] == 0;
+
+            total_pool += n_pool[c];
+            cp.pool.init(n_pool[c], sc.stride);
+            if (n_pool[c] <= 0) continue;
+            cp.pool_base = reserve(sc.name.c_str(), n_pool[c] * sc.stride, RAD_MEM_HOST_PINNED);
+            if (!cp.pool_base) {
+                RAD_ERR("mover: no pinned host memory for the '%s' pool: %lld slots of %s",
+                        sc.name.c_str(), (long long)n_pool[c], humanb(sc.stride).c_str());
+                return RAD_E_NOMEM;
+            }
+            /* The pool's base as the card addresses it (equal to the host address on a unified
+             * backend). Without one there is no zero-copy tier. */
+            cp.pool_dev = rad_dev_device_ptr(cp.pool_base);
+            /* Warned, not refused: a pool nothing zero-copies out of is not an error. The host
+             * pointer is valid on the device only where the two coincide. A deployment's pool is
+             * RAD_MEM_HOST_MAPPED (core/mem/pools.cpp), so this fires only on the test path. */
+            if (!cp.pool_dev) {
+                RAD_WARN("mover: the '%s' host pool has no device address; a kernel reading it "
+                         "zero-copy would fault", sc.name.c_str());
+                cp.pool_dev = cp.pool_base;
+            }
+        }
+    }
+
     /* ---- streams, events, move records ------------------------------------------------------ */
     RAD_TRY(rad_stream_create(&mover_, /*high_priority=*/0));
     /* Every event here is local: they order the mover's queue against this card's compute queue
@@ -396,6 +456,10 @@ int Mover::init(const Program& prog, const Plan& plan, const MoverConfig& cfg, P
     if (pageable_bytes_ > 0)
         RAD_INFO("mover: %s of pageable host memory for the units no tier could hold",
                  humanb(pageable_bytes_).c_str());
+    if (mirror_slots_ > 0)
+        RAD_INFO("mover: %lld of the pool slots mirror a resident unit (%s), filled once after "
+                 "the load: their demotions are address changes",
+                 (long long)mirror_slots_, humanb(mirror_bytes_).c_str());
     return RAD_OK;
 }
 
@@ -403,6 +467,27 @@ int Mover::bind_compute_stream(RadStream s) {
     if (!s) return RAD_E_INVAL;
     compute_ = s;
     return RAD_OK;
+}
+
+int Mover::fill_mirrors() {
+    if (mirror_slots_ <= 0) return RAD_OK;
+    if (!mover_) return RAD_E_STATE;
+    /* The load has finished and synced (Engine::load_weights), so every unit's bytes are in its
+     * slab slot and nothing else is in flight: the copies queue on the mover's stream and one
+     * sync ends them. A unit's weights sit at the same offsets in the pool slot as in the slab
+     * slot (deposit() writes a pooled unit's at mu.offset too), so one copy carries the unit. */
+    for (size_t u = 0; u < unit_.size(); ++u) {
+        const UnitState& us = unit_[u];
+        if (us.pool_slot < 0 || us.tier != Tier::VRAM || us.slab_slot < 0) continue;
+        if (us.klass < 0 || (size_t)us.klass >= pools_.size()) return RAD_E_STATE;
+        const ClassPools& cp = pools_[(size_t)us.klass];
+        if (!cp.pool_base) return RAD_E_STATE;
+        char* const dst = (char*)cp.pool_base + us.pool_slot * cp.stride;
+        const void* const src = cp.slot_ptr(us.slab_slot);
+        if (!src) return RAD_E_STATE;
+        if (rad_memcpy_async(dst, src, us.bytes, mover_) < 0) return RAD_E_DEVICE;
+    }
+    return rad_stream_sync(mover_) < 0 ? RAD_E_DEVICE : RAD_OK;
 }
 
 void* Mover::unit_base(int32_t unit) const {
@@ -1524,11 +1609,16 @@ int Mover::promote_to(int32_t unit, int64_t slot) {
     queue_move_copy(cp.slot_ptr(slot), src, us.bytes, rec);
     m.kind = Move::Kind::Promote;
     m.slab_slot = slot;
-    /* Into a lent slot the host copy stays: the loan can be recalled at any time, and a unit
-     * that kept its pool slot goes back by a change of address instead of needing a pool slot and
-     * a link copy just as the cache wants its memory. The quarantine then has no pool slot to
-     * free. Every pool unit keeps its slot on promotion: the pool is one cache, so the later demotion is a copyless drop for natives and deposits alike. */
-    m.pool_slot = cp.is_flex(slot) ? -1 : us.pool_slot;
+    /* Into a lent slot the host copy stays: the loan can be recalled at any time, and a unit that
+     * kept its pool slot goes back by a change of address instead of needing a pool slot and a
+     * link copy just as the cache wants its memory.
+     *
+     * In a class whose pool holds a slot for every unit that can move (pool_full, init) the host
+     * copy stays in every slot: no unit of the class needs a slot handed back, and giving this
+     * one up would leave the unit's next demotion looking for a free slot in a pool that has none
+     * (M-01). Otherwise the slot goes back after quarantine, as before, so the units the host pool
+     * had no room for can take it -- the pool is one cache and they turn over through it. */
+    m.pool_slot = (cp.is_flex(slot) || cp.pool_full) ? -1 : us.pool_slot;
     m.state = Move::State::Copying;
     m.unit = unit;
     ++copying_[(size_t)unit];
@@ -2043,8 +2133,9 @@ int Mover::retire(HeatEngine* heat, bool with_held) {
         switch (m.kind) {
             case Move::Kind::Promote:
                 us.slab_slot = m.slab_slot;
-                /* The source pool slot is freed after quarantine, unless the destination was
-                 * lent, in which case the unit keeps it (see promote_to). */
+                /* The source pool slot is freed after quarantine, unless the destination was lent
+                 * or the class's pool holds every unit that can move, in which case the unit keeps
+                 * it and the next demotion is an address change (see promote_to). */
                 if (m.pool_slot >= 0) us.pool_slot = -1;
                 us.tier = Tier::VRAM;
                 us.site = Site::Device;
@@ -2144,7 +2235,6 @@ int Mover::retire(HeatEngine* heat, bool with_held) {
         /* A Stage record never gets here: it is freed as soon as it lands. */
         ClassPools& cp = pools_[(size_t)unit_[(size_t)m.unit].klass];
         if (m.kind == Move::Kind::Promote) {
-            /* Every promotion keeps its pool slot: pool_slot is -1, nothing to free. */
             if (m.pool_slot >= 0) cp.pool.add_free(m.pool_slot);
         }
         else if (m.kind == Move::Kind::Evict && m.pool_slot >= 0)
@@ -2171,6 +2261,14 @@ std::string Mover::report() const {
              "slot; %llu slots quarantined\n",
              (unsigned long long)stats_.no_record, (unsigned long long)stats_.starved_slab,
              (unsigned long long)stats_.starved_pool, (unsigned long long)stats_.quarantined);
+    /* The mirror (M-01): pool slots that hold a resident unit's bytes, written once after the
+     * load. Every demotion of one of those units is a drop, so the d2h line above is what the
+     * units past the room cost; a starved pool slot now means a class the host pool had no room
+     * for, not a class whose pool the swap cycle emptied. */
+    if (mirror_slots_ > 0)
+        s += fmt("  mirror: %llu pool slots (%s) hold a resident unit's bytes from the load; their "
+                 "demotions are address changes\n",
+                 (unsigned long long)mirror_slots_, humanb(mirror_bytes_).c_str());
     /* The prefill stager (stage_units): the routed layers' pooled units copied into a pass's
      * buffers. Not `prefetched`, which counts the units heat moved into a slab slot: a long-context
      * prefill stages terabytes through here and prefetches nothing, so the promotion line's

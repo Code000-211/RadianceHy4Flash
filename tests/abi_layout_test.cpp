@@ -8,7 +8,7 @@
  *
  * Checked: a C translation unit (abi_c_test.c, strict C11) lays every struct out as C++ does; every
  * struct's listed fields account for its size, so the list in rad_abi_layout_rows.h is complete; and
- * the layout agrees with the table below, taken at RAD_ABI_VERSION 38 and RAD_FORMAT_VER 2. Under
+ * the layout agrees with the table below, taken at RAD_ABI_VERSION 45 and RAD_FORMAT_VER 2. Under
  * those versions a listed field may not move or change size, an ABI struct may only grow by fields
  * past its old end, and an on-disk struct may not change at all. The table is a snapshot of the
  * headers: nothing else states the layout. When it disagrees the test prints the live table.
@@ -58,8 +58,8 @@ std::vector<Row> cpp_rows() {
     };
 }
 
-/* The layout at RAD_ABI_VERSION 43 / RAD_FORMAT_VER 2 (see the file header). */
-constexpr uint32_t kTableAbi = 43, kTableFormat = 2;
+/* The layout at RAD_ABI_VERSION 45 / RAD_FORMAT_VER 2 (see the file header). */
+constexpr uint32_t kTableAbi = 45, kTableFormat = 2;
 const AbiRow kTable[] = {
 #include "abi_layout_table.h"
 };
@@ -226,13 +226,27 @@ TEST(the_span_pass_field_is_appended_past_the_build_contexts_end) {
 }
 
 /* ABI 43: a checkpoint inside the step. The probe's flag takes the tail padding behind gen_shape
- * (the probe keeps its 128 bytes); the batch's cut and bounds sit past its old end. */
+ * (the probe keeps its 128 bytes until ABI 44 appends past it); the batch's cut and bounds sit past
+ * its old end. */
 TEST(the_checkpoint_cut_fields_are_appended_past_the_old_ends) {
     CHECK_EQ(offsetof(RadArchProbe, ckpt_snap_ok), (size_t)124);
-    CHECK_EQ(sizeof(RadArchProbe), (size_t)128);
     CHECK_EQ(offsetof(RadBatch, ckpt_cut), (size_t)480);
     CHECK_EQ(offsetof(RadBatch, ckpt_cu), (size_t)488);
-    CHECK_EQ(sizeof(RadBatch), (size_t)496);
+}
+
+/* ABI 44: a chunk planned as layer-sliced sub-steps, and the prefill tail's host mirror. The probe's
+ * slicing flag is appended past the old 128-byte probe, the build context's declared slice set past
+ * span_pass_step, and the batch's tail mirror and layer range past the checkpoint cut -- all read at
+ * these offsets by a plugin built against these headers. */
+TEST(the_slice_layer_fields_are_appended_past_the_old_ends) {
+    CHECK_EQ(offsetof(RadArchProbe, slice_layers_ok), (size_t)128);
+    CHECK_EQ(sizeof(RadArchProbe), (size_t)136);
+    CHECK_EQ(offsetof(RadBuildCtx, layer_slices), (size_t)204);
+    CHECK_EQ(sizeof(RadBuildCtx), (size_t)208);
+    CHECK_EQ(offsetof(RadBatch, prefill_tail_h), (size_t)496);
+    CHECK_EQ(offsetof(RadBatch, layer_lo), (size_t)504);
+    CHECK_EQ(offsetof(RadBatch, layer_hi), (size_t)508);
+    CHECK_EQ(sizeof(RadBatch), (size_t)512);
 }
 
 RAD_TEST_MAIN()

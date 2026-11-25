@@ -13,7 +13,14 @@ window slots no sequence occupies), long8
 longctx (eight ~46K-token sessions: a prefill wave of one token each, then the same eight prompts
 decoded 128 tokens, so all eight are at long context together: the shape notes/backlog/refs/notes/
 longctx.md measured as N8 48K, where the stager overflows its ring -- longctx-pre / longctx-decode in
-the JSON). The token counts are the ones the backlog's own runs measured on these phases, so a lane's
+the JSON), and lctxN (N sessions of RAD_LCTX_CHARS characters -- 190,000 is the 58,903-token
+conversation of notes/backlog/CARDS.md §1.3, so the default is a 60K session -- filled by a one-token
+wave and then decoded for RAD_LCTX_NTOK tokens: the long-context decode stamps of T-03, at one
+decoder as `lctx1` and at four as `lctx4`, with `lctxN-pre` / `lctxN-decode` in the JSON), and stress (issue #251: RAD_STRESS_WAVES waves
+of eight requests at once, RAD_STRESS_CHARS characters of context and RAD_STRESS_NTOK tokens each, a
+fresh wave and then the same prompts again; failed requests and a server that stops are counted, not
+raised: `ok` / `err` / `server_dead`). The token
+counts are the ones the backlog's own runs measured on these phases, so a lane's
 ttft compares with the numbers in notes/backlog/."""
 import hashlib, json, sys, threading, time, urllib.request, os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -85,24 +92,54 @@ def request_gaps(content, n):
             ln = raw.decode(errors="replace").strip()
             if ln.startswith("data:") and ln[5:].strip() != "[DONE]": ts.append(time.time() - t0)
     return ts
+def stage_sampler(period=0.04):
+    """Poll /stats' expert staging while an arrival runs: (stop flag, samples, t0), a sample being
+    [ms since start, stage_layers, staged_bytes, stage_copies]. The design's staging check (S-02 §5,
+    §10 item 1) is per sub-step: the group's first slice should pay the whole chunk's copy and the
+    later ones find the ring warm, so when the increments happen, against `arrival_ttft`, matters as
+    much as their total."""
+    stop = threading.Event(); samples = []; t0 = time.time()
+    def run():
+        while not stop.is_set():
+            try:
+                e = find(json.loads(get("/stats")), "experts") or {}
+                samples.append([round((time.time() - t0) * 1000), int(e.get("stage_layers") or 0),
+                                int(e.get("staged_bytes") or 0), int(e.get("stage_copies") or 0)])
+            except Exception:
+                pass
+            stop.wait(period)
+    threading.Thread(target=run, daemon=True).start()
+    return stop, samples, t0
+
 def stall(name, nbg, chars, ntok=420, after=1.5):
     out = {}; bg = [None] * nbg
     def w(i): bg[i] = request_gaps(P[i], ntok)
     th = [threading.Thread(target=w, args=(i,)) for i in range(nbg)]
     m0 = metrics(); t0 = time.time()
+    stop, samples, _ = stage_sampler()
     for t in th: t.start()
     time.sleep(after); ta = time.time() - t0
     r = request(long_prompt(chars, 31 + nbg), 8); tb = time.time() - t0
     for t in th: t.join()
+    stop.set()
     m1 = metrics(); md = {k.split(":")[1]: m1[k] - m0.get(k, 0) for k in m1 if m1[k] != m0.get(k, 0)}
     gaps = []
     for ts in bg:
         g = sorted(((b - a) * 1000, a) for a, b in zip(ts, ts[1:]) if ta <= b <= tb + 0.5)
         gaps.append([round(x[0], 1) for x in g[-8:]])
     typ = sorted((b - a) * 1000 for ts in bg for a, b in zip(ts, ts[1:]) if b < ta)
+    # Staging inside the arrival window: the samples' increments over the last one before it.
+    base = [s for s in samples if s[0] / 1000 <= ta]
+    win = [s for s in samples if ta <= s[0] / 1000 <= tb + 0.5]
+    b0 = base[-1] if base else (samples[0] if samples else [0, 0, 0, 0])
+    stage = {"base": [round(ta * 1000), b0[1], b0[2], b0[3]],
+             "samples": [[s[0], s[1] - b0[1], s[2] - b0[2], s[3] - b0[3]] for s in win],
+             "stage_layers": (win[-1][1] if win else b0[1]) - b0[1],
+             "staged_bytes": (win[-1][2] if win else b0[2]) - b0[2],
+             "stage_copies": (win[-1][3] if win else b0[3]) - b0[3]}
     o = {"name": name, "bg": nbg, "arrival_prompt": r["prompt"], "arrival_ttft": round(r["ttft"], 3), "arrive_at": round(ta, 2), "first_at": round(ta + r["ttft"], 2),
-         "typical_gap_ms": round(typ[len(typ) // 2], 1) if typ else None, "worst_gaps_ms": gaps, "metrics": md, "clients": nbg, "mono_ns": [0, 0]}
-    print(json.dumps({k: v for k, v in o.items() if k != "metrics"}), flush=True); time.sleep(2); return o
+         "typical_gap_ms": round(typ[len(typ) // 2], 1) if typ else None, "worst_gaps_ms": gaps, "metrics": md, "clients": nbg, "mono_ns": [0, 0], "stage": stage}
+    print(json.dumps({k: v for k, v in o.items() if k != "metrics"} | {"steps_sliced": md.get("engine_steps_sliced_total", 0), "substeps": md.get("engine_substeps_total", 0)}), flush=True); time.sleep(2); return o
 def greedy_text(content, n=256):
     # Temperature 0 and ignore_eos off: no sampler noise and no cut-off, so the only thing that can
     # change the text is the step's chunking or a kernel's arithmetic.
@@ -268,8 +305,8 @@ def long8(chars, gen=32):
          "kv_mib": {x["at"]: x["kv_mib"] for x in v}, "host_mib": {x["at"]: x["host_mib"] for x in v},
          "expert_vram_units": {x["at"]: (x["expert_units"] or {}).get("vram") for x in v},
          "slab_mib": {x["at"]: x["slab_mib"] for x in v}, "lend_mib": {x["at"]: x["lend_mib"] for x in v},
-         "views": v}
-    print(json.dumps({k: x for k, x in o.items() if k != "views"}), flush=True)
+         "views": v, "waves": [a, r]}
+    print(json.dumps({k: x for k, x in o.items() if k not in ("views", "waves")}), flush=True)
     for x in v: print(json.dumps(x), flush=True)
     time.sleep(2)
     return o
@@ -294,7 +331,7 @@ def phase(name, prompts, n=256, effort="none"):
          "hit": sd.get("routed_res", 0) / max(1, sd.get("routed", 1)),
          "routed_per_step": sd.get("routed", 0) / max(1, steps),
          "miss_units_per_step": (sd.get("routed", 0) - sd.get("routed_res", 0)) / max(1, steps)}
-    print(json.dumps({k: (round(v, 3) if isinstance(v, float) else v) for k, v in o.items() if k not in ("stats", "metrics")}), flush=True)
+    print(json.dumps({k: (round(v, 3) if isinstance(v, float) else v) for k, v in o.items() if k not in ("stats", "metrics")} | {"steps_sliced": md.get("engine_steps_sliced_total", 0), "substeps": md.get("engine_substeps_total", 0)}), flush=True)
     time.sleep(2)
     return o
 def resume(chars, extra=900, turns=3, ntok=4):
@@ -330,8 +367,64 @@ def longctx(chars=140000, n=8, ntok=128):
     ps = [long_prompt(chars, 40 + i, stamp=True) for i in range(n)]
     pre = phase("longctx-pre", ps, 1)
     dec = phase("longctx-decode", ps, ntok)
-    return {"prefill": pre, "decode": dec}
+    return {"name": "longctx", "prefill": pre, "decode": dec}
+
+def lctx(n, chars, ntok):
+    """T-03, the long-context decode stamps: N conversations of about `chars` characters fill with a
+    one-token wave, then the same strings decode, so the decode passes carry the whole context. The
+    default 190,000 characters is the 58,903-token conversation notes/backlog/CARDS.md §1.3 measured,
+    so `lctx1` and `lctx4` are that session at one and at four decoders -- the shape K-25's
+    `qsa_select` and `idx_score` terms have no served number for (notes/backlog/refs/notes/idxint8.md
+    has only `--perfidx` ones); the run's short `c1` / `c4` phases are the baseline they compare to.
+    Both waves are recorded as ordinary phases (`lctxN-pre`, `lctxN-decode`), so agg.py --match, attr.py
+    and layer.py window the decode at 60K. `hit` near 1 and a non-zero `cache` in the server log say the
+    decode wave resumed the fill rather than prefilling it again -- at four sessions the whole 236K
+    tokens are in the pool, so read both before trusting the decode step's context."""
+    ps = [long_prompt(chars, 120 + i, stamp=True) for i in range(n)]
+    return [phase(f"lctx{n}-pre", ps, 1), phase(f"lctx{n}-decode", ps, ntok)]
+
 R = {"phases": []}
+def stress(waves, chars, ntok, clients=8):
+    """Sustained concurrent load (issue #251): `waves` waves of `clients` requests at once, each a
+    ~`chars`-character context decoded for `ntok` tokens. A wave's prompts are fresh (cold prefill
+    beside the others' decode) and the wave after it sends the same ones again (prefix hit, decode
+    at that context). A request that fails or a server that stops answering is counted,
+    not raised: `ok` / `err` and whether /health still answers are the result."""
+    ok = err = slow = 0; pr = []; t0 = time.time(); dead = False; wv = []; m0 = metrics(); m1 = {}
+    for wi in range(waves):
+        if wi % 2 == 0: pr = [long_prompt(chars, 300 + wi * clients + i, stamp=True) for i in range(clients)]
+        res = [None] * clients
+        def w(i):
+            try: res[i] = request(pr[i], ntok)
+            except Exception as e: res[i] = {"error": repr(e)[:120]}
+        th = [threading.Thread(target=w, args=(i,)) for i in range(clients)]
+        tw = time.time()
+        for t in th: t.start()
+        for t in th: t.join()
+        good = [r for r in res if "error" not in r and r["gen"] > 0]
+        ok += len(good); err += clients - len(good); slow += sum(1 for r in good if r["ttft"] > 30)
+        wv.append({"wave": wi, "ok": len(good), "wall": round(time.time() - tw, 2), "gen": sum(r["gen"] for r in good),
+                   "errors": [r["error"] for r in res if "error" in r][:2]})
+        print(json.dumps(wv[-1]), flush=True)
+        try: get("/health"); m1 = metrics()
+        except Exception: dead = True; break
+    o = {"name": "stress", "waves": len(wv), "of": waves, "clients": clients, "chars": chars, "ntok": ntok,
+         "ok": ok, "err": err, "slow": slow, "server_dead": dead, "wall": round(time.time() - t0, 1),
+         "steps": {k.split(":")[1]: m1[k] - m0.get(k, 0) for k in m1 if "engine_steps" in k and m1[k] != m0.get(k, 0)},
+         "per_wave": wv}
+    print(json.dumps({k: v for k, v in o.items() if k != "per_wave"}), flush=True)
+    return o
+def record(o):
+    """One phase's result into the JSON. A composite phase (`longctx`, `long8`) keeps its summary entry
+    as it always did, and now also records the waves it ran as phases of their own: the stamp readers
+    (`agg.py`, `attr.py`, `layer.py`) work per phase window and a summary entry has none, so without
+    this a stamped long-context run cannot be read at all -- the readers name and skip what has no
+    window, and read the waves this puts in."""
+    R["phases"].append(o)
+    if isinstance(o, dict):
+        for v in o.values():
+            for x in (v if isinstance(v, list) else [v]):
+                if isinstance(x, dict) and x.get("mono_ns") and "decode_steps" in x: R["phases"].append(x)
 if "nowarm" not in PH: request(P[11], 48); request(P[10], 48)
 for ph in PH:
     if ph == "c1": R["phases"].append(phase("c1", [P[0]]))
@@ -353,14 +446,23 @@ for ph in PH:
                                  after=float(os.environ.get("RAD_ARRIVE_S", 2.0))))
     elif ph.startswith("tail"):  # tailN: prompt of ~N chars lone, to size small prefill steps
         R["phases"].append(phase(ph, [long_prompt(int(ph[4:]), 3)], 2))
-    elif ph == "greedy": R["phases"].append(greedy())
-    elif ph == "longctx": R["phases"].append(longctx())
+    elif ph == "greedy": record(greedy())
+    elif ph == "longctx": record(longctx())
+    elif ph.startswith("lctx"):  # lctxN: N sessions of RAD_LCTX_CHARS fill, then the same strings decode
+        if not ph[4:].isdigit():
+            sys.exit(f"probe.py: lctx wants a session count (lctx1, lctx4); got '{ph}'")
+        R["phases"].extend(lctx(int(ph[4:]), int(os.environ.get("RAD_LCTX_CHARS", 190000)),
+                                int(os.environ.get("RAD_LCTX_NTOK", 128))))
     elif ph == "pf6c": R["phases"].append(phase("pf6c", [long_prompt(22000, 7, stamp=True)], 2))
     elif ph.startswith("resume"):  # resumeN: a ~N-character session, then N-row turns resumed
-        R["phases"].append(resume(int(ph[6:]), int(os.environ.get("RAD_RESUME_EXTRA", 900))))
-    elif ph == "idle": R["phases"].append(idle(int(os.environ.get("RAD_IDLE_CHARS", 72000))))
+        record(resume(int(ph[6:]), int(os.environ.get("RAD_RESUME_EXTRA", 900))))
+    elif ph == "idle": record(idle(int(os.environ.get("RAD_IDLE_CHARS", 72000))))
+    elif ph == "nowarm": pass  # read above: no warmup requests
+    elif ph == "stress":  # issue #251: RAD_STRESS_WAVES waves of eight ~12K-token requests
+        R["phases"].append(stress(int(os.environ.get("RAD_STRESS_WAVES", 40)), int(os.environ.get("RAD_STRESS_CHARS", 39500)),
+                                  int(os.environ.get("RAD_STRESS_NTOK", 96))))
     elif ph.startswith("live"): R["phases"].append(live(int(ph[4:])))
-    elif ph == "long8": R["phases"].append(long8(int(os.environ.get("RAD_LONG8_CHARS", 140000))))
+    elif ph == "long8": record(long8(int(os.environ.get("RAD_LONG8_CHARS", 140000))))
     else: sys.exit(f"probe.py: no phase '{ph}'; phases: c1 c1b c1s c2 c4 c8 c8s think pf2 pf6 pf6c pf8 pf20 "
-                  "c2 greedy longctx stall1 stall4 arr60 tailN idle liveN long8 resumeN nowarm")
+                  "greedy longctx lctxN stall1 stall4 arr60 tailN idle liveN long8 resumeN stress nowarm")
 json.dump(R, open(OUT, "w"), indent=1)

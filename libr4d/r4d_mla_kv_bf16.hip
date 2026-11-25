@@ -118,7 +118,7 @@ constexpr int kvp_chunk() {
     return best;
 }
 
-template <bool ABSORB, int MB, int NC, bool VEC, bool GATE>
+template <bool ABSORB, int MB, int NC, bool VEC, bool GATE, class CH>
 __device__ __forceinline__ void kvp_body(const uint16_t* __restrict__ x,
                                          const uint16_t* __restrict__ w,
                                          const uint16_t* __restrict__ g, uint16_t* __restrict__ y,
@@ -158,6 +158,24 @@ __device__ __forceinline__ void kvp_body(const uint16_t* __restrict__ x,
             for (int r = 0; r < MB; ++r) b[q][r] = kvp_ld8<VEC>(xp[r] + k0);
         }
     };
+    /* The quarter's weight fragments (the `load`'s a half) and token fragments (its b half) on
+     * their own, so that a chained launch can ask for the weight before the acquire. */
+    auto wload = [&](v8s (&a)[KC][NC], int c) {
+#pragma unroll
+        for (int q = 0; q < KC; ++q) {
+            const int k0 = 16 * (c * KC + q);
+#pragma unroll
+            for (int n = 0; n < NC; ++n) a[q][n] = kvp_wfrag<ABSORB, VEC>(wb, m.wp, o0 + 16 * n, k0, lane);
+        }
+    };
+    auto xload = [&](v8s (&b)[KC][MB], int c) {
+#pragma unroll
+        for (int q = 0; q < KC; ++q) {
+            const int k0 = 16 * (c * KC + q);
+#pragma unroll
+            for (int r = 0; r < MB; ++r) b[q][r] = kvp_ld8<VEC>(xp[r] + k0);
+        }
+    };
     auto step = [&](const v8s (&a)[KC][NC], const v8s (&b)[KC][MB]) {
 #pragma unroll
         for (int q = 0; q < KC; ++q)
@@ -166,7 +184,21 @@ __device__ __forceinline__ void kvp_body(const uint16_t* __restrict__ x,
 #pragma unroll
                 for (int r = 0; r < MB; ++r) acc[n][r] = kvp_wmma(a[q][n], b[q][r], acc[n][r]);
     };
-    load(a0, b0, 0);
+    /* Chained, the block waits in the poll while its predecessor runs (aql.cpp's chain plan), so
+     * the first quarter of kv_b is issued before the acquire: a static weight's bytes are written
+     * by no op of a pass (operand role RAD_OPD_WEIGHT, core/runtime/issue.cpp's haz_note orders no
+     * read of one), so neither load can see a partial write, and the fragments stay in registers
+     * across the acquire. The tokens, the attention output the predecessor wrote, stay behind the
+     * wait, exactly where the plain form's single `load` has them -- and they are this block's only
+     * read there, a vector load of its two rows, so the wait is the vector-cache one: no scalar
+     * load crosses it (tests/chain_scalar_audit.py, K-29). */
+    if constexpr (CH::on) {
+        wload(a0, 0);
+        r4d_chain_wait_vec();
+        xload(b0, 0);
+    } else {
+        load(a0, b0, 0);
+    }
 #pragma unroll 1
     for (int c = 0; c < NCH; c += 2) {
         load(a1, b1, c + 1);
@@ -233,8 +265,7 @@ __global__ __launch_bounds__(kvp_threads(ABSORB)) void kv_project_wmma(const uin
                                                        const uint16_t* __restrict__ w,
                                                        const uint16_t* __restrict__ g,
                                                        uint16_t* __restrict__ y, KvProjectMeta m) {
-    if constexpr (CH::on) r4d_chain_wait();
-    kvp_body<ABSORB, MB, NC, VEC, GATE>(x, w, g, y, m);
+    kvp_body<ABSORB, MB, NC, VEC, GATE, CH>(x, w, g, y, m);
     if constexpr (CH::on) r4d_chain_done();
 }
 
@@ -254,17 +285,20 @@ __global__ __launch_bounds__(kvp_threads(ABSORB)) void kv_project_wmma(const uin
 struct KvQuantMeta {
     long xr, wp, gr, qr, sr, yr;
     int rows;
+    int heads;  // the launched head count may be one past this (r4d_cliff_rows)
 };
 constexpr int kQG = 128;          // the quantiser's group: the rotation width and the scale's
 constexpr int kQTiles = kQG / 16; // column tiles of a group
 constexpr int kQThreads = 32 * kQTiles * 4;   // 8 tiles x 4 quarters of the contraction = 1024
 
+template <class CH>
 __device__ __forceinline__ void kvq_body(const uint16_t* __restrict__ x, const uint16_t* __restrict__ w,
                                          const uint16_t* __restrict__ g, signed char* __restrict__ q,
                                          float* __restrict__ sc, uint16_t* __restrict__ y,
                                          const KvQuantMeta& m) {
     constexpr int S = 4, K = kLatent / S, KS = K / 16, KC = kvp_chunk<false, 1, 1>(), NCH = KS / KC;
     static_assert(KS % (2 * KC) == 0, "chunks in pairs");
+    if ((int)blockIdx.y >= m.heads) return;  // a head the cliff pad launched (r4d_cliff_rows)
     __shared__ float part[S][kQTiles][32][8];
     __shared__ uint16_t ag[16][kQG];
     const int lane = threadIdx.x & 31, wave = threadIdx.x >> 5, head = blockIdx.y;
@@ -285,11 +319,36 @@ __device__ __forceinline__ void kvq_body(const uint16_t* __restrict__ x, const u
             b[qq] = kvp_ld8<true>(xp + k0);
         }
     };
+    /* kvp_body's wload / xload, over one column tile a wave: the weight's fragments of the first
+     * chunk on their own, so a chained launch can ask for them before the acquire. */
+    auto wload = [&](v8s (&a)[KC], int c) {
+#pragma unroll
+        for (int qq = 0; qq < KC; ++qq) {
+            const int k0 = 16 * (c * KC + qq);
+            a[qq] = kvp_wfrag<false, true>(wb, m.wp, o0, k0, lane);
+        }
+    };
+    auto xload = [&](v8s (&b)[KC], int c) {
+#pragma unroll
+        for (int qq = 0; qq < KC; ++qq) {
+            const int k0 = 16 * (c * KC + qq);
+            b[qq] = kvp_ld8<true>(xp + k0);
+        }
+    };
     auto step = [&](const v8s (&a)[KC], const v8s (&b)[KC]) {
 #pragma unroll
         for (int qq = 0; qq < KC; ++qq) acc = kvp_wmma(a[qq], b[qq], acc);
     };
-    load(a0, b0, 0);
+    /* Chained, the weight's first chunk goes out before the acquire and the tokens' after it, as
+     * kvp_body's do (a static weight's bytes; see the note there), and for the same reason the wait
+     * is the vector-cache one. */
+    if constexpr (CH::on) {
+        wload(a0, 0);
+        r4d_chain_wait_vec();
+        xload(b0, 0);
+    } else {
+        load(a0, b0, 0);
+    }
 #pragma unroll 1
     for (int c = 0; c < NCH; c += 2) {
         load(a1, b1, c + 1);
@@ -348,8 +407,7 @@ template <typename CH>
 __global__ __launch_bounds__(kQThreads) void kv_expand_gate_quant(
     const uint16_t* __restrict__ x, const uint16_t* __restrict__ w, const uint16_t* __restrict__ g,
     signed char* __restrict__ q, float* __restrict__ sc, uint16_t* __restrict__ y, KvQuantMeta m) {
-    if constexpr (CH::on) r4d_chain_wait();
-    kvq_body(x, w, g, q, sc, y, m);
+    kvq_body<CH>(x, w, g, q, sc, y, m);
     if constexpr (CH::on) r4d_chain_done();
 }
 
@@ -360,6 +418,11 @@ int kvp_emit(RadStream s, unsigned heads, const uint16_t* x, const uint16_t* w, 
     constexpr int OUT = ABSORB ? kLatent : kVd, PER = 16 * NC * (kvp_split<ABSORB>() == 1 ? 4 : 1);
     static_assert(OUT % PER == 0, "the workgroups' column tiles divide the output");
     const unsigned groups = (unsigned)((m.rows + 16 * MB - 1) / (16 * MB));
+    /* The heads axis is deliberately not stepped past the full-card cliff here: the K-17 A/B
+     * (notes/backlog/measurements/K-17.md) measured these 128-thread grids at 32 heads and a
+     * full-card wave count at 0.998-1.001x the padded launch (seven interleaved kbench sessions
+     * per arm, 24 shapes): a step here buys nothing measured. The window's exposure is the
+     * kernel's, not the wave count's alone -- the 1024-thread quantiser launch below pays it. */
     return R4D_EMIT(s, (kv_project_wmma<ABSORB, MB, NC, VEC, GATE, CH>),
                     dim3(OUT / PER, heads, groups), dim3(kvp_threads(ABSORB)), 0, x, w, g, y, m);
 }
@@ -526,8 +589,15 @@ extern "C" int r4d_rad_mla_expand_gate_had_quant_i8g(const RadArgs* a, RadStream
         !r4d_aligned(wp, 16) || !r4d_aligned(gp, 16) || (yp && !r4d_aligned(yp, 16)) ||
         !r4d_aligned(q->data, 4))
         return R4D_NO(RAD_E_ALIGN);
-    const KvQuantMeta m{ (long)xr, (long)w->stride[0], (long)gr, (long)qr, (long)sr, (long)yr, (int)M };
-    const dim3 grid(kVd / kQG, (unsigned)h, (unsigned)((M + 15) / 16));
+    const KvQuantMeta m{ (long)xr, (long)w->stride[0], (long)gr, (long)qr, (long)sr, (long)yr, (int)M,
+                         (int)h };
+    const unsigned zt = (unsigned)((M + 15) / 16);
+    /* The heads axis stepped past the full-card cliff (r4d_cliff_rows): at 32 heads one token
+     * tile is 2048 wavefronts (two tiles at M = 32), a count the K-17 A/B measured here at
+     * 1.09-1.26x at 32 heads and 1.01-1.06x at 64 (0.975x at M = 16, the one exception), and
+     * the extra head's workgroup returns at once. See notes/backlog/measurements/K-17.md. */
+    const dim3 grid(kVd / kQG, r4d_cliff_rows((unsigned)h, (unsigned)(kVd / kQG) * zt,
+                                              (unsigned)(kQThreads / 32)), zt);
     if (r4d_geti_or(a, "chain", 0) != 0 && M <= 64)
         return R4D_EMIT(s, (kv_expand_gate_quant<r4dchain>), grid, dim3(kQThreads), 0, xp, wp, gp,
                         (signed char*)q->data, (float*)sc->data, yp, m);

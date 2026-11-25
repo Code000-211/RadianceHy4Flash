@@ -760,6 +760,16 @@ void Engine::quiet_service() {
     quiet_cv_.notify_all();
 }
 
+int Engine::hooks_check(const HookReload& r, std::string* why) const {
+    for (const auto& rk : ranks_)
+        if (const int st = rk->ctx.hooks_check(r, why); st < 0) return st;
+    return RAD_OK;
+}
+
+void Engine::hooks_refresh() {
+    for (auto& rk : ranks_) rk->ctx.hooks_refresh();
+}
+
 int32_t* Engine::Readback::reserve(int64_t count) {
     if (count <= n) return p;
     if (p) rad_dev_free(p, RAD_MEM_HOST_PINNED);
@@ -805,6 +815,17 @@ Engine::~Engine() {
                  (unsigned long long)r->heat_credited, (unsigned long long)r->heat_idle,
                  (unsigned long long)r->ctx.route_dropped());
         RAD_INFO("%s", r->mover.report().c_str());
+    }
+    /* The device code each card ended up holding (M-14): the plan's receipt reads it before the
+     * first kernel has launched, when only the few modules the bring-up ran are loaded; this is
+     * the figure after serving, every module the run launched, each loaded whole. */
+    for (auto& r : ranks_) {
+        int64_t cb = 0;
+        int cm = 0;
+        if (dev_code_resident(r->device, &cb, &cm) != RAD_OK || cb <= 0) continue;
+        LogRank lr(r->index);
+        RAD_INFO("device code resident at exit: %s in %d code module(s), each loaded whole",
+                 humanb(cb).c_str(), cm);
     }
     /* Drain the transfer streams before the contexts. Ctx::shutdown drains the compute streams
      * and frees the arena, but the mover's stream also copies into the arena (the prefill
@@ -1508,6 +1529,10 @@ int Engine::step_loop() {
                                 b->phase == RAD_PHASE_DECODE  ? "decode"  : "MIXED",
                                 (long long)b->n_seq, (long long)b->n_tok);
             if (issued) s += " ahead";
+            /* A chunk group's sub-step (S-02): which layers of the trunk this pass runs. */
+            if (plan.slice_m > 0)
+                s += fmt(" layers=%d-%d slice=%d/%d", (int)plan.layer_lo, (int)plan.layer_hi,
+                         (int)plan.slice_j + 1, (int)plan.slice_m);
             for (int i = 0; i < b->n_seq && i < 8; ++i) {
                 s += fmt("  [%d] slot=%d q=%d ctx=%d", i, plan.e[(size_t)i].slot,
                          plan.e[(size_t)i].n_tokens, plan.e[(size_t)i].ctx_len);
@@ -2497,6 +2522,9 @@ int Engine::arena_step(const RadBatch* b, bool ahead) {
      * for it (`plan_next_`). Either way the question is whether that plan leaves a chunk, which is
      * nothing to stage when the hold follows it. */
     const bool more = b->phase != RAD_PHASE_DECODE && sched_.prefill_continues(ahead);
+    /* Inside a chunk group the next pass starts at its slice's first layer (S-02); 0 everywhere
+     * else, a whole trunk. */
+    const int32_t first_layer = more ? sched_.next_prefill_first_layer(ahead) : 0;
     for (auto& r : ranks_) {
         const int64_t allow = r->arena_lent[(size_t)level];
         if (r->mover.loan(Mover::kLendArena) > allow ||
@@ -2521,7 +2549,7 @@ int Engine::arena_step(const RadBatch* b, bool ahead) {
          * top that no level's buffers use. At the shared level the ring is memory the full plan
          * computes in, and a copy still going there when such a step starts would race it; a
          * pass's own copies are behind its own ops, which wait for them. */
-        r->stager.set_next_prefill(more && level == 0);
+        r->stager.set_next_prefill(more && level == 0, first_layer);
     }
     if (ranks_.size() > 1) (void)rad_dev_set(ranks_[0]->device);
     return RAD_OK;

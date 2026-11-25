@@ -983,10 +983,11 @@ models:
 *An n-gram table* (Qwen3.8-Flash-Next's is 47.7 GiB) is read a few rows a token. `disk` reads rows
 from the container through a row cache with direct reads on the host; about half of a step's rows
 are first-seen, so steps wait on the drive. `ram` copies the table into host memory at load (12 to
-40 s more startup, depending on the page cache) and the card's gather kernel reads the pinned copy,
-so a step has no host work. `vram` puts all of it on every card. `ram` needs the table's size free
-after the pinned host pools and the prefix cache's host tier, with `memory.host-headroom-mib` to spare
-(default 4 GiB), under every memory cgroup the process sits in, and refuses the start otherwise.
+40 s of reading, run beside the container pass, depending on the page cache) and the card's gather
+kernel reads the pinned copy, so a step has no host work. `vram` puts all of it on every card.
+`ram` needs the table's size free after the pinned host pools and the prefix cache's host tier, with
+`memory.host-headroom-mib` to spare (default 4 GiB), under every memory cgroup the process sits in,
+and refuses the start otherwise.
 `auto` takes the first of `vram`, `ram` and `disk` that holds the table. Without a device kernel
 for the gather (no libr4d) the table is read on the host: `vram` is refused, and `ram` is a copy in
 locked huge pages, which also needs a memlock limit that large (`--ulimit memlock=-1` in Docker,
@@ -1007,6 +1008,17 @@ otherwise. The driver counts a shared page against every process that pins it, s
 the pinned total is twice the table: set `amdgpu.no_system_mem_limit=1` (the cap is RAM less 1/64
 and 1.5 GiB) or the second pin can be refused. The kernel charges the tmpfs pages to the memory
 cgroup of the engine that filled them.
+
+A tmpfs holds the file on huge pages only where `shmem_enabled` allows them
+(`/sys/kernel/mm/transparent_hugepage/shmem_enabled`, `never` by default), so a plain `/dev/shm`
+leaves the table on 4 KiB pages: mount the directory's tmpfs with `huge=always`, or set
+`shmem_enabled=advise`. The gather reads 96-byte rows at random, so the page size is a cost of the
+cards' TLB and the driver's mapping rather than of the bandwidth; what the pages buy is startup,
+where the file is filled and pinned a whole range at a time -- on two R9700 at TP2 a reused file on a
+huge-page tmpfs answered in 22.5 s against 36 s for `ram`, while the same reuse on a 4 KiB tmpfs
+answered in 36.7 s, the same as `ram`. A container cannot ask for them itself
+(`docker run --tmpfs` refuses `huge=`, `--shm-size` sets a size and no page size, and the sysfs
+knob is the host's), so the mount belongs on the host and the directory is passed in from there.
 
 `ngram-placement: disk=DIR` reads the table from its own file, `DIR/ngram-<id>.bin`, instead of from
 the container: a table on a faster or separate drive (an Optane beside a model on a large NVMe, or a
@@ -1671,6 +1683,19 @@ prefill run in a different order, and at a tie that is a different token. Each s
 byte-identical across runs and restarts; reproducibility holds per configuration, and this key is
 part of the configuration like `tp` and `num-speculative-tokens`. Pin it before recording
 anything you will compare against later.
+
+**Slicing a chunk between layers** (`chunk-slices: MODE`, default off). A mixed step that carries
+one prefill chunk can be planned as m sub-steps over layer ranges instead of one pass over the whole
+trunk, with the decoding rows between them, so a long chunk no longer holds the other streams still
+for its whole duration. `auto` picks m from the measured chunk and decode step times against
+`chunk-slice-target-ms` (default 150 ms) and `chunk-slice-cost-pct` (default 10, the share of a
+chunk step's time the decodes may wait between two slices); `N` (1-8) sets m itself, capped at the
+trunk's layers and at a chunk of at least 128 rows. A sliced pass runs whole and serial, with the
+same KV bytes and the same `final_hidden` row as the unsliced one; a checkpoint is taken only at
+the group's last sub-step. Only a model whose plugin reports it can run its trunk over a layer
+range (`RadArchProbe::slice_layers_ok`) is sliced, so the flag is a no-op until a plugin reports
+that; the scheduler logs which of the two applied. `radiance:engine_steps_sliced_total` counts
+sliced chunks and `radiance:engine_substeps_total` the sub-steps they issued.
 
 ### 4.6 Speculative decoding
 
@@ -2587,10 +2612,12 @@ models:
 
 ### 4.10 Control vectors
 
-A **control vector** is a small GGUF file holding one direction per layer; applied while the model
-runs, it removes each token's residual-stream component along that direction. radiance implements
-llama.cpp's `--cvec-mode project` operation (`hc_project`, `docs/OPS.md`) for architectures whose
-plugin declares it; today that is `qwen4exp` (Qwen3.8-Flash-Next).
+A **control vector** is a small GGUF file holding one or more directions per layer; applied while
+the model runs, it removes each token's residual-stream component along those directions. radiance
+implements llama.cpp's `--cvec-mode project` operation (`hc_project`, `docs/OPS.md`) for
+architectures whose plugin declares it: `qwen4exp` (Qwen3.8-Flash-Next) and `hyv4flash`
+(Hy4-flash). `hyv4flash` has four hyper-connection streams per residual, and its package may carry
+**one direction per stream** (§4.10.1).
 
 **`control-vector: off` or `control-vector: on` loads one** (`disabled`, the default, is the same
 as the key unset). Without it nothing is read, the graph declares no projection op, a request that asks
@@ -2601,7 +2628,20 @@ them on. With the key the engine looks, in order, at:
 1. `<container without its extension>.control-vector.gguf` beside the model,
 2. `control-vector.gguf` in the container's directory (one file for a directory of quants), then
 3. `<home>/vectors/<architecture>-control-vector.gguf` for each `server.radiance-home`. radiance ships
-   `qwen4exp-control-vector.gguf` there (`data/vectors/`, installed into every plugin home).
+   `qwen4exp-control-vector.gguf` and `hyv4flash-control-vector.gguf` there (`data/vectors/`,
+   installed into every plugin home).
+
+**Directions per layer, and per stream.** A `direction.<l>` tensor is F32 and exactly the model's
+width. One row (`[n_embd]`) is a single direction; `[n_embd, k]` is k directions, applied as k
+chained projections, which removes the k-dimensional subspace they span (they should be
+orthonormal; the loader warns when they are not). A package may also set
+`controlvector.per_stream: true` (an I64), which declares that the rows are grouped by the model's
+hyper-connection streams: `rank` then counts direction GROUPS, each group holding one direction per
+stream, and stream s of group k is projected against its own row at `(((l*rank)+k)*hc + s)*n_embd`.
+The four Hy4 streams carry the refusal signal differently (their directions overlap at a cosine of
+0.1 to 0.6), so a package that averages them into one direction is materially weaker; §4.10.1 has
+the measurements. A per-stream package is applied only where the architecture declares chained
+projections; another architecture refuses it by name rather than steering one direction of k.
 
 The startup is refused, naming the reason, when the key is set and the architecture plugin does
 not apply control vectors, no file is found, or the file does not fit: its
@@ -2674,6 +2714,47 @@ changes; the stock column is a separate boot of 1.9.0). First generated token, 2
 Seventeen of eighteen policy prompts flip from a refusal opening to content; neutral prompts move
 by 0.002-0.003 nats.
 
+### 4.10.1 The Hy4-flash refusal package (per-stream)
+
+`hyv4flash` declares one projection per group per layer and carries four hyper-connection streams,
+so its package is `controlvector.per_stream: true` with `rank = 4 * groups`. radiance ships one,
+`data/vectors/hyv4flash-control-vector.gguf` (41 layers, 8 rows each, 4.0 MB), which lookup path 3
+finds when no file sits beside the container. It is the publisher's recipe
+(`huggingface.co/alesha-pro/Hy4-flash-Uncensored-GGUF`) run on the taps of the quant this host
+serves, not on their FP8 weights: per layer, per stream, `mean(harmful) - mean(harmless)` at the
+last prompt token, the harmless-mean span projected out, two groups over four framings
+(`N,NA|H,HA`: thinking off/on, with and without a coding-agent system prompt), orthonormalised
+within a stream. The sidecar `data/vectors/hyv4flash-control-vector.json` records the samples and
+the measurements below.
+
+Measured on this box (HarmBench-320, stock weights, nothing on disk changed):
+
+| | stock | package |
+|---|---:|---:|
+| refusals (audited genuine attempts of 320) | 313 | **111** |
+| strict grader | 294 | 54 |
+| first-token refusal mass, 8 hard prompts | 0.656 | 0.164 |
+| KL vs stock, mean / median / p99 | — | 0.20 / 0.08 / 1.9 |
+| top-1 agreement | — | 0.81 |
+| perplexity ratio | — | 1.06 |
+| benign capability, 28 tasks | 19/19 | 19/19 |
+
+The cost is visible on adversarial prompts: ~26% of the complied answers run past a 1024-token cap
+(an eval setting, not the model's 262144), ~9% leak chain-of-thought or a stray reasoning tag into
+the visible answer, and ~13% loop on lyrics. Ordinary work is unaffected.
+
+The table is the publisher's package on these weights. The shipped file is our derivation of the
+same recipe, and the two are within noise of each other on every measure taken: first-token refusal
+mass 0.167 against 0.164, KL 0.199 / 0.082 against 0.197 / 0.082, and 29 refusals of the publisher's
+held-out 146 against 28. Either is fine to ship; ours is the one that can be re-derived and re-tuned
+here.
+
+To use it: keep `control-vector: off` as the deployment default (as this host does), then either
+flip the dashboard's **Control vector** switch (`POST /admin/control-vector {"enabled": true}`),
+or send `"control_vector": true` on one request, or name the model `hy4-flash:uncensored`
+(`control-vector-variant: uncensored`). All three are the same switch; the field wins over the
+default for that request, and the variant name is refused together with `"control_vector": false`.
+
 ### 4.11 Every key
 
 `radiance --help` prints these, by level. A key written here as `server.KEY` or `memory.KEY` belongs
@@ -2703,6 +2784,9 @@ switch is set with `true`. The fleet's own keys (a model's `aliases`, `priority`
 | `prefill-room-gate: MODE` | off | `on`: a fresh prompt is admitted only when the whole prompt and one decode position fit the KV cache beside every running sequence and every prompt admitted ahead of it, and the requests behind it wait with it; a prompt that cannot fit even with nothing running fails (`idle_admission`) instead of waiting; long prompts then run one after another. `off`: a prompt is admitted when its first chunk fits, so a long one may fill the cache mid-prompt and be preempted, recomputing from its start |
 | `prefill-interleave: N` | auto:1 (0 under `deterministic: true`, KL mode, generators) | decode-only steps after each prefill chunk while other sequences decode (§4.5), at most 64; `auto` fits them in a quarter of the chunk step's measured time, `auto:SHARE` in SHARE of it (0 < SHARE <= 4); `0` lets every step carry a chunk |
 | `mixed-step-target-ms: N` | 0 (off) | soft completed-service-time target for mixed prefill/decode steps; learns one aggregate prefill cap while decoders are active and leaves uncontended prefill unchanged (§4.5) |
+| `chunk-slices: MODE` | off | `auto`: plan one prefill chunk as m layer-sliced sub-steps with the decoding rows between them, m from the measured chunk and decode step times against `chunk-slice-target-ms` and `chunk-slice-cost-pct`; `N` (1-8): m itself, capped at the trunk's layers and at a chunk of at least 128 rows. Only a model whose plugin reports it can run the trunk over a layer range (`RadArchProbe::slice_layers_ok`) is sliced; on any other a chunk keeps one step and the scheduler logs it (§4.5) |
+| `chunk-slice-target-ms: N` | 150 | the duration one layer-sliced sub-step targets, in milliseconds; `chunk-slices: auto` sizes m from it (§4.5) |
+| `chunk-slice-cost-pct: N` | 10 | the share of a chunk step's time the decodes may wait between two slices, in percent; with `chunk-slices: auto`, `0` makes the budget reject every split and keeps m at 1 (§4.5) |
 | `preempt-wait-ms: N` | 5000 | how long a preempted prefill may wait for its whole-recompute gate before reclaiming cache blocks and preempting lowest-priority running requests until one overdue request can prefill; `0` falls back on the next step. A preempted request publishes what it computed to the prefix cache, as a finished one does, so its recompute adopts its prompt instead of computing it again; under pressure the cache gives those blocks back, the newest last, before another request is preempted |
 | `busy-prefill-chunk: MODE` | auto | a prefill chunk's share of a step that has other work: `auto` leaves decode rows and waiting requests their room (§4.5), `off` takes the whole step, `N` holds it to N tokens |
 | `max-num-seqs: N` | 256 | largest number of sequences one step may carry |
@@ -4876,9 +4960,12 @@ curl -s -H "Authorization: Bearer $KEY" localhost:8000/diagnostics | jq '.findin
 
 Before the report the bring-up logs one `startup: <phase> in <x.x> s (at <y.y> s)` line per phase:
 `declare` (with `arena levels` in it), `plan` (with `host pool pin` in it), `weights` (the one pass
-over the container and the Engram table copies), `kv`, `contexts`, `settle` and `ready`, where `in`
-is the phase's own duration and `at` the seconds since the engine started; the n-gram table and
-container-pass lines give their own duration and take only the `(at <y.y> s)` suffix.
+over the container, which the Engram table copies run beside), `kv`, `contexts`, `settle` and
+`ready`, where `in` is the phase's own duration and `at` the seconds since the engine started; each
+n-gram table's line gives that table's own fill duration (`filled beside the container pass`) and
+the container-pass line its own, both taking only the `(at <y.y> s)` suffix. The tables start
+reading as the pass meets them and are joined after it, so the phase is the longer of the pass and
+the tables rather than their sum.
 
 ### 7.2 Messages and what they mean
 

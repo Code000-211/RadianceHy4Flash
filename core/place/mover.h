@@ -670,6 +670,16 @@ public:
         return n;
     }
 
+    /* The pool slots that hold a resident unit's bytes rather than a pooled unit's (M-01), and
+     * their bytes: what fill_mirrors() writes at load, so their demotions are address changes. */
+    int64_t mirror_slots() const { return mirror_slots_; }
+    int64_t mirror_bytes() const { return mirror_bytes_; }
+    /* Copies every mirrored unit's bytes from its slab slot into its pool slot, once, after the
+     * load and before the first dispatch. The bytes never change, so this is the only copy the
+     * mirror costs: a demotion is then a relabel (issue()), and promote_to() keeps the slot. A
+     * no-op when the host pool had no room left to mirror anything. */
+    int fill_mirrors();
+
     /* Where a unit's bytes are right now, as a device-visible address, or null for a file-tier
      * unit that has not been staged. */
     void* unit_base(int32_t unit) const;
@@ -848,6 +858,10 @@ private:
                                   : flex_ptr[(size_t)(slot - n_fixed)];
         }
         bool is_flex(int64_t slot) const { return slot >= n_fixed; }
+        /* The pool holds a slot for every unit of the class that can move, and none of the class
+         * is in the file tier to be deposited later (M-01): a promotion keeps its slot, because
+         * no unit of the class needs one handed back to it. */
+        bool pool_full = false;
     };
 
     const Program* prog_ = nullptr;
@@ -919,6 +933,10 @@ private:
      * order, so a layer's pooled units start out adjacent (pool_slot_for). */
     std::vector<std::vector<int32_t>> pool_layer_;
     int32_t n_layers_ = 0;
+    /* The pool slots sized past the plan's pooled units, for resident units (M-01): how many, and
+     * the bytes fill_mirrors() writes into them once. */
+    int64_t mirror_slots_ = 0;
+    int64_t mirror_bytes_ = 0;
 
     void*   static_vram_ = nullptr;
     int64_t static_bytes_ = 0;

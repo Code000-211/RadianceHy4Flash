@@ -1072,6 +1072,37 @@ int ref_row_topk(const RadArgs* a, RadStream) {
     return RAD_OK;
 }
 
+/* ------------------------------------------------------------------ cast_row_topk */
+/* row_topk over an f32 plane rounded to bf16 first, as ref_cast rounds it: the reference of the
+ * `cast` f32 -> bf16 then row_topk pair it fuses. The rounded copy is the bf16 plane the cast
+ * would have written; ranking it is row_topk's own code. */
+int ref_cast_row_topk(const RadArgs* a, RadStream s) {
+    if (!have(a, 3)) return RAD_E_INVAL;
+    const RadTensor* x = &a->t[0];
+    if (x->dtype != RAD_F32) return RAD_E_DTYPE;
+    const int64_t N = p_int(a, "N", x->rank >= 2 ? x->shape[x->rank - 1] : 0);
+    if (N <= 0) return RAD_E_SHAPE;
+    const int64_t M = numel(x) / N;
+    if (M <= 0 || a->n_t > 8) return RAD_E_SHAPE;
+    std::vector<uint16_t> xb((size_t)(M * N));
+    for (int64_t m = 0; m < M; ++m) {
+        const int64_t xb0 = rowoff(x, m, N), xs = laststride(x);
+        for (int64_t j = 0; j < N; ++j)
+            xb[(size_t)(m * N + j)] = f32_to_bf16(ldt(x, xb0 + j * xs));
+    }
+    RadTensor t[8];
+    for (int i = 0; i < a->n_t; ++i) t[i] = a->t[i];
+    t[0] = RadTensor{};
+    t[0].data = xb.data();
+    t[0].dtype = RAD_BF16;
+    t[0].rank = 2;
+    t[0].shape[0] = M;  t[0].shape[1] = N;
+    t[0].stride[0] = N; t[0].stride[1] = 1;
+    RadArgs b = *a;
+    b.t = t;
+    return ref_row_topk(&b, s);
+}
+
 /* ------------------------------------------------------------------ row_topk_merge */
 /* The other half of the vocab-parallel top-R: the R largest of world_size gathered per-rank
  * candidate sets, in the single-rank path's descending (idx, val) form.
