@@ -561,9 +561,15 @@ public:
      * is a change of address: a recall waits only for kernels to stop naming the slot.
      *
      * The fleet is the third lender (docs/MULTIMODEL.md §6.7): VRAM no model of the fleet holds,
-     * backed into a range the engine reserved for it and given back when the fleet needs it. */
+     * backed into a range the engine reserved for it and given back when the fleet needs it.
+     *
+     * The sliding-window KV groups are the fourth, on a loan of their own (M-11): their pools hold
+     * one window per sequence slot, so the slots no sequence occupies are unused VRAM, but the
+     * spare is sized by slots and never runs out on the FULL groups' token axis, so the two cannot
+     * share one number. It lends in window tokens, and its slots are not donors: its recall must be
+     * an address change too, since a sequence needs those blocks back at an admission. */
 
-    enum Lender { kLendKV = 0, kLendArena = 1, kLendFleet = 2, kLenders = 3 };
+    enum Lender { kLendKV = 0, kLendArena = 1, kLendFleet = 2, kLendKvWindow = 3, kLenders = 4 };
 
     /* The bytes one stretch must span for lend_from to cut a slot for every unit it would carve
      * one for (each movable unit in the pinned pool), with each slot's alignment and the empty
@@ -572,8 +578,12 @@ public:
 
     /* Registers the stretches a lender may ever lend; once per lender, after its memory is
      * carved. Each stretch is cut into slots of each class's stride from the top down, so a small
-     * loan covers a prefix of a large loan's slots and the deepest slot is given back first. */
-    int     lend_from(int lender, const std::vector<LoanStrip>& strips);
+     * loan covers a prefix of a large loan's slots and the deepest slot is given back first.
+     * `share_unit_budget`: a class's slots stand for the units that can fill them, so a lender
+     * lending a region the units an earlier lender already carved for could occupy takes only what
+     * is left. The sliding window's loan passes it (its slots and the KV cache's hold the same
+     * experts); the arena's and the fleet's do not, their regions belonging to other budgets. */
+    int     lend_from(int lender, const std::vector<LoanStrip>& strips, bool share_unit_budget = false);
 
     /* How much a lender lends, in its own measure. A target, not a transaction: newly covered
      * slots can be filled at once, while uncovered ones empty as their units drop and their

@@ -6,7 +6,9 @@ arr60 (a ~60K-token arrival 2 s into one decoder, RAD_ARRIVE_S: S-10's "TTFT of 
 of decode"), tailN (a prompt of ~N characters), c1s (64 tok), c8s (48 tok), greedy (three prompts and one 5.7K arrival
 at temperature 0 with ignore_eos off: the text itself, as gen / chars / sha256, so two runs' answers
 compare byte for byte -- the merge bar's first clause), idle (a finished conversation's KV
-leaves VRAM for the experts and its prefix still resumes; RAD_IDLE_CHARS, RAD_IDLE_WAIT_S), long8
+leaves VRAM for the experts and its prefix still resumes; RAD_IDLE_CHARS, RAD_IDLE_WAIT_S), liveN
+(N decoders, /stats read while they all decode and again once they are done: M-11's gain, the
+window slots no sequence occupies), long8
 (the item's eight long conversations at once, then idle, demand and return; RAD_LONG8_CHARS), and
 longctx (eight ~46K-token sessions: a prefill wave of one token each, then the same eight prompts
 decoded 128 tokens, so all eight are at long context together: the shape notes/backlog/refs/notes/
@@ -268,6 +270,38 @@ def loan_frag(v):
             "live_mib": round(live * mib, 1),
             "spare_tokens": l.get("spare_tokens"), "loan_tokens": l.get("loan_tokens")}
 
+def live(n, ntok=256):
+    """M-11: the loan at N live sequences -- the item's own point, "73-129 units at 1-4 live
+    sequences". Starts N decoders, reads /stats while they all decode (the loan ticks every 100 ms
+    and fills a slot only for a unit that is wanted, so a read 1.5 s in is settled), and again when
+    they are done: `expert_vram_units` and `slab_mib` against `lend_mib` at each point, the units
+    the window group's idle slots let the slab hold. `views` keeps the whole /stats and /sessions
+    reading at each of the three points."""
+    ps = [P[i] for i in (1, 3, 5, 7)][:n]
+    res = [None] * n
+    def w(i): res[i] = request(ps[i], ntok)
+    v = [view("start")]
+    t0 = time.time()
+    th = [threading.Thread(target=w, args=(i,)) for i in range(n)]
+    for t in th: t.start()
+    time.sleep(float(os.environ.get("RAD_LIVE_S", 1.5)))
+    v.append(view("live"))
+    for t in th: t.join()
+    v.append(view("end"))
+    wall = max(r["t1"] for r in res) - t0
+    o = {"name": f"live{n}", "clients": n, "gen": sum(r["gen"] for r in res), "wall": round(wall, 3),
+         "ttft": [round(r["ttft"], 3) for r in res],
+         "agg_tps": round(sum(r["gen"] for r in res) / wall, 1),
+         "sum_req_dec_tps": round(sum(r["dec"] for r in res), 1),
+         "expert_vram_units": {x["at"]: (x["expert_units"] or {}).get("vram") for x in v},
+         "slab_mib": {x["at"]: x["slab_mib"] for x in v},
+         "lend_mib": {x["at"]: x["lend_mib"] for x in v},
+         "starved_slab": {x["at"]: x["starved_slab"] for x in v}, "views": v}
+    print(json.dumps({k: x for k, x in o.items() if k != "views"}), flush=True)
+    for x in v: print(json.dumps(x), flush=True)
+    time.sleep(2)
+    return o
+
 def long8(chars, gen=32):
     """The item's multi-session case (M longctx, 8 sessions of ~50K tokens: 391K cached tokens): eight
     long conversations at once, then idle, then a decode-only request that asks the experts for the
@@ -445,7 +479,8 @@ for ph in PH:
     elif ph == "stress":  # issue #251: RAD_STRESS_WAVES waves of eight ~12K-token requests
         R["phases"].append(stress(int(os.environ.get("RAD_STRESS_WAVES", 40)), int(os.environ.get("RAD_STRESS_CHARS", 39500)),
                                   int(os.environ.get("RAD_STRESS_NTOK", 96))))
+    elif ph.startswith("live"): R["phases"].append(live(int(ph[4:])))
     elif ph == "long8": record(long8(int(os.environ.get("RAD_LONG8_CHARS", 140000))))
     else: sys.exit(f"probe.py: no phase '{ph}'; phases: c1 c1b c1s c2 c4 c8 c8s think pf2 pf6 pf6c pf8 pf20 "
-                  "greedy longctx lctxN stall1 stall4 arr60 tailN idle long8 resumeN stress nowarm")
+                  "greedy longctx lctxN stall1 stall4 arr60 tailN idle liveN long8 resumeN stress nowarm")
 json.dump(R, open(OUT, "w"), indent=1)

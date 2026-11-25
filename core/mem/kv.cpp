@@ -914,6 +914,23 @@ int64_t KVManager::lent_blocks(size_t i, int64_t tokens) const {
     return b < p.n_blocks ? b : p.n_blocks;
 }
 
+/* A fixed-window group lends the slots no sequence occupies (see "the loan" in kv.h). A runtime
+ * window's blocks are the reference itself, a streamed group's are a launch's, and a flex cache's
+ * stripes are the fleet's rather than the cache's to give. */
+bool KVManager::win_lendable(int32_t g) const {
+    const KVGroupPlan* p = plan(g);
+    return p && p->kind == RAD_KV_WINDOW && p->window_blocks > 0 && !p->runtime_win &&
+           p->n_blocks > 0 && p->block_size > 0 && p->bytes_per_block > 0 && !p->streamed() &&
+           !flex();
+}
+
+int64_t KVManager::window_lent_blocks(size_t i, int64_t tokens) const {
+    const KVGroupPlan& p = plans_[i];
+    if (!win_lendable(p.index) || tokens <= 0) return 0;
+    const int64_t b = tokens / p.block_size;
+    return b < p.n_blocks ? b : p.n_blocks;
+}
+
 int64_t KVManager::held_top(size_t i) const {
     const auto& h = held_hist_[i];
     for (size_t b = h.size(); b-- > 0;)
@@ -935,15 +952,19 @@ int KVManager::grow_for(int32_t g, int64_t blocks, bool* waiting_for_fleet) {
     if ((size_t)g < short_peak_.size() && short_by > short_peak_[(size_t)g])
         short_peak_[(size_t)g] = short_by;
 
-    if (!lendable(g) || loan_ <= 0 || live_[(size_t)g] >= p.n_blocks) return RAD_E_FULL;
+    /* Which loan answers for this group: the FULL groups share one, a window group has its own
+     * (see "the loan" in kv.h). */
+    const bool win = win_lendable(g);
+    const int64_t lent = win ? win_loan_ : loan_;
+    if ((!win && !lendable(g)) || lent <= 0 || live_[(size_t)g] >= p.n_blocks) return RAD_E_FULL;
     int64_t live = live_[(size_t)g] + short_by + buf_blocks((size_t)g);
     if (live > p.n_blocks) live = p.n_blocks;
     /* The loan, in tokens, that leaves this group `live` blocks. It only shrinks: a shortfall in
      * one group never lends more of another. */
     int64_t keep = (p.n_blocks - live) * p.block_size;
-    if (keep > loan_) keep = loan_;
+    if (keep > lent) keep = lent;
     if (reclaim_) {
-        const int rc = reclaim_(keep, waiting_for_fleet);
+        const int rc = reclaim_(g, keep, waiting_for_fleet);
         if (rc == RAD_E_FULL) return rc;   /* a flex cache the fleet could not grow: the request waits */
         if (rc < 0) {
             RAD_ERR("KV group '%s': a request needs %lld more blocks and the expert slab could not "
@@ -952,7 +973,7 @@ int KVManager::grow_for(int32_t g, int64_t blocks, bool* waiting_for_fleet) {
             return rc;
         }
     }
-    RAD_TRY(set_loan(keep));
+    RAD_TRY(win ? set_window_loan(keep) : set_loan(keep));
     return free_usable_[(size_t)g] >= blocks ? RAD_OK : RAD_E_FULL;
 }
 
@@ -1007,6 +1028,61 @@ int KVManager::set_loan(int64_t tokens) {
     return RAD_OK;
 }
 
+/* The window's spare: the slots no sequence occupies, which a pool sized for one window per slot
+ * leaves at the top of its carve. Same shape as spare_tokens, over the window groups and with the
+ * shortfall peak already decayed by it. */
+int64_t KVManager::spare_window_tokens() {
+    int64_t spare = -1;
+    for (size_t i = 0; i < plans_.size(); ++i) {
+        if (!win_lendable(plans_[i].index)) continue;
+        const KVGroupPlan& p = plans_[i];
+        int64_t keep = held_top(i) + buf_blocks(i);
+        if (keep > p.n_blocks) keep = p.n_blocks;
+        const int64_t t = (p.n_blocks - keep) * p.block_size;
+        if (spare < 0 || t < spare) spare = t;
+    }
+    return spare > 0 ? spare : 0;
+}
+
+int64_t KVManager::window_loan_step() const {
+    int64_t step = -1;
+    for (size_t i = 0; i < plans_.size(); ++i) {
+        if (!win_lendable(plans_[i].index)) continue;
+        const int64_t t = buf_blocks(i) * plans_[i].block_size;
+        if (step < 0 || t < step) step = t;
+    }
+    return step > 0 ? step : 0;
+}
+
+int KVManager::set_window_loan(int64_t tokens) {
+    if (tokens < 0) tokens = 0;
+    /* Check every group before moving any, so a refused loan changes nothing. */
+    for (size_t i = 0; i < plans_.size(); ++i) {
+        if (!win_lendable(plans_[i].index)) continue;
+        const int64_t live = plans_[i].n_blocks - window_lent_blocks(i, tokens);
+        if (live < live_[i] && held_top(i) > live) {
+            RAD_ERR("KV group '%s': asked to lend down to block %lld with a block held at or above "
+                    "%lld", plans_[i].name.c_str(), (long long)live,
+                    (long long)(held_top(i) - bucket_blocks_[i]));
+            return RAD_E_STATE;
+        }
+    }
+    apply_window_loan(tokens);
+    return RAD_OK;
+}
+
+void KVManager::apply_window_loan(int64_t tokens) {
+    for (size_t i = 0; i < plans_.size(); ++i) {
+        if (!win_lendable(plans_[i].index)) continue;
+        const int64_t live = plans_[i].n_blocks - window_lent_blocks(i, tokens);
+        /* As apply_loan: the ids between the old and the new mark are free, so the count moves by
+         * exactly the distance. */
+        free_usable_[i] += live - live_[i];
+        live_[i] = live;
+    }
+    win_loan_ = tokens;
+}
+
 void KVManager::apply_loan(int64_t tokens) {
     for (size_t i = 0; i < plans_.size(); ++i) {
         if (!lendable(plans_[i].index)) continue;
@@ -1059,6 +1135,7 @@ int64_t KVManager::flex_token_bytes() const {
 
 int KVManager::follow(const KVManager& leader) {
     if (leader.loan_ != loan_) apply_loan(leader.loan_);
+    if (leader.win_loan_ != win_loan_) apply_window_loan(leader.win_loan_);
     return RAD_OK;
 }
 int64_t KVManager::free_states(int32_t g) const {
