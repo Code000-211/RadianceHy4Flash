@@ -946,6 +946,12 @@ int rad_issue(RadCtx* c, rad_op op, const RadOperand* opd, int n_opd, int64_t n)
 int rad_lane(RadCtx* c, int lane);
 int rad_lane_join(RadCtx* c, int from, int to);
 
+/* The domain this deployment's issue dispatches `op` to: RAD_DOMAIN_DEVICE or RAD_DOMAIN_HOST
+ * (abi/rad_abi.h). The placement planner moves an op to the host after declare, when its weight
+ * operands are all host-placed (core/runtime/ctx.h "the placement seam"), so the plugin can only
+ * ask at run time. A negative status for a handle that was never declared. Additive export. */
+int rad_op_domain(RadCtx* c, rad_op op);
+
 /* Same, with the ranged value taken from the batch. */
 #define RAD_ISSUE(c, op, ...) rad_issue((c), (op), RAD_OPD(__VA_ARGS__), RAD_N_BATCH)
 #define RAD_ISSUE_N(c, op, n, ...) rad_issue((c), (op), RAD_OPD(__VA_ARGS__), (n))

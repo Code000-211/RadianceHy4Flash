@@ -441,20 +441,27 @@ void hc_write_kernel(const unsigned short* __restrict__ y, const unsigned short*
 
 /* ============================================================== hc_project
  *
- * The control vector (core/cvec.h): h[s] -= scale * (h[s] . v) * v for each of the hc streams of a
- * row whose `on` flag is 1 -- llama.cpp's `--cvec-mode project`, issued after a layer's write into
- * the stream. ONE direction for every stream: the dot is per stream, against the same v. One
+ * The control vector (core/cvec.h): h[s] -= scale * (h[s] . v_s) * v_s for each of the hc streams of
+ * a row whose `on` flag is 1 -- llama.cpp's `--cvec-mode project`, issued after a layer's write into
+ * the stream. `vsep` selects the direction layout: 0 is ONE direction shared by every stream (the
+ * dot is per stream, against the same v), and a nonzero `vsep` (the direction stride, `n`) is a
+ * PER-STREAM table where stream s reads its own direction at v + s*n. Hy4's four hyper-connection
+ * streams carry the refusal signal differently (cosines 0.1-0.6), so the published refusal vector
+ * is per-stream (alesha-pro/Hy4-flash-Uncensored-GGUF, tools/abliteration/directions_rt.py). One
  * workgroup per (row, stream), and a zero flag is not read and not written, so an unprojected
  * request's stream is the stock model's. */
 __global__ __launch_bounds__(kThreads)
 void hc_project_kernel(unsigned short* __restrict__ h, const float* __restrict__ v,
-                       const int32_t* __restrict__ on, long rows, long n, long hrow, float scale) {
+                       const int32_t* __restrict__ on, long rows, long n, long hrow, float scale,
+                       long vsep) {
     const long r = blockIdx.y;
     if (r >= rows || on[r] == 0) return;   /* a row's switch: the whole workgroup takes it */
-    unsigned short* hp = h + r * hrow + (long)blockIdx.x * n;
+    const long s = (long)blockIdx.x;
+    const float* vs = v + s * vsep;
+    unsigned short* hp = h + r * hrow + s * n;
 
     float acc = 0.0f;
-    for (long i = threadIdx.x; i < n; i += kThreads) acc += bf2f(hp[i]) * v[i];
+    for (long i = threadIdx.x; i < n; i += kThreads) acc += bf2f(hp[i]) * vs[i];
     /* A wave sums itself and the waves meet in LDS, at kWave 32: the shuttle is the wave's own
      * width here, not the 64 a 64-wide __shfl_down would assume but gfx12 does not run. */
     __shared__ float s_g[kWaves];
@@ -469,7 +476,7 @@ void hc_project_kernel(unsigned short* __restrict__ h, const float* __restrict__
     __syncthreads();
 
     const float g = s_g[0];
-    for (long i = threadIdx.x; i < n; i += kThreads) hp[i] = f2bf(bf2f(hp[i]) - g * v[i]);
+    for (long i = threadIdx.x; i < n; i += kThreads) hp[i] = f2bf(bf2f(hp[i]) - g * vs[i]);
 }
 
 /* A wave's dot product of the LDS vector with a contiguous bf16 row, using 512-byte loads but
@@ -5535,8 +5542,9 @@ extern "C" int r4d_rad_hc_write(const RadArgs* a, RadStream stream) {
 enum { HCP_H = 0, HCP_V, HCP_ON };
 
 /* The control vector's projection. `v` is one layer's unit direction, [n], used for EVERY stream
- * (the dot is per stream against the same direction): a [hc, n] table is refused here rather than
- * read as one direction a stream, which is what a per-stream offset would silently do. */
+ * (the dot is per stream against the same direction) unless the op declares `vsep` = n, which is the
+ * per-stream table [hc, n] and is then required: neither layout can be read as the other by
+ * accident. */
 extern "C" int r4d_rad_hc_project(const RadArgs* a, RadStream stream) {
     const RadTensor* h  = r4d_opt(a, HCP_H);
     const RadTensor* v  = r4d_opt(a, HCP_V);
@@ -5546,14 +5554,17 @@ extern "C" int r4d_rad_hc_project(const RadArgs* a, RadStream stream) {
     long long rows = 0, n = 0, hc = 0, hrow = 0;
     const int rc = hc_common(a, h, &rows, &n, &hc, &hrow);
     if (rc != RAD_OK) return rc;
+    const long long vsep = r4d_geti_or(a, "vsep", 0);
+    if (vsep != 0 && vsep != n) return R4D_NO(RAD_E_INVAL);
     long long vrows = 0, onrows = 0;
-    if (r4d_rows_pitch(v, n, &vrows) < 0 || vrows != 1) return R4D_NO(RAD_E_STRIDE);
+    if (r4d_rows_pitch(v, n, &vrows) < 0) return R4D_NO(RAD_E_STRIDE);
+    if (vrows != (vsep != 0 ? hc : 1)) return R4D_NO(RAD_E_STRIDE);
     if (r4d_rows_pitch(on, 1, &onrows) < 0 || onrows < rows) return R4D_NO(RAD_E_STRIDE);
 
     return R4D_EMIT(stream, hc_project_kernel, dim3((unsigned)hc, (unsigned)rows), dim3(kThreads),
                     0, (unsigned short*)h->data, (const float*)v->data,
                     (const int32_t*)on->data, (long)rows, (long)n, (long)hrow,
-                    (float)r4d_getf(a, "scale", 1.0));
+                    (float)r4d_getf(a, "scale", 1.0), (long)vsep);
 }
 
 enum { MTE_H = 0, MTE_E, MTE_WH, MTE_WE, MTE_FCH, MTE_FCE, MTE_X };

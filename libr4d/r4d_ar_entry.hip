@@ -137,6 +137,9 @@ struct ArInst {
      * each card reaches over its own link (see build). */
     int  host       = 0;
     long gate_ctr   = 0;      /* the blocks that have seen their peer's bytes land (r4d_ar_seq.h) */
+    /* The split junction's wave sums and two words a (launch parity, row) (K-13, r4d_ihc.h's
+     * JuncSplit): rank-local and coarse, since only this rank's blocks touch it. */
+    long jparts     = 0;
     /* The eight-rank two-shot's per-rank shard weights (r4d_ar_shards.h), fixed at build so the
      * scratch was sized for them and a recorded launch keeps its table. */
     int  shard_weighted = 0;
@@ -397,6 +400,14 @@ int build(ArInst* in, long long group, int rank, int world, long long max_numel,
             stg = r4d_ar_ipc_alloc((long)nslots * in->slot_bytes, 0, handle, &hlen));
     }
 
+    /* K-13: the split junction's scratch, one JuncSplit a rank, zeroed by the allocation: its words
+     * must read zero at the first launch. Coarse for the same reason as the counters above. */
+    long jsp = 0;
+    if (world == 2) {
+        R4D_TRY("ar_ipc_alloc(jparts)",
+            jsp = r4d_ar_ipc_alloc((long)sizeof(r4d_ihc::JuncSplit), 0, handle, &hlen));
+    }
+
     /* This rank's own packed copy, for the rotated 6-bit wire only: the reduce must fold exactly
      * the bytes it sent. The 6-bit payload is 3/8 of the bf16 message and the f32 scales 1/32 of
      * it, laid out from half the slot; a row padded to whole 512-element chunks
@@ -413,6 +424,7 @@ int build(ArInst* in, long long group, int rank, int world, long long max_numel,
     in->my_seq     = sq;
     in->locpack    = lp;
     in->my_stage   = stg;
+    in->jparts     = jsp;
     in->gate_ctr   = sq + 2L * maxb * 4;   /* the word after the sequence counters (r4d_ar_seq.h) */
 
     Rendezvous& rv = rv_for(group);
@@ -526,6 +538,7 @@ void release(ArInst* in) {
     r4d_ar_ipc_free(in->my_seq);
     r4d_ar_ipc_free(in->locpack);
     r4d_ar_ipc_free(in->my_stage);
+    r4d_ar_ipc_free(in->jparts);
     delete in;
 }
 
@@ -1698,8 +1711,18 @@ extern "C" int r4d_rad_ar_rmsnorm_ihc_junction(const RadArgs* a, RadStream s) {
     const long words16 = (long)(j.M * (long long)j.r.n / 8);
     const long coded = j.r.n % 256 == 0 ? ar_coded(a, in, words16) : 0;
     const int chain = r4d_geti_or(a, "chain", 0) != 0 && j.M <= 64 ? 1 : 0;
+    /* K-13: at decode heights several blocks a row, each owning a run of the 16 waves (the launcher
+     * splits the count into rows and parts). A caller's own block count is kept, and the launch stays
+     * within the instance's cap; both ranks derive the same split from the same M and caps. */
+    int parts = 0;
+    if (cfgv.nblocks <= 0 && in->jparts && j.M >= 1 && j.M <= (long long)r4d_ihc::kSplitRows) {
+        const int cap = in->nb_cap < in->max_blocks ? in->nb_cap : in->max_blocks;
+        for (int b = (int)r4d_ihc::kSplitParts; b > 1; b >>= 1)
+            if (j.M * b <= (long long)cap) { parts = b; break; }
+        if (parts > 1) nblocks = (int)(j.M * (long long)parts);
+    }
     const int e = r4d_ar_ihc_junction_2rank(in->peer_scratch[0], in->my_scratch, in->peer_flags[0],
-                                            in->my_flags, in->my_seq, in->slot16, &j,
+                                            in->my_flags, in->my_seq, in->slot16, in->jparts, &j,
                                             (long)(uintptr_t)s, nblocks, cfgv.drain, cfgv.acq,
                                             in->my_stage, chain, coded ? 1 : 0);
     return e == 0 ? RAD_OK : RAD_E_SHAPE;

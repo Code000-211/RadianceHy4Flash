@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <array>
 #include <charconv>
+#include <chrono>
 #include <cmath>
 #include <climits>
 #include <cstdlib>
@@ -1996,11 +1997,29 @@ static int parse_logprobs(const json& b, const OaiLimits& lim, Endpoint ep, OaiR
     return RAD_OK;
 }
 
+std::string format_prep_phases(const OaiRequest& r) {
+    std::string out;
+    auto add = [&](const char* name, int64_t ns) {
+        char buf[48];
+        if (ns >= 0) std::snprintf(buf, sizeof buf, " %s=%.2fms", name, (double)ns * 1e-6);
+        else std::snprintf(buf, sizeof buf, " %s=-", name);
+        out += buf;
+    };
+    add("parse", r.prep_parse_ns);
+    add("render", r.prep_render_ns);
+    add("encode", r.prep_encode_ns);
+    add("grammar", r.prep_grammar_ns);
+    add("submit", r.prep_submit_ns);
+    return out;
+}
+
 int parse_chat_request(const std::string& body, const OaiDeps& d, const OaiLimits& lim,
                        OaiRequest* out, ApiError* err) {
     json b;
+    const int64_t t_parse0 = prep_now_ns();
     RAD_TRY(parse_request_object(body, lim, &b, err));
     RAD_TRY(vet_keys(b, Endpoint::Chat, err));
+    out->prep_parse_ns = prep_now_ns() - t_parse0;
 
     out->endpoint = Endpoint::Chat;
     out->id = random_id("chatcmpl-");
@@ -2312,7 +2331,9 @@ int parse_chat_request(const std::string& body, const OaiDeps& d, const OaiLimit
 
     ChatRender render;
     std::string why;
+    const int64_t t_render0 = prep_now_ns();
     const int rs = d.chat->apply(messages, tools, opt, &render, &why);
+    out->prep_render_ns = prep_now_ns() - t_render0;
     if (rs < 0) {
         *err = template_refusal(opt, lim, rs, why);
         return rs;
@@ -2356,11 +2377,15 @@ int parse_chat_request(const std::string& body, const OaiDeps& d, const OaiLimit
         out->stops_after = render.think_close;
 
     /* The grammar may be the caller's or the template's own. */
-    RAD_TRY(compile_grammar(d, out, out->tools_present ? "tools" : "grammar", err));
+    const int64_t t_grammar0 = prep_now_ns();
+    const int gst = compile_grammar(d, out, out->tools_present ? "tools" : "grammar", err);
+    out->prep_grammar_ns = prep_now_ns() - t_grammar0;
+    RAD_TRY(gst);
 
     const std::string& rendered = render.prompt;
 
     PromptInput p;
+    const int64_t t_encode0 = prep_now_ns();
     if (media.empty()) {
         /* add_special is false: the template renders the model's special tokens; BOS is placed
          * below. */
@@ -2373,6 +2398,7 @@ int parse_chat_request(const std::string& body, const OaiDeps& d, const OaiLimit
         mo.image_size = out->image_size;
         RAD_TRY(tokenize_with_media(rendered, d, media, mo, &p, err));
     }
+    out->prep_encode_ns = prep_now_ns() - t_encode0;
     /* A tokenizer that states add_bos gets exactly one BOS in front. The render drops a BOS the
      * template writes when add_bos is set (ChatTemplate, as llama.cpp's chat does, which leaves it
      * to the tokenizer), and some templates never write one, so it is added here unless the
@@ -2401,8 +2427,10 @@ int parse_chat_request(const std::string& body, const OaiDeps& d, const OaiLimit
 int parse_completion_request(const std::string& body, const OaiDeps& d, const OaiLimits& lim,
                              OaiRequest* out, ApiError* err, bool native) {
     json b;
+    const int64_t t_parse0 = prep_now_ns();
     RAD_TRY(parse_request_object(body, lim, &b, err));
     RAD_TRY(vet_keys(b, Endpoint::Completion, err, native));
+    out->prep_parse_ns = prep_now_ns() - t_parse0;
     if (native && !get_bool(b, "return_tokens", &out->return_tokens, err)) return RAD_E_INVAL;
 
     out->endpoint = Endpoint::Completion;
@@ -2414,9 +2442,14 @@ int parse_completion_request(const std::string& body, const OaiDeps& d, const Oa
     if (out->model.empty()) out->model = lim.model_id;
 
     RAD_TRY(parse_sampling(b, lim, out, err));
-    RAD_TRY(parse_output_format(b, d, out, err));
-
-    RAD_TRY(compile_grammar(d, out, b.contains("grammar") ? "grammar" : "response_format", err));
+    const int64_t t_grammar0 = prep_now_ns();
+    const int ost = parse_output_format(b, d, out, err);
+    const int gst = ost < 0 ? ost
+                  : compile_grammar(d, out, b.contains("grammar") ? "grammar" : "response_format",
+                                    err);
+    out->prep_grammar_ns = prep_now_ns() - t_grammar0;
+    RAD_TRY(ost);
+    RAD_TRY(gst);
 
     if (!get_bool(b, "echo", &out->echo, err)) return RAD_E_INVAL;
 
@@ -2451,6 +2484,7 @@ int parse_completion_request(const std::string& body, const OaiDeps& d, const Oa
         return RAD_E_UNSUPPORTED;
     }
 
+    const int64_t t_encode0 = prep_now_ns();
     auto pit = b.find("prompt");
     if (pit == b.end() || pit->is_null()) {
         *err = err_bad("prompt", "is required");
@@ -2532,6 +2566,7 @@ int parse_completion_request(const std::string& body, const OaiDeps& d, const Oa
         *err = err_bad("prompt", "expected a string or an array");
         return RAD_E_INVAL;
     }
+    out->prep_encode_ns = prep_now_ns() - t_encode0;
 
     /* The batch shares one `max_tokens`, so the longest prompt sets the clamp. */
     size_t longest = 0;

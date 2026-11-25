@@ -5,6 +5,7 @@
 #include "engine.h"
 #include "engine_hostmem.h"
 #include "hf_model.h"
+#include "plugin/registry.h"
 #include "rad_internal.h"
 #include "server/front.h"
 #include "server/history.h"
@@ -478,6 +479,8 @@ private:
     void   reap();
     void   ttl_tick();
     std::string reload();
+    /* POST /admin/kernels/reload: the refusal, or "" with what was reloaded in `done`. */
+    std::string reload_kernels(json* done);
     void   stop_all();
     void   add_routes();
     /* Whether `q`'s caller may reach the fleet's admin routes: everyone who pays the api key, or
@@ -2323,6 +2326,58 @@ void Fleet::ttl_tick() {
     }
 }
 
+/* The loaded overrides' rebuilt hooks, taken by every engine of the process at once and without a
+ * model reload (docs/PLUGIN.md §14). The rows are one table that every engine reads, so every
+ * serving engine is held at a step boundary together -- each run_quiet holds its engine while the
+ * next is asked -- and the commit happens only once all of them, and the parked ones, have agreed
+ * to it. On the scheduler thread, so no model starts or stops loading meanwhile. */
+std::string Fleet::reload_kernels(json* done) {
+    std::vector<Engine*> serving, held;
+    for (auto& mp : models_) {
+        const Model& m = *mp;
+        if (m.op.load() != kIdle)
+            return "model '" + m.entry.name + "' is loading, restoring or leaving; ask again once "
+                   "it is done";
+        if (!m.engine) continue;
+        if (!m.parked && m.spilling())
+            return "model '" + m.entry.name + "' is still moving its weights onto its cards; ask "
+                   "again once it is done";
+        /* A parked engine's step loop rests in its hold, and one that ended runs no more: neither
+         * passes a step boundary, and neither runs a step until this thread lets it. */
+        const bool ended = m.ended && m.ended->load();
+        (m.parked || ended ? held : serving).push_back(m.engine.get());
+    }
+    HookReload rl;
+    std::string why;
+    if (rad_tools_registry().reload_prepare(&rl, &why) < 0) return why;
+    json libs = json::array();
+    for (const HookReload::Lib& l : rl.libs)
+        libs.push_back(json{ { "library", l.name }, { "file", l.path }, { "rows", l.rows } });
+
+    bool committed = false;
+    std::function<int(size_t)> hold = [&](size_t i) -> int {
+        if (i < serving.size()) return serving[i]->run_quiet([&] { return hold(i + 1); });
+        for (Engine* e : serving)
+            if (const int st = e->hooks_check(rl, &why); st < 0) return st;
+        for (Engine* e : held)
+            if (const int st = e->hooks_check(rl, &why); st < 0) return st;
+        Registry::reload_finish(rl, true);
+        committed = true;
+        for (Engine* e : serving) e->hooks_refresh();
+        for (Engine* e : held) e->hooks_refresh();
+        return RAD_OK;
+    };
+    const int st = hold(0);
+    if (!committed) {
+        Registry::reload_finish(rl, false);
+        return why.empty() ? std::string("an engine stopped before it came to rest: ") +
+                                 rad_strerror(st)
+                           : why;
+    }
+    *done = json{ { "reloaded", libs }, { "engines", (int64_t)(serving.size() + held.size()) } };
+    return std::string();
+}
+
 std::string Fleet::reload() {
     FleetConfig nf;
     if (fleet::load(fc_.path, &nf) != RAD_OK) return "the file does not load (see the log)";
@@ -2801,6 +2856,24 @@ void Fleet::add_routes() {
             return ok({ { "id", name }, { "pinned", pin } });
         }
         return bad(q, 404, "no admin action '" + action + "'; load, park, unload, pin or unpin");
+    });
+    /* A rebuilt override's hooks into the running engines (docs/PLUGIN.md §14). A refusal names
+     * why and leaves every engine as it was. */
+    front_.route("POST", "/admin/kernels/reload",
+                 [this, guard, ok, bad, run_cmd](const server::HttpRequest& q) {
+        if (auto g = guard(q)) return *g;
+        auto done = std::make_shared<json>();
+        const auto r = run_cmd([this, done] {
+            const std::string why = reload_kernels(done.get());
+            if (!why.empty()) RAD_WARN("kernel reload refused: %s", why.c_str());
+            else RAD_INFO("kernel reload: %s", done->dump().c_str());
+            return why;
+        }, 600000);
+        if (!r.first)
+            return bad(q, 503, "the kernel reload is still waiting for the engines to come to "
+                               "rest; its outcome goes to the log");
+        if (!r.second.empty()) return bad(q, 409, "kernel reload refused: " + r.second);
+        return ok(*done);
     });
     front_.route("POST", "/admin/reload", [this, guard, ok, bad, run_cmd](const server::HttpRequest& q) {
         if (auto g = guard(q)) return *g;

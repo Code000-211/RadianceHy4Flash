@@ -455,6 +455,78 @@ TEST(a_table_copied_into_locked_memory_is_the_mapping_byte_for_byte) {
     f.close();
 }
 
+/* B-01: the four Engram tables read at once, not one after the other. Two fills started before
+ * either is waited on land their own bytes into their own memory, a fill dropped without a wait
+ * joins before its memory is freed, and a fill that reads the wrong bytes fails where it is waited
+ * on, not where it was started. */
+TEST(tables_filling_apart_land_their_own_bytes) {
+    const std::string p = radtest::tmp_path("tfill");
+    RadWriter w;
+    REQUIRE(w.begin(p.c_str()) >= 0);
+    w.set_arch("radtest");
+    const RadWriter::Weight a = mkw("ngram.a", plain_bf16(), 1500, 999, -1, -1, 0);
+    const Planes awant = planes_of(a, 5);
+    REQUIRE(w.add_weight(a, awant.ptr.data()) >= 0);
+    const RadWriter::Weight b = mkw("ngram.b", plain_bf16(), 4000, 7, -1, -1, 0);
+    const Planes bwant = planes_of(b, 6);
+    REQUIRE(w.add_weight(b, bwant.ptr.data()) >= 0);
+    REQUIRE(w.finish() >= 0);
+
+    RadFile f;
+    REQUIRE(f.open(p.c_str()) >= 0);
+    const RadFilePlane& pa = f.plane(*f.find("ngram.a"), 0);
+    const RadFilePlane& pb = f.plane(*f.find("ngram.b"), 0);
+    const uint8_t* sa = f.data(pa);
+    const uint8_t* sb = f.data(pb);
+    const int64_t na = (int64_t)pa.bytes, nb = (int64_t)pb.bytes;
+    REQUIRE(na > 0);
+    REQUIRE(nb > 0);
+
+    TableCopy ca, cb;
+    std::string why;
+    const int rc = table_copy_reserve(na, &ca, &why);
+    /* A locked-memory limit below the copy is the machine's setting, not a defect. */
+    if (rc == RAD_E_NOMEM && why.find("mlock2") != std::string::npos) SKIP("%s", why.c_str());
+    REQUIRE_EQ(rc, (int)RAD_OK);
+    REQUIRE_EQ(table_copy_reserve(nb, &cb, &why), (int)RAD_OK);
+
+    TableFill fa, fb;
+    CHECK_EQ(fa.start(f, sa, na, (int64_t)pa.offset, (uint8_t*)ca.base), (int)RAD_OK);
+    CHECK_EQ(fb.start(f, sb, nb, (int64_t)pb.offset, (uint8_t*)cb.base), (int)RAD_OK);
+    std::string bwhy, awhy;
+    CHECK_EQ(fb.wait(&bwhy), (int)RAD_OK);   /* the table started second is waited on first */
+    CHECK_EQ(fa.wait(&awhy), (int)RAD_OK);
+    CHECK(fa.seconds() > 0.0);
+    CHECK(fb.seconds() > 0.0);
+    CHECK(std::memcmp(cb.base, sb, (size_t)nb) == 0);
+    CHECK(std::memcmp(ca.base, sa, (size_t)na) == 0);
+
+    /* Dropped without a wait: the destructor joins, so the bytes are there before the free. */
+    TableCopy dropped;
+    REQUIRE_EQ(table_copy_reserve(na, &dropped, &why), (int)RAD_OK);
+    {
+        TableFill g;
+        REQUIRE_EQ(g.start(f, sa, na, (int64_t)pa.offset, (uint8_t*)dropped.base), (int)RAD_OK);
+    }
+    CHECK(std::memcmp(dropped.base, sa, (size_t)na) == 0);
+
+    /* Read from the wrong file offset (16 bytes on, still inside the container): real bytes,
+     * wrong ones, caught by the wait's check. */
+    TableCopy bad;
+    REQUIRE_EQ(table_copy_reserve(na, &bad, &why), (int)RAD_OK);
+    TableFill fbad;
+    REQUIRE_EQ(fbad.start(f, sa, na, (int64_t)pa.offset + 16, (uint8_t*)bad.base), (int)RAD_OK);
+    std::string fwhy;
+    CHECK_EQ(fbad.wait(&fwhy), (int)RAD_E_IO);
+    CHECK(fwhy.find("does not match") != std::string::npos);
+
+    table_copy_free(&bad);
+    table_copy_free(&dropped);
+    table_copy_free(&ca);
+    table_copy_free(&cb);
+    f.close();
+}
+
 /* --ngram-placement disk=DIR (#130): the first open fills the table's own file from the container,
  * renamed into place whole; the mapping holds the container's bytes and is that file's (the disk
  * gather finds the file behind its mapping); a second open reuses it unfilled; a file that is not
