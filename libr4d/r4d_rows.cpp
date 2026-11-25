@@ -6645,9 +6645,12 @@ static const RadConstraint cNemotronAttn128[] = { C_IN("dtype", "bf16"), C_GE("M
  * workgroup moves a row's key tile grid with it, so the axis trades a little arithmetic for time
  * rather than time alone. Both points stay inside this op's prefill bound against libref, which is
  * why the axis is legal (perf.md §1, E4); tests/r4d_emu/test_attn_kv_sink.cpp runs both and the two
- * against each other. The default is the 128-row tile: measured on gfx1201 (K-56b), 64 rows is
- * 1.6-7 % faster at window 512 but 5-8 % slower where the mask is the same for every row (window 0,
- * the dense layers), so the tuner picks it per shape and the dense path keeps 128. */
+ * against each other. The default is the 128-row tile: on one lane (iks, one R9700 at the 210 W cap,
+ * gfx1201, `--perfkvsink 20` in both orders) 64 rows is 4.4-8.8 % faster at window 512 (8.0 % at
+ * 64 heads M 1024, 4.4 % at M 2048) and 2.7-5.3 % slower where every row's mask is the same (window
+ * 0, the dense layers), while the 128-row point is the pre-change kernel to within the lane's 2 %
+ * spread; so the tuner picks it per shape and the dense path keeps 128. `notes/backlog/closed/K-56b.md`
+ * carries the rows and the commands. */
 static const int64_t kAkvSinkBq[] = { 64, 128 };
 static const RadTunable tAttnKvSink[] = {
   { "bq", kAkvSinkBq, NELEM(kAkvSinkBq), 128, "query rows a workgroup: 128 (16 waves) or 64 (8 waves)" },
