@@ -396,6 +396,24 @@ Round 5: the block rule has arms of its own. `dual_block_rows` says in which blo
 - Change: `r4d_idx_pool_gated_f32.hip:72-182` (page check only at `:177-180`): after the wait read the page and return when no group of the workgroup closes and `out` / `q8` are null (3 of 4 decode steps of a lone sequence close nothing). Then `:133-137` (one-thread 128-term f64 sum) overlapped with the trig `:159-163`; then one op for work + pool + tail (`r4d_qsa_work_bf16.hip:57-114`, `r4d_qsa_tail_store_bf16.hip:41-61`, `hyv4flash_indexer.h:354-376`; check the alias proof against the rollback contract in the tail store's header).
 - Why: M: `idx_pool_gated` 12 x 9.4 us + `qsa_work` 12 x 3.0 + `qsa_tail_store` 12 x 3.0 + key norm = 0.19 ms a pass (1.3 %).
 - Verify: `idx_pool_gated` kbench rows; rollback gate `tools/hy4flash_rollback_gate.py`.
+- Status (measured on `local`, gpu2, 2026-11-25; base `ca4ad936`, branch `fa662813`; clang++ of the ROCm toolchain, `-DRAD_WITH_HIP=ON -DRAD_GPU_TARGETS=gfx1201`; 210 W cap read back on both cards; `RAD_SRC=<base tree> RADIANCE_AQL_STAMP=1 scripts/backlog/run.sh <tag> nospec.yaml greedy,c1,c8` on each arm):
+  - **Greedy, byte-identical** (the bar's first clause): all four rows equal in the two arms — `d6da4fb3…`, `0699709c…`,
+    `e7a23c5d…` and the 5.7K arrival `466e53a2921d…` (gen 64, 260 chars). Both arms must pin the corpus (`RAD_SRC`): the
+    arrival's prompt is cut from the tree's own source, and the branch touches files the walk reads, so unpinned arms send
+    two different prompts (base tree 22218 chars `561d14c4…`, branch tree 22126 `40ca8f3e…`) — the earlier round's
+    "bytes differ" was that prompt, not the kernels (note added to CARDS.md §1 under `prompts.py`).
+  - **Stamps, indexer key side per decode pass** (12 launches): c1 `idx_pool_gated` 12 x 23.8 = 285 us + `qsa_work` 38 +
+    `qsa_tail_store` 37 = 360 us -> `qsa_work_pool_tail` 12 x 7.4 = 89 us; c8 167 + 38 + 37 = 242 us -> 12 x 18.0 = 216 us.
+  - **Served e2e**: c1 69.23 -> 69.06 tok/s (ms/step 14.02 -> 14.04), c8 301.87 -> 298.81 tok/s (-1.0 %; K-23 measured 2.7 %
+    between two runs of its own base at c8, so this is inside the lane's noise).
+  - **kbench** (run on this tree in the previous measurement round, `--timing-only` rows in us): `idx_pool_gated`
+    13.13-13.15 (M 1..8) / 21.65-21.80 (M 16..128), `qsa_work` 3.48-3.82, `qsa_tail_store` 2.66 -> `qsa_work_pool_tail`
+    3.19-3.29 (M 1..4) / 19.87 (M 8) / 22.06-23.05 (M 16..128); full run: fusions 4 byte-identical to their declared chain.
+  - **Rollback gate**: PASS (0 failing checks, 94 rejected rows that closed a group) on this head in the previous round;
+    the converted gpu-mini container it needs is not on this host, so this round did not re-run it.
+  - **Card-less**: `r4d_emu_idxpool`, `r4d_emu_qsa`, `r4d_emu_qsafront`, `r4d_fuse_test`, `hyv4flash_arch_test`,
+    `sched_test`, `ref_hy4_ops_test` pass; RDNA4 ISA suite `check-tree.sh --compile-commands build/compile_commands.json
+    --changed-since origin/claude/peaceful-wright-hhqnhi` exits 0 (both touched kernels PASS).
 
 #### K-25 `qsa_select` at long context: multi-workgroup select (154 us a launch at 64K, 305 us at 200K)
 - Area kernel · BI (same selection, ties as today) · Gain at >= 32K context: 10-20 % of a c1 decode step / less at c8 / same / 1 % · Conf medium (numbers from `notes/idxint8.md` `--perfidx`, not re-measured in a served run) · Effort M

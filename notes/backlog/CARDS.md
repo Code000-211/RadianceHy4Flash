@@ -95,6 +95,10 @@ scripts/backlog/lane.sh --env iks-A               # what a lane exports: port, m
 - **`bench.py <port> <tag> <out-dir>`** the served benchmark (decode, prefill, cold/warm, `--reps`, `--temp`), and
   **`prompts.py`** holds the prompts and the code corpus both tools send: they are read from the tree the tools sit
   in (`RAD_SRC` overrides), never from a copy on the measuring host, so a lane's prompt is the same text everywhere.
+  The 5.7K arrival of `greedy` is cut from that corpus, so two arms on **different trees** send different text as soon as
+  the change adds, removes or edits a file the walk reads (`libr4d/`, `arch/hyv4flash/`, `core/`, `libavx/` …), and the bar's
+  byte comparison then fails on the prompt, not on the arms: a cross-tree A/B pins one corpus for both arms with
+  `RAD_SRC=<one tree>` (K-24 lost a measurement round to this). The three fixed `greedy` prompts are unaffected.
 - **`layer.py <stamps.csv> <probe.json> <phase> <rec> [<li>]`**, **`agg.py <stamps.csv> <probe.json> [--top N]`**,
   **`attr.py <stamps.csv> <probe.json> [--top N]`**: the per-layer and per-op tables from a run's stamps. They are
   plain CPU tools over those two files (run them as `python3 scripts/backlog/agg.py …`; they are 644 in the tree),
