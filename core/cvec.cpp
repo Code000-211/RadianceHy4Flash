@@ -286,7 +286,10 @@ int control_vector_load(const std::string& path, const std::string& arch, int64_
             /* A basis is applied as k chained projections. Rows that are not orthogonal do not
              * remove the k-space the package was derived for: the second projection takes the part
              * of the stream along v_2 that v_1 left, and removes it whole. */
-            for (int64_t j = 0; j < k; ++j) {
+            /* A per-stream package's rows are groups of one direction per stream, and only the
+             * rows of one stream are chained on one stream: row k meets rows k-4, k-8, ... */
+            const int64_t step = per_stream ? 4 : 1;
+            for (int64_t j = k - step; j >= 0; j -= step) {
                 const float* b = &out->dir[(size_t) ((l * file_rank + j) * n_embd)];
                 double dot = 0.0;
                 for (int64_t i = 0; i < n_embd; ++i) dot += (double) dst[i] * (double) b[i];
@@ -316,7 +319,7 @@ int control_vector_load(const std::string& path, const std::string& arch, int64_
     if (worst_dot > 1e-2)
         RAD_WARN("control vector: %s: the rows of a layer are not orthogonal (worst |v_i.v_j| = "
                  "%.4f); the chained projections then remove more than the intended %lld-space",
-                 path.c_str(), worst_dot, (long long) file_rank);
+                 path.c_str(), worst_dot, (long long) (per_stream ? file_rank / 4 : file_rank));
     return RAD_OK;
 }
 

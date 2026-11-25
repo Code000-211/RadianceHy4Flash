@@ -14,6 +14,7 @@
 
 #include "cvec.h"
 
+#include <algorithm>
 #include <cmath>
 #include <filesystem>
 #include <fstream>
@@ -363,6 +364,30 @@ TEST(a_rank_k_basis_loads_in_order_with_the_package_scale) {
     CHECK_EQ(one.cv.rank, (int64_t) 1);
     CHECK_EQ(one.cv.per_stream, (int64_t) 0);
     CHECK_EQ(rad::control_vector_view(one.cv, one.cv.dir.data()).rank, (int64_t) 1);
+}
+
+/* A per-stream package's rows of different streams are different vectors, not a basis: only one
+ * stream's rows are chained, so only they are held to orthogonality. Rows that agree across
+ * streams draw no warning; rows of one stream that agree do. */
+TEST(orthogonality_is_checked_within_a_stream_only) {
+    const int64_t n = 64, k = 8;
+    GgufWriter same = make_basis(n, 4, k, true);
+    for (auto& t : same.tensors) {
+        std::fill(t.data.begin(), t.data.end(), 0.0f);
+        /* Group 0: every stream along axis 0; group 1: every stream along axis 1. */
+        for (int64_t j = 0; j < k; ++j) t.data[(size_t) (j * n + (j < 4 ? 0 : 1))] = 1.0f;
+    }
+    Loaded a;
+    const std::string w1 = stderr_of([&] { a = load(same, n, 8, "ps-cross.gguf"); });
+    CHECK_OK(a.rc);
+    CHECK(w1.find("not orthogonal") == std::string::npos);
+
+    GgufWriter bad = same;
+    for (auto& t : bad.tensors) t.data[(size_t) (4 * n + 0)] = 1.0f;   /* stream 0, group 1 */
+    Loaded b;
+    const std::string w2 = stderr_of([&] { b = load(bad, n, 8, "ps-same.gguf"); });
+    CHECK_OK(b.rc);
+    CHECK(w2.find("not orthogonal") != std::string::npos);
 }
 
 /* What a basis file may not be: per-stream with a row count no multiple of the four streams,
