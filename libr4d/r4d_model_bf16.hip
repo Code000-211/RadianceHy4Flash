@@ -830,7 +830,7 @@ __global__ __launch_bounds__(kThreads) void r4dchain_kv_store(R4D_KVS_PARAMS) {
 // L, the rotary of the last R (one head, gptj pairs, plain or imrope positions) and the store of the
 // row as one KV head of (L + R) / 2 (its first half the key slot, the rest the value slot), in one
 // workgroup a token. The three bodies are the standalone kernels' own (rmsnorm_body at n = L in place,
-// rope_body at one head of R, kv_store_body), called in order with a barrier between: every
+// rope_body_at at one head of R, kv_store_row), called in order with a barrier between: every
 // column goes through the same expressions in the same order, so the row and the cache slot are the
 // chain's bytes. The norm's sum is the 256-lane partition whatever the width (r4d_common.h), which
 // is why this block's 256 threads fold what the standalone launch's 1024 or 512 do.
@@ -848,16 +848,21 @@ struct MlaRowFront {
 static_assert(sizeof(MlaRowFront) == 104, "MlaRowFront has padding");
 template <bool WF32, class CH>
 __global__ __launch_bounds__(kThreads) void mla_row_front_kernel(MlaRowFront p) {
-    if (CH::on) r4d_chain_wait();
+    /* K-29: the step's position and slot mapping in front of the wait, which then covers their
+     * loads; the row's own columns behind it are the launch in front's. Nothing behind the wait is a
+     * scalar load (tests/chain_scalar_audit.py), so the vector-cache wait does. */
+    const RopePos rp = rope_pos(p.pos, blockIdx.x, p.plane, p.rscale);
+    const int32_t slot = p.slot[blockIdx.x];
+    if (CH::on) r4d_chain_wait_vec();
     rmsnorm_body<WF32, kThreads>(p.row, p.gain, p.row, p.L, p.eps, 0.0f, 1.0f, p.pitch, p.pitch,
                                  gridDim.x);
     __syncthreads();
-    rope_body(p.row + p.L, p.pos, p.R, 1u, p.R, p.R / 2, (int)p.R, p.gptj, p.theta, p.rscale,
-              p.pitch, p.mode, p.s0, p.s1, p.s2, p.n_sec, p.plane, RadYarn{}, RadLlama3{});
+    rope_body_at(p.row + p.L, p.pos, p.R, 1u, p.R, p.R / 2, (int)p.R, p.gptj, p.theta, p.rscale,
+                 p.pitch, p.mode, p.s0, p.s1, p.s2, p.n_sec, p.plane, RadYarn{}, RadLlama3{}, rp);
     __syncthreads();
     const uint32_t half = (p.L + p.R) / 2;
-    kv_store_body(p.row, p.row + half, p.slot, p.kv, half, 1u, p.block_size, p.n_blocks, p.pitch,
-                  p.pitch);
+    kv_store_row(p.row, p.row + half, slot, p.kv, half, 1u, p.block_size, p.n_blocks, p.pitch,
+                 p.pitch);
     if (CH::on) r4d_chain_done();
 }
 
