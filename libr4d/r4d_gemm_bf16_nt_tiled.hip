@@ -248,7 +248,10 @@ int r4d_gemm_bf16_nt_tiled_f32(long a, long w, long c, int M, int K, int N, int 
 }
 
 // ============================================================== the plugin ABI entry point
-extern "C" int r4d_rad_gemm_bf16_tiled(const RadArgs* a, RadStream s) {
+// The two rows' common entry: the chunk check, the split rule and the tile choice, with only the
+// tile's output form telling them apart. Sharing it keeps the arming and the rule from drifting
+// between the two rows.
+static int rad_bf16_tiled_entry(const RadArgs* a, RadStream s, bool f32_out) {
   GemmOps g;
   int rc = gemm_ops(a, &g, 0);
   if (rc != RAD_OK) return rc;
@@ -259,25 +262,19 @@ extern "C" int r4d_rad_gemm_bf16_tiled(const RadArgs* a, RadStream s) {
   if (rc != RAD_OK) return rc;
   int tile = (int)r4d_geti_or(a, "tile", 0);
   if (tile == 0) tile = r4d_gemm_bf16_nt_tiled_arm((int)g.M, (int)g.N);
-  const int e = r4d_gemm_bf16_nt_tiled(r4d_addr(g.a), r4d_addr(g.b), r4d_addr(g.y), (int)g.M,
-                                       (int)g.K, (int)g.N, c.sk, tile, (long)(uintptr_t)s);
+  const int e = (f32_out ? r4d_gemm_bf16_nt_tiled_f32 : r4d_gemm_bf16_nt_tiled)(
+      r4d_addr(g.a), r4d_addr(g.b), r4d_addr(g.y), (int)g.M, (int)g.K, (int)g.N, c.sk, tile,
+      (long)(uintptr_t)s);
   return e == 0 ? RAD_OK : R4D_NO(e < 0 ? RAD_E_SHAPE : RAD_E_DEVICE);
+}
+
+extern "C" int r4d_rad_gemm_bf16_tiled(const RadArgs* a, RadStream s) {
+  return rad_bf16_tiled_entry(a, s, false);
 }
 
 /* The router's prefill GEMM: the same tile and the same split rule, C written as f32. The
  * projection is a routing score (gemm_nt_f32), so its output is f32 and its consumer is the
  * sigmoid/top-k, not another GEMM. */
 extern "C" int r4d_rad_gemm_bf16_tiled_f32(const RadArgs* a, RadStream s) {
-  GemmOps g;
-  int rc = gemm_ops(a, &g, 0);
-  if (rc != RAD_OK) return rc;
-  if (!r4d_bf16_gemm_chunk_rows(g.M, g.N, g.K, 64, 64)) return R4D_NO(RAD_E_SHAPE);
-  Cfg c;
-  rc = cfg_for(a, g.K, g.M, 16, BR_FLAT, &c, (g.N + 15) / 16);
-  if (rc != RAD_OK) return rc;
-  int tile = (int)r4d_geti_or(a, "tile", 0);
-  if (tile == 0) tile = r4d_gemm_bf16_nt_tiled_arm((int)g.M, (int)g.N);
-  const int e = r4d_gemm_bf16_nt_tiled_f32(r4d_addr(g.a), r4d_addr(g.b), r4d_addr(g.y), (int)g.M,
-                                           (int)g.K, (int)g.N, c.sk, tile, (long)(uintptr_t)s);
-  return e == 0 ? RAD_OK : R4D_NO(e < 0 ? RAD_E_SHAPE : RAD_E_DEVICE);
+  return rad_bf16_tiled_entry(a, s, true);
 }
