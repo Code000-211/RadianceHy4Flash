@@ -136,6 +136,14 @@ struct G3Env {
     }
     ~G3Env() { for (const char* k : set) unsetenv(k); }
 };
+/* Two Engram layers (in front of layers 0 and 2): the case P-06 is about, where the group is
+ * shared -- one window, one bound layer, and only the last of the two layers commits a step. */
+void two_engram_layers(MetaKV& k) {
+    k.set("engram_layer_ids", "1 3");
+    k.set("engram_layer_head_vocab_sizes.1", "11 13 17 19 23 29 31 37 41 43");
+    k.set("engram_layer_head_vocab_sizes.3", "11 13 17 19 23 29 31 37 41 43");
+}
+
 struct Declared {
     MetaKV mk;
     RadBuilder b;
@@ -143,8 +151,9 @@ struct Declared {
     int rc = 0;
     explicit Declared(void (*encs)(RadBuilder*) = bf16_encs, int world = 1, int rank = 0,
                       bool wide = false, int64_t ff_exp = 128, int64_t latent = 0,
-                      int64_t top_k = 0, int64_t n_exp = 0)
+                      int64_t top_k = 0, int64_t n_exp = 0, void (*kvset)(MetaKV&) = nullptr)
         : mk(mini_meta(wide, ff_exp, 128, latent, top_k, n_exp)) {
+        if (kvset) kvset(mk);
         encs(&b);
         ctx = build_ctx(rank, world);
         G3Env g3env;
@@ -439,6 +448,67 @@ TEST(the_ahead_ids_are_hashed_only_for_a_host_gather) {
     run(false, "1");            /* the A/B arm: hashed for a device gather too */
     run(true, "0");             /* never hashed */
     unsetenv("RADIANCE_HY4_ENGRAM_AHEAD");
+}
+
+TEST(the_engram_layers_share_one_window) {
+    Declared d(bf16_encs, 1, 0, false, 128, 0, 0, 0, two_engram_layers);
+    REQUIRE_EQ(d.rc, RAD_OK);
+    const RadBuilder& b = d.b;
+    const RecKV* eg = kv_named(b, "kv_engram_tokens");
+    REQUIRE(eg != nullptr);
+    /* One window for the two layers: ngram - 1 ids a sequence (plus the speculative entries),
+     * i32, and one bound layer, so a sequence holds one CONV state per checkpoint. */
+    REQUIRE(eg->d.kind == RAD_KV_CONV);
+    CHECK_EQ(eg->d.conv_width, 3);      /* the config's ngram */
+    CHECK_EQ(eg->d.n_head_kv, 1);
+    CHECK_EQ(eg->d.head_dim, 1);
+    const rad_kvgroup g = (rad_kvgroup)(eg - b.kv_groups.data() + 1);
+    /* Declared and bound once, to the first of the two layers: a sequence owns one CONV state per
+     * checkpoint and a rollback copies one, not one a layer. */
+    int nb = 0;
+    for (const auto& bd : b.binds)
+        if (bd.second == g) {
+            ++nb;
+            CHECK_EQ(bd.first, 0);
+        }
+    CHECK_EQ(nb, 1);
+    /* A step with both layouts (a decode sequence and a prefill chunk): every Engram layer issues
+     * its own `engram_ids` (the multipliers, sizes and offsets differ a layer), every issue reads
+     * the window through that one bound layer, and only the last Engram layer's issue of a layout
+     * advances it -- so all of them hash the window the step opened with. */
+    auto k = kit(b, { 1 }, { 12 }, 0);
+    RadCtx c{ .b = &d.b, .batch = &k->b };
+    hyv4flash::step(&c, &k->b);
+    CHECK(c.step_fail.empty());
+    CHECK_LINT(b, &c);
+    int n_ids = 0, n_adv = 0;
+    for (const RecIssue& is : c.issues) {
+        REQUIRE(is.op != 0);
+        const RecOp& o = b.ops[(size_t)is.op - 1];
+        if (o.op != "engram_ids") continue;
+        ++n_ids;
+        bool kv = false;
+        std::string mult;
+        for (const RadOperand& od : is.opd) {
+            if (od.kind == RAD_OPK_KV) {
+                kv = true;
+                CHECK_EQ((int64_t)od.handle, (int64_t)g);
+                CHECK_EQ((int64_t)od.offset, 0);   /* the bound layer, both layers of the pair */
+            }
+            if (od.kind == RAD_OPK_WEIGHT && od.handle > 0 &&
+                (size_t)od.handle <= b.weights.size()) {
+                const std::string& n = b.weights[(size_t)od.handle - 1].name;
+                if (n.size() > 4 && n.compare(n.size() - 4, 4, "mult") == 0) mult = n;
+            }
+        }
+        CHECK(kv);
+        REQUIRE(!mult.empty());
+        const int adv = (int)pint(&o, "advance");
+        CHECK_EQ(adv, mult == "blk.2.engram_mult" ? 1 : 0);   /* layer 2 is the last of the two */
+        n_adv += adv;
+    }
+    CHECK_EQ(n_ids, 4);         /* one a layer, in each of the two layouts */
+    CHECK_EQ(n_adv, 2);         /* the window moves on once a layout, not once a layer */
 }
 
 TEST(last_layer_keeps_cache_writers_at_chunk_height_and_queries_at_output_height) {
