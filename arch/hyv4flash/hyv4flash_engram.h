@@ -97,10 +97,13 @@ struct EngramWire {
             before = decl_b(b, nm.f("eg.before"), RAD_BF16, { T, s.hc * s.n_embd }, RAD_BUF_PERSIST);
             m1 = decl_b(b, nm.f("eg.minus_one"), RAD_BF16, { T, s.hc * s.n_embd }, RAD_BUF_PERSIST);
         }
-        return ids && ahead && mask && raw && q && qs && rt && e && key && val &&
-                       (!taps_on() || (before && m1))
-                   ? RAD_OK
-                   : RAD_E_INVAL;
+        if (!(ids && ahead && mask && raw && q && qs && rt && e && key && val &&
+              (!taps_on() || (before && m1))))
+            return RAD_E_INVAL;
+        /* A layer writes these before reading them, so their bytes are free between layers
+         * (P-11). The taps' scratch is PERSIST. Left out: `eg.ids` and `eg.mask`, which the
+         * model writes once a step for every layer's engram to read. */
+        return wire_full_write(b, { ahead, raw, q, qs, rt, e, key, val });
     }
 };
 

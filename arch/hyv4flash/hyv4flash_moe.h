@@ -255,10 +255,23 @@ struct MoeWire {
             RAD_ARCH_TRY(w.eff.declare_qs(b, nm, gq, nm.f("moe.expert_ff"), F, T * k, i8, true));
             w.eff.q8_fed = w.eff.q8_rot = i8;
         }
-        return lat.x && routed && sgu && sff && sout && w.logits && w.ids && w.ew && w.eoff &&
-                       w.ecnt && w.sorted && w.egu && w.eff.x && w.edn
-                   ? RAD_OK
-                   : RAD_E_INVAL;
+        if (!(lat.x && routed && sgu && sff && sout && w.logits && w.ids && w.ew && w.eoff &&
+              w.ecnt && w.sorted && w.egu && w.eff.x && w.edn))
+            return RAD_E_INVAL;
+        /* A layer writes these from one end to the other before reading them, so their bytes are
+         * free between layers (P-11). `ecnt` is PERSIST (the routing table). The activation codes
+         * are declared only for a quantised arm; they follow the plane they code. Left out:
+         * `moe.latent` (the shared and the routed branch both write it), `moe.expert_weights`,
+         * `moe.expert_sorted` and `moe.expert_slot` (written piecewise by the router's own ops, so
+         * a run of theirs cannot be shown to write what it reads). `moe.expert_ids`, the fold's
+         * `gate_up` / `ff` / `down` planes: with the debug taps on, a snapshot copy of the ids is
+         * issued after those planes were written and before the routing reads them, so with the
+         * plan lending their bytes an out-of-order tap would read what the next layer wrote. */
+        RAD_ARCH_TRY(wire_full_write(b, { routed, sgu, sff, sout, w.logits }));
+        if (lat.g8 > 0) RAD_ARCH_TRY(wire_full_write(b, { lat.q8, lat.s8 }));
+        if (w.hr.g8 > 0) RAD_ARCH_TRY(wire_full_write(b, { w.hr.q8, w.hr.s8 }));
+        if (w.eff.g8 > 0) RAD_ARCH_TRY(wire_full_write(b, { w.eff.q8, w.eff.s8 }));
+        return RAD_OK;
     }
 };
 

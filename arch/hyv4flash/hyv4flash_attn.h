@@ -112,10 +112,20 @@ struct AttnWire {
         ag = bf("attn_gated", { T, a.v_width() });
         o = bf("o_proj", { T, s.n_embd });
         cu_p = cu_prefill;
-        return qa && q_nope && q_rope && row && q_lat && lat && q_full && latc && kvb && k && v && ao &&
-                       gate && ag && o && cu_p
-                   ? RAD_OK
-                   : RAD_E_INVAL;
+        if (!(qa && q_nope && q_rope && row && q_lat && lat && q_full && latc && kvb && k && v && ao &&
+              gate && ag && o && cu_p))
+            return RAD_E_INVAL;
+        /* Every layer writes these from one end to the other before reading them, so the arena may
+         * lend their bytes between layers (P-11). Left out, and why: `row` is written in pieces by
+         * its norm and its rotary; `cu_p` is the model's one buffer, written once a step and read
+         * by every layer; `q_a`, `q_full`, `attn_latent`, `attn_gated` and `attn_gate` are written
+         * by more than one op of a layer (a concatenation, a rotary over part of the plane, two
+         * halves of a gated fold), so a run of them cannot be shown to write what it reads and the
+         * runtime would refuse the read (rad_buf_full_write). `latent` is left out for a second
+         * reason: the arch streams the layers, so a later layer's indexer writes its planes after
+         * this layer's latent was written and before it is read, and a run's bytes may only be lent
+         * to a stretch that is issued after it. */
+        return wire_full_write(b, { q_nope, q_rope, q_lat, kvb, k, v, ao, o });
     }
 };
 

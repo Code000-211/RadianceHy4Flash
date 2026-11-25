@@ -109,6 +109,16 @@ struct IndexWire {
                              RAD_BUF_PERSIST);
             if (!zero_pos || !ident || !sel_ids) return RAD_E_INVAL;
         }
+        /* A layer writes these before reading them, so their bytes are free between layers
+         * (P-11). The taps' scratch is PERSIST and `nc` counts what earlier groups closed. Left
+         * out: `ix.query` and `ix.head_weights` (written by several ops of a group: the two
+         * copies, then the row writes), `ix.score` (the score op writes it in row tiles) and
+         * `ix.nsel` (a later layer's `qsa_select` reads it after earlier layers' planes were
+         * written, so its run's bytes cannot be lent across layers). The taps' own planes `tk`,
+         * `stage`, `page` and `bpos` are streamed: a later layer's taps write them after an earlier
+         * layer's latent, so their bytes are not lent either. */
+        RAD_ARCH_TRY(wire_full_write(b, { iqn, iqr, sel, len }));
+        if (s.ix_fp8) RAD_ARCH_TRY(wire_full_write(b, { iqf, qcodes, qscale, iwf }));
         return RAD_OK;
     }
 };

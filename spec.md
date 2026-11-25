@@ -428,7 +428,13 @@ Declare produces:
 
 The arena is sized for `max_tok` and liveness is computed over the declared list, a superset of
 what any step issues: a plan correct for the worst step is correct for every step, with no
-allocator on the hot path. A plugin that sets `RadArchProbe::shape_probe_ok` is declared again at
+allocator on the hot path. A buffer's life is a list of runs, not one interval: a buffer the plugin
+names to `rad_buf_full_write` is written across by the ops that use it before they read it, so a
+run ends at every write and the buffer is dead between its runs, where another buffer may take its
+bytes (`BufferInfo::runs`, `core/build/rad_bufplan.cpp`). The promise is checked, not assumed: a
+run must write every byte its own ops read of the buffer, and `Ctx::issue` refuses a read of bytes
+the run never wrote (`RAD_E_STATE`, by name). Without the call a buffer keeps one run, from its
+first declaring op to its last. A plugin that sets `RadArchProbe::shape_probe_ok` is declared again at
 smaller `max_tok` values (`RadBuildCtx::shape_probe`). Each result is an arena level packing the
 same buffers for smaller steps; while steps are that small, the arena above the level is lent to
 the expert slab.
