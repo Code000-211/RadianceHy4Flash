@@ -93,6 +93,9 @@ const std::vector<TolRow> g_tol = {
     /* Two implementations of the same quantiser must agree, so this is tight. */
     { "quant_act",    "*",        1e-6 },
     { "dequant",      "*",        1e-6 },
+    /* cast_row_topk is the cast then row_topk, its outputs that pair's bytes: a copy (below), not
+     * a cast. Ahead of "cast", which it would otherwise match as a prefix. */
+    { "cast_row_topk", "*",       0.0  },
     { "cast",         "*",        1e-6 },
     /* Copies, and stores that round each element once the same way: bit-exact or broken. A
      * top-k's values and pairs are copies of its input. */

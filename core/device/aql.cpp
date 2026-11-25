@@ -192,6 +192,10 @@ struct Module {
     hsa_executable_t exec[kMaxDevices] = {};
     bool        loaded[kMaxDevices] = {};
     std::string load_err[kMaxDevices];
+    /* Bytes of code object loaded on each device -- the `im.size` module_load took -- so the VRAM
+     * budget can say what share of the card's `already held` is device code (M-14). 0 where the
+     * module never loaded there, including where the load failed. */
+    int64_t     loaded_bytes[kMaxDevices] = {};
 };
 
 struct Func {
@@ -508,6 +512,9 @@ bool module_load(Module* m, int ord, const ModuleImage& im, std::string* why) {
         m->load_err[ord] = "the code object did not load on " + d.isa;
     } else {
         m->exec[ord] = ex;
+        /* What the card now holds for this module, whole: the code object loads as one piece at
+         * the kernel's first launch, forms of it this model never runs and all. */
+        m->loaded_bytes[ord] = (int64_t)im.size;
     }
     if (!m->load_err[ord].empty()) { *why = m->load_err[ord]; return false; }
     return true;
@@ -4897,6 +4904,31 @@ int a_code_runs(size_t from, size_t to, int device, char* why, int cap) {
     return 1;
 }
 
+/* What the card holds in device code: the code objects loaded on it, and the modules they came
+ * from. A module loads whole at its first kernel, so the total is what a build carrying forms this
+ * model never launches costs the card -- the share of `already held` M-14 sets out to measure, and
+ * the number a deployment listing only the forms it uses (R4D_MOEIQR_FORMS is one) gives back. */
+int a_code_resident(int device, int64_t* bytes, int* modules) {
+    if (device < 0 || (size_t)device >= G().dev.size()) return RAD_E_INVAL;
+    std::vector<Module*> ms;
+    {
+        Registry& r = reg();
+        std::lock_guard<std::mutex> lk(r.mu);
+        ms = r.order;
+    }
+    int64_t total = 0;
+    int     n = 0;
+    for (Module* m : ms) {
+        std::lock_guard<std::mutex> lk(m->mu);
+        if (m->loaded_bytes[device] <= 0) continue;
+        total += m->loaded_bytes[device];
+        ++n;
+    }
+    if (bytes) *bytes = total;
+    if (modules) *modules = n;
+    return RAD_OK;
+}
+
 DeviceBackend g_aql;
 
 }  // namespace
@@ -4948,6 +4980,10 @@ int chain_marks(void* stream, unsigned* seen, unsigned n) {
 }  // namespace aql
 
 size_t aql_code_registered(void) { return a_code_mark(); }
+
+int aql_code_resident(int device, int64_t* bytes, int* modules) {
+    return a_code_resident(device, bytes, modules);
+}
 
 const DeviceBackend* aql_backend_if_present(void) {
     static const DeviceBackend* b = []() -> const DeviceBackend* {
@@ -5034,6 +5070,7 @@ const DeviceBackend* aql_backend_if_present(void) {
         g_aql.tape_record = a_tape_record;
         g_aql.code_mark = a_code_mark;
         g_aql.code_runs = a_code_runs;
+        g_aql.code_resident = a_code_resident;
         g_aql.tape_set_overlap = a_tape_set_overlap;
         g_aql.tape_destroy = a_tape_destroy;
         g_aql.stream_gate = a_stream_gate;

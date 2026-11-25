@@ -2502,14 +2502,14 @@ uint8_t stamp_byte(rad_weight w, size_t i) {
     v ^= v >> 15; v *= 0x2C1B3C6Du; v ^= v >> 12; v *= 0x297A2D39u; v ^= v >> 15;
     return (uint8_t)v;
 }
-int stamp_units(LoanRig& r, bool check, int* bad) {
+int stamp_units_impl(Mover& m, const Fixture& f, const Plan& p, bool check, int* bad) {
     RadStream s = nullptr;
     RAD_TRY(rad_stream_create(&s, 0));
     std::vector<uint8_t> buf;
-    for (const MoveUnit& mu : r.hf.plan.units)
+    for (const MoveUnit& mu : p.units)
         for (rad_weight w : mu.weights) {
-            const size_t n = (size_t)r.hf.f.prog.weights[w].logical_bytes;
-            void* at = r.m.residency()->lookup(w)->ptr;
+            const size_t n = (size_t)f.prog.weights[w].logical_bytes;
+            void* at = m.residency()->lookup(w)->ptr;
             buf.resize(n);
             if (check) {
                 RAD_TRY(rad_memcpy_async(buf.data(), at, (int64_t)n, s));
@@ -2524,6 +2524,10 @@ int stamp_units(LoanRig& r, bool check, int* bad) {
         }
     rad_stream_destroy(s);
     return RAD_OK;
+}
+/* The two rigs below (LoanRig, MirrorRig) both carry a mover over a HeatFixture. */
+int stamp_units(LoanRig& r, bool check, int* bad) {
+    return stamp_units_impl(r.m, r.hf.f, r.hf.plan, check, bad);
 }
 /* A full loan, every unit stamped, then one swap whose budgeted victim finds the pool full: the
  * promotion lands in a working slot and the victim takes the host copy of a lent unit. */
@@ -3631,6 +3635,151 @@ TEST(mover_reserves_from_the_weight_pool_rather_than_beside_it) {
     CHECK(pools.host_pinned().ok());
     for (rad_weight w = 1; (size_t)w < hf.f.prog.weights.size(); ++w)
         CHECK(m.residency()->lookup(w)->ptr != nullptr);
+}
+
+namespace {
+/* A pool-backed mover over the heat fixture: the path Engine::load_weights drives, where the host
+ * pool's budget (and not a test allocation) is what the mirror is sized against. */
+struct MirrorRig {
+    HeatFixture hf;
+    Pools       pools;
+    Mover       m;
+    HeatEngine  h;
+    RadStream   compute = nullptr;
+    ComputeWork work;
+    int         d = 0;
+
+    ~MirrorRig() {
+        if (compute) {
+            rad_stream_sync(compute);
+            rad_stream_destroy(compute);
+        }
+    }
+
+    int build(int host_pool_mib) {
+        Config c = hf.cfg;
+        c.vram_kv_mib = 16;
+        c.host_pool_mib = host_pool_mib;
+        RAD_TRY(pools.configure(c, /*vram_capacity=*/0, &rad_malloc_allocator(),
+                                &rad_malloc_allocator()));
+        RAD_TRY(m.init(hf.f.prog, hf.plan, MoverConfig{}, &pools));
+        RAD_TRY(h.init(hf.plan, HeatParams{}));
+        RAD_TRY(rad_stream_create(&compute, 0));
+        return m.bind_compute_stream(compute);
+    }
+    /* One dispatch: retire what landed, run the step's reads, balance. */
+    int dispatch() {
+        RAD_TRY(m.begin_dispatch((uint64_t)d++, &h));
+        work.run(compute);
+        return m.balance(&h);
+    }
+    /* One dispatch that also lets the heat engine decide, and issues what it asks for. */
+    int step(const int32_t* ids, const int32_t* counts, int n) {
+        RAD_TRY(m.begin_dispatch((uint64_t)d++, &h));
+        work.run(compute);
+        h.observe_ids(0, ids, counts, (uint32_t)n);
+        std::vector<Swap> sw;
+        RAD_TRY(h.step(&sw));
+        for (const Swap& s : sw) m.issue(s, &h);   /* a swap that cannot go out is a no-op */
+        return RAD_OK;
+    }
+    /* A unit the plan put in VRAM that is not there any more: what a swap's demotion moved. */
+    int32_t demoted() {
+        for (int32_t u = 0; u < (int32_t)hf.plan.units.size(); ++u)
+            if (hf.plan.units[(size_t)u].movable && hf.plan.units[(size_t)u].tier == Tier::VRAM &&
+                h.tier(u) != Tier::VRAM)
+                return u;
+        return -1;
+    }
+};
+int stamp_units(MirrorRig& r, bool check, int* bad) {
+    return stamp_units_impl(r.m, r.hf.f, r.hf.plan, check, bad);
+}
+}  /* namespace */
+
+/* M-01: the host pool holds a slot for every unit of a class it has room for, and the load writes
+ * the resident units' bytes into them once (Mover::fill_mirrors). A demotion of such a unit is a
+ * change of address, and a promotion back into a budgeted slot keeps the slot, so a unit goes back
+ * to the same address without a byte crossing the link -- the d2h the exit report and /stats
+ * experts count, and the "starved of a pool slot" a long-context run reported 17,897 times. */
+TEST(a_mirrored_unit_is_demoted_and_promoted_without_a_copy_off_the_card) {
+    MirrorRig r;
+    CHECK_OK(r.build(/*host_pool_mib=*/64));
+    /* Four experts resident and four pooled, and room for all eight: every unit has a slot. */
+    CHECK_EQ(r.m.mirror_slots(), (int64_t)4);
+    CHECK(r.pools.host_pinned().ok());
+
+    /* The load: bytes stamped where the units stand, then the fill that ends load_weights. */
+    CHECK_OK(stamp_units(r, false, nullptr));
+    CHECK_OK(r.m.fill_mirrors());
+
+    /* Experts 4-7 are wanted and none of them is resident: the swap that brings one in demotes a
+     * resident, and that demotion must not copy. */
+    const int32_t ids[4] = {4, 5, 6, 7};
+    const int32_t counts[4] = {10, 10, 10, 10};
+    int32_t gone = -1;
+    for (Deadline dl; gone < 0 && !dl.passed();) {
+        CHECK_OK(r.step(ids, counts, 4));
+        gone = r.demoted();
+    }
+    REQUIRE(gone >= 0);
+    for (Deadline dl; any_busy(r.h, r.hf.plan) && !dl.passed();) CHECK_OK(r.dispatch());
+    int bad = 0;
+    CHECK_OK(stamp_units(r, true, &bad));
+    CHECK_EQ(bad, 0);       /* its bytes are where its residency entry now says: the mirror slot */
+    const void* const mirror = r.m.unit_base(gone);
+    CHECK_EQ(r.m.stats().d2h_bytes, (uint64_t)0);    /* nothing crossed the link */
+    CHECK(r.m.stats().dropped >= (uint64_t)1);        /* the demotion was a drop */
+
+    /* Hot again: the engine promotes it into the slot the demotion freed, a budgeted one, and the
+     * mirror slot stays its own (the class's pool covers every unit), so its next demotion lands
+     * on the same bytes. */
+    const int32_t one[1] = { r.hf.plan.units[(size_t)gone].expert };
+    const int32_t ten[1] = { 10 };
+    for (Deadline dl; r.h.tier(gone) != Tier::VRAM && !dl.passed();) CHECK_OK(r.step(one, ten, 1));
+    REQUIRE_EQ(r.h.tier(gone), Tier::VRAM);
+    for (Deadline dl; any_busy(r.h, r.hf.plan) && !dl.passed();) CHECK_OK(r.dispatch());
+    CHECK(r.m.unit_base(gone) != mirror);
+    CHECK_EQ(r.m.stats().d2h_bytes, (uint64_t)0);
+
+    for (Deadline dl; r.h.tier(gone) == Tier::VRAM && !dl.passed();)
+        CHECK_OK(r.step(ids, counts, 4));
+    REQUIRE(r.h.tier(gone) != Tier::VRAM);
+    for (Deadline dl; any_busy(r.h, r.hf.plan) && !dl.passed();) CHECK_OK(r.dispatch());
+    CHECK_EQ(r.m.unit_base(gone), mirror);           /* the same pool slot, kept while resident */
+    CHECK_EQ(r.m.stats().d2h_bytes, (uint64_t)0);
+    bad = 0;
+    CHECK_OK(stamp_units(r, true, &bad));
+    CHECK_EQ(bad, 0);
+}
+
+/* M-01: the other term of the sizing. A class the host pool cannot cover gets min(units,
+ * room/stride) slots, and hands them back on promotion, so the units past the room still turn
+ * over through the pool as they did before the mirror. */
+TEST(the_mirror_takes_only_the_room_the_host_pool_has) {
+    /* A 7 MiB host pool over four pooled and four resident experts: 4 MiB for the pooled units
+     * leaves 3 MiB, so two of the four residents are mirrored, not four. */
+    MirrorRig r;
+    CHECK_OK(r.build(/*host_pool_mib=*/7));
+    CHECK_EQ(r.m.mirror_slots(), (int64_t)2);
+    CHECK(r.pools.host_pinned().ok());
+    CHECK(r.pools.host_pinned().used() <= (int64_t)7 * MiB);
+    CHECK(r.pools.host_pinned().avail() > 0);
+
+    CHECK_OK(stamp_units(r, false, nullptr));
+    CHECK_OK(r.m.fill_mirrors());
+
+    /* Two residents have a slot and two do not. Over rounds of swaps the two without one are
+     * demoted too, and their demotion copies (d2h) into a pool slot a promotion handed back. */
+    const int32_t ids[4] = {4, 5, 6, 7};
+    const int32_t counts[4] = {10, 10, 10, 10};
+    for (Deadline dl; (r.m.stats().demotions < 4 || r.m.stats().d2h_bytes == 0) && !dl.passed();)
+        CHECK_OK(r.step(ids, counts, 4));
+    CHECK(r.m.stats().demotions >= (uint64_t)4);
+    CHECK(r.m.stats().d2h_bytes > (uint64_t)0);
+    int bad = 0;
+    CHECK_OK(stamp_units(r, true, &bad));
+    CHECK_EQ(bad, 0);
 }
 
 TEST(mover_declines_to_move_under_a_static_plan) {

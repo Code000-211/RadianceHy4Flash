@@ -1,4 +1,4 @@
-/* abi_layout_table.h -- every abi/ struct's size and field offsets at RAD_ABI_VERSION 44 and
+/* abi_layout_table.h -- every abi/ struct's size and field offsets at RAD_ABI_VERSION 45 and
  * RAD_FORMAT_VER 2, as { type, field, offset, size } rows ("" is the struct itself). A snapshot
  * of the headers on x86-64 Linux, which abi_layout_test.cpp holds the layout to; regenerate it
  * from the test's printout only together with a version bump. */
@@ -240,11 +240,13 @@
 { "RadAudioGenDecl", "ref_max", 272, 4 },
 { "RadAudioGenDecl", "tmpl_ref_instruct", 280, 8 },
 { "RadAudioGenDecl", "neg_tmpl_ref", 288, 8 },
-{ "RadControlVector", "", 0, 32 },
+{ "RadControlVector", "", 0, 48 },
 { "RadControlVector", "dir", 0, 8 },
 { "RadControlVector", "scales", 8, 8 },
 { "RadControlVector", "n_embd", 16, 8 },
 { "RadControlVector", "n_layers", 24, 8 },
+{ "RadControlVector", "rank", 32, 8 },
+{ "RadControlVector", "per_stream", 40, 8 },
 { "RadAudioFormat", "", 0, 72 },
 { "RadAudioFormat", "struct_size", 0, 4 },
 { "RadAudioFormat", "audio_open", 8, 8 },
