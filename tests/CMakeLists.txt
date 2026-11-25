@@ -49,7 +49,10 @@ set(RAD_TESTS_WITH_LEGACY chatparse_test chatparse_gemma4_test)
 # r4d_ar_links_test checks libr4d's header-only link reader, so it needs only the include path.
 # relayout_iqr_test holds the IQR relayout to the stored form r4d_iqr.h describes, so it also
 # compiles r4d_iqr_layout.cpp.
-set(RAD_TESTS_WITH_R4D_HOST relayout_parity_test r4d_ar_links_test relayout_iqr_test)
+# r4d_fuse_test holds the chains libr4d's fused rows declare (r4d_fuse.cpp) to their steps' ops and
+# operands, and the operand descriptions those rows publish (r4d_shapes.cpp) to what their kernels
+# accept, so it compiles both.
+set(RAD_TESTS_WITH_R4D_HOST relayout_parity_test r4d_ar_links_test relayout_iqr_test r4d_fuse_test)
 # Their relayouts' vector loops, at every CPU level (libr4d/r4d_hsimd.h), built for these tests
 # whether or not libr4d itself is.
 include(${CMAKE_SOURCE_DIR}/cmake/RadSimdLevels.cmake)
@@ -241,6 +244,14 @@ foreach(t ${RAD_TESTS})
     endif()
     if(n STREQUAL relayout_iqr_test)
       target_sources(${n} PRIVATE ${CMAKE_SOURCE_DIR}/libr4d/r4d_iqr_layout.cpp)
+    endif()
+    # r4d_fuse_test calls libr4d's `replaces` hooks: the chains a fused row publishes, which is
+    # what r4d_selftest and rad-kbench's fusion oracle declare and run (abi/rad_abi.h, RadFuseFn).
+    # It also asks the row's `opd_shape` hook (r4d_shapes.cpp) for its operands, as rad-kbench draws
+    # them, and holds the answers to what the kernel's own checks require.
+    if(n STREQUAL r4d_fuse_test)
+      target_sources(${n} PRIVATE ${CMAKE_SOURCE_DIR}/libr4d/r4d_fuse.cpp
+                                  ${CMAKE_SOURCE_DIR}/libr4d/r4d_shapes.cpp)
     endif()
   elseif(n IN_LIST RAD_TESTS_WITH_PACK)
     add_executable(${n} ${t} ${CMAKE_SOURCE_DIR}/arch/minimaxh3/rad_ref2va_pack.cpp)
@@ -645,11 +656,14 @@ set(R4D_EMU_HIP ${R4D_DIR}/r4d_attn_paged_window.hip ${R4D_DIR}/r4d_pair_argmax_
 list(APPEND R4D_EMU_HIP ${R4D_DIR}/r4d_attn_kv_sink_h256.hip)
 list(APPEND R4D_EMU_HIP ${R4D_DIR}/r4d_ihc_bf16.hip ${R4D_DIR}/r4d_engram_bf16.hip
                         ${R4D_DIR}/r4d_mla_kv_bf16.hip ${R4D_DIR}/r4d_dfly.hip
+                        ${R4D_DIR}/r4d_idx_pool_gated_f32.hip ${R4D_DIR}/r4d_qsa_work_bf16.hip
+                        ${R4D_DIR}/r4d_qsa_tail_store_bf16.hip
+                        ${R4D_DIR}/r4d_qsa_work_pool_tail_bf16.hip
                         ${R4D_DIR}/r4d_model_bf16.hip ${R4D_DIR}/r4d_rowtopk_bf16.hip
                         ${R4D_DIR}/r4d_idx_score_bf16.hip)
 set(R4D_EMU_TESTS attn pick norm escale qsa lora f32 mhc kda mla moefuse kvres
                   dsa lili vit)
-list(APPEND R4D_EMU_TESTS attn_kv_sink hy4 mla_sink mla_kv row topk)
+list(APPEND R4D_EMU_TESTS attn_kv_sink hy4 mla_sink mla_kv idxpool qsafront row topk)
 set(R4D_EMU_BUILT OFF)
 if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$")
   # No fiber switch for this ISA.
@@ -695,7 +709,8 @@ else()
                 ${R4D_EMU}/test_dsa.cpp ${R4D_EMU}/test_lili.cpp
                 ${R4D_EMU}/test_vit.cpp ${R4D_EMU}/test_attn_kv_sink.cpp
                 ${R4D_EMU}/test_hy4.cpp ${R4D_EMU}/test_mla_sink.cpp
-                ${R4D_EMU}/test_mla_kv.cpp ${R4D_EMU}/test_row.cpp ${R4D_EMU}/test_topk.cpp)
+                ${R4D_EMU}/test_mla_kv.cpp ${R4D_EMU}/test_idxpool.cpp
+                ${R4D_EMU}/test_qsafront.cpp ${R4D_EMU}/test_row.cpp ${R4D_EMU}/test_topk.cpp)
       get_filename_component(stem ${src} NAME_WE)
       set(lang "")
       if(src MATCHES "\\.hip$")
@@ -732,8 +747,8 @@ else()
   endif()
 endif()
 if(R4D_EMU_BUILT)
-  foreach(t pick norm escale qsa lora f32 mhc kda mla moefuse kvres dsa lili vit hy4 mla_sink mla_kv
-            row topk)
+  foreach(t pick norm escale qsa lora f32 mhc kda mla moefuse kvres dsa lili vit hy4 mla_sink
+            mla_kv idxpool qsafront row topk)
     add_test(NAME r4d_emu_${t} COMMAND ${CMAKE_BINARY_DIR}/tests/r4d_emu_${t})
   endforeach()
   # Hy4-flash's non-absorbed prefill (attn_kv_sink_h256): about 4 s.
@@ -753,7 +768,14 @@ if(R4D_EMU_BUILT)
   # load one -- expand bit for bit, shrink to its bound. kda_update is held to libref's within
   # rounding, and that test needs it.
   # r4d_emu_mla_kv: the kv_b projections on WMMA against libref, their law and the fused gate.
+  # r4d_emu_idxpool: the compressed indexer's gated pool against libref, byte for byte, with the
+  # dead-page early-out's fixtures.
   set_tests_properties(r4d_emu_mla_kv PROPERTIES LABELS "r4d_emu" TIMEOUT ${RAD_TEST_TIMEOUT})
+  set_tests_properties(r4d_emu_idxpool PROPERTIES LABELS "r4d_emu" TIMEOUT ${RAD_TEST_TIMEOUT})
+  # r4d_emu_qsafront: the fused key side against the three ops it replaces (qsa_work ->
+  # idx_pool_gated -> qsa_tail_store), byte for byte, with the tail's alias bound on both sides of
+  # its edge. No libref: the three ops are the oracle.
+  set_tests_properties(r4d_emu_qsafront PROPERTIES LABELS "r4d_emu" TIMEOUT ${RAD_TEST_TIMEOUT})
   # r4d_emu_row: mla_row_norm_rope_store's fused norm / rope / kv_store against the chain the three
   # ops make, byte for byte, over plain and imrope rotary, both gain dtypes, padding slots, a
   # chained call and a rotary wider than a block.
@@ -761,7 +783,7 @@ if(R4D_EMU_BUILT)
   # r4d_emu_topk: row_topk's one- and two-launch forms and cast_row_topk against the cast then
   # row_topk, byte for byte, and the cast's rounding over every f32 pattern.
   set_tests_properties(r4d_emu_topk PROPERTIES LABELS "r4d_emu" TIMEOUT ${RAD_TEST_TIMEOUT})
-  set_tests_properties(r4d_emu_lora r4d_emu_kda r4d_emu_hy4 r4d_emu_mla_kv PROPERTIES
+  set_tests_properties(r4d_emu_lora r4d_emu_kda r4d_emu_hy4 r4d_emu_mla_kv r4d_emu_idxpool PROPERTIES
                        ENVIRONMENT "RADIANCE_HOME=${CMAKE_BINARY_DIR}/radiance_home")
   # A seeded random sweep, mostly prefill shapes on the WMMA kernel, which the emulator runs at
   # about 2 s a case: `slow`. `r4d_emu_attn sweep 200` is a longer run by hand, a superset of it.
