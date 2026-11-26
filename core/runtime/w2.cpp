@@ -339,8 +339,13 @@ void Ctx::w2_serve(W2State& x) {
         }
         /* The done word counts the units as they land (RAD_W2_DONE), so a tail that comes before
          * the list's end still reads from the ring what is there. */
+        /* w2-explore, RADIANCE_W2_NO_YIELD=1: the list does not wait for a stream's hold of the link. */
+        static const unsigned no_yield = [] {
+            const char* v = std::getenv("RADIANCE_W2_NO_YIELD");
+            return v && *v && *v != '0' ? (unsigned)RAD_XP_NO_YIELD : 0u;
+        }();
         if (rad_xp_list(x.device, nullptr, n, src, dst, bytes, x.done + g * kW2DoneStride, RAD_W2_DONE(seq, 0),
-                        RAD_XP_DONE_EACH) == RAD_OK) {
+                        RAD_XP_DONE_EACH | no_yield) == RAD_OK) {
             x.lists.fetch_add(1, std::memory_order_relaxed);
             x.units.fetch_add(n, std::memory_order_relaxed);
         } else {
