@@ -655,6 +655,36 @@ TEST(the_engine_s_queues_come_off_the_card_before_the_split) {
     CHECK(unclaimed < 114 * MiB);
 }
 
+/* Engine::plan's queue probe: free VRAM before it and after each stream it opens. A kept queue
+ * costs nothing; the runtime's one-time 140 MiB lands on the first fresh queue that has room, which
+ * in a start that found the card still full is one of the probe's (notes/backlog/measurements/
+ * vram-queue-probe.md: 175.37 MiB instead of 35.37 MiB, one start in eight). The smaller of two
+ * fresh drops is the queue. */
+TEST(the_queue_probe_takes_the_smaller_fresh_drop) {
+    const int64_t MiB = 1LL << 20, q = 35 * MiB + 380 * 1024, once = 140 * MiB;
+    const int64_t f0 = 32317 * MiB;
+    /* A kept queue first (no drop), then two fresh ones: the normal start. */
+    QueueProbe a = vram_queue_cost({ f0, f0, f0 - q, f0 - 2 * q });
+    CHECK_EQ(a.fresh, 2);
+    CHECK_EQ(a.bytes, q);
+    /* The one-time allocation on the first fresh queue, or on the second: the queue either way. */
+    QueueProbe b = vram_queue_cost({ f0, f0, f0 - q - once, f0 - 2 * q - once });
+    CHECK_EQ(b.fresh, 2);
+    CHECK_EQ(b.bytes, q);
+    QueueProbe c = vram_queue_cost({ f0, f0 - q, f0 - 2 * q - once });
+    CHECK_EQ(c.bytes, q);
+    /* Reading noise of a kept queue (the counters move by tens of KiB) is not a queue. */
+    QueueProbe d = vram_queue_cost({ f0, f0 - 64 * 1024, f0 + 32 * 1024 });
+    CHECK_EQ(d.fresh, 0);
+    CHECK_EQ(d.bytes, 0);
+    /* One fresh queue is what there is: taken as it is, as before. */
+    QueueProbe e = vram_queue_cost({ f0, f0 - q });
+    CHECK_EQ(e.fresh, 1);
+    CHECK_EQ(e.bytes, q);
+    CHECK_EQ(vram_queue_cost({}).fresh, 0);
+    CHECK_EQ(vram_queue_cost({ f0 }).bytes, 0);
+}
+
 /* The runtime keeps queue scratch resident once a kernel with a private segment has run
  * (rad_dev_resident_scratch_bytes); it is part of the hardware queues' term, the largest rank's. */
 TEST(resident_queue_scratch_is_charged_with_the_hardware_queues) {
