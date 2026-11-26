@@ -8197,6 +8197,8 @@ static void iqr_dual_case(const Plugin& pl, const IqrCase& f, int64_t M, int64_t
     dfree_all();
 }
 
+#include "r4d_selftest_w2.h"   /* moe_w2_split_case: a routed GEMM split under W2 */
+
 /* moe_gemm_iqr against the dense IQR GEMM over the same expert buffers. Every expert is an IQR
  * weight (the computed trellis under one f32 scale a row, `run` rows a trellis run), in two classes
  * of their own rows and K; the routing is random with `drop` trailing dropped slots. The grouped
@@ -8263,6 +8265,7 @@ static void moe_iqr_case(const Plugin& pl, const MoeIqrShape& sh) {
                                  PI("K_odd", Kc[1]), PI("group", 128), PS("dtype", "i8a8h"),
                                  PI("parts", sh.parts) };
     std::vector<void*> d_w((size_t)E), d_s((size_t)E);
+    std::vector<size_t> w_bytes((size_t)E, 0);
     RadLayout lw[2], ls[2];
     for (int64_t e = 0; e < E; ++e) {
         const int q = (int)(e & 1);
@@ -8314,6 +8317,7 @@ static void moe_iqr_case(const Plugin& pl, const MoeIqrShape& sh) {
         }
         d_w[(size_t)e] = dalloc(wq.size());
         d_s[(size_t)e] = dalloc(wsc.size());
+        w_bytes[(size_t)e] = wq.size();
         if (!d_w[(size_t)e] || !d_s[(size_t)e]) { ok(nm, false, "hipMalloc failed"); dfree_all(); return; }
         st_memcpy(d_w[(size_t)e], wq.data(), wq.size(), hipMemcpyHostToDevice);
         st_memcpy(d_s[(size_t)e], wsc.data(), wsc.size(), hipMemcpyHostToDevice);
@@ -8379,6 +8383,10 @@ static void moe_iqr_case(const Plugin& pl, const MoeIqrShape& sh) {
     if (rq != RAD_OK) { ok(nm, false, "rc " + std::to_string(rq)); dfree_all(); return; }
     std::vector<uint16_t> y((size_t)(Tr * N));
     st_memcpy(y.data(), d_y, y.size() * 2, hipMemcpyDeviceToHost);
+    /* The same launch split under W2 (the decode grid's shapes): the plain bytes in two launches. */
+    moe_w2_split_case(nm, r, ts, ps, d_y, off, E, Tr, N, !sh.sorted, [&](int64_t e) {
+        return std::make_pair(d_w[(size_t)e], w_bytes[(size_t)e]);
+    });
 
     /* The reference, a run's rows at a time through the dense row over the same buffers. */
     std::vector<float> want((size_t)(Tr * N), 0.0f);
@@ -26436,6 +26444,14 @@ static void moe_w4_gemm(const Plugin& pl, int64_t Tr, const MoeW4Shape& sh, int 
      * inside the decode band. */
     const int64_t map_bytes = (1 + 2 * (ne + Tr / 16 + 2)) * 4;
     void* d_map = dalloc((size_t)map_bytes);
+    /* The down projection against an int8 activation (the engine's routed down at decode), split
+     * under W2: the plain bytes in two launches. A class's experts are stacked in one plane. */
+    if (act8 == 1 && sh.sorted_a && sh.parts == 1)
+        moe_w2_split_case(what, r, ts, ps, d_y, off, ne, Tr, N, false, [&](int64_t e) {
+            const int c = (int)(e & 1);
+            const size_t per = wq[c].size() / (size_t)nec[c];
+            return std::make_pair((void*)((char*)d_w[c] + (size_t)(e / 2) * per), per);
+        });
 
     /* The reference, once: every form must reproduce it. Rows are independent. */
     std::vector<double> ref((size_t)(Tr * N), 0.0);
@@ -39168,7 +39184,11 @@ static void device_phase(const Plugin& pl) {
                 { "prefill down", 6, 16, 256, 8, 2, 96, 512, 512, 256, 256, 1, true, 0 },
                 { "prefill down", 2, 15, 256, 8, 2, 96, 512, 512, 256, 256, 1, true, 0 },
             };
+            const int w2_before = g_w2_split;
             for (const MoeIqrShape& sh : kIqr) moe_iqr_case(pl, sh);
+            /* The decode grid's shapes above took the W2 split (r4d_selftest_w2.h). */
+            ok("moe_gemm_iqr: W2 split launches ran on the decode grid", g_w2_split - w2_before >= 8,
+               fmt("%d shapes split, %d did not read the operand", g_w2_split - w2_before, g_w2_whole));
             /* a large prefill pass: the packed map's bytes against the run map's, at four bits and
              * at three (Hy4-flash's routed gate_up) */
             moe_iqr_pack_case(pl, 2048, false);
@@ -39195,6 +39215,7 @@ static void device_phase(const Plugin& pl) {
             moe_down_mt_case(pl, 4096);
             moe_down_mt_case(pl, 8192);
         }
+        const int w2_before8 = g_w2_split;
         for (const MoeW4Shape& sh : kShapes8)
             for (const int64_t t : { (int64_t)24, (int64_t)200, (int64_t)600 }) {
                 /* And the activation's scale per 256 of K where every class's K is whole ones. */
@@ -39207,6 +39228,12 @@ static void device_phase(const Plugin& pl) {
                     if (w8 || w8m) moe_w4_gemm(pl, t, sh, 0, false, w8m, 2, 2, ag);
                 }
             }
+        /* The down shapes inside the decode band took the W2 split (r4d_selftest_w2.h). */
+        if (w4 || w4m)
+            ok("moe_gemm_w4a8i8: W2 split launches ran on the sorted operand's decode kernel",
+               g_w2_split - w2_before8 >= 1,
+               fmt("%d launches split, %d did not read the operand so far", g_w2_split - w2_before8,
+                   g_w2_whole));
     }
 
     if (sel("glm_index_layout")) glm_index_layout_check(pl);

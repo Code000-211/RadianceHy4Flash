@@ -1569,6 +1569,14 @@ int rad_expert_prefetch_step(RadCtx* c, int layer) {
     return c ? static_cast<rad::Ctx*>(c)->xp_step(layer) : RAD_E_INVAL;
 }
 
+void* rad_expert_w2(RadCtx* c, int layer, const rad_weight* first, int64_t n_place, int64_t rows) {
+    return c ? static_cast<rad::Ctx*>(c)->w2_layer(layer, first, n_place, rows) : nullptr;
+}
+
+void rad_expert_w2_tail(RadCtx* c) {
+    if (c) static_cast<rad::Ctx*>(c)->w2_tail();
+}
+
 void* rad_weight_ptr(RadCtx* c, rad_weight w) {
     return c ? static_cast<rad::Ctx*>(c)->weight_ptr(w) : nullptr;
 }

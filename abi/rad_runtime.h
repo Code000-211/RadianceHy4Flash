@@ -1055,6 +1055,17 @@ int rad_expert_prefetch_mark(RadCtx* c);
 /* Ahead of `layer`'s routed GEMMs, on every routed layer of every pass. */
 int rad_expert_prefetch_step(RadCtx* c, int layer);
 
+/* "Weg 2" (rad_w2.h): the routed layer's control block for a pass of `rows` rows, a device
+ * pointer the block hands to the router (which plans in it), to the first routed GEMMs as `w2` and
+ * to the tail's as `w2_tail`; or null, and the block issues the layer as it always did -- the
+ * switch is off (the default), the pass is narrower than the form pays for, or the layer's tables
+ * are not bound yet. `first[x]` is place x's first weight (its gate_up codes), `n_place` the
+ * places the expert offsets and the weight tables index. The array must outlive the call only. */
+void* rad_expert_w2(RadCtx* c, int layer, const rad_weight* first, int64_t n_place, int64_t rows);
+/* Right in front of the tail's first launch of a layer rad_expert_w2 gave a block for: where the
+ * ring is ordinary device memory, that launch drops what the card's caches hold of it. */
+void  rad_expert_w2_tail(RadCtx* c);
+
 /* A weight's pointer, for the rare plugin-private kernel invoked outside the op vocabulary. Waits
  * on the mover. The weight may move afterwards, so the pointer is valid only within one issue. */
 void* rad_weight_ptr(RadCtx* c, rad_weight w);

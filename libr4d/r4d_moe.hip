@@ -47,6 +47,7 @@
 #include "r4d_launch.h"
 #include "r4d_moe_sort.h"
 #include "r4d_moe_gather.h"
+#include "r4d_w2.h"
 
 #include <hip/hip_bf16.h>
 
@@ -1558,8 +1559,13 @@ void moe_gemm_q_kernel(R4D_MOEGQ_PARAMS) {
     const MoeCls c_odd, const MoeCls c_2, const MoeCls c_3, const int32_t* __restrict__ off,    \
     uint16_t* __restrict__ Y, uint32_t T, uint32_t N, uint32_t n_expert, uint32_t G,            \
     uint32_t a_ld, uint32_t as_ld, uint32_t y_ld, uint32_t mode, const MoeTab tab
-template <int W4, bool I8 = false>
-__device__ __forceinline__ void moe_down_dec_body(R4D_MOEDD_PARAMS) {
+/* W2 (abi/rad_w2.h): `w2` is the layer's control block and `mode` bit 5 the tail. The first pass
+ * serves the resident experts' tiles (and zeroes the rows past the live count), the tail the
+ * misses', each from the ring where its copy has landed; a block of the other kind returns behind
+ * its search. An expert's tiles, and so its bytes, are the one launch's. */
+constexpr uint32_t kModeW2Tail = 32u;
+template <int W4, bool I8 = false, bool W2 = false>
+__device__ __forceinline__ void moe_down_dec_body(R4D_MOEDD_PARAMS, const RadW2Layer* w2 = nullptr) {
     constexpr bool UW = true;
     constexpr uint32_t FM = 16, FN = 64, FK = kFK, NTHR = 4 * kWave;
     constexpr uint32_t kSub = W4 == 3 ? 4u : (W4 == 2 || W4 == 4 || W4 == 5) ? 2u : 1u;
@@ -1590,6 +1596,7 @@ __device__ __forceinline__ void moe_down_dec_body(R4D_MOEDD_PARAMS) {
     /* The last block owns no run: it zeroes every column of the rows past the live count (dropped
      * slots, or protected experts' rows their own GEMM writes afterwards). */
     if (blockIdx.x == gridDim.x - 1) {
+        if constexpr (W2) { if (mode & kModeW2Tail) return; }
         const uint32_t live = (uint32_t)off[n_expert];
         for (uint32_t r = live; r < T; ++r)
             for (uint32_t c = cg0 + tid; c < cend; c += NTHR) Y[(size_t)r * y_ld + c] = 0;
@@ -1616,6 +1623,10 @@ __device__ __forceinline__ void moe_down_dec_body(R4D_MOEDD_PARAMS) {
 #pragma unroll
     for (uint32_t k = 0; k < NPT; ++k) {
         nt[k] = tid * NPT + k < n_expert ? (ov[k + 1] - ov[k] + FM - 1) / FM : 0u;
+        /* W2's tail numbers the misses' tiles alone: its grid holds no more. */
+        if constexpr (W2) {
+            if ((mode & kModeW2Tail) && !r4d_w2::in_tail(w2, tid * NPT + k)) nt[k] = 0u;
+        }
         cnt += nt[k];
     }
     const uint32_t inc = (uint32_t)wave_incl_scan_i32((int32_t)cnt, lane);
@@ -1658,6 +1669,14 @@ __device__ __forceinline__ void moe_down_dec_body(R4D_MOEDD_PARAMS) {
     const uint32_t K = C.k, w_ld = C.w_ld, ws_ld = C.s_ld;
     const uint8_t*  Wp0  = wtab_at(C.w, C.w_s0, e >> cshift);
     const uint16_t* Wsp0 = (const uint16_t*)wtab_at(C.s, C.s_s0, e >> cshift);
+    if constexpr (W2) {
+        const bool tail = (mode & kModeW2Tail) != 0u;
+        if (!r4d_w2::mine(w2, e, tail)) return;       /* the table entries are loaded beside it */
+        if (tail) {
+            Wp0  = (const uint8_t*)r4d_w2::where(w2, e, Wp0);
+            Wsp0 = (const uint16_t*)r4d_w2::where(w2, e, Wsp0);
+        }
+    }
     const uint8_t*  Wp   = uw_ptr<UW>(Wp0);
     const uint16_t* Wsp  = uw_ptr<UW>(Wsp0);
 
@@ -1877,6 +1896,15 @@ void moe_down_dec_kernel(R4D_MOEDD_PARAMS) {
     if (CH::on) r4d_chain_wait();
     moe_down_dec_body<W4, I8>(Aq, As, c_even, c_odd, c_2, c_3, off, Y, T, N, n_expert, G, a_ld,
                               as_ld, y_ld, mode, tab);
+    if (CH::on) r4d_chain_done();
+}
+/* The W2 form: a kernel of its own, so a launch without the operand is the instantiation above. */
+template <int W4, bool I8, class CH>
+__global__ __launch_bounds__(4 * kWave)
+void moe_down_dec_w2_kernel(R4D_MOEDD_PARAMS, const RadW2Layer* w2) {
+    if (CH::on) r4d_chain_wait();
+    moe_down_dec_body<W4, I8, true>(Aq, As, c_even, c_odd, c_2, c_3, off, Y, T, N, n_expert, G,
+                                    a_ld, as_ld, y_ld, mode, tab, w2);
     if (CH::on) r4d_chain_done();
 }
 #undef R4D_MOEDD_PARAMS
@@ -2911,6 +2939,13 @@ static int moe_gemm_launch(const RadArgs* a, RadStream stream, int ncls = 2) {
                                 ncls == 4 ? r4d_opt(a, 9) : nullptr,
                                 ncls == 4 ? r4d_opt(a, 11) : nullptr };
     const RadTensor* Y      = r4d_opt(a, ncls == 4 ? 12 : 8);
+    /* `w2` / `w2_tail` (optional, behind split): the layer's W2 control block, on the first pass
+     * or on the tail (abi/rad_w2.h). Read by the sorted operand's decode kernel alone; any other
+     * form runs every expert on both launches, which writes the same bytes twice. */
+    const RadTensor* w2o    = r4d_opt(a, ncls == 4 ? 14 : 10);
+    const RadTensor* w2t    = r4d_opt(a, ncls == 4 ? 15 : 11);
+    const bool  w2_tail = w2t && w2t->data;
+    const void* w2p = w2_tail ? w2t->data : (w2o && w2o->data ? w2o->data : nullptr);
     if (!Aq || !As || !sorted || !off || !Y) return R4D_NO(RAD_E_INVAL);
     for (int q = 0; q < ncls; ++q)
         if (!Wc[q] || !Wsc[q]) return R4D_NO(RAD_E_INVAL);
@@ -3101,7 +3136,18 @@ static int moe_gemm_launch(const RadArgs* a, RadStream stream, int ncls = 2) {
                                (const int32_t*)off->data, (uint16_t*)Y->data,                    \
                                (uint32_t)T, (uint32_t)N, (uint32_t)n_expert, (uint32_t)g2,       \
                                (uint32_t)a_ld, (uint32_t)as_ld, (uint32_t)y_ld, mode, tabv)
-            if (chain) R4D_MOE_DD(r4dchain); else R4D_MOE_DD(R4dUnchained);
+#define R4D_MOE_DW(CH_)                                                                          \
+            emit_rc = R4D_EMIT(stream, (moe_down_dec_w2_kernel<W4, I8, CH_>),                    \
+                               dim3((w2_tail ? std::min(slots, rad_w2_tail_tiles((uint32_t)T))   \
+                                             : slots) + 1u, groups), dim3(4 * kWave), 0,         \
+                               (const uint8_t*)Aq->data, (const float*)As->data, ce, co, c2, c3, \
+                               (const int32_t*)off->data, (uint16_t*)Y->data,                    \
+                               (uint32_t)T, (uint32_t)N, (uint32_t)n_expert, (uint32_t)g2,       \
+                               (uint32_t)a_ld, (uint32_t)as_ld, (uint32_t)y_ld,                  \
+                               mode | (w2_tail ? kModeW2Tail : 0u), tabv, (const RadW2Layer*)w2p)
+            if (w2p) { if (chain) R4D_MOE_DW(r4dchain); else R4D_MOE_DW(R4dUnchained); }
+            else if (chain) R4D_MOE_DD(r4dchain); else R4D_MOE_DD(R4dUnchained);
+#undef R4D_MOE_DW
 #undef R4D_MOE_DD
             if (emit_rc != RAD_OK) return emit_rc;
             R4D_MOE_CHK();
