@@ -204,21 +204,49 @@ inline std::pair<bool, const GbnfElement*> match_char(const GbnfElement* pos, ui
     return { found == is_positive, pos };
 }
 
+/* The code points a partial sequence can still finish as, by well-formed UTF-8 (Unicode Table 3-7:
+ * no overlong form, no surrogate, nothing past U+10FFFF). False when there are none. A head with no
+ * continuation byte yet is where the table cuts inside the bits' natural range (E0 needs A0-BF,
+ * ED 80-9F, F0 90-BF, F4 80-8F); past the second byte every cut is aligned, so a sequence the
+ * decoder let through finishes anywhere in its range. The decoder checks each step against the
+ * range of the state it started from (utf8_may_go_on), since a state alone does not say how long
+ * its sequence is (E0 9F and DF both carry 0x1F with one byte to go). */
+inline bool utf8_range(PartialUtf8 p, uint32_t* lo, uint32_t* hi) {
+    if (p.n_remain < 0) return false;
+    if (p.n_remain == 0) { *lo = *hi = p.value; return true; }
+    uint64_t low  = (uint64_t)p.value << (p.n_remain * 6);
+    uint64_t high = low | ((1ull << (p.n_remain * 6)) - 1);
+    if (p.n_remain == 1) low = std::max<uint64_t>(low, 0x80);
+    if (p.n_remain == 2) {
+        low = std::max<uint64_t>(low, 0x800);
+        if (p.value == 0xD) high = std::min<uint64_t>(high, 0xD7FF);     /* ED: no surrogates */
+    }
+    if (p.n_remain == 3) low = std::max<uint64_t>(low, 0x10000);
+    high = std::min<uint64_t>(high, 0x10FFFF);
+    if (low > high || (low >= 0xD800 && high <= 0xDFFF)) return false;
+    *lo = (uint32_t)low;
+    *hi = (uint32_t)high;
+    return true;
+}
+
+/* Whether a sequence carried as `from` may go on as `to`, the same sequence some continuation
+ * bytes later (`to.n_remain` 0: finished, `to.value` the code point). */
+inline bool utf8_may_go_on(PartialUtf8 from, PartialUtf8 to) {
+    uint32_t flo, fhi, tlo, thi;
+    if (!utf8_range(from, &flo, &fhi) || to.n_remain < 0) return false;
+    tlo = to.value << (to.n_remain * 6);
+    thi = tlo | (uint32_t)((1u << (to.n_remain * 6)) - 1);
+    return tlo <= fhi && flo <= thi;
+}
+
 /* True iff some completion of a partial UTF-8 sequence could satisfy the range at pos, so a
- * byte-level BPE token ending mid-codepoint stays admissible. */
+ * byte-level BPE token ending mid-codepoint stays admissible. Only well-formed completions count
+ * (utf8_range). */
 inline bool match_partial_char(const GbnfElement* pos, PartialUtf8 partial) {
     const bool is_positive = pos->type == GRE_CHAR || pos->type == GRE_CHAR_ANY;
 
-    const uint32_t partial_value = partial.value;
-    const int      n_remain      = partial.n_remain;
-    if (n_remain < 0 || (n_remain == 1 && partial_value < 2)) return false;
-
-    uint32_t low  = partial_value << (n_remain * 6);
-    const uint32_t high = low | (uint32_t)((1 << (n_remain * 6)) - 1);
-    if (low == 0) {
-        if (n_remain == 2)      low = 1u << 11;
-        else if (n_remain == 3) low = 1u << 16;
-    }
+    uint32_t low, high;
+    if (!utf8_range(partial, &low, &high)) return false;
 
     do {
         if (pos[1].type == GRE_CHAR_RNG_UPPER) {

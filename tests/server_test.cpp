@@ -2329,8 +2329,6 @@ TEST(a_dropped_stream_cancels_at_the_scheduler) {
     q.method = "POST";
     q.path = "/v1/chat/completions";
     q.body = R"({"messages":[{"role":"user","content":"hi"}],"stream":true})";
-    std::atomic<bool> gone{false};
-    q.closed = [&gone] { return gone.load(); };
 
     HttpResponse r = f.srv->router().dispatch(q);
     CHECK_EQ(r.status, 200);
@@ -2341,11 +2339,10 @@ TEST(a_dropped_stream_cancels_at_the_scheduler) {
     CHECK(!f.sched.saw_cancel());
     CHECK_EQ(f.srv->in_flight(), 1LL);
 
-    /* The peer goes away. The transport notices on its next pull and tears the provider down. */
-    gone.store(true);
-    std::string c;
-    bool more = r.next(c);
-    CHECK(!more);
+    /* The peer goes away. The transport notices -- its own peer check runs before every chunk it
+     * writes, and the write to a closed socket fails there -- and reports it as on_close. The
+     * provider above does not probe the socket itself, so this is where the drop reaches the
+     * server. */
     r.on_close(false);
 
     CHECK(f.sched.saw_cancel());

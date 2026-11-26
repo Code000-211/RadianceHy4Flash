@@ -16,15 +16,16 @@
 
 namespace {
 
-/* The declared handle of a weight or buffer recorded by the fake builder. */
+/* The declared handle of a weight or buffer recorded by the fake builder, in the ABI's handle types
+ * (rad_weight, rad_buf), so a list of them builds the vectors the ops record without narrowing. */
 template <class R>
-int64_t handle_of(const std::vector<R>& v, const char* name) {
+uint32_t handle_of(const std::vector<R>& v, const char* name) {
     for (size_t i = 0; i < v.size(); ++i)
-        if (v[i].name == name) return (int64_t)(i + 1);
+        if (v[i].name == name) return (uint32_t)(i + 1);
     return 0;
 }
-int64_t w_h(const RadBuilder& b, const char* name) { return handle_of(b.weights, name); }
-int64_t b_h(const RadBuilder& b, const char* name) { return handle_of(b.bufs, name); }
+rad_weight w_h(const RadBuilder& b, const char* name) { return handle_of(b.weights, name); }
+rad_buf    b_h(const RadBuilder& b, const char* name) { return handle_of(b.bufs, name); }
 
 /* Doubles the plugin read through float config values: compared with a tolerance, not ==. */
 bool near(double a, double b, double tol) { return std::abs(a - b) < tol; }

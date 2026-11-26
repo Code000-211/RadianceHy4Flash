@@ -19,6 +19,7 @@
 #include "ngram.h"
 #include "suffix.h"
 #include "diag/diagnose.h"
+#include "gsuffix.h"
 
 #include <chrono>
 #include <condition_variable>
@@ -110,6 +111,10 @@ struct SchedReq {
     bool        draft_suffix = false;
     bool        suffix_hot = false;
     SuffixIndex suffix_ix;
+    /* The prompt's index has been copied to the scheduler's suffix stash (suffix_index). */
+    bool        suffix_stashed = false;
+    /* The global cache's response the last suffix proposal came from (0: the request's own). */
+    uint64_t    suffix_src = 0;
     /* Prompt lookup's index over prompt ++ output (ngram.h), built at the sequence's first lookup
      * and extended by each later one. It depends on the tokens alone, so preemption keeps it; it
      * is keyed by request id, so a recycled slot starts over, and a closed request frees it. */
@@ -741,6 +746,35 @@ private:
      * Called as each prefill chunk commits, so the first decode does not index the whole prompt
      * (suffix.h). */
     void suffix_index(SchedReq& s, const Request& r);
+    /* --draft-suffix: a long prompt's finished index is copied into a small stash; the next
+     * request whose prompt starts with those tokens (the conversation's next turn) takes it over
+     * at admission (suffix_adopt) and indexes only what it adds. Either way the index holds
+     * exactly what a build from nothing would (suffix_test). */
+    void suffix_adopt(SchedReq& s);
+    struct SuffixStash {
+        std::vector<int32_t> tokens;
+        SuffixIndex ix;
+        uint64_t used = 0;
+    };
+    std::vector<SuffixStash> suffix_stash_;
+    /* --draft-suffix-global-mib: earlier responses across requests (gsuffix.h). */
+    GlobalSuffix gsuffix_;
+    /* Drafts the head's verifies accept, a moving average (the global chain's gate). */
+    double  head_accept_ewma_ = 0;
+    int64_t head_verifies_ = 0;
+    uint64_t suffix_stash_clock_ = 0;
+    /* Prompts shorter than this are cheap to index again; the stash holds at most this many
+     * copies and bytes. */
+    static constexpr int64_t kSuffixStashMin = 4096;
+    static constexpr size_t  kSuffixStashMax = 16;
+    static constexpr int64_t kSuffixStashBytes = (int64_t)512 << 20;
+public:
+    /* Tests: the stash's size. */
+    size_t suffix_stash_size() const { return suffix_stash_.size(); }
+    /* The engine loads and saves it (--prefix-cache-dir). */
+    GlobalSuffix& global_suffix() { return gsuffix_; }
+    void set_disk_metrics(const SchedMetrics::Disk& d) { m_.disk = d; }
+private:
     /* Prompt lookup is the deployment's only drafter and --draft-window adaptive is on: its
      * proposals feed each sequence's estimate and are capped by its window, as a head's are. */
     bool lookup_adapt_ = false;

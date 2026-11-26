@@ -72,11 +72,13 @@ struct Sched {
     uint64_t progress = 0;
 } S;
 
-/* Hands the core to the next live fiber of the round, in thread order, or back to the scheduler
- * after the last: the order fibers run in is the scheduler's own, at one switch a hand-off. */
+/* Hands the core to the next live fiber of the round, in thread order (descending under
+ * emu_reverse_order), or back to the scheduler after the last: the order fibers run in is the
+ * scheduler's own, at one switch a hand-off. */
+int emu_step() { return emu_reverse_order ? -1 : 1; }
 void yield() {
     Fiber& me = S.f[S.cur];
-    for (int t = S.cur + 1; t < S.nthreads; ++t)
+    for (int t = S.cur + emu_step(); t >= 0 && t < S.nthreads; t += emu_step())
         if (!S.f[t].done) {
             S.cur = t;
             emu_switch(&me.sp, S.f[t].sp);
@@ -389,6 +391,7 @@ static void lds_reserve(size_t bytes) {
 
 int emu_grids = 0;
 int emu_last_block = 0;
+int emu_reverse_order = 0;
 const char* emu_last_kernel = "";
 void emu_run_grid(dim3 grid, dim3 block, void (*body)(void*), void* ctx, size_t dyn_lds) {
     ++emu_grids;
@@ -434,8 +437,8 @@ void emu_run_grid(dim3 grid, dim3 block, void (*body)(void*), void* ctx, size_t 
             const uint64_t p0 = S.progress;
             /* One round: the first live fiber runs, each hands on to the next (yield), and the
              * last hands back here. */
-            int first = 0;
-            while (S.f[first].done) ++first;
+            int first = emu_reverse_order ? n - 1 : 0;
+            while (S.f[first].done) first += emu_step();
             S.cur = first;
             emu_switch(&S.main_sp, S.f[first].sp);
             S.cur = -1;

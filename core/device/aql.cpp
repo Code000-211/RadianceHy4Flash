@@ -4920,6 +4920,9 @@ int a_code_runs(size_t from, size_t to, int device, char* why, int cap) {
  * model never launches costs the card -- the share of `already held` M-14 sets out to measure, and
  * the number a deployment listing only the forms it uses (R4D_MOEIQR_FORMS is one) gives back. */
 int a_code_resident(int device, int64_t* bytes, int* modules) {
+    /* The host backend beside HIP (no card visible) asks here too, and the AQL backend never
+     * started: it has loaded no device code anywhere, which is "cannot say", not a bad index. */
+    if (!G().ok) return RAD_E_UNSUPPORTED;
     if (device < 0 || (size_t)device >= G().dev.size()) return RAD_E_INVAL;
     std::vector<Module*> ms;
     {
