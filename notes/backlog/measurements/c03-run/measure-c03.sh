@@ -5,13 +5,17 @@
 # Run it under the lane lock, whole:
 #   flock -w 7200 /tmp/hy4-lane.lock -c '/home/ubuntu/projects/wt-c03/notes/backlog/measurements/c03-run/measure-c03.sh'
 #
-# Every boot is a `systemd-run --user` transient unit on :8180 with the model on both R9700s; the
-# script stops the house engine first and stops each arm's engine before the next. It does NOT
-# restore the house engine: under the lane handoff the parent restores hy4-u4 once the worker queue
-# drains, so :8180 is left free on purpose (and is checked to be free).
+# Every boot is a `systemd-run --user` transient unit on a PRIVATE port (:8199) with the model on
+# both R9700s; the script stops the house engine first and stops each arm's engine before the next.
+# It does NOT restore the house engine: under the lane handoff the parent restores hy4-u4 once the
+# worker queue drains, so :8180 is left free on purpose (and is checked to be free).
 set -uo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 OUT=${OUT:-/home/ubuntu/r9700-serving/hy4flash/c03-measure-$(date +%Y%m%d-%H%M)}
+# A private port, not :8180: other workers' probes post to :8180 blindly, and during the first attempt
+# their concurrent c8 streams landed in a measured boot and tripled the streamed bytes. Nothing else
+# on the host knows this port, so a measured boot only ever serves this script's own requests.
+PORT=${PORT:-8199}
 BASE=/home/ubuntu/projects/wt-c03-base   # cf11ed50
 HEAD=/home/ubuntu/projects/wt-c03        # this branch
 PROBE=$OUT/probe
@@ -37,7 +41,7 @@ meta() {
     echo "date: $(date -Is)"
     echo "host: $(hostname) kernel $(uname -r)"
     echo "cpu: $(lscpu | sed -n 's/^Model name: *//p')"
-    echo "lane: local hy4-flash lane, :8180, house alias qwen3.8-27b / qwen3.8-27b-local"
+    echo "lane: local hy4-flash lane, private port $PORT, house alias qwen3.8-27b / qwen3.8-27b-local"
     echo "gpus: $(amd-smi static --asic 2>/dev/null | grep -E 'MARKET_NAME' | sed 's/.*: //' | paste -sd'|')"
     echo "gpu_ids: $(for d in /sys/class/drm/card*/device; do [ -e "$d/vendor" ] || continue; [ "$(cat "$d/vendor" 2>/dev/null)" = "0x1002" ] && echo "$(basename "$(dirname "$d")"):$(cat "$d/device")"; done | paste -sd' ')"
     echo "tp: 2"
@@ -64,10 +68,10 @@ meta() {
   } | tee "$OUT/meta.txt"
 }
 
-port_free() { for _ in $(seq 1 90); do ss -ltn 2>/dev/null | grep -q ':8180 ' || return 0; sleep 2; done; return 1; }
+port_free() { for _ in $(seq 1 90); do ss -ltn 2>/dev/null | grep -q ':$PORT ' || return 0; sleep 2; done; return 1; }
 wait_ready() {
   for i in $(seq 1 200); do
-    if curl -s --max-time 3 http://127.0.0.1:8180/v1/models 2>/dev/null | grep -q 'qwen3.8-27b'; then
+    if curl -s --max-time 3 http://127.0.0.1:$PORT/v1/models 2>/dev/null | grep -q 'qwen3.8-27b'; then
       log "  READY ~$((i))s"; return 0
     fi
     st=$(systemctl --user is-active c03-meas 2>/dev/null || true)
@@ -83,7 +87,7 @@ boot() {   # arm, round, cfgname
   local arm=$1 r=$2 cfg=$3
   systemctl --user stop hy4-u4 2>/dev/null
   systemctl --user stop c03-meas 2>/dev/null
-  port_free || { log "  !! :8180 held"; return 1; }
+  port_free || { log "  !! :$PORT held"; return 1; }
   systemctl --user reset-failed c03-meas 2>/dev/null || true
   local wd; wd=$(realpath "$(dirname "$(bin_of "$arm")")/..")
   log "  boot loadavg=$(cut -d' ' -f1-3 /proc/loadavg) swap=$(awk '/SwapTotal/{t=$2}/SwapFree/{f=$2}END{printf "%.0f/%.0f MiB", (t-f)/1024, t/1024}' /proc/meminfo)"
@@ -113,7 +117,7 @@ probe_phase() {   # arm, cfg, r, phase
   case $ph in c1|c8) reps=3;; esac
   off0=$(wc -l < "$OUT/$tag-boot.log" 2>/dev/null || echo 0)
   for k in $(seq 1 $reps); do
-    timeout 900 python3 "$PROBE/probe.py" 8180 "$OUT/$tag-$ph-$k.json" "$ph" \
+    timeout 900 python3 "$PROBE/probe.py" "$PORT" "$OUT/$tag-$ph-$k.json" "$ph" \
       > "$OUT/$tag-$ph-$k.probe.log" 2>&1
     log "  $tag $ph $k rc=$?"
   done
@@ -125,24 +129,30 @@ probe_phase() {   # arm, cfg, r, phase
 run_boot() {  # arm, r, cfg
   local arm=$1 r=$2 cfg=$3 tag="$arm-$cfg-r$r"
   boot "$arm" "$r" "$cfg" || { stop; return 1; }
-  # one discarded warm-up decode pass: without it the first request pays the expert page-in
-  timeout 600 python3 "$PROBE/probe.py" 8180 "$OUT/$tag-warm.json" c1 > "$OUT/$tag-warm.log" 2>&1
+  # a discarded warm-up: one 24.9K-token prefill exercises every layer's experts broadly and two
+  # c1 passes settle the heat map, so the measured passes do not carry the boot's page-in
+  timeout 600 python3 "$PROBE/probe.py" "$PORT" "$OUT/$tag-warm.json" pf20 > "$OUT/$tag-warm.log" 2>&1
+  timeout 600 python3 "$PROBE/probe.py" "$PORT" "$OUT/$tag-warm2.json" c1 >> "$OUT/$tag-warm.log" 2>&1
+  timeout 600 python3 "$PROBE/probe.py" "$PORT" "$OUT/$tag-warm3.json" c1 >> "$OUT/$tag-warm.log" 2>&1
   : > "$OUT/$tag.logwindow"
   local ph rc=0
   for ph in ${PHASES//,/ }; do
     probe_phase "$arm" "$cfg" "$r" "$ph" || rc=1
   done
-  curl -s --max-time 10 http://127.0.0.1:8180/metrics > "$OUT/$tag.metrics.txt" 2>/dev/null
+  curl -s --max-time 10 http://127.0.0.1:$PORT/metrics > "$OUT/$tag.metrics.txt" 2>/dev/null
   stop
   return $rc
 }
 
 meta
-systemctl --user stop hy4-u4 2>/dev/null; port_free || { log "!! :8180 held before the run"; exit 3; }
+systemctl --user stop hy4-u4 2>/dev/null; port_free || { log "!! :$PORT held before the run"; exit 3; }
 
 for r in $(seq 1 "$ROUNDS"); do
   for cfg in $CFGS; do
-    for arm in $ARMS; do
+    # alternate the arm order every round: an interleaved base/head pair per round, with the
+    # first boot of a round alternating between the arms so neither arm always pays the cold start
+    if [ $(( (r + ${#cfg}) % 2 )) -eq 0 ]; then order=$ARMS; else order=$(echo $ARMS | tr ' ' '\n' | tac | tr '\n' ' '); fi
+    for arm in $order; do
       log "== round $r $cfg $arm"
       run_boot "$arm" "$r" "$cfg" || log "   $arm r$r $cfg FAILED"
     done
@@ -154,9 +164,9 @@ done
 # workers. Leave hy4-u4 stopped and :8180 free, and say so in the report.
 log "leaving hy4-u4 stopped and :8180 free for the parent's restore (lane handoff)"
 systemctl --user stop c03-meas 2>/dev/null
-if ss -ltn 2>/dev/null | grep -q ':8180 '; then
-  log "!! :8180 still held after the run"
+if ss -ltn 2>/dev/null | grep -qE ':(8180|'$PORT') '; then
+  log "!! a lane port is still held after the run"
 else
-  log ":8180 free"
+  log ":$PORT free"
 fi
 log "RESULTS IN $OUT"

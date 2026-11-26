@@ -24,7 +24,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.abspath(os.path.join(HERE, "..", "..", "..", ".."))
 STAMPGAPS = os.path.join(REPO, "scripts", "stampgaps.py")
 
-RANKS_RE = re.compile(r"^\S+ step (decode|other): .* ranks ([0-9.]+) save")
+RANKS_RE = re.compile(r"step (decode|other): .* ranks ([0-9.]+) save")
 
 
 def boots():
@@ -116,7 +116,7 @@ for arm, cfg, r, tag in boots():
     lines = open(os.path.join(RUN, tag + "-boot.log"), errors="replace").read().splitlines()
     for ph, (a, b) in sorted(w.items()):
         for ln in lines[a:b]:
-            m = RANKS_RE.match(ln)
+            m = RANKS_RE.search(ln)
             if not m:
                 continue
             kind, v = m.group(1), float(m.group(2))
