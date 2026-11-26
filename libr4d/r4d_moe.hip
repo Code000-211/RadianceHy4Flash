@@ -1780,7 +1780,7 @@ __device__ __forceinline__ void moe_down_dec_body(R4D_MOEDD_PARAMS, const RadW2L
             if (!b4 && r4d_w2::posted(w2, e)) return;   /* the launch's last blocks run it */
         } else if (!inl && !ring3 && !r4d_w2::mine(w2, e, tail)) return;   /* the table entries are loaded beside it */
         if (tail || inl || ring3 || b4) {
-            Wp0  = (const uint8_t*)r4d_w2::where(w2, e, Wp0, nullptr, (inl || b4) ? w2->spin : 0u);
+            Wp0  = (const uint8_t*)r4d_w2::where(w2, e, Wp0, nullptr, w2->spin);
             Wsp0 = (const uint16_t*)r4d_w2::where(w2, e, Wsp0);
         }
     }

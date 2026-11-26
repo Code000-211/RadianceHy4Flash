@@ -469,7 +469,7 @@ __device__ __forceinline__ void moe_iqr_body(R4D_MOEIQR_PARAMS) {
         } else if (!inl && !ring3 && !r4d_w2::mine(L, e, tail)) return;
         if (tail || inl || ring3 || b4) {
             bool ring = false;
-            pw = r4d_w2::where(L, e, pw, &ring, (inl || b4) ? L->spin : 0u);
+            pw = r4d_w2::where(L, e, pw, &ring, L->spin);
             ps = r4d_w2::where(L, e, ps);
             /* One count a posted unit: gate_up's block of the run's first tile and columns. */
             if (!a_sorted && tid == 0u && by == 0u && s_sel[3] == 0u &&
