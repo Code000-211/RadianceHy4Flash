@@ -5407,7 +5407,7 @@ int Engine::start() {
             const int n = r->mover.pool_ranges(lo, hi, st, kXpMaxPools);
             if (n > 0) r->ctx.xp_open(lo, hi, st, n);
         }
-    /* "Weg 2" (core/runtime/w2.h), behind RADIANCE_W2 (default off): resident experts first on
+    /* "Weg 2" (core/runtime/w2.h), on by default, RADIANCE_W2=0 turns it off: resident experts first on
      * wide passes, the misses' whole units copied meanwhile on the prefetch's DMA queue (which the
      * TP1 prefetch above does not share: one of the two is on). Every rank plans and copies its
      * own half. */

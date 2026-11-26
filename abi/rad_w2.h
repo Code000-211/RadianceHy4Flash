@@ -1,7 +1,7 @@
 /* rad_w2.h -- "Weg 2": resident experts first, budgeted whole-unit copies for the misses (issue #309,
  * notes/backlog/design/M-20.md §5-§7). What the kernels (libr4d), the runtime (core/runtime/w2.cpp)
- * and the MoE block (arch/common/rad_block_moe_fp8.h) share. Prototype, behind RADIANCE_W2
- * (default off: no block issues a W2 operand, and every launch is the one it was).
+ * and the MoE block (arch/common/rad_block_moe_fp8.h) share. On by default; RADIANCE_W2=0 turns it
+ * off (no block issues a W2 operand, and every launch is the one it was).
  *
  * A routed layer under expert-tiered placement reads its off-card experts ("misses") from the
  * pinned host pool across the link, inside the gate_up and down GEMMs, where every resident

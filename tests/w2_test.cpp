@@ -68,10 +68,10 @@ TEST(the_window_by_distinct_experts_goes_through_the_lanes_four_shapes) {
     }
 }
 
-TEST(the_switch_is_off_by_default_and_its_knobs_are_clamped) {
+TEST(the_switch_is_on_by_default_off_at_zero_and_its_knobs_are_clamped) {
     g_env.clear();
     W2Config c = w2_config(fake_env);
-    CHECK(!c.on);
+    CHECK(c.on);                                             /* on unless RADIANCE_W2=0 */
     CHECK_EQ(c.min_rows, 16);
     CHECK_EQ(c.kmax, RAD_W2_MAX_COPY);
     CHECK(c.ring_cached);                                    /* ordinary device memory + an acquire */
@@ -82,14 +82,16 @@ TEST(the_switch_is_off_by_default_and_its_knobs_are_clamped) {
     g_env["RADIANCE_W2"] = "0";
     CHECK(!w2_config(fake_env).on);
     g_env["RADIANCE_W2"] = "";
-    CHECK(!w2_config(fake_env).on);
+    CHECK(w2_config(fake_env).on);
     g_env["RADIANCE_W2"] = "1";
     CHECK(w2_config(fake_env).on);
+    g_env["RADIANCE_W2"] = "0";                              /* the knobs below do not turn it on */
     g_env["RADIANCE_W2_MIN_ROWS"] = "6";
     g_env["RADIANCE_W2_KMAX"] = "3";
     g_env["RADIANCE_W2_WIN_US0"] = "20.5";
     g_env["RADIANCE_W2_WIN_US_EXPERT"] = "2.25";
     c = w2_config(fake_env);
+    CHECK(!c.on);
     CHECK_EQ(c.min_rows, 6);
     CHECK_EQ(c.kmax, 3);
     CHECK_EQ(c.win_us0, 20.5);

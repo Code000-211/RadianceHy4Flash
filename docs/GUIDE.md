@@ -4839,7 +4839,7 @@ the startup log says what is in force. `RADIANCE_ROUTE_TRACE=<file>` records ran
 `rad-heat-replay`, whose `--layer-min N` replays the trace with every layer held at N resident units
 (the thin layers raised at the start from the layers above N, so the slab does not grow, clamped to
 what the slab can hold; a swap whose demotion would take a layer under N is abandoned) and prints
-what the floor costs the hit rate. `RADIANCE_W2=1` (a prototype, off by default; issue #309,
+what the floor costs the hit rate. "Weg 2" (on by default, `RADIANCE_W2=0` turns it off; issue #309,
 `abi/rad_w2.h`) runs a routed layer of a wide decode pass (`RADIANCE_W2_MIN_ROWS` rows and up,
 default 16: the verify passes of several sequences) resident experts first: the router's launch marks
 the routed experts that are off the card and posts at most `RADIANCE_W2_KMAX` of their whole units

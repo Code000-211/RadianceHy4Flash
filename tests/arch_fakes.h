@@ -202,7 +202,7 @@ struct RadCtx {
     /* The ops this fake's step dispatches to the host (rad_op_domain); every other op is device. */
     std::vector<rad_op>   host_ops;
     /* rad_expert_w2: the control block every routed layer is handed for a pass of `w2_min_rows`
-     * rows and up; null (the default) is a core with the switch off. `w2_asked` counts the calls. */
+     * rows and up; null (the default) is a core with RADIANCE_W2=0. `w2_asked` counts the calls. */
     void*                 w2 = nullptr;
     int64_t               w2_min_rows = 0;
     int                   w2_asked = 0;

@@ -1,8 +1,10 @@
 /* w2.h -- "Weg 2" (abi/rad_w2.h), the runtime's half: the switch, the budget table and the state a
  * Ctx holds while it is on (Ctx::w2_, w2.cpp).
  *
- * RADIANCE_W2=1 turns it on (default off: Ctx::w2_open is never called, rad_expert_w2 returns null
- * and no block issues a W2 operand). With it on:
+ * On by default (owner decision, issue #309: the no-drafter decode pays 0.1-0.4 % for the ring's
+ * reservation, the DFly2 c8 verify pass gains about 1 ms). RADIANCE_W2=0 turns it off: Ctx::w2_open
+ * is never called, rad_expert_w2 returns null and no block issues a W2 operand, so every launch is
+ * the one it was without W2. With it on:
  *   RADIANCE_W2_MIN_ROWS  the lowest pass height that takes the form (default 16: the verify
  *                         passes of several sequences; one sequence's passes and a no-drafter
  *                         decode stay on the one-launch form, whose tail launches would cost them
@@ -19,7 +21,7 @@
 namespace rad {
 
 struct W2Config {
-    bool   on = false;
+    bool   on = true;                    /* RADIANCE_W2=0 clears it */
     int    min_rows = 16;
     int    kmax = RAD_W2_MAX_COPY;
     double win_us0 = RAD_W2_WIN_US0;

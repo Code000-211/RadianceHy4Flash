@@ -798,13 +798,14 @@ TEST(w2_is_off_until_opened_and_binds_a_layer_at_its_first_wide_pass) {
 
     const uint64_t lo[2] = { 0x100000000ull, 0x300000000ull }, hi[2] = { 0x140000000ull, 0x300000000ull };
     const uint64_t stride[2] = { 0x180000ull, 0x1000ull };   /* the second range is empty: left out */
-    rad::W2Config off;                       /* the default: off */
+    rad::W2Config off;                       /* RADIANCE_W2=0 */
+    off.on = false;
     f.ctx.w2_open(off, lo, hi, stride, 2);
     CHECK(!f.ctx.w2_on());
     CHECK(f.ctx.w2_layer(0, first, 4, 48) == nullptr);
 
-    rad::W2Config on;
-    on.on = true;
+    rad::W2Config on;                        /* the default: on */
+    CHECK(on.on);
     f.ctx.w2_open(on, lo, hi, stride, 2);
     if (!f.ctx.w2_on()) {                    /* a backend without the queue: it stays off */
         CHECK(f.ctx.w2_layer(0, first, 4, 48) == nullptr);

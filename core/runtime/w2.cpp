@@ -25,7 +25,7 @@ W2Config w2_config(const char* (*get)(const char*)) {
         return end && end != v && std::isfinite(x) ? x : d;
     };
     const char* on = get("RADIANCE_W2");
-    c.on = on && *on && std::strcmp(on, "0") != 0;
+    c.on = !(on && !std::strcmp(on, "0"));                   /* on unless RADIANCE_W2=0 */
     c.min_rows = (int)std::clamp(num("RADIANCE_W2_MIN_ROWS", c.min_rows), 1.0, 65536.0);
     c.kmax = (int)std::clamp(num("RADIANCE_W2_KMAX", c.kmax), 0.0, (double)RAD_W2_MAX_COPY);
     c.win_us0 = std::clamp(num("RADIANCE_W2_WIN_US0", c.win_us0), 0.0, 1e6);
