@@ -560,19 +560,29 @@ __device__ __forceinline__ uint32_t moe_iqr_body(const uint32_t bx, R4D_MOEIQR_P
  * The run-tile grid (not MAP) is sized for a pass's usual tile count, not for the bound
  * (r4d_moe_run_grid, r4d_moe.hip): its G = gridDim.x - 1 tile blocks serve tiles x, x + G,
  * x + 2 G, ... below the launch's count, each by the same body as one block a tile would, so the
- * bytes do not depend on G. A barrier parts two tiles of a block (the body's LDS). */
+ * bytes do not depend on G. A barrier parts two tiles of a block (the body's LDS). WR is that
+ * walk; a grid at the bound (below 128 rows) takes the form without it, whose code is the
+ * one-tile-a-block kernel's (the walk costs a c1 verify pass's gate_up ~1.5 % in registers and
+ * scheduling, measured). */
 template <class F, uint32_t KW, uint32_t RTB, bool MAP, uint32_t NT, uint32_t TPW, class CH,
-          bool PK = false>
+          bool PK = false, bool WR = false>
 __global__ __launch_bounds__(KW * RTB * kWave) R4D_WAVES(NT > 4u ? 6 : 8)
 void moe_iqr_kernel(R4D_MOEIQR_PARAMS) {
     if (CH::on) r4d_chain_wait();
-    const uint32_t stride = gridDim.x - 1u;
-    for (uint32_t bx = blockIdx.x;; bx += stride) {
-        const uint32_t nt = moe_iqr_body<F, KW, RTB, MAP, NT, TPW, PK>(
-            bx, X, XS, c_0, c_1, c_2, c_3, sorted, off, Y, map, T, fy, n_expert, inv_k, x_ld,
-            xs_ld, y_ld, mode, run_tiles, inv_ft);
-        if (MAP || bx + stride >= nt) break;
-        __syncthreads();
+    static_assert(!WR || !MAP, "the walk is the run-tile grid's");
+    if constexpr (!WR) {
+        moe_iqr_body<F, KW, RTB, MAP, NT, TPW, PK>(blockIdx.x, X, XS, c_0, c_1, c_2, c_3, sorted,
+                                                   off, Y, map, T, fy, n_expert, inv_k, x_ld,
+                                                   xs_ld, y_ld, mode, run_tiles, inv_ft);
+    } else {
+        const uint32_t stride = gridDim.x - 1u;
+        for (uint32_t bx = blockIdx.x;; bx += stride) {
+            const uint32_t nt = moe_iqr_body<F, KW, RTB, MAP, NT, TPW, PK>(
+                bx, X, XS, c_0, c_1, c_2, c_3, sorted, off, Y, map, T, fy, n_expert, inv_k, x_ld,
+                xs_ld, y_ld, mode, run_tiles, inv_ft);
+            if (bx + stride >= nt) break;
+            __syncthreads();
+        }
     }
     if (CH::on) r4d_chain_done();
 }
@@ -763,6 +773,7 @@ struct Launch {
     uint32_t* map;
     uint32_t T, N, n_expert, inv_k, x_ld, xs_ld, y_ld, mode, run_tiles, inv_ft;
     uint32_t gx, nkb;
+    bool wrap;    /* the run-tile grid is below its bound: the kernel's walk (WR) */
     bool packed;  /* the map is the packed one, at kPackTiles token tiles a block */
     bool chain;   /* the chained form (r4d_chain.h) */
 };
@@ -781,8 +792,8 @@ static inline long long pack_cap_split(long long T, long long n_expert) {
 template <class F>
 int launch_form(const Launch& g, RadStream stream) {
     int rc;
-#define R4D_MOEIQR_E(kw_, rtb_, map_, nt_, tpw_, ch_)                                             \
-    rc = R4D_EMIT(stream, (moe_iqr_kernel<F, kw_, rtb_, map_, nt_, tpw_, ch_>),                   \
+#define R4D_MOEIQR_W(kw_, rtb_, map_, nt_, tpw_, ch_, wr_)                                        \
+    rc = R4D_EMIT(stream, (moe_iqr_kernel<F, kw_, rtb_, map_, nt_, tpw_, ch_, false, wr_>),       \
                   dim3(g.gx, g.N / (16u * rtb_ * tpw_)), dim3(kw_ * rtb_ * kWave), 0, g.x, g.xs,  \
                   g.c[0], g.c[1], g.c[2], g.c[3], g.sorted, g.off, g.y, (const uint32_t*)g.map,   \
                   g.T, g.N / (g.mode >> 8), g.n_expert, g.inv_k, g.x_ld, g.xs_ld, g.y_ld, g.mode, \
@@ -790,6 +801,10 @@ int launch_form(const Launch& g, RadStream stream) {
 #define R4D_MOEIQR_GO(kw_, rtb_, map_, nt_, tpw_)                                                 \
     do { if (g.chain) R4D_MOEIQR_E(kw_, rtb_, map_, nt_, tpw_, r4dchain);                         \
          else         R4D_MOEIQR_E(kw_, rtb_, map_, nt_, tpw_, R4dUnchained); } while (0)
+/* the run-tile grid below its bound takes the walk (moe_iqr_kernel's WR) */
+#define R4D_MOEIQR_E(kw_, rtb_, map_, nt_, tpw_, ch_)                                             \
+    do { if (!map_ && g.wrap) R4D_MOEIQR_W(kw_, rtb_, map_, nt_, tpw_, ch_, !map_);               \
+         else                 R4D_MOEIQR_W(kw_, rtb_, map_, nt_, tpw_, ch_, false); } while (0)
     /* The run map's grid (prefill): a wave a weight tile down all of its K, four tiles a block,
      * kMapTiles token tiles a decode. The decode grid: a wave a tile and a block four, except that
      * a wide K (eight 128-K blocks and up) under kOneWaveMinRows routed rows is shared between
@@ -814,6 +829,7 @@ int launch_form(const Launch& g, RadStream stream) {
     else                           R4D_MOEIQR_GO(1u, 4u, false, 1u, 2u);
 #undef R4D_MOEIQR_GO
 #undef R4D_MOEIQR_E
+#undef R4D_MOEIQR_W
     return rc;
 }
 
@@ -945,6 +961,7 @@ int moe_iqr_launch(const RadArgs* a, RadStream stream, int ncls) {
         const long long bound = (T + (long long)(kRows - 1) * (T < n_expert ? T : n_expert)) /
                                 (long long)kRows;
         g.gx = (uint32_t)r4d_moe_run_grid(T, bound) + 1u;
+        g.wrap = (long long)g.gx - 1 < bound;
         /* The band's one launch has a chained form; the run map's two launches stay plain. */
         g.chain = r4d_geti_or(a, "chain", 0) != 0;
     } else {

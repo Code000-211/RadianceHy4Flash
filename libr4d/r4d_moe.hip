@@ -1873,18 +1873,24 @@ __device__ __forceinline__ uint32_t moe_down_dec_body(const uint32_t j, R4D_MOED
 /* The kernel around the body, as moe_gemm_q_kernel around its own: CH `r4dchain` is the chained
  * form. The grid's run tiles are r4d_moe_run_grid's, not the bound: its gridDim.x - 1 tile blocks
  * serve tiles j, j + that, ... below the launch's count, each by the same body, so the bytes do
- * not depend on the grid. A barrier parts two tiles of a block (the body's LDS). */
-template <int W4, bool I8, class CH>
+ * not depend on the grid. A barrier parts two tiles of a block (the body's LDS). WR is that walk;
+ * a grid at the bound takes the form without it, the one-tile-a-block kernel's code. */
+template <int W4, bool I8, class CH, bool WR = false>
 __global__ __launch_bounds__(4 * kWave)
 void moe_down_dec_kernel(R4D_MOEDD_PARAMS) {
     if (CH::on) r4d_chain_wait();
-    const uint32_t stride = gridDim.x - 1u;
-    for (uint32_t j = blockIdx.x;; j += stride) {
-        const uint32_t nt = moe_down_dec_body<W4, I8>(j, Aq, As, c_even, c_odd, c_2, c_3, off, Y,
-                                                      T, N, n_expert, G, a_ld, as_ld, y_ld, mode,
-                                                      tab);
-        if (j + stride >= nt) break;
-        __syncthreads();
+    if constexpr (!WR) {
+        moe_down_dec_body<W4, I8>(blockIdx.x, Aq, As, c_even, c_odd, c_2, c_3, off, Y, T, N,
+                                  n_expert, G, a_ld, as_ld, y_ld, mode, tab);
+    } else {
+        const uint32_t stride = gridDim.x - 1u;
+        for (uint32_t j = blockIdx.x;; j += stride) {
+            const uint32_t nt = moe_down_dec_body<W4, I8>(j, Aq, As, c_even, c_odd, c_2, c_3, off,
+                                                          Y, T, N, n_expert, G, a_ld, as_ld, y_ld,
+                                                          mode, tab);
+            if (j + stride >= nt) break;
+            __syncthreads();
+        }
     }
     if (CH::on) r4d_chain_done();
 }
@@ -3098,11 +3104,14 @@ static int moe_gemm_launch(const RadArgs* a, RadStream stream, int ncls = 2) {
         if (!dn_dec && g_moe_down_dec_pin > 0) return R4D_NO(RAD_E_UNSUPPORTED);
         if (dn_dec && g2 > 0) {
             /* r4d_moe_run_grid's blocks for the run tiles, which serve any more in turn */
-            const unsigned slots  = (unsigned)r4d_moe_run_grid(T, std::min(T, n_expert) +
-                                                                      (T + 15) / 16);
+            const long long bound = std::min(T, n_expert) + (T + 15) / 16;
+            const unsigned slots  = (unsigned)r4d_moe_run_grid(T, bound);
+            const bool wrap = (long long)slots < bound;
             const unsigned groups = (unsigned)((N + 64 * g2 - 1) / (64 * g2));
 #define R4D_MOE_DD(CH_)                                                                          \
-            emit_rc = R4D_EMIT(stream, (moe_down_dec_kernel<W4, I8, CH_>),                       \
+            emit_rc = wrap ? R4D_MOE_DD_EMIT(CH_, true) : R4D_MOE_DD_EMIT(CH_, false)
+#define R4D_MOE_DD_EMIT(CH_, WR_)                                                                \
+                      R4D_EMIT(stream, (moe_down_dec_kernel<W4, I8, CH_, WR_>),                  \
                                dim3(slots + 1u, groups), dim3(4 * kWave), 0,                     \
                                (const uint8_t*)Aq->data, (const float*)As->data, ce, co, c2, c3, \
                                (const int32_t*)off->data, (uint16_t*)Y->data,                    \
