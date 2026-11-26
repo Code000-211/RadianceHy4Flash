@@ -4140,6 +4140,11 @@ TEST(g3_junctions_write_the_codes_their_readers_take) {
  *       the rotated int8 pair the down projection reads, so no op names them; MoeFP8's own rule
  *       does ask for them (down_codebook_fp8 / down_supported,
  *       arch/common/rad_block_moe_fp8.h), the mixed IQR-gate_up-behind-a-w6-down recipe with them.
+ *   moe.expert_ff -- only in the last plan, where the experts' down projection is i8a8h as the served
+ *       model reads it: the fused gated quantiser writes the int8 pair, so the bf16 product itself is
+ *       arena. MoeFP8::declare refuses a wire without it (the two tests of
+ *       quantised_experts_are_served_clamped), which is why this PR drops the planes the arch can
+ *       hand over and not this one; the measurement file counts what each side is worth.
  *   moe.latent.q / .s -- the same for the latent linear: the gather's output is read as the rotated
  *       int8 pair, and MoeFP8::declare refuses a wire whose latent carries no codes at all.
  *   ix.stage -- the indexer stages a closing group's raw keys through it, and the step issues that
@@ -4213,9 +4218,7 @@ int64_t dead_bytes(const RadBuilder& b) {
 
 /* The served u3's shape (the recipe of /models/hy4-flash-iqr-v4-u3.rad): the trunk's linears and both
  * experts' under the rotated computed trellis, and the Engram table stored as E4M3 rows so its rows
- * take no round trip. This is the plan the card-less dump of the served model was read from, and the
- * only one here where the routed arm's bf16 product itself has no reader: with a rotated int8 trunk
- * the fused gated quantiser writes the int8 pair and `silu_mul` is never declared for the experts. */
+ * take no round trip. This is the plan the card-less dump of the served model was read from. */
 void served_u3_encs(RadBuilder* b) {
     int8_trunk_encs(b);
     const RadEncoding iqr = enc_trellis(RAD_U4, true);
@@ -4227,6 +4230,19 @@ void served_u3_encs(RadBuilder* b) {
             e.second = iqr;
     b->encs.insert(b->encs.begin(), { { "engram_table", rad_enc_affine(RAD_F8E4M3, RAD_F32, 1, 0) },
                                       { "engram_mult", rad_enc_plain(RAD_I64) } });
+}
+
+/* The same recipe with the routed arm's down projection stored as i8a8h, the form the served model
+ * is read at: the gather hands the expert gate rotated int8 codes, the fused `gated_had_quant_i8g`
+ * writes the int8 pair itself, and no op of the declared list reads the bf16 product -- which is
+ * `moe.expert_ff`, the largest plane of the dump at the rig's shapes (48 MiB at TP2/2048, 96 MiB at
+ * TP4/8192). At the trellis down above the gate falls back to the chain, so the product is written
+ * and read there; both rows are pinned because the dump's list depends on which of the two the
+ * library serves. */
+void served_u3_i8a8h_encs(RadBuilder* b) {
+    served_u3_encs(b);
+    for (auto& e : b->encs)
+        if (e.first == "ffn_down_exps") e.second = enc_i8(true);
 }
 
 }  // namespace
@@ -4255,10 +4271,14 @@ TEST(no_transient_is_declared_that_no_op_reads) {
           },
           1, "ix.stage moe.expert_ff.q moe.expert_ff.s moe.latent.q moe.latent.s ", 110592 },
         { "bf16, two ranks", bf16_encs, 2, "ix.stage ", 9216 },
-        /* The served model itself: here the routed arm's bf16 product joins the residue, which is
-         * the largest plane of the dump at the rig's shapes and the reason the card's sum is not
-         * reached from the arch alone (see the measurement file). */
+        /* The served recipe, as the dump of the served model was read (its Engram table at E4M3, so
+         * the round trip is off, and the trunk on rotated int8 activations). */
         { "the served u3", served_u3_encs, 1,
+          "ix.stage moe.expert_ff.q moe.expert_ff.s moe.latent.q moe.latent.s ", 110592 },
+        /* The same with the experts' down projection at i8a8h: the gated quantiser serves the arm
+         * alone, so the bf16 product itself joins the list -- the plane the card counts and this
+         * change leaves where MoeFP8's own rule asks for it. */
+        { "served u3, i8a8h down", served_u3_i8a8h_encs, 1,
           "ix.stage moe.expert_ff moe.expert_ff.q moe.expert_ff.s moe.latent.q moe.latent.s ", 0 },
     };
     for (const Plan& p : plans) {
