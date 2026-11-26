@@ -1116,6 +1116,36 @@ TEST(the_debug_taps_are_persistent_buffers_and_lint_clean) {
     }
 }
 
+/* X-05's Change line, as a guard rather than as prose. The backlog's X-05 entry asks that `hyv4flash`
+ * set `kv_stream_ok` and that `mla_attn_sel_sink` read a selection of the sparse latent; both shipped
+ * ahead of this card -- the flag at `arch/hyv4flash/hyv4flash.cpp:1603` (`489fd4f4`), the op in
+ * `libavx/avx_hy4.cpp:520` -- and the rows X-05a adds to GUIDE §4.4.1 and ARCHITECTURES state which
+ * of the three latent/index groups streams and which is read whole. That claim now fails a test
+ * instead of a reader's trust: the probe claims the capability, the selection-reading attention is
+ * declared, the indexer's pooled keys are dense-read (the scorer reads every group of the history
+ * every step, so they are never a streamed group), and the two latent groups are not. */
+TEST(x05_which_group_streams_and_which_is_read_whole) {
+    Declared d;
+    REQUIRE_EQ(d.rc, RAD_OK);
+    RadBuilder& b = d.b;
+
+    RadArchProbe pr{};
+    REQUIRE_EQ(hyv4flash::probe(d.mk.meta(), &pr), RAD_OK);
+    CHECK_EQ(pr.kv_stream_ok, 1);                  /* the item's first clause */
+    CHECK(count_op(b, "mla_attn_sel_sink") > 0);    /* and its second: a selection is read */
+
+    for (const char* n : { "kv_latent_sparse", "kv_latent_sliding" }) {
+        const RecKV* k = kv_named(b, n);
+        REQUIRE(k != nullptr);
+        CHECK(!k->dense);                          /* paged; the sparse one is the streamed one */
+    }
+    const RecKV* ix = kv_named(b, "kv_index_keys");
+    REQUIRE(ix != nullptr);
+    CHECK(ix->dense);                              /* `rad_kv_group_dense_read`, never streamed */
+    CHECK_EQ(count_op(b, "kv_store_streamed"), 2);  /* the sparse layers, and nothing else */
+    CHECK_EQ(count_op(b, "kv_resolve"), 2);
+}
+
 /* Streamed KV (docs/KV-STREAMING.md, WP14): the sparse latent group streams like GLM's MLA. A pass
  * on the ring stores through kv_store_streamed (mirror and ring), selects even at or below the dense
  * limit, and resolves between qsa_select and mla_attn_sel_sink with qsa_select's entry count; a
