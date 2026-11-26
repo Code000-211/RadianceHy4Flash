@@ -2591,6 +2591,8 @@ int ref_moe_gemm_q_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* ou
     else    o.t(SD, { ne1, (N1 + sg.rows - 1) / sg.rows, (K1 + sg.k - 1) / sg.k });
     o.t(D, { M * k, N });                             /* y -- in sorted order */
     o.skip();                                         /* split -- optional */
+    o.skip();                                         /* w2 -- optional */
+    o.skip();                                         /* w2_tail -- optional */
     return o.finish("moe_gemm_q", operand, out);
 }
 
@@ -2637,6 +2639,8 @@ int ref_moe_gemm_q_mod4_shape(const RadParam* p, int n_p, int operand, RadOpdDes
     cls(3);
     o.t(D, { M * k, N });                             /* y -- in sorted order */
     o.skip();                                         /* split -- optional */
+    o.skip();                                         /* w2 -- optional */
+    o.skip();                                         /* w2_tail -- optional */
     return o.finish("moe_gemm_q_mod4", operand, out);
 }
 
@@ -2666,6 +2670,8 @@ int ref_moe_gemm_w4a8_shape(const RadParam* p, int n_p, int operand, RadOpdDesc*
     o.t((uint32_t)RAD_BF16, { ne1, N1, K1 / 128 });      /* w_odd_scale */
     o.t((uint32_t)RAD_BF16, { M * k, N });               /* y -- in sorted order */
     o.skip();                                         /* split -- optional */
+    o.skip();                                         /* w2 -- optional */
+    o.skip();                                         /* w2_tail -- optional */
     return o.finish("moe_gemm_q", operand, out);
 }
 
@@ -2694,6 +2700,8 @@ int ref_moe_gemm_w4a4_shape(const RadParam* p, int n_p, int operand, RadOpdDesc*
     o.t((uint32_t)RAD_BF16, { ne1, N1, K1 / 128 });      /* w_odd_scale */
     o.t((uint32_t)RAD_BF16, { M * k, N });               /* y -- in sorted order */
     o.skip();                                         /* split -- optional */
+    o.skip();                                         /* w2 -- optional */
+    o.skip();                                         /* w2_tail -- optional */
     return o.finish("moe_gemm_q", operand, out);
 }
 

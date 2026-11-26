@@ -27,6 +27,7 @@
 #include "ref_host.h"
 #include "r4d_moe_sort.h"
 #include "r4d_moe_gather.h"
+#include "r4d_w2.h"
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -132,6 +133,144 @@ Scatter scatter_kernel(const std::vector<int32_t>& ids, int nl, int base, const 
                  ids.data(), s.sorted.data(), s.off.data(), s.cnt.data(), (uint32_t)T, (uint32_t)nl,
                  (int32_t)base, prot, (int32_t*)nullptr);
     return s;
+}
+
+/* A routed layer's W2 control block on the host (abi/rad_w2.h), for the plan behind
+ * router_sigmoid_topk_scatter's sort: every place has a "table entry" `tab[x]`, a third of them
+ * naming a slot of one of two pinned pools (a miss when routed), the rest an address outside both;
+ * `budget` is the list's cap whatever the distinct count. check() holds what a launch left against
+ * a host model of the plan: the mask, the counts, the post's number, the mailbox and the copy
+ * records, the counters -- and that a launch with nothing to copy posts nothing. */
+struct W2Rig {
+    RadW2Layer L{};
+    std::vector<uint64_t> tab;
+    RadW2Box box[RAD_W2_BOXES]{};
+    uint32_t head = 0, done = 0;
+    RadW2Stats stats{};
+    int n = 0;
+    uint32_t want_head = 0;
+    RadW2Stats want_stats{};
+    static constexpr uint64_t kPool0 = 0x100000000ull, kPool1 = 0x200000000ull, kRing = 0x7000000000ull;
+    static constexpr uint64_t kStride0 = 0x180000ull, kStride1 = 0x200000ull;
+
+    W2Rig(int n_place, int budget, std::mt19937& rng) : tab((size_t)n_place), n(n_place) {
+        L.magic = RAD_W2_MAGIC;
+        L.ring = kRing;
+        L.slot = kStride1;
+        L.done = &done;
+        L.box = box;
+        L.head = &head;
+        L.stats = &stats;
+        L.n_expert = (uint32_t)n_place;
+        L.group = 2;
+        L.pools.n = 2;
+        L.pools.lo[0] = kPool0; L.pools.hi[0] = kPool0 + 64 * kStride0; L.pools.stride[0] = kStride0;
+        L.pools.lo[1] = kPool1; L.pools.hi[1] = kPool1 + 64 * kStride1; L.pools.stride[1] = kStride1;
+        for (int d = 0; d <= RAD_W2_MAX_EXPERT; ++d) L.kmax[d] = (uint8_t)budget;
+        for (int x = 0; x < n_place; ++x) {
+            const uint32_t r = (uint32_t)rng();
+            /* in a pool slot, some bytes into it (the first weight need not start the unit) */
+            if (r % 3 == 0)
+                tab[(size_t)x] = (r & 8 ? kPool1 + (r >> 8) % 64 * kStride1 : kPool0 + (r >> 8) % 64 * kStride0) +
+                                 (r >> 16) % 4096;
+            else
+                tab[(size_t)x] = 0x9000000000ull + (uint64_t)x * 4096;
+            L.ent[x] = r % 17 == 5 ? nullptr : &tab[(size_t)x];       /* an expert with no entry */
+            L.mask[x] = 0xAA;
+        }
+    }
+    std::string check(const std::vector<int32_t>& cnt) {
+        std::vector<int> miss;
+        uint32_t distinct = 0;
+        std::vector<uint8_t> want((size_t)n, RAD_W2_RESIDENT);
+        for (int x = 0; x < n; ++x) {
+            if (cnt[(size_t)x] <= 0) continue;
+            ++distinct;
+            const uint64_t p = tab[(size_t)x];
+            const bool pool = (p >= L.pools.lo[0] && p < L.pools.hi[0]) || (p >= L.pools.lo[1] && p < L.pools.hi[1]);
+            if (L.ent[x] && pool) { miss.push_back(x); want[(size_t)x] = RAD_W2_INPLACE; }
+        }
+        /* the tail serves the first RAD_W2_TAIL_EXPERTS misses; the rest stay in the first pass */
+        const size_t all = miss.size();
+        if (all > (size_t)RAD_W2_TAIL_EXPERTS) {
+            for (size_t j = RAD_W2_TAIL_EXPERTS; j < all; ++j) want[(size_t)miss[j]] = RAD_W2_RESIDENT;
+            want_stats.spilled += (uint32_t)(all - RAD_W2_TAIL_EXPERTS);
+        }
+        const uint32_t k = std::min<uint32_t>((uint32_t)all, L.kmax[distinct]);
+        const uint32_t seq = k ? want_head + 1 : 0;
+        if (k) ++want_head;
+        want_stats.plans += 1;
+        want_stats.misses += (uint32_t)all;
+        want_stats.posted += k;
+        want_stats.posted_n[k] += 1;
+        for (uint32_t j = 0; j < k; ++j) want[(size_t)miss[j]] = (uint8_t)(RAD_W2_COPY0 + j);
+        if (std::memcmp(L.mask, want.data(), (size_t)n) != 0) return "the mask is not the model's";
+        if (L.n_miss != all || L.n_copy != k || L.n_distinct != distinct) return "the counts differ";
+        if (L.seq != seq || head != want_head) return "the post's number is wrong";
+        if (std::memcmp(&stats, &want_stats, sizeof stats) != 0) return "the counters differ";
+        if (!k) return std::string();
+        const RadW2Box& b = box[seq % RAD_W2_BOXES];
+        if (b.seq != seq || b.n != k || b.group != L.group) return "the mailbox header is wrong";
+        if (b.sum != rad_w2_box_sum(seq, k, L.group, b.jobs)) return "the post's sum is not the sum of its words";
+        for (uint32_t j = 0; j < k; ++j) {
+            const uint64_t p = tab[(size_t)miss[j]];
+            const int pi = p >= L.pools.lo[1] ? 1 : 0;
+            const uint64_t lo = L.pools.lo[pi], st = L.pools.stride[pi], base = lo + (p - lo) / st * st;
+            const uint64_t dst = kRing + (uint64_t)j * L.slot;
+            if (b.jobs[j].src != base || b.jobs[j].dst != dst || b.jobs[j].bytes != st)
+                return "a job is not the miss's pool slot to its ring slot";
+            if (L.copy[j].base != base || L.copy[j].dst != dst || L.copy[j].bytes != st)
+                return "a copy record differs from its job";
+        }
+        return std::string();
+    }
+};
+
+/* What a routed GEMM's block asks under W2 (r4d_w2.h): whose expert a block of the first pass and
+ * of the tail is, and where the tail reads a miss -- the ring only for a posted unit whose list
+ * has landed and whose entry still names the pool slot the copy was made from. */
+void w2_block_cases(int& cases, int& fails) {
+    RadW2Layer L{};
+    uint32_t done = 0;
+    L.done = &done;
+    L.seq = 41;
+    L.mask[3] = RAD_W2_INPLACE;
+    L.mask[5] = RAD_W2_COPY0;
+    L.mask[9] = (uint8_t)(RAD_W2_COPY0 + 1);
+    L.copy[0] = { 0x1000, 0x900000, 0x400 };
+    L.copy[1] = { 0x2000, 0x900400, 0x400 };
+    auto want = [&](bool cond, const char* what) {
+        ++cases;
+        if (!cond) { std::printf("FAIL W2 block: %s\n", what); ++fails; }
+    };
+    want(r4d_w2::mine(&L, 0, false) && !r4d_w2::mine(&L, 0, true), "a resident expert is the first pass's");
+    want(!r4d_w2::mine(&L, 3, false) && r4d_w2::mine(&L, 3, true), "a miss read in place is the tail's");
+    want(!r4d_w2::mine(&L, 5, false) && r4d_w2::mine(&L, 5, true), "a posted miss is the tail's");
+    want(r4d_w2::mine(&L, RAD_W2_MAX_EXPERT + 7, false), "a place past the mask is resident");
+    bool ring = true;
+    const void* p = (const void*)0x1010;
+    want(r4d_w2::where(&L, 5, p, &ring) == p && !ring, "a list that has not landed: in place");
+    done = RAD_W2_DONE(41, 0);
+    want(r4d_w2::where(&L, 5, p, &ring) == p && !ring, "the post's list with no unit landed yet: in place");
+    done = RAD_W2_DONE(41, 1);
+    want(r4d_w2::where(&L, 5, p, &ring) == (const void*)0x900010 && ring,
+         "the list's first unit landed: the ring, at the same offset");
+    want(r4d_w2::where(&L, 9, (const void*)0x23ff) == (const void*)0x23ff,
+         "its second unit still copying: in place");
+    done = RAD_W2_DONE(41, 2);
+    want(r4d_w2::where(&L, 9, (const void*)0x23ff) == (const void*)0x9007ff, "the second slot's last byte");
+    want(r4d_w2::where(&L, 9, (const void*)0x2400) == (const void*)0x2400, "a pointer past the slot: in place");
+    want(r4d_w2::where(&L, 5, (const void*)0x5000, &ring) == (const void*)0x5000 && !ring,
+         "an entry that moved off the pool slot: in place");
+    want(r4d_w2::where(&L, 3, (const void*)0x1010) == (const void*)0x1010, "a miss without a copy: in place");
+    want(r4d_w2::where(&L, 0, (const void*)0x1010) == (const void*)0x1010, "a resident expert: its entry");
+    done = RAD_W2_DONE(40, 8);
+    want(r4d_w2::where(&L, 5, p) == p, "an older post's list, all of it landed: in place");
+    done = RAD_W2_DONE(42, 8);
+    want(r4d_w2::where(&L, 5, p) == p, "a later post's word: in place");
+    L.seq = 0;
+    done = 0;
+    want(r4d_w2::where(&L, 5, p) == p, "a layer that posted nothing: in place");
 }
 
 struct RouterShape {
@@ -319,6 +458,58 @@ void router_scatter_cases(std::mt19937& rng, int& cases, int& fails) {
                     M, ne, k, sh.mode, base, nl, sh.protect ? " protect " : "",
                     sh.protect ? sh.protect : "", with_inv ? " with inverse" : "", rc, bad);
                 ++fails;
+            }
+        }
+
+        /* The same launch with a `w2` operand (abi/rad_w2.h): every output above unchanged, and the
+         * plan behind the sort held to a host model, over three budgets (none, two units, every
+         * miss up to the ring's eight) and twice in a row (the rank's posts are numbered). */
+        for (int budget = 0; budget < 3; ++budget) {
+            W2Rig rig(nl, budget == 0 ? 0 : budget == 1 ? 2 : RAD_W2_MAX_COPY, rng);
+            for (int pass = 0; pass < 2; ++pass) {
+                std::vector<int32_t> ids((size_t)M * ip, kPoison), sorted((size_t)T + 4, kPoison),
+                    off((size_t)nl + 5, kPoison), cnt((size_t)nl + 4, kPoison),
+                    inv((size_t)T + 4, kPoison);
+                std::vector<float> w((size_t)M * wp, -7.25f);
+                std::vector<uint16_t> gate((size_t)(M + 2) * gp, kGatePoison);
+                RadTensor tf[10];
+                std::memcpy(tf, t, sizeof t);
+                tf[2].data = ids.data();
+                tf[3].data = w.data();
+                tf[4].data = sorted.data();
+                tf[5].data = off.data();
+                tf[6].data = cnt.data();
+                tf[7].data = sh.gate ? gate.data() : nullptr;
+                tf[8] = tf[4];
+                tf[8].data = pass ? inv.data() : nullptr;
+                tf[9] = RadTensor{};
+                tf[9].data = &rig.L;
+                tf[9].dtype = RAD_U8;
+                tf[9].rank = 1;
+                tf[9].shape[0] = (int64_t)sizeof(RadW2Layer);
+                tf[9].stride[0] = 1;
+                RadArgs a{};
+                a.t = tf;
+                a.n_t = 10;
+                a.p = p.data();
+                a.n_p = n_p;
+                ++cases;
+                const int rc = r4d_rad_router_sigmoid_topk_scatter(&a, nullptr);
+                int bad = 0;
+                bad += ids != ids_ref;
+                bad += std::memcmp(w.data(), w_ref.data(), w.size() * 4) != 0;
+                bad += std::memcmp(sorted.data(), ks.sorted.data(), (size_t)T * 4) != 0;
+                bad += std::memcmp(off.data(), ks.off.data(), (size_t)(nl + 1) * 4) != 0;
+                bad += std::memcmp(cnt.data(), ks.cnt.data(), (size_t)nl * 4) != 0;
+                if (pass) bad += std::memcmp(inv.data(), ks.inv.data(), (size_t)T * 4) != 0;
+                const std::string why = rig.check(ks.cnt);
+                if (rc != RAD_OK || bad || !why.empty()) {
+                    std::printf("FAIL router_sigmoid_topk_scatter with w2 at M=%d ne=%d k=%d slice %d+%d "
+                                "budget %d pass %d (rc %d, %d mismatching outputs)%s%s\n",
+                                M, ne, k, base, nl, budget, pass, rc, bad, why.empty() ? "" : ": ",
+                                why.c_str());
+                    ++fails;
+                }
             }
         }
     }
@@ -951,6 +1142,7 @@ int main() {
     std::mt19937 rng(23);
     int fails = 0, cases = 0;
     router_scatter_cases(rng, cases, fails);
+    w2_block_cases(cases, fails);
     gather_inverse_cases(rng, cases, fails);
     gather_sixteen_cases(rng, cases, fails);
     gather_quant_cases(rng, cases, fails);

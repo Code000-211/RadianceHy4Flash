@@ -4,6 +4,7 @@
 #include "r4d_common.h"
 #include "r4d_emit.h"
 #include "r4d_moe_sort.h"
+#include "r4d_w2.h"
 #include <climits>
 #include <cmath>
 
@@ -490,6 +491,38 @@ __global__ void __launch_bounds__(NW * 32)
                                               (uint32_t)n_local, sl, inv);
     if (CH::on) r4d_chain_done();
 }
+/* The same launch with the W2 plan behind the sort (r4d_w2.h, abi/rad_w2.h): the body above, then
+ * each routed expert marked resident or missing and the layer's copy list posted. A kernel of its
+ * own, so the launch without a `w2` operand is the instantiation it was. */
+template <int OWN, uint32_t NW, bool INV, class CH>
+__global__ void __launch_bounds__(NW * 32)
+    router_sigmoid_scatter_w2_kernel(const float* logits, const float* bias, int* ids,
+                                     float* weights, int32_t* sorted, int32_t* off, int32_t* cnt,
+                                     uint16_t* gate, int32_t* inv, long lp, long bp, long ip,
+                                     long wp, long gp, int m, int ne, int n_local, int k, int norm,
+                                     float factor, int base, r4d_moesort::Protect prot,
+                                     RadW2Layer* w2) {
+    if (CH::on) r4d_chain_wait();
+    __shared__ r4d_moesort::ScatterLds<NW> sl;
+    __shared__ r4d_w2::PlanLds pl;
+    const int lane = threadIdx.x & 31, wave = threadIdx.x >> 5;
+    for (int e = threadIdx.x; e < n_local; e += (int)(NW * 32)) sl.cnt[e] = 0;
+    for (int r = wave; r < m; r += (int)NW) {
+        const int e = router_sigmoid_row<OWN>(logits, bias, ids, weights, lp, bp, ip, wp, r, ne, k,
+                                              norm, factor, lane) -
+                      base;
+        if (lane < k)
+            sl.e[r * k + lane] =
+                e >= 0 && e < n_local ? r4d_moesort::sort_place(e, (uint32_t)n_local, prot) : -1;
+        if (gate && !lane) gate[(long)r * gp] = f32_to_bf16(1.0f);
+    }
+    lds_barrier();
+    r4d_moesort::scatter_small_place<NW, INV>(sorted, off, cnt, (uint32_t)(m * k),
+                                              (uint32_t)n_local, sl, inv);
+    lds_barrier();
+    r4d_w2::plan(w2, sl.cnt, pl, NW * 32u, (uint32_t)n_local);
+    if (CH::on) r4d_chain_done();
+}
 int router_body(const RadArgs* a, RadStream stream) {
     if (!a || a->n_t < 4) return RAD_E_INVAL;
     const auto &lg = a->t[0], &bias = a->t[1], &ids = a->t[2], &w = a->t[3];
@@ -555,6 +588,9 @@ int router_scatter_body(const RadArgs* a, RadStream stream) {
     const RadTensor *sorted = &a->t[4], *off = &a->t[5], *cnt = &a->t[6];
     const RadTensor* gate = a->n_t > 7 ? r4d_opt(a, 7) : nullptr;
     const RadTensor* inv = a->n_t > 8 ? r4d_opt(a, 8) : nullptr;
+    /* `w2` (optional, last): the layer's W2 control block (abi/rad_w2.h); the plan runs behind
+     * the sort. */
+    const RadTensor* w2 = a->n_t > 9 ? r4d_opt(a, 9) : nullptr;
     const long ne = r4d_geti_or(a, "n_expert", 0), k = r4d_geti_or(a, "top_k", 0);
     const long nl = r4d_geti_or(a, "n_local", ne), base = r4d_geti_or(a, "expert_base", 0);
     const float factor = (float)r4d_getf(a, "route_scale", 0);
@@ -595,8 +631,20 @@ int router_scatter_body(const RadArgs* a, RadStream stream) {
                     inv ? (int32_t*)inv->data : (int32_t*)nullptr, lg.stride[0], bias.stride[0],   \
                     ids.stride[0], w.stride[0], (long)gp, (int)m, (int)ne, (int)nl, (int)k, norm,  \
                     factor, (int)base, prot)
+#define R4D_RSS_W(OWN, NW, INV, CH)                                                                \
+    R4D_EMIT(stream, (router_sigmoid_scatter_w2_kernel<OWN, NW, INV, CH>), dim3(1),                \
+                    dim3((NW) * 32), 0, (const float*)lg.data, (const float*)bias.data,            \
+                    (int*)ids.data, (float*)w.data, (int32_t*)sorted->data, (int32_t*)off->data,   \
+                    (int32_t*)cnt->data, gate ? (uint16_t*)gate->data : (uint16_t*)nullptr,        \
+                    inv ? (int32_t*)inv->data : (int32_t*)nullptr, lg.stride[0], bias.stride[0],   \
+                    ids.stride[0], w.stride[0], (long)gp, (int)m, (int)ne, (int)nl, (int)k, norm,  \
+                    factor, (int)base, prot, (RadW2Layer*)w2->data)
 #define R4D_RSS_I(OWN, NW, INV)                                                                    \
-    return ch ? R4D_RSS_C(OWN, NW, INV, r4dchain) : R4D_RSS_C(OWN, NW, INV, R4dUnchained)
+    do {                                                                                           \
+        if (w2 && w2->data)                                                                        \
+            return ch ? R4D_RSS_W(OWN, NW, INV, r4dchain) : R4D_RSS_W(OWN, NW, INV, R4dUnchained); \
+        return ch ? R4D_RSS_C(OWN, NW, INV, r4dchain) : R4D_RSS_C(OWN, NW, INV, R4dUnchained);     \
+    } while (0)
 #define R4D_RSS(OWN, NW)                                                                           \
     do {                                                                                           \
         if (inv) R4D_RSS_I(OWN, NW, true);                                                         \
@@ -612,6 +660,7 @@ int router_scatter_body(const RadArgs* a, RadStream stream) {
     R4D_RSS(16, 32u);
 #undef R4D_RSS
 #undef R4D_RSS_I
+#undef R4D_RSS_W
 #undef R4D_RSS_C
 }
 template <class CH>

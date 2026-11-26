@@ -9,6 +9,7 @@
  * wait, not a host sync" is checked through Ctx::stream_waits() and the device layer's count of
  * host blocks (rad_dev_host_blocks).
  */
+#include "runtime/w2.h"
 #include "rad_test.h"
 #include "host_kargs_main.h"
 #include "rad_prefill_split.h"
@@ -776,6 +777,93 @@ TEST(a_weight_table_issued_against_its_declaration_is_refused) {
 
 /* Routing never blocks the compute stream: the histogram is copied back asynchronously and the
  * heat engine drains it on a later step (spec §5.5). */
+/* W2 (core/runtime/w2.h, issue #309) is off unless the engine opened it with the switch on: the
+ * context then hands out no control block whatever the pass, holds no state for it and mixes
+ * nothing into a pass's key. Opened (where the backend has a prefetch DMA queue; this one's memory
+ * is the host's, so the block can be read here), a layer is bound at the first pass wide enough:
+ * its block carries the pools, the ring's group, the done word behind the ring and the budget
+ * table, later passes get the same block, and each binding moves the epoch a pass's key carries. */
+TEST(w2_is_off_until_opened_and_binds_a_layer_at_its_first_wide_pass) {
+    Fixture f;
+    f.add_buffer("x", RAD_BF16, 64, 4, 0);
+    CHECK_OK(f.start());
+    const rad_weight first[4] = { 1, 1, 1, 1 };
+    CHECK(!f.ctx.w2_on());
+    CHECK_EQ(f.ctx.w2_epoch(), (uint64_t)0);
+    for (int64_t rows : { 1, 16, 48, 1024 })
+        for (int layer : { 0, 1 }) CHECK(f.ctx.w2_layer(layer, first, 4, rows) == nullptr);
+    CHECK(rad_expert_w2((RadCtx*)&f.ctx, 0, first, 4, 48) == nullptr);
+    RadW2Stats st{};
+    CHECK(!f.ctx.w2_stats(&st));
+
+    const uint64_t lo[2] = { 0x100000000ull, 0x300000000ull }, hi[2] = { 0x140000000ull, 0x300000000ull };
+    const uint64_t stride[2] = { 0x180000ull, 0x1000ull };   /* the second range is empty: left out */
+    rad::W2Config off;                       /* the default: off */
+    f.ctx.w2_open(off, lo, hi, stride, 2);
+    CHECK(!f.ctx.w2_on());
+    CHECK(f.ctx.w2_layer(0, first, 4, 48) == nullptr);
+
+    rad::W2Config on;
+    on.on = true;
+    f.ctx.w2_open(on, lo, hi, stride, 2);
+    if (!f.ctx.w2_on()) {                    /* a backend without the queue: it stays off */
+        CHECK(f.ctx.w2_layer(0, first, 4, 48) == nullptr);
+        return;
+    }
+    CHECK_EQ(f.ctx.w2_epoch(), (uint64_t)0);
+    /* too narrow, no such layer, no places, too many places: no block and no binding */
+    CHECK(f.ctx.w2_layer(0, first, 4, on.min_rows - 1) == nullptr);
+    CHECK(f.ctx.w2_layer(-1, first, 4, 48) == nullptr);
+    CHECK(f.ctx.w2_layer(2, first, 4, 48) == nullptr);
+    CHECK(f.ctx.w2_layer(0, nullptr, 4, 48) == nullptr);
+    CHECK(f.ctx.w2_layer(0, first, 0, 48) == nullptr);
+    CHECK(f.ctx.w2_layer(0, first, RAD_W2_MAX_EXPERT + 1, 48) == nullptr);
+    CHECK_EQ(f.ctx.w2_epoch(), (uint64_t)0);
+
+    const RadW2Layer* L0 = (const RadW2Layer*)f.ctx.w2_layer(0, first, 4, on.min_rows);
+    REQUIRE(L0 != nullptr);
+    CHECK_EQ(f.ctx.w2_epoch(), (uint64_t)1);
+    CHECK(f.ctx.w2_layer(0, first, 4, 48) == (void*)L0);      /* bound once */
+    CHECK_EQ(f.ctx.w2_epoch(), (uint64_t)1);
+    const RadW2Layer* L1 = (const RadW2Layer*)f.ctx.w2_layer(1, first, 4, 48);
+    REQUIRE(L1 != nullptr);
+    CHECK(L1 != L0);
+    CHECK_EQ(f.ctx.w2_epoch(), (uint64_t)2);
+    for (const RadW2Layer* L : { L0, L1 }) {
+        CHECK_EQ(L->magic, (uint64_t)RAD_W2_MAGIC);
+        CHECK_EQ(L->n_expert, 4u);
+        CHECK_EQ(L->pools.n, 1);
+        CHECK_EQ(L->pools.lo[0], lo[0]);
+        CHECK_EQ(L->pools.hi[0], hi[0]);
+        CHECK_EQ(L->pools.stride[0], stride[0]);
+        CHECK_EQ(L->slot, stride[0]);
+        CHECK(L->box != nullptr);
+        CHECK(L->head != nullptr);
+        CHECK(L->stats != nullptr);
+        CHECK_EQ(L->seq, 0u);
+        uint8_t km[RAD_W2_MAX_EXPERT + 1];
+        rad::w2_fill_kmax(on, km);
+        CHECK_EQ(std::memcmp(L->kmax, km, sizeof km), 0);
+        for (int x = 0; x < RAD_W2_MAX_EXPERT; ++x) CHECK_EQ((int)L->mask[x], 0);
+    }
+    /* each layer's group of ring slots, and a done word of its own outside every slot */
+    CHECK_EQ(L0->group, 0u);
+    CHECK_EQ(L1->group, 1u);
+    CHECK_EQ(L1->ring, L0->ring + (uint64_t)RAD_W2_MAX_COPY * stride[0]);
+    const uint64_t ring_end = L0->ring + (uint64_t)RAD_W2_GROUPS * RAD_W2_MAX_COPY * stride[0];
+    for (const RadW2Layer* L : { L0, L1 }) {
+        const uint64_t d = (uint64_t)(uintptr_t)L->done;
+        CHECK(d < L0->ring || d >= ring_end);                   /* in no slot */
+    }
+    CHECK(L1->done != L0->done);
+    CHECK_EQ(L0->head, L1->head);                              /* one post counter a rank */
+    CHECK(f.ctx.w2_stats(&st));
+    CHECK_EQ(st.plans, 0u);
+    f.ctx.w2_close();
+    CHECK(!f.ctx.w2_on());
+    CHECK(f.ctx.w2_layer(0, first, 4, 48) == nullptr);
+}
+
 TEST(route_report_is_asynchronous_and_drains_oldest_first) {
     Fixture f;
     f.add_buffer("x", RAD_BF16, 64, 4, 0);

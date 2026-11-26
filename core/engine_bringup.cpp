@@ -30,6 +30,7 @@
 #include "runtime/arena.h"
 #include "runtime/kvbind.h"
 #include "runtime/xprefetch.h"
+#include "runtime/w2.h"
 #include "sample/gbnf.h"
 #include "sched/scheduler.h"
 #include "text/token_view.h"
@@ -2000,6 +2001,14 @@ int Engine::plan() {
                     if (w.decl.group.expert >= 0) nl = std::max(nl, (int64_t)w.decl.group.layer + 1);
                 f.n_queues += 1;
                 f.prefetch = xp_device_bytes(wf.expert_unit_max, nl);
+            } else if (wf.routed && wf.expert_unit_max > 0 && !cfg_.deterministic && w2_config().on &&
+                       (cfg_.placement == "auto" || cfg_.placement == "expert_tiered") &&
+                       rad_xp_supported(r->device)) {
+                /* W2's ring and control blocks (core/runtime/w2.h), where its switch is on. */
+                int64_t nl = r->program.meta.n_layers;
+                for (const WeightInfo& w : r->program.weights)
+                    if (w.decl.group.expert >= 0) nl = std::max(nl, (int64_t)w.decl.group.layer + 1);
+                f.prefetch = w2_device_bytes(wf.expert_unit_max, nl);
             }
             RadDeviceProps props{};
             rad_dev_props(r->device, &props);
@@ -5397,6 +5406,18 @@ int Engine::start() {
             uint64_t lo[kXpMaxPools], hi[kXpMaxPools], st[kXpMaxPools];
             const int n = r->mover.pool_ranges(lo, hi, st, kXpMaxPools);
             if (n > 0) r->ctx.xp_open(lo, hi, st, n);
+        }
+    /* "Weg 2" (core/runtime/w2.h), behind RADIANCE_W2 (default off): resident experts first on
+     * wide passes, the misses' whole units copied meanwhile on the prefetch's DMA queue (which the
+     * TP1 prefetch above does not share: one of the two is on). Every rank plans and copies its
+     * own half. */
+    if (const W2Config w2c = w2_config(); w2c.on && !cfg_.deterministic)
+        for (auto& r : ranks_) {
+            if (r->ctx.xp_on()) continue;
+            RAD_TRY(rad_dev_set(r->device));
+            uint64_t lo[RAD_W2_MAX_POOLS], hi[RAD_W2_MAX_POOLS], st[RAD_W2_MAX_POOLS];
+            const int n = r->mover.pool_ranges(lo, hi, st, RAD_W2_MAX_POOLS);
+            if (n > 0) r->ctx.w2_open(w2c, lo, hi, st, n);
         }
     /* Expert streaming X1 (b): the mover's paced copies go out from the routed layers' marks
      * (Ctx::xp_mark), which recorded passes then carry. Not beside the TP1 prefetch, which rides

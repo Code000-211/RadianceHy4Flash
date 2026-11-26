@@ -50,6 +50,7 @@
 #include "rad_fp8.h"
 #include "rad_block_glm_router.h"
 #include "rad_device.h"
+#include "rad_w2.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -554,6 +555,10 @@ struct MoeFP8 {
      * expert's rows before the checkpoint are then a run of their own, as a step ending there
      * gives them (moe_gemm_iqr's packed map), so they take the same paths. */
     mutable const int32_t* split_tok = nullptr;
+    /* "Weg 2" (abi/rad_w2.h): set by step() around a decode-phase step issued as one pass. Such a
+     * pass asks the core for the layer's control block (rad_expert_w2), which is null unless the
+     * switch is on and the pass wide enough; null, pass() issues exactly what it always did. */
+    mutable bool w2_pass = false;
     /* The block over the first `T` rows of its buffers, for passes that need fewer rows than the
      * batch (the MTP head's history pass reads its output only at drafting rows). */
     void step_rows(RadCtx* c, int64_t T, const SideOps* side = nullptr) const;
@@ -1921,7 +1926,20 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
      * `router_fused_gate`) the shared gate in one launch. Otherwise the separate ops. */
     const bool rfused = op_router_fused && rows <= router_fused_rows;
     const bool sfused = op_sigmoid_scatter && rows <= sigmoid_scatter_rows;
-    if (sfused) {
+    /* W2: the layer's control block where this pass takes the form (the router's fused launch
+     * plans in it, the quantised GEMMs read it), else null. */
+    void* const w2p = w2_pass && sfused && r0 == 0 && rows == T && !c.expert_bf16 && !w_gu.empty()
+                          ? rad_expert_w2(c_, layer, w_gu.data(), n_reg, rows) : nullptr;
+    const RadOperand w2o = w2p ? praw(w2p, RAD_U8, (int64_t)sizeof(RadW2Layer)) : RAD_NONE;
+    if (sfused && w2p) {
+        glm_router.project(c_, r0, rows, r0);
+        RAD_ISSUE_N(c_, op_sigmoid_scatter, rows, brow_slice(w.logits, r0, rows, ne_all),
+                    RAD_W(glm_router.correction), brow_slice(w.ids, r0, rows, k),
+                    brow_slice(w.ew, r0, rows, k), brows(w.sorted, rows * k),
+                    brows(w.eoff, ne + 1), ecnt,
+                    sigmoid_scatter_gate ? brow_slice(w.sgate, r0, rows, 1) : RAD_NONE,
+                    scatter_inv ? brows(w.inv, rows * k) : RAD_NONE, w2o);
+    } else if (sfused) {
         glm_router.project(c_, r0, rows, r0);
         RAD_ISSUE_N(c_, op_sigmoid_scatter, rows, brow_slice(w.logits, r0, rows, ne_all),
                     RAD_W(glm_router.correction), brow_slice(w.ids, r0, rows, k),
@@ -1991,33 +2009,46 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
     /* Apply the previous layer's prefetch prediction: substitute the copied experts into the
      * tables. */
     (void)rad_expert_prefetch_step(c_, layer);
-    if (c.expert_bf16)
-        RAD_ISSUE_N(c_, op_gu, rows, brow_slice(w.h.x, r0, rows, g.n_embd),
-                    RAD_WTAB(w_gu[0], ne), brows(w.sorted, rows * k), brows(w.eoff, ne + 1),
-                    brows(w.egu, rows * k));
-    else if (ncls == 4) {
-        /* `split` only where set, so every other step's operand list carries none. */
-        const RadOperand o_[] = {
-            brow_slice(gin_q, r0, rows, g.n_embd),
-            brow_slice(gin_s, r0, rows, g.n_embd / gin_g),
-            RAD_WTAB(w_gu[0], n4[0]), RAD_WTAB(w_gus[0], n4[0]),
-            brows(w.sorted, rows * k), brows(w.eoff, n_reg + 1),
-            RAD_WTAB(w_gu[1], n4[1]), RAD_WTAB(w_gus[1], n4[1]),
-            RAD_WTAB(w_gu[2], n4[2]), RAD_WTAB(w_gus[2], n4[2]),
-            RAD_WTAB(w_gu[3], n4[3]), RAD_WTAB(w_gus[3], n4[3]),
-            brows(w.egu, rows * k), sp };
-        rad_issue(c_, op_gu, o_, (int)(sizeof o_ / sizeof *o_) - (split_on ? 0 : 1), rows);
-    } else {
-        /* `split` only where set, so every other step's operand list carries none. */
-        const RadOperand o_[] = {
-            brow_slice(gin_q, r0, rows, g.n_embd),
-            brow_slice(gin_s, r0, rows, g.n_embd / gin_g),
-            RAD_WTAB(w_gu[0], n_reg / 2), RAD_WTAB(w_gus[0], n_reg / 2),
-            brows(w.sorted, rows * k), brows(w.eoff, n_reg + 1),
-            RAD_WTAB(w_gu[1], n_reg / 2), RAD_WTAB(w_gus[1], n_reg / 2),
-            brows(w.egu, rows * k), sp };
-        rad_issue(c_, op_gu, o_, (int)(sizeof o_ / sizeof *o_) - (split_on ? 0 : 1), rows);
-    }
+    /* Operands a routed GEMM's list of `n` (ending split, w2, w2_tail) is issued with: the launch
+     * as it always was (tail 0: split only where set), through `w2` (1), or all (2). */
+    const auto w2_count = [](int n, int tail, bool split) {
+        return tail == 0 ? n - 2 - (split ? 0 : 1) : tail == 1 ? n - 1 : n;
+    };
+    /* The routed gate_up GEMM. `tail` 0 is the launch as it always was; under W2 (`w2p`) the first
+     * launch (1) carries `w2` and serves the resident experts, the tail's (2) `w2_tail` and serves
+     * the misses, at the same pass height. */
+    const auto issue_gu = [&](int tail) {
+        if (c.expert_bf16)
+            RAD_ISSUE_N(c_, op_gu, rows, brow_slice(w.h.x, r0, rows, g.n_embd),
+                        RAD_WTAB(w_gu[0], ne), brows(w.sorted, rows * k), brows(w.eoff, ne + 1),
+                        brows(w.egu, rows * k));
+        else if (ncls == 4) {
+            /* `split` only where set, so every other step's operand list carries none. */
+            const RadOperand o_[] = {
+                brow_slice(gin_q, r0, rows, g.n_embd),
+                brow_slice(gin_s, r0, rows, g.n_embd / gin_g),
+                RAD_WTAB(w_gu[0], n4[0]), RAD_WTAB(w_gus[0], n4[0]),
+                brows(w.sorted, rows * k), brows(w.eoff, n_reg + 1),
+                RAD_WTAB(w_gu[1], n4[1]), RAD_WTAB(w_gus[1], n4[1]),
+                RAD_WTAB(w_gu[2], n4[2]), RAD_WTAB(w_gus[2], n4[2]),
+                RAD_WTAB(w_gu[3], n4[3]), RAD_WTAB(w_gus[3], n4[3]),
+                brows(w.egu, rows * k), sp, tail == 1 ? w2o : RAD_NONE,
+                tail == 2 ? w2o : RAD_NONE };
+            rad_issue(c_, op_gu, o_, w2_count((int)(sizeof o_ / sizeof *o_), tail, split_on), rows);
+        } else {
+            /* `split` only where set, so every other step's operand list carries none. */
+            const RadOperand o_[] = {
+                brow_slice(gin_q, r0, rows, g.n_embd),
+                brow_slice(gin_s, r0, rows, g.n_embd / gin_g),
+                RAD_WTAB(w_gu[0], n_reg / 2), RAD_WTAB(w_gus[0], n_reg / 2),
+                brows(w.sorted, rows * k), brows(w.eoff, n_reg + 1),
+                RAD_WTAB(w_gu[1], n_reg / 2), RAD_WTAB(w_gus[1], n_reg / 2),
+                brows(w.egu, rows * k), sp, tail == 1 ? w2o : RAD_NONE,
+                tail == 2 ? w2o : RAD_NONE };
+            rad_issue(c_, op_gu, o_, w2_count((int)(sizeof o_ / sizeof *o_), tail, split_on), rows);
+        }
+    };
+    issue_gu(w2p ? 1 : 0);
     if (shared && !sh_first)
         shared_up(c_, T, r0, rows,
                   (rfused && router_fused_gate) || (sfused && sigmoid_scatter_gate));
@@ -2040,29 +2071,45 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
     if (sh_dn_first) sh_down.step(c_, w.sff, w.sout, T, r0, rows);
     const bool side_dn_first = side && T >= sh_down_first_lo && T <= sh_down_first_hi;
     if (side_dn_first) side->at(2);
-    if (c.expert_bf16)
-        RAD_ISSUE_N(c_, op_dn, rows, brows(w.eff.x, rows * k), RAD_WTAB(w_dn[0], ne),
-                    brows(w.sorted, rows * k), brows(w.eoff, ne + 1), brows(w.edn, rows * k));
-    else if (ncls == 4) {
-        /* `split` only where set, so every other step's operand list carries none. */
-        const RadOperand o_[] = {
-            brows(gq_exp.a.cq(), rows * k), brows(gq_exp.a.cs(), rows * k),
-            RAD_WTAB(w_dn[0], n4[0]), RAD_WTAB(w_dns[0], n4[0]),
-            brows(w.sorted, rows * k), brows(w.eoff, n_reg + 1),
-            RAD_WTAB(w_dn[1], n4[1]), RAD_WTAB(w_dns[1], n4[1]),
-            RAD_WTAB(w_dn[2], n4[2]), RAD_WTAB(w_dns[2], n4[2]),
-            RAD_WTAB(w_dn[3], n4[3]), RAD_WTAB(w_dns[3], n4[3]),
-            brows(w.edn, rows * k), sp };
-        rad_issue(c_, op_dn, o_, (int)(sizeof o_ / sizeof *o_) - (split_on ? 0 : 1), rows);
-    } else {
-        /* `split` only where set, so every other step's operand list carries none. */
-        const RadOperand o_[] = {
-            brows(gq_exp.a.cq(), rows * k), brows(gq_exp.a.cs(), rows * k),
-            RAD_WTAB(w_dn[0], n_reg / 2), RAD_WTAB(w_dns[0], n_reg / 2),
-            brows(w.sorted, rows * k), brows(w.eoff, n_reg + 1),
-            RAD_WTAB(w_dn[1], n_reg / 2), RAD_WTAB(w_dns[1], n_reg / 2),
-            brows(w.edn, rows * k), sp };
-        rad_issue(c_, op_dn, o_, (int)(sizeof o_ / sizeof *o_) - (split_on ? 0 : 1), rows);
+    /* The routed down GEMM, as issue_gu. */
+    const auto issue_dn = [&](int tail) {
+        if (c.expert_bf16)
+            RAD_ISSUE_N(c_, op_dn, rows, brows(w.eff.x, rows * k), RAD_WTAB(w_dn[0], ne),
+                        brows(w.sorted, rows * k), brows(w.eoff, ne + 1), brows(w.edn, rows * k));
+        else if (ncls == 4) {
+            /* `split` only where set, so every other step's operand list carries none. */
+            const RadOperand o_[] = {
+                brows(gq_exp.a.cq(), rows * k), brows(gq_exp.a.cs(), rows * k),
+                RAD_WTAB(w_dn[0], n4[0]), RAD_WTAB(w_dns[0], n4[0]),
+                brows(w.sorted, rows * k), brows(w.eoff, n_reg + 1),
+                RAD_WTAB(w_dn[1], n4[1]), RAD_WTAB(w_dns[1], n4[1]),
+                RAD_WTAB(w_dn[2], n4[2]), RAD_WTAB(w_dns[2], n4[2]),
+                RAD_WTAB(w_dn[3], n4[3]), RAD_WTAB(w_dns[3], n4[3]),
+                brows(w.edn, rows * k), sp, tail == 1 ? w2o : RAD_NONE,
+                tail == 2 ? w2o : RAD_NONE };
+            rad_issue(c_, op_dn, o_, w2_count((int)(sizeof o_ / sizeof *o_), tail, split_on), rows);
+        } else {
+            /* `split` only where set, so every other step's operand list carries none. */
+            const RadOperand o_[] = {
+                brows(gq_exp.a.cq(), rows * k), brows(gq_exp.a.cs(), rows * k),
+                RAD_WTAB(w_dn[0], n_reg / 2), RAD_WTAB(w_dns[0], n_reg / 2),
+                brows(w.sorted, rows * k), brows(w.eoff, n_reg + 1),
+                RAD_WTAB(w_dn[1], n_reg / 2), RAD_WTAB(w_dns[1], n_reg / 2),
+                brows(w.edn, rows * k), sp, tail == 1 ? w2o : RAD_NONE,
+                tail == 2 ? w2o : RAD_NONE };
+            rad_issue(c_, op_dn, o_, w2_count((int)(sizeof o_ / sizeof *o_), tail, split_on), rows);
+        }
+    };
+    issue_dn(w2p ? 1 : 0);
+    if (w2p) {
+        /* W2's tail: the misses' gate_up, the quantiser over the pass again (it rewrites the
+         * resident rows' codes with the same bytes) and the misses' down, behind the resident
+         * experts' down (the `w2` operand orders them) so the copies had the link and the window
+         * to themselves. */
+        rad_expert_w2_tail(c_);
+        issue_gu(2);
+        gq_exp.step(c_, w.egu, rows * k, 0, rows * k);
+        issue_dn(2);
     }
     /* This layer's streamed experts are consumed; the next layer's copies may start. */
     (void)rad_expert_prefetch_mark(c_);
@@ -2221,7 +2268,9 @@ inline void MoeFP8::step(RadCtx* c_, const RadBatch* batch, const SideOps* side)
     /* One pass over the whole step: `split` gives the rows before the checkpoint runs of their
      * own (split_tok). */
     split_tok = cut ? batch->ckpt_cu + 1 : nullptr;
+    w2_pass = batch->phase == RAD_PHASE_DECODE && !cut;
     step_rows(c_, T, side);
+    w2_pass = false;
     split_tok = nullptr;
 }
 

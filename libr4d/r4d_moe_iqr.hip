@@ -46,6 +46,7 @@
 #include "r4d_iqr.h"
 #include "r4d_iqr_dec.h"
 #include "r4d_moe_sort.h"
+#include "r4d_w2.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -220,8 +221,16 @@ __device__ __forceinline__ void dot_run(const Ctx& c, uint32_t rt, uint32_t kph,
     const int32_t* __restrict__ off, uint16_t* __restrict__ Y, const uint32_t* __restrict__ map,  \
     uint32_t T, uint32_t fy, uint32_t n_expert, uint32_t inv_k, uint32_t x_ld, uint32_t xs_ld,    \
     uint32_t y_ld, uint32_t mode, uint32_t run_tiles, uint32_t inv_ft
-template <class F, uint32_t KW, uint32_t RTB, bool MAP, uint32_t NT, uint32_t TPW, bool PK = false>
+/* W2 (abi/rad_w2.h, the decode grid only): `map`, which that grid does not use, is the layer's
+ * control block, and `mode` bit 4 says so; bit 5 is the tail. The first pass serves the resident
+ * experts' tiles and the tail the misses', each from the ring where its copy has landed; a block
+ * of the other kind returns behind its search. The tile an expert's rows get, and so every sum,
+ * is the one launch's. */
+constexpr uint32_t kModeW2 = 16u, kModeW2Tail = 32u;
+template <class F, uint32_t KW, uint32_t RTB, bool MAP, uint32_t NT, uint32_t TPW, bool PK = false,
+          bool W2 = false>
 __device__ __forceinline__ void moe_iqr_body(R4D_MOEIQR_PARAMS) {
+    static_assert(!W2 || !MAP, "W2: the decode grid");
     using D = Dec<F>;
     static_assert(D::MAD && F::SC == kRowF32 && F::LRB == 0,
                   "the routed kernel reads a computed trellis under one f32 scale a row");
@@ -279,6 +288,8 @@ __device__ __forceinline__ void moe_iqr_body(R4D_MOEIQR_PARAMS) {
         static_assert(NPT * NTHR == kMaxExpert && NPT <= 16, "a thread's experts in one round");
         __shared__ uint32_t s_rc[NW];
         if (blockIdx.x == gridDim.x - 1u) {
+            /* W2: the first pass zeroed them */
+            if constexpr (W2) { if (mode & kModeW2Tail) return; }
             const uint32_t live = (uint32_t)off[n_expert];
             if (live < T) zero_rows(live, T);
             return;
@@ -294,6 +305,11 @@ __device__ __forceinline__ void moe_iqr_body(R4D_MOEIQR_PARAMS) {
 #pragma unroll
         for (uint32_t k = 0; k < NPT; ++k) {
             nt[k] = tid * NPT + k < n_expert ? (ov[k + 1] - ov[k] + kRows - 1u) / kRows : 0u;
+            /* W2's tail numbers the misses' tiles alone: its grid holds no more. */
+            if constexpr (W2) {
+                if ((mode & kModeW2Tail) && !r4d_w2::in_tail((const RadW2Layer*)map, tid * NPT + k))
+                    nt[k] = 0u;
+            }
             cnt += nt[k];
         }
         const uint32_t inc = (uint32_t)wave_incl_scan_i32((int32_t)cnt, lane);
@@ -321,6 +337,7 @@ __device__ __forceinline__ void moe_iqr_body(R4D_MOEIQR_PARAMS) {
             s_sel[0] = tid * NPT + k;
             s_sel[1] = ov[k] + rem * kRows;
             s_sel[2] = ov[k + 1];
+            if constexpr (W2) s_sel[3] = rem;
         }
         lds_barrier();
         e = s_sel[0];
@@ -338,8 +355,31 @@ __device__ __forceinline__ void moe_iqr_body(R4D_MOEIQR_PARAMS) {
     const uint32_t cls = e & ((1u << cshift) - 1u);
     const IqrCls& C = cls == 0u ? c_0 : cls == 1u ? c_1 : cls == 2u ? c_2 : c_3;
     Ctx c{};
+    if constexpr (W2) {
+        const RadW2Layer* L = (const RadW2Layer*)map;
+        const bool tail = (mode & kModeW2Tail) != 0u;
+        /* the table entries beside the mask byte, not behind it */
+        const void* pw = C.w[e >> cshift];
+        const void* ps = C.s[e >> cshift];
+        if (!r4d_w2::mine(L, e, tail)) return;
+        if (tail) {
+            bool ring = false;
+            pw = r4d_w2::where(L, e, pw, &ring);
+            ps = r4d_w2::where(L, e, ps);
+            /* One count a posted unit: gate_up's block of the run's first tile and columns. */
+            if (!a_sorted && tid == 0u && blockIdx.y == 0u && s_sel[3] == 0u &&
+                (uint32_t)L->mask[e] >= RAD_W2_COPY0 && L->stats)
+            {
+                atomicAdd(ring ? &L->stats->landed : &L->stats->late, 1u);
+                if (ring && L->n_copy <= RAD_W2_MAX_COPY) atomicAdd(&L->stats->landed_n[L->n_copy], 1u);
+            }
+        }
+        c.W = uniform((const uint8_t*)pw);
+        c.S = uniform((const uint8_t*)ps);
+    } else {
     c.W = uniform((const uint8_t*)C.w[e >> cshift]);
     c.S = uniform((const uint8_t*)C.s[e >> cshift]);
+    }
     c.tab = nullptr;
     c.N = C.n;
     c.nkb = C.k / kBlock;
@@ -551,11 +591,11 @@ __device__ __forceinline__ void moe_iqr_body(R4D_MOEIQR_PARAMS) {
  * chained form (r4d_chain.h), every block waiting before its first read and adding once after
  * its last write. Eight token tiles a block hold 237 registers: six waves a SIMD. */
 template <class F, uint32_t KW, uint32_t RTB, bool MAP, uint32_t NT, uint32_t TPW, class CH,
-          bool PK = false>
+          bool PK = false, bool W2 = false>
 __global__ __launch_bounds__(KW * RTB * kWave) R4D_WAVES(NT > 4u ? 6 : 8)
 void moe_iqr_kernel(R4D_MOEIQR_PARAMS) {
     if (CH::on) r4d_chain_wait();
-    moe_iqr_body<F, KW, RTB, MAP, NT, TPW, PK>(X, XS, c_0, c_1, c_2, c_3, sorted, off, Y, map, T, fy,
+    moe_iqr_body<F, KW, RTB, MAP, NT, TPW, PK, W2>(X, XS, c_0, c_1, c_2, c_3, sorted, off, Y, map, T, fy,
                                            n_expert, inv_k, x_ld, xs_ld, y_ld, mode, run_tiles,
                                            inv_ft);
     if (CH::on) r4d_chain_done();
@@ -749,6 +789,10 @@ struct Launch {
     uint32_t gx, nkb;
     bool packed;  /* the map is the packed one, at kPackTiles token tiles a block */
     bool chain;   /* the chained form (r4d_chain.h) */
+    /* W2 (abi/rad_w2.h), the decode grid only: the layer's control block, and whether this is
+     * the tail. */
+    const void* w2 = nullptr;
+    bool w2_tail = false;
 };
 
 /* The packed map's entry bound: an expert one entry per 128 rows begun and one for its dot
@@ -771,8 +815,20 @@ int launch_form(const Launch& g, RadStream stream) {
                   g.c[0], g.c[1], g.c[2], g.c[3], g.sorted, g.off, g.y, (const uint32_t*)g.map,   \
                   g.T, g.N / (g.mode >> 8), g.n_expert, g.inv_k, g.x_ld, g.xs_ld, g.y_ld, g.mode, \
                   g.run_tiles, g.inv_ft)
+#define R4D_MOEIQR_W(kw_, rtb_, tpw_, ch_)                                                        \
+    rc = R4D_EMIT(stream, (moe_iqr_kernel<F, kw_, rtb_, false, 1u, tpw_, ch_, false, true>),      \
+                  dim3(g.w2_tail ? std::min(g.gx, rad_w2_tail_tiles(g.T) + 1u) : g.gx,            \
+                       g.N / (16u * rtb_ * tpw_)),                                                \
+                  dim3(kw_ * rtb_ * kWave), 0, g.x, g.xs,                                         \
+                  g.c[0], g.c[1], g.c[2], g.c[3], g.sorted, g.off, g.y, (const uint32_t*)g.w2,    \
+                  g.T, g.N / (g.mode >> 8), g.n_expert, g.inv_k, g.x_ld, g.xs_ld, g.y_ld,         \
+                  g.mode | kModeW2 | (g.w2_tail ? kModeW2Tail : 0u), g.run_tiles, g.inv_ft)
 #define R4D_MOEIQR_GO(kw_, rtb_, map_, nt_, tpw_)                                                 \
-    do { if (g.chain) R4D_MOEIQR_E(kw_, rtb_, map_, nt_, tpw_, r4dchain);                         \
+    do { if (g.w2 && !(map_)) {                                                                   \
+             if (g.chain) R4D_MOEIQR_W(kw_, rtb_, tpw_, r4dchain);                                \
+             else         R4D_MOEIQR_W(kw_, rtb_, tpw_, R4dUnchained);                            \
+         }                                                                                        \
+         else if (g.chain) R4D_MOEIQR_E(kw_, rtb_, map_, nt_, tpw_, r4dchain);                    \
          else         R4D_MOEIQR_E(kw_, rtb_, map_, nt_, tpw_, R4dUnchained); } while (0)
     /* The run map's grid (prefill): a wave a weight tile down all of its K, four tiles a block,
      * kMapTiles token tiles a decode. The decode grid: a wave a tile and a block four, except that
@@ -797,6 +853,7 @@ int launch_form(const Launch& g, RadStream stream) {
     else if (!two)                 R4D_MOEIQR_GO(1u, 4u, false, 1u, 1u);
     else                           R4D_MOEIQR_GO(1u, 4u, false, 1u, 2u);
 #undef R4D_MOEIQR_GO
+#undef R4D_MOEIQR_W
 #undef R4D_MOEIQR_E
     return rc;
 }
@@ -819,6 +876,11 @@ int moe_iqr_launch(const RadArgs* a, RadStream stream, int ncls) {
     /* `split` (optional, after y): a checkpoint inside the step -- the token at which each expert's
      * run is cut in two for the map (moe_iqr_packmap_kernel). */
     const RadTensor* split  = r4d_opt(a, ncls == 4 ? 13 : 9);
+    /* `w2` / `w2_tail` (optional, after split): the layer's W2 control block, on the first pass or
+     * on the tail (abi/rad_w2.h). Read by the decode grid alone; any other form runs every expert
+     * on both launches, which writes the same bytes twice. */
+    const RadTensor* w2     = r4d_opt(a, ncls == 4 ? 14 : 10);
+    const RadTensor* w2t    = r4d_opt(a, ncls == 4 ? 15 : 11);
     if (!Aq || !As || !sorted || !off || !Y) return R4D_NO(RAD_E_INVAL);
     if (!Aq->data || !As->data || !sorted->data || !off->data || !Y->data)
         return R4D_NO(RAD_E_INVAL);
@@ -930,6 +992,8 @@ int moe_iqr_launch(const RadArgs* a, RadStream stream, int ncls) {
                           1u);
         /* The band's one launch has a chained form; the run map's two launches stay plain. */
         g.chain = r4d_geti_or(a, "chain", 0) != 0;
+        if (w2t && w2t->data) { g.w2 = w2t->data; g.w2_tail = true; }
+        else if (w2 && w2->data) g.w2 = w2->data;
     } else {
         long long cap = r4d_moe_blockmap_cap(T, n_expert, kRows * kMapTiles);
         if (!a->scratch || a->scratch_bytes < r4d_moe_blockmap_bytes(cap))
