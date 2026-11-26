@@ -1597,6 +1597,8 @@ __device__ __forceinline__ void moe_down_dec_body(R4D_MOEDD_PARAMS, const RadW2L
         inl = w2form == 1u || w2form == 2u;
         ring3 = w2form == 3u;
     }
+    const bool late4 = w2form == 4u;
+    bool b4 = false;
     /* The block's columns: G 64-wide tiles from cg0, the last group cut at N. */
     uint32_t cg0 = blockIdx.y * G * FN;
     if (!inl && cg0 >= N) return;       /* the launcher's grid has none; block-uniform */
@@ -1725,8 +1727,26 @@ __device__ __forceinline__ void moe_down_dec_body(R4D_MOEDD_PARAMS, const RadW2L
                 if ((((pm >> q) & 1u) != 0u) != useb) nt[q] = 0u;
         }
     }
-    if (!inl && j >= ntile) return;     /* fewer tiles than slots: block-uniform */
-    if (j >= before && j < before + cnt) {
+    if constexpr (W2) {
+        if (late4 && j >= ntile) {
+            /* r4d_moe_iqr.hip's inline4: the launch's last empty blocks run the posted tiles */
+            uint32_t y4 = 0u, e4 = 0u, rs4 = 0u, rl4 = 0u, rem4 = 0u;
+            b4 = r4d_w2::late_tile(w2, off, T, gridDim.x - 1u - ntile, j - ntile, FM, &y4, &e4,
+                                   &rs4, &rl4, &rem4);
+            if (!b4) return;
+            cg0 = (uint32_t)__builtin_amdgcn_readfirstlane((int)y4) * G * FN;
+            if (cg0 >= N) return;
+            cend = cg0 + G * FN < N ? cg0 + G * FN : N;
+            ng = (cend - cg0 + FN - 1) / FN;
+            if (tid == 0u) {
+                s_sel[0] = e4;
+                s_sel[1] = rs4;
+                s_sel[2] = rl4;
+            }
+        }
+    }
+    if (!inl && !b4 && j >= ntile) return;     /* fewer tiles than slots: block-uniform */
+    if (!b4 && j >= before && j < before + cnt) {
         uint32_t m = j - before;
         bool hit = false;
 #pragma unroll
@@ -1756,9 +1776,11 @@ __device__ __forceinline__ void moe_down_dec_body(R4D_MOEDD_PARAMS, const RadW2L
     const uint16_t* Wsp0 = (const uint16_t*)wtab_at(C.s, C.s_s0, e >> cshift);
     if constexpr (W2) {
         const bool tail = (mode & kModeW2Tail) != 0u;
-        if (!inl && !ring3 && !r4d_w2::mine(w2, e, tail)) return;   /* the table entries are loaded beside it */
-        if (tail || inl || ring3) {
-            Wp0  = (const uint8_t*)r4d_w2::where(w2, e, Wp0, nullptr, inl ? w2->spin : 0u);
+        if (late4) {
+            if (!b4 && r4d_w2::posted(w2, e)) return;   /* the launch's last blocks run it */
+        } else if (!inl && !ring3 && !r4d_w2::mine(w2, e, tail)) return;   /* the table entries are loaded beside it */
+        if (tail || inl || ring3 || b4) {
+            Wp0  = (const uint8_t*)r4d_w2::where(w2, e, Wp0, nullptr, (inl || b4) ? w2->spin : 0u);
             Wsp0 = (const uint16_t*)r4d_w2::where(w2, e, Wsp0);
         }
     }

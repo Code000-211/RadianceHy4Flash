@@ -253,7 +253,7 @@ __device__ __forceinline__ void moe_iqr_body(R4D_MOEIQR_PARAMS) {
     /* w2-explore, the inline form: the block's column group `by` and its tile are renumbered
      * behind the search (every posted expert's tile behind every other tile of the launch). */
     uint32_t by = blockIdx.y, ycol0 = blockIdx.y * kCols;
-    bool inl = false, ring3 = false;
+    bool inl = false, ring3 = false, late4 = false, b4 = false;
     /* Rows [ra, rb) of the block's columns, zeroed: dropped slots, which no run owns. */
     auto zero_rows = [&](uint32_t ra, uint32_t rb) {
         for (uint32_t x = tid; x < (rb - ra) * kCols; x += NTHR)
@@ -296,6 +296,7 @@ __device__ __forceinline__ void moe_iqr_body(R4D_MOEIQR_PARAMS) {
             if (!(mode & kModeW2Tail)) w2form = ((const RadW2Layer*)map)->form;
             inl = w2form == 1u || w2form == 2u;
             ring3 = w2form == 3u;
+            late4 = w2form == 4u;
         }
         uint32_t bx = blockIdx.x;
         if (!inl && blockIdx.x == gridDim.x - 1u) {
@@ -407,8 +408,25 @@ __device__ __forceinline__ void moe_iqr_body(R4D_MOEIQR_PARAMS) {
                     if ((((pm >> q) & 1u) != 0u) != useb) nt[q] = 0u;
             }
         }
-        if (!inl && bx >= ntile) return;
-        if (bx >= before && bx < before + cnt) {
+        uint32_t e4 = 0u, rs4 = 0u, rl4 = 0u, rem4 = 0u;
+        if constexpr (W2) {
+            if (late4 && bx >= ntile) {
+                uint32_t y4 = 0u;
+                b4 = r4d_w2::late_tile((const RadW2Layer*)map, off, T, gridDim.x - 1u - ntile,
+                                       bx - ntile, kRows, &y4, &e4, &rs4, &rl4, &rem4);
+                if (!b4) return;
+                by = __builtin_amdgcn_readfirstlane(y4);
+                ycol0 = by * kCols;
+                if (tid == 0u) {
+                    s_sel[0] = e4;
+                    s_sel[1] = rs4;
+                    s_sel[2] = rl4;
+                    s_sel[3] = rem4;
+                }
+            }
+        }
+        if (!inl && !b4 && bx >= ntile) return;
+        if (!b4 && bx >= before && bx < before + cnt) {
             /* the thread's (bx - before)-th tile: its expert and the tile's first row */
             uint32_t rem = bx - before, k = 0;
             bool hit = false;
@@ -446,10 +464,12 @@ __device__ __forceinline__ void moe_iqr_body(R4D_MOEIQR_PARAMS) {
         /* the table entries beside the mask byte, not behind it */
         const void* pw = C.w[e >> cshift];
         const void* ps = C.s[e >> cshift];
-        if (!inl && !ring3 && !r4d_w2::mine(L, e, tail)) return;
-        if (tail || inl || ring3) {
+        if (late4) {
+            if (!b4 && r4d_w2::posted(L, e)) return;   /* the launch's last blocks run it */
+        } else if (!inl && !ring3 && !r4d_w2::mine(L, e, tail)) return;
+        if (tail || inl || ring3 || b4) {
             bool ring = false;
-            pw = r4d_w2::where(L, e, pw, &ring, inl ? L->spin : 0u);
+            pw = r4d_w2::where(L, e, pw, &ring, (inl || b4) ? L->spin : 0u);
             ps = r4d_w2::where(L, e, ps);
             /* One count a posted unit: gate_up's block of the run's first tile and columns. */
             if (!a_sorted && tid == 0u && by == 0u && s_sel[3] == 0u &&

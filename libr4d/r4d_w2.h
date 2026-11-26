@@ -39,6 +39,7 @@ struct PlanLds {
     uint8_t miss[RAD_W2_MAX_EXPERT];
     int32_t n_distinct, n_miss;
     uint32_t seq, k;
+    uint32_t ntb, pad;
     uint64_t term[RAD_W2_MAX_COPY];      /* each job's part of the post's sum */
 };
 
@@ -61,6 +62,7 @@ __device__ __forceinline__ void plan(RadW2Layer* L, const int32_t* cnt, PlanLds&
         s.n_miss = 0;
         s.seq = 0;
         s.k = 0;
+        s.ntb = 0;
     }
     __syncthreads();
     for (uint32_t x = tid; x < n; x += nthr) {
@@ -127,6 +129,8 @@ __device__ __forceinline__ void plan(RadW2Layer* L, const int32_t* cnt, PlanLds&
                     sys_store(&box->jobs[j].dst, dst);
                     sys_store(&box->jobs[j].bytes, st);
                     s.term[j] = rad_w2_job_term(j, base, dst, st);
+                    L->cp_place[j] = (uint16_t)x;
+                    atomicAdd(&s.ntb, ((uint32_t)cnt[x] + 15u) / 16u);
                     m = (uint8_t)(RAD_W2_COPY0 + j);
                 } else {
                     /* Moved onto the card between the two reads: no job, and no term in the sum;
@@ -135,6 +139,7 @@ __device__ __forceinline__ void plan(RadW2Layer* L, const int32_t* cnt, PlanLds&
                     L->copy[j].base = 0;
                     L->copy[j].dst = 0;
                     L->copy[j].bytes = 0;
+                    L->cp_place[j] = (uint16_t)0xffffu;
                     s.term[j] = 0x5EED5EED5EED5EEDull + j;
                 }
             }
@@ -145,6 +150,7 @@ __device__ __forceinline__ void plan(RadW2Layer* L, const int32_t* cnt, PlanLds&
     if (tid == 0) {
         L->n_miss = n_miss;
         L->n_copy = k;
+        L->ntb = s.ntb;
         L->n_distinct = n_distinct;
         L->seq = seq;
         RadW2Stats* st = L->stats;
@@ -175,6 +181,54 @@ __device__ __forceinline__ bool in_tail(const RadW2Layer* L, uint32_t x) {
  * are numbered behind every other expert's. */
 __device__ __forceinline__ bool posted(const RadW2Layer* L, uint32_t x) {
     return x < RAD_W2_MAX_EXPERT && L->mask[x] >= RAD_W2_COPY0;
+}
+
+/* w2-explore, form 4: the posted experts' tiles for the launch's last empty blocks. `E` empty
+ * blocks a row (past the launch's `ntile` tiles, before the row's last block), `ex` the block's
+ * index among its row's, `rows` a tile's rows. False: the block has none. Else the tile is
+ * column group *by, expert *e, sorted rows from *rs within a run ending at *rl, the run's tile
+ * *rem. Block-uniform. */
+__device__ __forceinline__ bool late_tile(const RadW2Layer* L, const int32_t* off, uint32_t T,
+                                          uint32_t E, uint32_t ex, uint32_t rows, uint32_t* by,
+                                          uint32_t* e, uint32_t* rs, uint32_t* rl, uint32_t* rem) {
+    /* Most empty blocks leave on arithmetic alone, the rest of them on one load: only the
+     * launch's last `ntb` blocks a column group go on (the plan's count, a bound). */
+    const uint32_t gy = gridDim.y;
+    const uint32_t r = (gy - 1u - blockIdx.y) * E + (E - 1u - ex);
+    if (r >= (T / rows + (uint32_t)RAD_W2_MAX_COPY) * gy) return false;
+    if (r >= L->ntb * gy) return false;
+    const uint32_t k = L->seq ? (L->n_copy < RAD_W2_MAX_COPY ? L->n_copy : RAD_W2_MAX_COPY) : 0u;
+    if (!k) return false;
+    uint32_t o0[RAD_W2_MAX_COPY], o1[RAD_W2_MAX_COPY], tl[RAD_W2_MAX_COPY], ntb = 0u;
+#pragma unroll
+    for (uint32_t j = 0; j < RAD_W2_MAX_COPY; ++j) {
+        const uint32_t p = L->cp_place[j];
+        const bool ok = j < k && p < RAD_W2_MAX_EXPERT;
+        const uint32_t a = ok ? (uint32_t)off[p] : 0u, b = ok ? (uint32_t)off[p + 1u] : 0u;
+        o0[j] = a < T ? a : T;
+        o1[j] = b < T ? b : T;
+        tl[j] = ok ? (o1[j] - o0[j] + rows - 1u) / rows : 0u;
+        ntb += tl[j];
+    }
+    const uint32_t nb = ntb * gy;
+    if (r >= nb) return false;
+    const uint32_t q = nb - 1u - r;
+    const uint32_t y = q / ntb;
+    uint32_t t = q - y * ntb, jj = 0u;
+    bool hit = false;
+#pragma unroll
+    for (uint32_t j = 0; j < RAD_W2_MAX_COPY; ++j) {
+        const bool take = !hit && t < tl[j];
+        jj = take ? j : jj;
+        t = (hit || take) ? t : t - tl[j];
+        hit = hit || take;
+    }
+    *by = y;
+    *e = L->cp_place[jj];
+    *rs = o0[jj] + t * rows;
+    *rl = o1[jj];
+    *rem = t;
+    return true;
 }
 
 /* What a routed GEMM's block does with its expert `e` (a place) under W2. `tail` false is the

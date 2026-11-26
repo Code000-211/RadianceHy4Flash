@@ -153,6 +153,13 @@ typedef struct RadW2Layer {
     uint32_t        n_miss, n_copy, n_distinct;
     RadW2Copy       copy[RAD_W2_MAX_COPY];
     uint8_t         mask[RAD_W2_MAX_EXPERT];
+    /* w2-explore, form 4 ("inline4"): the place of posted unit j (0xffff: none). The one launch
+     * keeps its numbering and its search; a posted expert's blocks return where they stand, and
+     * the launch's last blocks that found no tile (the end of its last rows) run the posted
+     * experts' tiles, which they find from this list without a search. */
+    uint16_t        cp_place[RAD_W2_MAX_COPY];
+    uint32_t        ntb;                  /* the posted experts' run tiles (16 rows), a bound */
+    uint32_t        pad2;
 } RadW2Layer;
 
 /* ------------------------------------------------------------------ the budget (host)
