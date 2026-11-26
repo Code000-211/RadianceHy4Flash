@@ -413,10 +413,15 @@ struct Ffn {
         return code_form(b, wn);
     }
 
-    /* `in_codes` (G-3b): the rotated int8 codes of `x` the junction in front writes. */
+    /* `in_codes` (G-3b): the rotated int8 codes of `x` the junction in front writes.
+     * `shared_ff` is the model's slot for the shared expert's product plane, the same arrangement as
+     * `dense_ff`: this Ffn is one layer's and copies the wire each layer, so the slot cannot live on
+     * its own copy -- it is the model's, and the first layer whose shared arm is unfused declares
+     * the plane into it for every later one (P-11b). */
     int declare(RadBuilder* b, Names& nm, const Shape& s, const Geom& geom, int l, rad_buf x,
                 rad_buf y, const MoeWire& wire, rad_buf dense_gu, rad_buf* dense_ff,
-                rad_buf dense_out, MoeFP8::Src* src, const ActFP8* in_codes = nullptr) {
+                rad_buf dense_out, MoeFP8::Src* src, const ActFP8* in_codes = nullptr,
+                rad_buf* shared_ff = nullptr) {
         g = geom;
         layer = l;
         n_embd = s.n_embd;
@@ -498,8 +503,8 @@ struct Ffn {
             RAD_ARCH_TRY(shared.declare(b, nm, g, s, l, nm.f("blk.%d.ffn_gate_up_shexp", l),
                                         nm.f("blk.%d.ffn_down_shexp", l),
                                         nm.ckpt("%s.shared_experts", mp), s.n_ff_shared_r, xf,
-                                        w.sout, w.sgu, w.sff, &lat_in, in_codes, &w.sff,
-                                        "moe.shared_ff"));
+                                        w.sout, w.sgu, shared_ff ? *shared_ff : 0, &lat_in, in_codes,
+                                        shared_ff, "moe.shared_ff"));
             /* Issued inside MoeFP8's pass, ahead of their declared place behind latent_out, the
              * arm's buffers are excluded from sharing (SideOps' rule). It reads x's codes (or x),
              * which nothing in the routed span writes, and writes only its own buffers. */

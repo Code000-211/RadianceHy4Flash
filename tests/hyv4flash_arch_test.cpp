@@ -4192,6 +4192,25 @@ bool named_by_op(const RadBuilder& b, const char* name) {
     return false;
 }
 
+/* The bytes the plan of this test charges for nothing: a plane the list allows must not grow into a
+ * wider one behind the same name, so the lint reads the bytes too. */
+int64_t dead_bytes(const RadBuilder& b) {
+    int64_t n = 0;
+    for (size_t i = 0; i < b.bufs.size(); ++i) {
+        const RadBufDecl& d = b.bufs[i].d;
+        if ((int)d.kind != (int)RAD_BUF_TRANSIENT) continue;
+        const rad_buf h = (rad_buf)(i + 1);
+        bool used = false;
+        for (const auto& o : b.ops)
+            if (in(o.reads, h) || in(o.writes, h)) { used = true; break; }
+        if (used) continue;
+        int64_t numel = 1;
+        for (uint32_t r = 0; r < d.rank; ++r) numel *= d.shape[r];
+        n += rad_dtype_bytes(d.dtype, numel);
+    }
+    return n;
+}
+
 }  // namespace
 
 TEST(no_transient_is_declared_that_no_op_reads) {
@@ -4202,27 +4221,32 @@ TEST(no_transient_is_declared_that_no_op_reads) {
         /* The planes this plan leaves without a use, sorted, with the reason from the comment
          * above: `moe.expert_ff` only where the experts are bf16 does an op read the product. */
         const char* kept;
+        /* And their bytes, so a plane the list allows cannot quietly become a wider one. */
+        long long dead;
     };
     const Plan plans[] = {
-        { "bf16", bf16_encs, 1, "ix.stage " },
-        { "int8 trunk", int8_trunk_encs, 1, "ix.stage " },
+        { "bf16", bf16_encs, 1, "ix.stage ", 0 },
+        { "int8 trunk", int8_trunk_encs, 1, "ix.stage ", 0 },
         { "int8 experts",
           [](RadBuilder* b) { bf16_encs(b); b->encs[0].second = b->encs[1].second = enc_i8(true); },
-          1, "ix.stage moe.expert_ff.q moe.expert_ff.s moe.latent.q moe.latent.s " },
+          1, "ix.stage moe.expert_ff.q moe.expert_ff.s moe.latent.q moe.latent.s ", 0 },
         { "iqr experts",
           [](RadBuilder* b) {
               bf16_encs(b);
               b->encs[0].second = b->encs[1].second = enc_trellis(RAD_U4, true);
           },
-          1, "ix.stage moe.expert_ff.q moe.expert_ff.s moe.latent.q moe.latent.s " },
-        { "bf16, two ranks", bf16_encs, 2, "ix.stage " },
+          1, "ix.stage moe.expert_ff.q moe.expert_ff.s moe.latent.q moe.latent.s ", 0 },
+        { "bf16, two ranks", bf16_encs, 2, "ix.stage ", 0 },
     };
     for (const Plan& p : plans) {
-        fprintf(stderr, "plan %s\n", p.what);
         Declared d(p.encs, p.world);
         REQUIRE_EQ(d.rc, RAD_OK);
         steps_clean_at(d.b, 0, 1);   /* every step kind, each lint clean */
+        const int64_t bytes = dead_bytes(d.b);
+        fprintf(stderr, "plan %-16s dead %lld bytes: %s\n", p.what, (long long)bytes,
+                dead_join(unused_transients(d.b)).c_str());
         CHECK_EQ(dead_join(unused_transients(d.b)), std::string(p.kept));
+        CHECK_EQ(bytes, (int64_t)p.dead);
     }
 }
 
@@ -4231,19 +4255,23 @@ TEST(no_transient_is_declared_that_no_op_reads) {
  * where the declare cannot see which form the layer takes; each is now declared where the form is
  * settled, so a model that runs the other form reserves nothing for it. */
 TEST(the_product_planes_follow_the_gate_that_writes_them) {
-    /* The rotated int8 trunk with the fused gate: the gate writes the codes, so no layer of the
-     * model -- dense MLP or shared expert -- has a bf16 product plane at all. */
+    /* The rotated int8 trunk with the fused gate: the shared arm's gate writes the codes it was
+     * asked for, so the model has no shared-expert product plane at all -- that is the plane this
+     * round takes away. The dense MLP's gate_up is not a rotated int8 weight in this container, so
+     * its pair is unfused, its plane is there, and `silu_mul` names it: charged and used, which is
+     * not the arena this card is about. */
     {
         Declared d(int8_trunk_encs, 1);
         REQUIRE_EQ(d.rc, RAD_OK);
         steps_clean_at(d.b, 0, 1);
         CHECK_EQ(count_op(d.b, "gated_had_quant_i8g") > 0, true);
-        CHECK_EQ(count_buf(d.b, "dense_ff"), 0);
         CHECK_EQ(count_buf(d.b, "moe.shared_ff"), 0);
+        CHECK_EQ(count_buf(d.b, "dense_ff"), 1);
+        CHECK(named_by_op(d.b, "dense_ff"));
     }
-    /* The switch off: the pair is back, the first layer of each kind declares its plane for every
-     * later one (one buffer, not one a layer), and `silu_mul` names it -- charged and used, which
-     * is not what the card is about. */
+    /* The switch off: the pair is back, the first MoE layer declares its plane into the model's slot
+     * for every later one -- one buffer for the model's two MoE layers, not one a layer -- and the
+     * activation op names it. */
     setenv("RADIANCE_HY4_FUSED_QUANT", "0", 1);
     Declared unfused(int8_trunk_encs, 1);
     unsetenv("RADIANCE_HY4_FUSED_QUANT");
@@ -4254,6 +4282,8 @@ TEST(the_product_planes_follow_the_gate_that_writes_them) {
     CHECK_EQ(count_buf(unfused.b, "moe.shared_ff"), 1);
     CHECK(named_by_op(unfused.b, "moe.shared_ff"));
     CHECK_EQ(count_op(unfused.b, "silu_mul") > 0, true);
+    /* Both are named, so neither is what the plan charges for nothing. */
+    CHECK_EQ(dead_join(unused_transients(unfused.b)), std::string("ix.stage "));
 }
 
 /* P-11b. The Engram round trip's three planes follow the trip: the served recipe stores the table
@@ -4270,7 +4300,9 @@ TEST(the_engram_round_trip_declares_its_planes_only_when_it_is_taken) {
     }, 1, 0, false, 128, 0, 0, 0, two_engram_layers);
     REQUIRE_EQ(e4m3.rc, RAD_OK);
     steps_clean_at(e4m3.b, 0, 1);
-    REQUIRE(find_w(e4m3.b, "blk.1.engram_table.scale") != nullptr);   /* the trip really was off */
+    /* two_engram_layers puts the Engram at blk.0 and blk.2: the scale view is what says the trip
+     * really was not taken. */
+    REQUIRE(find_w(e4m3.b, "blk.0.engram_table.scale") != nullptr);
     for (const char* n : { "eg.rows.q", "eg.rows.s", "eg.rows.rt" })
         CHECK_EQ(count_buf(e4m3.b, n), 0);
 
