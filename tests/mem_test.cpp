@@ -8999,3 +8999,14 @@ TEST(a_streamed_op_exists_only_for_a_capable_architecture_and_a_ring) {
     CHECK(!kvstream_op_gated(ctx, "kv_store"));
     CHECK(!kvstream_op_gated(ctx, "attn_paged"));
 }
+
+TEST(host_pool_page_size_switch_parses_and_stays_off_by_default) {
+    CHECK(!host_pool_small_pages(nullptr));
+    CHECK(!host_pool_small_pages(""));
+    CHECK(!host_pool_small_pages("thp"));
+    CHECK(host_pool_small_pages("4k"));
+    CHECK(host_pool_small_pages("4096"));
+    CHECK(host_pool_small_pages("small"));
+    /* the flag the AQL pin path reads is never left set after the pool's allocation */
+    CHECK(g_pin_small_pages.load() == 0);
+}

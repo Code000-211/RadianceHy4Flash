@@ -4740,7 +4740,9 @@ void* pin_pieces(int64_t bytes) {
     char* const p = (char*)at;
 
     prefer_numa_node(p, len, current_card_numa_node());
-    if (len >= ((int64_t)2 << 20)) {
+    if (g_pin_small_pages.load(std::memory_order_relaxed) != 0) {
+        (void)::madvise(p, (size_t)len, MADV_NOHUGEPAGE);
+    } else if (len >= ((int64_t)2 << 20)) {
         ::madvise(p, (size_t)len, MADV_HUGEPAGE);
         warn_if_no_huge_pages();
     }
