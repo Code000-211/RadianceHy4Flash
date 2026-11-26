@@ -4127,3 +4127,71 @@ TEST(g3_junctions_write_the_codes_their_readers_take) {
     /* every junction that writes codes removes the quantiser behind it */
     CHECK(had_on < count_op(off.b, "had_quant_act_i8g"));
 }
+
+/* P-11b. The buffer plan charges a transient the whole program when no op of the declared list
+ * names it (core/build/rad_bufplan.cpp; `radiance --debug-graph` prints the ones it counts, with
+ * the bytes), so each of them is arena the engine holds and never reads. The Hy4 plan declared six
+ * such planes; it declares them only where a path that reads them is declared now. The list below
+ * is what is left on purpose, a reason each: a new plane no op names fails this test by its name.
+ *   moe.expert_ff -- the routed arm's bf16 product. The fused SwiGLU writes the codes the down
+ *       projection reads (G-3a), but a layer inside --calib-layers keeps the unfused pair
+ *       (fuse_clamped_i8, arch/common/rad_block_moe_fp8.h) and the plane is one for every MoE
+ *       layer, so the wire declares it for all of them.
+ *   moe.shared_ff -- the shared expert's, the same rule one block further (decl_gated_fold_iqr).
+ *   ix.stage -- the indexer stages a closing group's raw keys through it; the step declares the op
+ *       that names it only where that path is served, which the wire cannot know at declare time. */
+namespace {
+
+std::string dead_join(const std::vector<std::string>& v) {
+    std::string s;
+    for (const std::string& n : v) s += n + " ";
+    return s;
+}
+
+/* The plan's own rule: a transient no op of the declared list reads or writes. */
+std::vector<std::string> unused_transients(const RadBuilder& b) {
+    std::vector<std::string> dead;
+    for (size_t i = 0; i < b.bufs.size(); ++i) {
+        if ((int)b.bufs[i].d.kind != (int)RAD_BUF_TRANSIENT) continue;
+        const rad_buf h = (rad_buf)(i + 1);
+        bool used = false;
+        for (const auto& o : b.ops)
+            if (in(o.reads, h) || in(o.writes, h)) { used = true; break; }
+        if (!used) dead.push_back(b.bufs[i].name);
+    }
+    std::sort(dead.begin(), dead.end());
+    return dead;
+}
+
+}  // namespace
+
+TEST(no_transient_is_declared_that_no_op_reads) {
+    static const char* kKept[] = { "ix.stage", "moe.expert_ff", "moe.shared_ff" };
+    const std::string kept = dead_join({ kKept, kKept + 3 });
+    struct Plan {
+        const char* what;
+        void (*encs)(RadBuilder*);
+        int world;
+    };
+    const Plan plans[] = {
+        { "bf16", bf16_encs, 1 },
+        { "int8 trunk", int8_trunk_encs, 1 },
+        { "int8 experts",
+          [](RadBuilder* b) { bf16_encs(b); b->encs[0].second = b->encs[1].second = enc_i8(true); },
+          1 },
+        { "iqr experts",
+          [](RadBuilder* b) {
+              bf16_encs(b);
+              b->encs[0].second = b->encs[1].second = enc_trellis(RAD_U4, true);
+          },
+          1 },
+        { "bf16, two ranks", bf16_encs, 2 },
+    };
+    for (const Plan& p : plans) {
+        fprintf(stderr, "plan %s\n", p.what);
+        Declared d(p.encs, p.world);
+        REQUIRE_EQ(d.rc, RAD_OK);
+        steps_clean_at(d.b, 0, 1);   /* every step kind, each lint clean */
+        CHECK_EQ(dead_join(unused_transients(d.b)), kept);
+    }
+}
