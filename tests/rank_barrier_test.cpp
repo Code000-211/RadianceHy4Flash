@@ -30,9 +30,6 @@
 
 namespace {
 
-int64_t ns_between(const timespec& a, const timespec& b) {
-    return (int64_t)(b.tv_sec - a.tv_sec) * 1000000000ll + (int64_t)(b.tv_nsec - a.tv_nsec);
-}
 int64_t thread_cpu_ns() {
     timespec t{};
     clock_gettime(CLOCK_THREAD_CPUTIME_ID, &t);

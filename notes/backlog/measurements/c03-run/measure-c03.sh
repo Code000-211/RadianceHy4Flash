@@ -68,7 +68,7 @@ meta() {
   } | tee "$OUT/meta.txt"
 }
 
-port_free() { for _ in $(seq 1 90); do ss -ltn 2>/dev/null | grep -q ':$PORT ' || return 0; sleep 2; done; return 1; }
+port_free() { for _ in $(seq 1 90); do ss -ltn 2>/dev/null | grep -q ":$PORT " || return 0; sleep 2; done; return 1; }
 wait_ready() {
   for i in $(seq 1 200); do
     if curl -s --max-time 3 http://127.0.0.1:$PORT/v1/models 2>/dev/null | grep -q 'qwen3.8-27b'; then
