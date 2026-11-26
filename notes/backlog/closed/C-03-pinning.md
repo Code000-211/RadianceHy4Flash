@@ -1,6 +1,6 @@
 # C-03 / CCD pinning — dropped, with the numbers
 
-The item (issue #112) asks for two things: a spin-then-park rank barrier, and pinning the step and
+The item (issue #98) asks for two things: a spin-then-park rank barrier, and pinning the step and
 rank threads to one CCX. This file records the second as **dropped**, which CARDS.md §2 asks for
 when a change ships without part of its item.
 
