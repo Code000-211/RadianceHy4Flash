@@ -677,6 +677,50 @@ TEST(a_device_hole_is_decided_per_instance) {
     CHECK_EQ(p.device_holes(true)[0]->index, 2);
 }
 
+/* An op that resolves nowhere is dead (Program::dead_ops: rad-convert refuses it and picks the KV
+ * width by the count) and a hole, unless the plugin dropped it for a fallback (rad_op_dropped):
+ * the plugin holds no handle to it, so it is never issued. The drop answers the last declaration
+ * only, and only an unresolved one. */
+TEST(a_dropped_op_is_neither_dead_nor_a_hole) {
+    NEED_PLUGIN(reg)
+    Builder b(reg, make_meta(), make_ctx());
+    RadBuilder* h = &b;
+
+    CHECK_EQ(rad_op_dropped(h), RAD_E_STATE);              /* nothing declared yet */
+
+    /* t_skinny serves M <= 64 and M >= 4096: a range inside the gap resolves in no domain. */
+    rad_weight w = decl_w(b, "w");
+    const RadParam gap[] = { RAD_RANGE("M", 100, 200), RAD_INT("N", 4096), RAD_INT("K", 4096),
+                             RAD_STR("dtype", "bf16") };
+    CHECK_EQ(b.decl_op("t_skinny", gap, 4, &w, 1), RAD_NULL_HANDLE);   /* op 1: kept, dead */
+    CHECK_EQ(b.program().dead_ops(), (size_t)1);
+    const size_t holes = b.program().device_holes(true).size();
+    CHECK(holes > 0);
+
+    /* op 2: the same op, dropped, and its fallback declared in its place. */
+    CHECK_EQ(b.decl_op("t_skinny", gap, 4, &w, 1), RAD_NULL_HANDLE);
+    CHECK_EQ(rad_op_dropped(h), RAD_OK);
+    rad_op fb = decl_gemm(b, w);
+    CHECK(fb != RAD_NULL_HANDLE);
+    CHECK_EQ(rad_op_dropped(h), RAD_E_STATE);              /* a resolved op is issued */
+
+    REQUIRE_EQ((int)b.program().ops.size(), 4);
+    CHECK(!b.program().ops[1].dropped);
+    CHECK(b.program().ops[2].dropped);
+    CHECK(!b.program().ops[3].dropped);
+    CHECK_EQ(b.program().dead_ops(), (size_t)1);           /* the undropped one still counts */
+    const auto now = b.program().device_holes(true);
+    CHECK_EQ(now.size(), holes);                            /* the dropped one adds none */
+    for (const Program::Miss* m : now) CHECK_EQ(m->index, 1);
+    CHECK_EQ(b.status(), RAD_OK);
+
+    /* A declaration the builder refused records no op, so there is nothing to drop. */
+    const RadParam bad[] = { RAD_INT("N", 4096) };
+    CHECK_EQ(b.decl_op("t_gemm", bad, 1, &w, 1), RAD_NULL_HANDLE);
+    CHECK_EQ(rad_op_dropped(h), RAD_E_STATE);
+    CHECK(!b.program().ops[3].dropped);
+}
+
 /* ================================================================== init, after the whole graph */
 TEST(a_refusing_init_becomes_a_miss_and_not_an_abort) {
     NEED_PLUGIN(reg)

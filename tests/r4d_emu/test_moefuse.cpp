@@ -754,6 +754,7 @@ void gather_quant_launcher_cases(std::mt19937& rng, int& cases, int& fails) {
     struct LShape {
         int M, n, g8, pin;
         bool f32w, wide;
+        int axis = 0;   /* K-59's `form` axis, passed as a param with the pin off */
     };
     const LShape shapes[] = {
         { 8, 2560, 128, 0, false, false },    /* a decode height: the sixteen-slot form */
@@ -762,6 +763,11 @@ void gather_quant_launcher_cases(std::mt19937& rng, int& cases, int& fails) {
         { 48, 512, 256, 0, false, true },
         { 48, 2560, 128, 3, false, false },   /* the sixteen-slot form, pinned at prefill */
         { 48, 512, 128, 2, false, true },     /* the wide form, pinned */
+        /* The same two forms taken by the rad-tune axis instead of the pin: at prefill the rule
+         * would run the wide form and at a decode height the sixteen-slot one, so the kernel that
+         * ran names the axis's form and not the rule's. */
+        { 48, 2560, 128, 0, false, false, 3 },
+        { 48, 512, 128, 0, false, true, 2 },
     };
     const int k = 16, ne = 288;
     const float s_poison = -1234.5f;
@@ -818,12 +824,12 @@ void gather_quant_launcher_cases(std::mt19937& rng, int& cases, int& fails) {
                                sh.f32w ? RAD_F32 : RAD_BF16, M, k, k),
                            vec1(inv.inv.data(), RAD_I32, T), mat(q.data(), RAD_I8, M, n, n),
                            mat(s.data(), RAD_F32, M, nkb, nkb), mat(y.data(), RAD_BF16, M, n, n) };
-        RadParam p[3] = { pint("n", n), pint("top_k", k), pint("group", g8) };
+        RadParam p[4] = { pint("n", n), pint("top_k", k), pint("group", g8), pint("form", sh.axis) };
         RadArgs a{};
         a.t = t;
         a.n_t = 6;
         a.p = p;
-        a.n_p = 3;
+        a.n_p = sh.axis ? 4 : 3;
         a.world_size = 1;
         ++cases;
         if (inv.rc != RAD_OK) {
@@ -836,9 +842,9 @@ void gather_quant_launcher_cases(std::mt19937& rng, int& cases, int& fails) {
         r4d_moe_gather_pin_form(0);
         const char* want_kernel = sh.wide ? "gather_wide_kernel" : "gather_kernel16_q8";
         if (rc != RAD_OK || !std::strstr(emu_last_kernel, want_kernel)) {
-            std::printf("FAIL moe_gather_inv_i8g through its launcher at M=%d n=%d g8=%d pin %d %s "
-                        "weights: rc %d, %s, wanted the %s form\n", M, n, g8, sh.pin,
-                        sh.f32w ? "f32" : "bf16", rc, emu_last_kernel, want_kernel);
+            std::printf("FAIL moe_gather_inv_i8g through its launcher at M=%d n=%d g8=%d pin %d "
+                        "axis %d %s weights: rc %d, %s, wanted the %s form\n", M, n, g8, sh.pin,
+                        sh.axis, sh.f32w ? "f32" : "bf16", rc, emu_last_kernel, want_kernel);
             ++fails;
             continue;
         }

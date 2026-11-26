@@ -103,6 +103,11 @@ inline int64_t pipe_rows(int64_t T) {
     return ((T + 1) / 2 + 63) / 64 * 64;
 }
 
+/* Both pieces at or above the floor (#282: the gate checked n0 alone, so 1984 rows cut 1024 + 960). */
+inline bool pipe_cut_ok(int64_t n0, int64_t n1) {
+    return n0 >= pipe_min_rows() && n1 >= pipe_min_rows();
+}
+
 /* The second lane (abi/rad_runtime.h): issue on lane 1 while lane 0 runs on, then join. */
 inline void pipe_on1(RadCtx* c, const std::function<void()>& fn) {
     rad_lane(c, 1);
@@ -1178,18 +1183,19 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     }
     /* Every junction needs its narrow reduction for the pipeline to have one form to issue on the
      * second lane; then name what that lane touches to the planner (Ctx::lane1_ rule 3: a transient
-     * there could otherwise share arena bytes with a run of lane 0's that overlaps it in time). The
-     * connection buffers are PERSIST already, so this costs the routed/shared sums and the
-     * attention's output, the only transients lane 1 reads. */
+     * there could otherwise share arena bytes with a run of lane 0's that overlaps it in time).
+     * Every buffer of every junction (Junction::bufs): the connection buffers are PERSIST already,
+     * so this costs the transients -- the routed/shared sums, the attention's output, the G-3b
+     * codes the junctions write and the last junction's `final_hidden` (#282: those two were left
+     * out, and the last layer's piece wrote `final_hidden` on lane 1 into bytes lane 0's arms were
+     * still using). */
     for (const Layer& l : m.layers)
         if (!l.j_mid.pipe_ok() || !l.j_end.pipe_ok()) m.pipe_on = false;
-    if (m.pipe_on) {
-        for (rad_buf v : { m.tr.h, m.tr.post, m.tr.xn })
-            if (v) rad_buf_concurrent(b, v);
+    if (m.pipe_on)
         for (const Layer& l : m.layers)
-            for (rad_buf v : { l.attn.w.o, l.ffn.junction_a(), l.ffn.junction_b() })
-                if (v) rad_buf_concurrent(b, v);
-    }
+            for (const Junction* j : { &l.j_mid, &l.j_end })
+                for (rad_buf v : j->bufs())
+                    if (v) rad_buf_concurrent(b, v);
     RAD_ARCH_TRY(m.t_final.declare(b, nm, T, "final_hidden", -1, RAD_BF16, E, m.final_hidden));
     m.unpack_hidden = decl_copy(b, T, E, RAD_BF16, m.final_hidden, m.final_hidden);
     HY4_NEED(m.unpack_hidden, "cast (last layer hidden)");
@@ -1384,7 +1390,7 @@ static void step(RadCtx* c, const RadBatch* batch) {
      * rows (their reduction would have to pick a lane too), and both pieces above the band floor so
      * each one's kernels are the ones the whole step's shape would have picked. */
     const int64_t n0 = pipe_rows(T), n1 = T - n0;
-    const bool pipe = m.pipe_on && nmm == 0 && batch->n_seq == 1 && n0 >= pipe_min_rows() && n1 > 0;
+    const bool pipe = pipe_cut_ok(n0, n1) && m.pipe_on && nmm == 0 && batch->n_seq == 1;
     RAD_ISSUE_N(c, m.embed, T, praw(batch->token_ids, RAD_I32, T), RAD_W(m.token), brows(m.x0, T));
     if (nmm > 0) {
         /* Rank 0 holds the rows, the others zeros: the exact sum gives every rank the rows. */

@@ -151,6 +151,11 @@ struct SchedMetrics {
     int64_t ahead_refused_suffix_hot = 0;
     int64_t ahead_refused_ends_every = 0;
     int64_t ahead_refused_kv = 0;
+    int64_t suffix_global = 0, suffix_global_busy = 0, suffix_adopted = 0, suffix_global_credited = 0;
+    /* --prefix-cache-dir (sched/metrics.h SchedMetrics::Disk). */
+    int64_t disk_written_bytes = 0, disk_written_hour = 0, disk_admitted = 0, disk_rejected = 0;
+    int64_t disk_deferred = 0, disk_entries = 0, disk_snaps = 0, disk_bytes = 0, disk_loaded = 0;
+    int64_t disk_paged_in = 0, disk_compactions = 0;
     /* Per-position draft acceptance. The pooled `draft_acceptance` cannot tell a drafter that
      * decays with depth from one whose later rounds are broken. Per position j: verifies that
      * reached j (every earlier position accepted) and how many of those took j. */

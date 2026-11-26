@@ -199,6 +199,25 @@ struct SchedMetrics {
     bool    draft_adaptive = false;
     float   draft_depth_adaptive = 0.0f;
     int64_t draft_verify_depth[RAD_METRICS_MAX_SPEC + 1] = {};
+    /* Suffix proposals the global cache won (--draft-suffix-global-mib), and lookups that found it
+     * mid-insert and skipped it. */
+    int64_t suffix_global = 0;
+    int64_t suffix_global_busy = 0;
+    /* Accepted rows credited back to the responses the global chains came from (their LRFU). */
+    int64_t suffix_global_credited = 0;
+    /* --prefix-cache-dir, set by the engine after each flush and page-in. */
+    struct Disk {
+        int64_t written_bytes = 0;      /* payload bytes written, all flushes */
+        int64_t written_hour = 0;       /* of those, in the last hour */
+        int64_t admitted = 0;           /* items written */
+        int64_t rejected = 0;           /* new items not admitted (never reused, short, idle) */
+        int64_t deferred = 0;           /* admitted, over the write budget for now */
+        int64_t entries = 0, snaps = 0; /* what the store holds */
+        int64_t bytes = 0;              /* on disk, every segment */
+        int64_t loaded = 0;             /* entries indexed at startup */
+        int64_t paged_in = 0;           /* entries read back on a hit */
+        int64_t compactions = 0;
+    } disk;
     /* Prompt lookup's verify gate (sched/lookup.h), when lookup is the only drafter: proposals
      * made, proposals held back unverified and their drafts, and of the held proposals scored
      * against the text that followed, the drafts that came true (what a verify would have
@@ -213,6 +232,8 @@ struct SchedMetrics {
     int64_t suffix_steps = 0;
     int64_t suffix_rows = 0;
     int64_t suffix_accepted = 0;
+    /* Requests whose suffix index was taken over from an earlier turn's prompt (suffix stash). */
+    int64_t suffix_adopted = 0;
     /* Why Scheduler::step_next_locked did not issue the next step ahead of the commit (S-07): one
      * counter per reason, and only the first check that refuses counts. With steps_ahead they are
      * every step_next the engine made once a step was in flight, so /stats can say where the gap

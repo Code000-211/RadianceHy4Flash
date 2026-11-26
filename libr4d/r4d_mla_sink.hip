@@ -782,6 +782,20 @@ int sink_body(const RadArgs* a, RadStream stream) {
     if (form == 1) hg = 1;
     if (form == 2 && heads > 16) hg = 2;
     if (form == 5 && heads > 32) hg = 4;
+    /* The `hg` axis (K-59): rad-tune's, the same sixteen-head groups the law above and the form pins
+     * take -- 1, 2 or 4 a workgroup, 0 the law. The pin above wins where it is set, so the test that
+     * compares the forms still pins them. A group the shape cannot fill (the law's own bound,
+     * heads > 16 * (hg / 2): a workgroup more than half used) is refused rather than launched with
+     * idle groups, and every accepted value computes each head exactly as the others do, so the
+     * choice moves no bits (tests/r4d_emu/test_mla_sink.cpp walks it). */
+    if (!form) {
+        const long long hgb = r4d_geti_or(a, "hg", 0);
+        if (hgb) {
+            if (hgb != 1 && hgb != 2 && hgb != 4) return RAD_E_UNSUPPORTED;
+            if (heads <= 16 * (hgb / 2)) return RAD_E_UNSUPPORTED;
+            hg = (int)hgb;
+        }
+    }
     const SinkMeta m{ q.stride[0],
                       q.stride[1],
                       qr.stride[0],
