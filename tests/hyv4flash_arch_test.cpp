@@ -4140,12 +4140,13 @@ TEST(g3_junctions_write_the_codes_their_readers_take) {
  *       the rotated int8 pair the down projection reads, so no op names them; MoeFP8's own rule
  *       does ask for them (down_codebook_fp8 / down_supported,
  *       arch/common/rad_block_moe_fp8.h), the mixed IQR-gate_up-behind-a-w6-down recipe with them.
- *   moe.expert_ff -- only in the last plan, where the routed arm is read as i8a8h (rotated int8
- *       latent and experts' down projection) as the served model runs it: the fused gated quantiser
- *       writes the int8 pair, so the bf16 product itself is arena. MoeFP8::declare refuses a wire
- *       without it (the two tests of quantised_experts_are_served_clamped), which is why this PR
- *       drops the planes the arch can hand over and not this one; the measurement file counts what
- *       each side is worth.
+ *   moe.expert_ff -- the routed arm's bf16 product. The rig's dump names it (48 MiB at TP2/2048, 96
+ *       at TP4/8192): there the fused gated quantiser serves the expert gate and nothing reads the
+ *       plane. No plan of this fixture reaches that form -- at this geometry `silu_mul` is still
+ *       declared for the arm -- so the product is in none of the lists below. It stays in the arena
+ *       either way: MoeFP8::declare refuses a wire without it (the two tests of
+ *       quantised_experts_are_served_clamped), which is why this PR hands over the planes the arch
+ *       can place and not this one.
  *   moe.latent.q / .s -- the same for the latent linear: the gather's output is read as the rotated
  *       int8 pair, and MoeFP8::declare refuses a wire whose latent carries no codes at all.
  *   ix.stage -- the indexer stages a closing group's raw keys through it, and the step issues that
@@ -4233,21 +4234,6 @@ void served_u3_encs(RadBuilder* b) {
                                       { "engram_mult", rad_enc_plain(RAD_I64) } });
 }
 
-/* The same recipe with the routed arm read as i8a8h, the form the served model runs at: the latent
- * linear and the experts' down projection are rotated int8, so the gather hands the expert gate
- * rotated int8 codes (ActFP8::q8_fed and q8_rot), `gated_had_quant_i8g` writes the int8 pair itself
- * and no op of the declared list reads the bf16 product. That product is `moe.expert_ff`, the largest
- * plane of the dump at the rig's shapes (48 MiB at TP2/2048, 96 MiB at TP4/8192). At the trellis arm
- * above the gate falls back to the chain, so the plane is written and read there; both rows are
- * pinned because which of the two the library serves decides whether the dump names it. */
-void served_u3_i8a8h_encs(RadBuilder* b) {
-    served_u3_encs(b);
-    for (auto& e : b->encs) {
-        if (e.first == "ffn_down_exps") e.second = enc_i8(true);
-        if (e.first == "ffn_latent_in" || e.first == "ffn_latent_out") e.second = enc_i8(true);
-    }
-}
-
 }  // namespace
 
 TEST(no_transient_is_declared_that_no_op_reads) {
@@ -4255,8 +4241,9 @@ TEST(no_transient_is_declared_that_no_op_reads) {
         const char* what;
         void (*encs)(RadBuilder*);
         int world;
-        /* The planes this plan leaves without a use, sorted, with the reason from the comment
-         * above: `moe.expert_ff` only where the experts are bf16 does an op read the product. */
+        /* The planes this plan leaves without a use, sorted, each with its reason in the comment
+         * above. The set is the same for every plan but the bf16 ones, where the MoE codes the arm
+         * does not need are not declared at all. */
         const char* kept;
         /* And their bytes, so a plane the list allows cannot quietly become a wider one. */
         long long dead;
@@ -4274,15 +4261,15 @@ TEST(no_transient_is_declared_that_no_op_reads) {
           },
           1, "ix.stage moe.expert_ff.q moe.expert_ff.s moe.latent.q moe.latent.s ", 110592 },
         { "bf16, two ranks", bf16_encs, 2, "ix.stage ", 9216 },
-        /* The served recipe, as the dump of the served model was read (its Engram table at E4M3, so
-         * the round trip is off, and the trunk on rotated int8 activations). */
+        /* The served recipe as the rig's dump was read (the Engram table at E4M3, so the round trip
+         * is off; the trunk's linears and the experts' under the rotated trellis). It pins the four
+         * MoE code planes of the dump's list. The product itself, `moe.expert_ff`, is not dead here:
+         * at this geometry the expert gate is not served the fused gated quantiser, so `silu_mul`
+         * still writes the plane and the down projection's quantiser reads it. On the rig it is --
+         * the dump names it, 48 MiB at TP2/2048 and 96 MiB at TP4/8192, the largest plane of the ten
+         * that stay; see notes/backlog/measurements/P-11b.md. */
         { "the served u3", served_u3_encs, 1,
           "ix.stage moe.expert_ff.q moe.expert_ff.s moe.latent.q moe.latent.s ", 110592 },
-        /* The same with the routed arm read as i8a8h: the gated quantiser serves the arm alone, so
-         * the bf16 product itself joins the list -- the plane the card counts and this change leaves
-         * where MoeFP8's own rule asks for it. */
-        { "served u3, i8a8h arm", served_u3_i8a8h_encs, 1,
-          "ix.stage moe.expert_ff moe.expert_ff.q moe.expert_ff.s moe.latent.q moe.latent.s ", 0 },
     };
     for (const Plan& p : plans) {
         Declared d(p.encs, p.world);
