@@ -33,6 +33,7 @@ using rad::RAD_DIO_WRITE;
 using rad::RAD_DIO_CREATE;
 using rad::RAD_DIO_TRUNC;
 using rad::RAD_DIO_ALLOW_BUFFERED;
+using rad::RAD_DIO_BUFFERED;
 
 namespace {
 
@@ -1164,6 +1165,44 @@ TEST(directfile_refuses_a_missing_file) {
     CHECK(f.open("/nonexistent/rad/dio/path.bin", RAD_DIO_READ | RAD_DIO_ALLOW_BUFFERED) < 0);
     CHECK(!f.is_open());
     CHECK(f.open(nullptr, RAD_DIO_READ) < 0);
+}
+
+/* --keep-container-cache reads the container buffered on purpose, so the pages land in the page
+ * cache the next load reads from. On a filesystem that supports O_DIRECT the flag must still say
+ * buffered, and the bytes must come back the same through the bounce. */
+TEST(directfile_buffered_opens_buffered_where_o_direct_works) {
+    const std::string path = temp_path("dio_buffered");
+    const int64_t A = DirectFile::alignment();
+    DevBuf<uint8_t> b(A, RAD_MEM_HOST_PINNED), r(A, RAD_MEM_HOST_PINNED);
+    CHECK(b && r);
+    if (!b || !r) { ::unlink(path.c_str()); return; }
+    fill(b, A, 0x5EED);
+
+    {
+        DirectFile w;
+        CHECK_OK(w.open(path.c_str(), RAD_DIO_WRITE | RAD_DIO_CREATE | RAD_DIO_TRUNC |
+                                      RAD_DIO_ALLOW_BUFFERED));
+        if (!w.is_open()) { ::unlink(path.c_str()); return; }
+        CHECK_OK(w.write_at(b, 0, A));
+    }
+
+    DirectFile probe;
+    CHECK_OK(probe.open(path.c_str(), RAD_DIO_READ | RAD_DIO_ALLOW_BUFFERED));
+    const bool fs_direct = probe.direct();
+    probe.close();
+
+    DirectFile f;
+    CHECK_OK(f.open(path.c_str(), RAD_DIO_READ | RAD_DIO_BUFFERED));
+    CHECK(f.is_open());
+    CHECK(!f.direct());
+    if (!fs_direct)
+        fprintf(stderr, "       (note: %s has no O_DIRECT; buffered is also the fallback)\n",
+                path.c_str());
+    std::memset(r, 0, (size_t)A);
+    CHECK_OK(f.read_at(r, 0, A));
+    CHECK_EQ(std::memcmp(r, b, (size_t)A), 0);
+    f.close();
+    ::unlink(path.c_str());
 }
 
 /* ------------------------------------------------------------------ elastic memory

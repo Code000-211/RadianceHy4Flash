@@ -205,7 +205,9 @@ struct Indexer {
              * tests declare 16-wide ones. `mk` answers that with a null handle -- an unresolved op
              * is recorded and returns null (abi/rad_builder.h), and declaring one is not an error
              * -- so the null handle is the three-op path's cue, where `HY4_NEED` would fail the
-             * whole declare on a geometry the three ops serve. */
+             * whole declare on a geometry the three ops serve. `optional_op` marks the unresolved
+             * op dropped (rad_op_dropped), so rad-convert and the engine do not count it as a hole. */
+            op_front = optional_op(b, op_front);
         }
         if (!op_front) {
             op_work = mk(b, "qsa_work",

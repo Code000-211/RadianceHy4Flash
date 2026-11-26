@@ -634,6 +634,15 @@ int rad_op_resolved(RadBuilder* b, rad_op h);
  * library defines, and emits the chain when the answer is 0. Additive export. */
 int rad_op_declared(RadBuilder* b, const char* op);
 
+/* The op the last rad_decl_op declared did not resolve, and the plugin declares its fallback (the
+ * unfused chain) in its place: the op is dropped. The plugin holds no handle to it, so it is never
+ * issued; it stays in the op list by name (the graph dump shows it), and what counts holes leaves
+ * it out -- the engine's device holes (Program::device_holes), the reference-kernel gate and
+ * rad-convert's dead-op count (Program::dead_ops). An unresolved op the plugin does not drop is
+ * still a hole. Call it right after the declaration it answers. RAD_OK, or RAD_E_STATE when the
+ * last rad_decl_op recorded no op, resolved, or declare has finished. Additive export. */
+int rad_op_dropped(RadBuilder* b);
+
 /* ================================================================== checkpoint name map */
 /* The plugin owns the map from checkpoint tensor names to declared weight names, including
  * convert-time fusions (q/k/v into one qkv, gate and up into gate_up). It is the only component

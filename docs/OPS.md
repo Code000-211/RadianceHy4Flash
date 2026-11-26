@@ -3865,7 +3865,7 @@ refuses the graph rather than resolving a similar op.
 | `idx_pool_gated` | `M`(range) `n` `ratio` `rotary_dim` `eps`:f64 `theta`:f64 `mode` `sections`/opt `block_size`/opt `dtype` | `k`, `wv`w, `wg`w, `ape`w, `gain`w, `pos`, `page`?, `cache`:inout? → `out`? |
 | `idx_pool_gated_fp8` | `M`(range) `n` `ratio` `rotary_dim` `eps`:f64 `theta`:f64 `mode` `sections`/opt `block_size`/opt `dtype` | `k`, `wv`w, `wg`w, `ape`w, `gain`w, `pos`, `page`?, `cache`:inout? → `q`?, `scale`? |
 | `idx_score` | `M`(range) `n` `heads` `blocks` `seqs` `dtype` | `q`, `gate`, `k`, `bt`, `cu`, `nc` → `score` |
-| `engram_ids` | `M`(range) `heads` `ngram` `pad` `map_size` `image`/opt `video`/opt | `tok`, `state`:inout, `cu`, `pos`, `token_map`w, `mult`w, `vocab_sizes`w, `offsets`w, `num_accepted`?, `cache_idx`? → `ids`, `mask`, `ahead_ids`? |
+| `engram_ids` | `M`(range) `heads` `ngram` `pad` `map_size` `image`/opt `video`/opt `advance`/opt | `tok`, `state`:inout, `cu`, `pos`, `token_map`w, `mult`w, `vocab_sizes`w, `offsets`w, `num_accepted`?, `cache_idx`? → `ids`, `mask`, `ahead_ids`? |
 | `engram_norm` | `M`(range) `heads` `n` `eps`:f64 `dtype` | `e`, `gain`w → `y` |
 | `engram_gate` | `M`(range) `n` `hc` `eps`:f64 `dtype` | `key`, `val`, `mask`, `w_key`w, `w_query`w, `w_val`w, `w_branch`w, `h`:inout |
 | `dfly_sel` | `M`(range) `blocks_in` `blocks` `ratio` `seqs` | `sel`, `nsel`, `src`, `bt`, `pos`, `cu` → `out`, `len`, `count`? |
@@ -4161,12 +4161,15 @@ supplies `pos`, the position within the document, so the cold state of a new seq
 step when `num_accepted` is present, the prefill layout otherwise); `cache_idx` picks the slot of
 each sequence (the sequence index when absent). It is optional and sits after `num_accepted`, so
 the operands the design note lists keep their positions. One issue serves one Engram layer (the
-multipliers, sizes and offsets differ a layer); the history is shared, so only the first issue of a
-step may advance it. `ids` is i32 or i64, `mask` i32. `ahead_ids` (i32 `[A, heads]`) is
-`ngram_ids`' read-ahead (above): `tok` then holds A more tokens, the last sequence's following prompt
-(`cu` ends at the step's last row, that sequence's), hashed at the positions after its last into
-`ahead_ids`; ids, mask and the window written back are the step's alone. Hy4-flash passes them to
-the gather's `ahead`.
+multipliers, sizes and offsets differ a layer), and layers that hash the same tokens can share one
+window: `advance` 0 reads the window and leaves it as it was, so a model whose Engram layers share a
+history (Hy4-flash's four do, on one bound layer) issues every layer but the last of the step with
+`advance` 0 and the last with 1, and every layer of the step hashes the window the step opened
+with. The default is 1, the single-layer form. `ids` is i32 or i64, `mask` i32. `ahead_ids` (i32
+`[A, heads]`) is `ngram_ids`' read-ahead (above): `tok` then holds A more tokens, the last
+sequence's following prompt (`cu` ends at the step's last row, that sequence's), hashed at the
+positions after its last into `ahead_ids`; ids, mask and the window written back are the step's
+alone. Hy4-flash passes them to the gather's `ahead`.
 
 **`engram_norm`**: `y[m][i] = round( gain[i] * x[m][i] * rsqrt(mean_head(x^2) + eps) )`, one rms a
 head of `n` (96) channels, the sum in f64. **`eps` is a parameter**: HF's port builds these norms as

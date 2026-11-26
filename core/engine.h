@@ -26,6 +26,7 @@
 #include "build/startup.h"
 #include "diag/diag.h"
 #include "mem/hostarena.h"
+#include "mem/pcstore.h"
 #include "runtime/ctx.h"   /* KVStageRun */
 #include "sched/mem_iface.h"
 #include "sched/scheduler.h"
@@ -42,6 +43,7 @@
 #include "place/expert_restore.h"
 
 #include <atomic>
+#include <deque>
 #include <chrono>
 #include <cstdio>
 #include <condition_variable>
@@ -921,6 +923,31 @@ private:
      * rank's shard of one snapshot (KVManager::set_checkpoint_store). Off the card because no
      * kernel reads a snapshot; it is only copied back into a sequence's state. */
     HostArena ck_store_;
+    /* --prefix-cache-dir (engine_pcache.cpp, core/mem/pcstore.h): the cache across restarts.
+     * Null when off. Used on the step thread only. */
+    std::unique_ptr<PrefixStore> pstore_;
+    uint64_t pstore_last_ns_ = 0;
+    int64_t  pstore_seen_ = -1;
+    /* --prefix-cache-dir-write-mib-per-hour: a token bucket of one hour's bytes; the stop's
+     * write may take it below zero. The last hour's writes, for the metric. */
+    double   pstore_bucket_ = 0;
+    uint64_t pstore_bucket_ns_ = 0;
+    uint64_t pstore_compact_ns_ = 0;
+    std::deque<std::pair<uint64_t, int64_t>> pstore_hour_;
+    SchedMetrics::Disk pstore_m_;
+    void pcache_publish_metrics();
+    std::string pcache_key_text();
+    int  pcache_open();
+    int64_t pcache_activity() const;
+    void pcache_page_in(const Request& req);
+    void pcache_flush(bool final);
+    void pcache_tick(uint64_t now_ns);
+    /* --draft-suffix-global-mib's file, in --prefix-cache-dir under its own key. */
+    std::string gsuffix_path_, gsuffix_key_;
+    uint64_t gsuffix_saved_gen_ = 0;
+    uint64_t gsuffix_last_ns_ = 0;
+    void gsuffix_open();
+    void gsuffix_save(bool final);
     std::atomic<bool> ck_released_{ false };   /* release_host_spare closed it; unpark opens it */
     int64_t           ck_slot_ = 0, ck_cap_ = 0;
     int  repin_host_spare(std::string* why);

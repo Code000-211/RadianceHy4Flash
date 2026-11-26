@@ -28,6 +28,7 @@
 #pragma once
 #include "ngram.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <vector>
 
@@ -108,6 +109,25 @@ public:
         if (upto <= filled_) return;
         index_to(seq, upto);
         ix_.index(seq, min_match, min_match + kExtra, upto - 1);
+    }
+
+    /* A copy built over one request's prompt, taken over by another whose sequence starts with
+     * the same tokens (Scheduler's suffix stash). */
+    void set_owner(uint64_t owner) { ix_.set_owner(owner); }
+    int  k() const { return k_; }
+    /* Tests: the index's contents, independent of its tables' shapes. */
+    std::vector<uint64_t> contents() const {
+        std::vector<uint64_t> v = ix_.contents();
+        v.push_back(0xffffffffffffffffull);
+        for (const Table* t : { &followed_, &follow_ }) {
+            std::vector<uint64_t> w;
+            for (uint64_t e : t->t) if (e) w.push_back(e);
+            std::sort(w.begin(), w.end());
+            v.insert(v.end(), w.begin(), w.end());
+            v.push_back(0xfffffffffffffffeull);
+        }
+        v.push_back((uint64_t)filled_);
+        return v;
     }
 
     int64_t indexed() const { return filled_; }
