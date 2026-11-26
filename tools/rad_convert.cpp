@@ -981,18 +981,6 @@ int main(int argc, char** argv) {
         return n;
     };
 
-    /* Ops resolved in no domain: nothing has checked their weights' planned encoding. Device-only
-     * holes are placement options, not refusals. */
-    auto dead_ops = [](const Program& p) {
-        size_t n = 0;
-        for (size_t i = 1; i < p.ops.size(); ++i) {
-            bool any = false;
-            for (const Band& bd : p.ops[i].bands)
-                for (int d = 0; d < RAD_N_DOMAINS && !any; ++d) if (bd.dom[d]) any = true;
-            if (!any) ++n;
-        }
-        return n;
-    };
     /* The KV cache width is a serve-time choice the container does not record; only the kernels
      * differ (an int8-cache attention may have no bf16 form). Without --kv-cache-dtype, check
      * against the first width at which every op resolves, else report the one with fewest holes. */
@@ -1012,7 +1000,10 @@ int main(int argc, char** argv) {
                         "the plain dtype it was declared at -- fix those first");
             return 1;
         }
-        const size_t d = dead_ops(trial);
+        /* Ops resolved in no domain (Program::dead_ops): nothing has checked their weights'
+         * planned encoding. Device-only holes are placement options, not refusals, and an op the
+         * plugin dropped for its fallback (rad_op_dropped) is never issued. */
+        const size_t d = trial.dead_ops();
         if (k > 0 && d == 0)
             RAD_INFO("checked at --kv-cache-dtype %s: at %s, %zu op(s) have no kernel",
                      width_name(widths[k]), width_name(widths[0]), dead);
@@ -1022,7 +1013,10 @@ int main(int argc, char** argv) {
     if (dead) {
         RAD_ERR("%zu op(s) resolved to no kernel in any domain at --kv-cache-dtype %s, so nothing "
                 "can read the weights they take:", dead, width_name(prog.ctx.kv_dtype));
-        for (const auto& m : prog.misses) RAD_ERR("    %s", m.line().c_str());
+        for (const auto& m : prog.misses)
+            if (m.index <= 0 || (size_t)m.index >= prog.ops.size() ||
+                !prog.ops[(size_t)m.index].dropped)
+                RAD_ERR("    %s", m.line().c_str());
         return 1;
     }
 

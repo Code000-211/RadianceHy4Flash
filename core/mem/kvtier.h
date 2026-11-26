@@ -62,6 +62,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace rad {
@@ -209,6 +210,41 @@ public:
     int64_t  ckpt_bytes() const { return cfg_.ckpt_bytes; }
     int64_t  ckpt_slots() const { return cfg_.ckpt_slots; }
 
+    /* ---------------- the store on disk (core/mem/pcstore.h, --prefix-cache-dir) ----------------
+     *
+     * A record whose bytes the store holds is `disk`: either beside its host copy (the two are the
+     * same bytes, so dropping the host copy for room loses nothing) or, with no host slot, as its
+     * only copy (a disk record: tier Host, host_slot -1, on no list). A lookup reaches a disk
+     * record like any off-device one (resident_off_device); the engine reads it into a host slot
+     * (page_in_slot, page_in_done) before the promotion, which needs a slot. New bytes in the host
+     * slot (a write-back landing, a rebind) clear the flag. */
+    void add_disk(const BlockHash& key, uint64_t used_ns, int64_t depth);
+    bool disk_only(const BlockHash& key) const;
+    /* A host slot for a disk record's bytes. A full arena gives up the host copy of the least
+     * valuable record the store also holds, which becomes a disk record; RAD_E_FULL when there
+     * is none. The record is pending until page_in_done. */
+    int  page_in_slot(const BlockHash& key, int32_t* slot);
+    /* The read landed (ok) or failed: on failure the slot goes back and the record is erased, and
+     * the caller drops the cache entry (PrefixCache::drop_offdevice). */
+    void page_in_done(const BlockHash& key, int32_t slot, bool ok, uint64_t now_ns);
+    struct PersistView {
+        int32_t  host_slot = -1;
+        bool     disk = false;
+        bool     pending = false;
+        uint64_t used_ns = 0;
+        int64_t  depth = 0;
+        KVTier   tier = KVTier::Device;
+    };
+    bool persist_view(const BlockHash& key, PersistView* v) const;
+    /* After a flush: the store holds this record's bytes, or no longer holds them. A disk record
+     * the store dropped is erased; true when that happened, so the caller drops the entry. */
+    void set_disk(const BlockHash& key);
+    bool clear_disk(const BlockHash& key);
+    void*  host_ptr(int32_t slot) const { return slot >= 0 ? arena_.at(slot) : nullptr; }
+    /* Every block of the stored conversations at least `min_tokens` long (the store's admission
+     * of long sessions). */
+    void long_chains(int64_t min_tokens, std::unordered_set<BlockHash, BlockHashHash>* out) const;
+
     /* ---------------- the session view ----------------
      *
      * The cache is keyed by block; a session is one published chain, the blocks one request
@@ -224,6 +260,7 @@ public:
         uint64_t    first_seen_ns = 0;
         uint64_t    last_used_ns = 0;
         int64_t     on_device = 0, on_host = 0;                /* blocks, by tier */
+        int64_t     on_disk = 0;                               /* only in the store on disk */
         /* Linear state on a hybrid model, counted apart from blocks: a snapshot is thousands of
          * blocks' worth of bytes and there are only --checkpoint-slots of them. */
         int64_t     snapshots = 0;                             /* this session holds */
@@ -285,6 +322,9 @@ public:
         /* `host_drops` is entries the full arena gave up; `held_back` copies it did not take,
          * because every host entry was worth as much (their entries stay in VRAM only). */
         int64_t host_drops = 0, failures = 0, held_back = 0;
+        /* Host copies given up because the store on disk holds the same bytes, and disk records
+         * read back into a host slot (--prefix-cache-dir). */
+        int64_t to_disk_only = 0, paged_in = 0;
         int64_t host_bytes = 0;
         int64_t host_hits = 0;
         /* Step-thread host time under the scheduler's lock: restores issued at admission, and
@@ -326,6 +366,7 @@ private:
         bool     queued  = false;   /* in wb_q_: waiting for a copy */
         bool     clean_q = false;   /* in clean_q_: a drop the cache has not been asked about */
         bool     listed  = false;   /* on host_lru_; `it` is valid */
+        bool     disk    = false;   /* the store on disk holds these bytes (add_disk) */
         std::vector<int32_t> blocks;
         /* ---- the linear half ----
          * Snapshot store slot and token position, for the session view. `ck_slot` is -1 for most

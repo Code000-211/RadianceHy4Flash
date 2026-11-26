@@ -10,6 +10,25 @@ namespace rad {
 
 enum { RAD_SCHED_MAX_KV_GROUPS = 16 };
 
+/* The pieces of the KV loan's headroom for the group that lends least, in that group's blocks:
+ * where the loan stops (`held_top`), what the pool holds under it (`held`), the buffer it keeps
+ * (`buffer_blocks`) and the live mark as it stands (`live`). A block released under the highest
+ * held one is free and still unlendable, so `held_top - held` is the fragmentation a compaction
+ * would recover, and `live - held_top - buffer_blocks` the headroom the arbiter has not lent yet.
+ * `group` is -1 when nothing can lend (no paged FULL group, or a follower that tracks no held
+ * blocks). Zero everywhere else. */
+struct KvSpareSplit {
+    int32_t group         = -1;
+    int64_t block_tokens  = 0;
+    int64_t block_bytes   = 0;
+    int64_t held          = 0;
+    int64_t held_top      = 0;
+    int64_t buffer_blocks = 0;
+    int64_t live          = 0;
+    int64_t spare_tokens  = 0;
+    int64_t loan_tokens   = 0;
+};
+
 struct SchedMetrics {
     int64_t step = 0;
 
@@ -101,6 +120,10 @@ struct SchedMetrics {
          * difference is the VRAM the elastic pool released behind unheld blocks. */
         int64_t bytes_carved = 0;
     } kv[RAD_SCHED_MAX_KV_GROUPS];
+    /* Where the loan stops and what keeps it there, for the group that lends least: the counters
+     * that turn kv[].bytes_used into a fragmentation reading (a block under the highest held one is
+     * free and still unlendable). group is -1 when the manager cannot answer. */
+    KvSpareSplit kv_spare;
     /* KV streaming: the rings' depth over every streamed group, and the resolve's cumulative misses
      * and bytes copied in from the host mirrors. Zero when nothing streams. */
     int64_t kv_resident_blocks = 0;
@@ -176,6 +199,25 @@ struct SchedMetrics {
     bool    draft_adaptive = false;
     float   draft_depth_adaptive = 0.0f;
     int64_t draft_verify_depth[RAD_METRICS_MAX_SPEC + 1] = {};
+    /* Suffix proposals the global cache won (--draft-suffix-global-mib), and lookups that found it
+     * mid-insert and skipped it. */
+    int64_t suffix_global = 0;
+    int64_t suffix_global_busy = 0;
+    /* Accepted rows credited back to the responses the global chains came from (their LRFU). */
+    int64_t suffix_global_credited = 0;
+    /* --prefix-cache-dir, set by the engine after each flush and page-in. */
+    struct Disk {
+        int64_t written_bytes = 0;      /* payload bytes written, all flushes */
+        int64_t written_hour = 0;       /* of those, in the last hour */
+        int64_t admitted = 0;           /* items written */
+        int64_t rejected = 0;           /* new items not admitted (never reused, short, idle) */
+        int64_t deferred = 0;           /* admitted, over the write budget for now */
+        int64_t entries = 0, snaps = 0; /* what the store holds */
+        int64_t bytes = 0;              /* on disk, every segment */
+        int64_t loaded = 0;             /* entries indexed at startup */
+        int64_t paged_in = 0;           /* entries read back on a hit */
+        int64_t compactions = 0;
+    } disk;
     /* Prompt lookup's verify gate (sched/lookup.h), when lookup is the only drafter: proposals
      * made, proposals held back unverified and their drafts, and of the held proposals scored
      * against the text that followed, the drafts that came true (what a verify would have
@@ -190,6 +232,8 @@ struct SchedMetrics {
     int64_t suffix_steps = 0;
     int64_t suffix_rows = 0;
     int64_t suffix_accepted = 0;
+    /* Requests whose suffix index was taken over from an earlier turn's prompt (suffix stash). */
+    int64_t suffix_adopted = 0;
     /* Why Scheduler::step_next_locked did not issue the next step ahead of the commit (S-07): one
      * counter per reason, and only the first check that refuses counts. With steps_ahead they are
      * every step_next the engine made once a step was in flight, so /stats can say where the gap

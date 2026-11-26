@@ -914,6 +914,11 @@ struct LinearFP8 {
      * are the same as for declare(). */
     int  probe(RadBuilder* b, Names& nm, const Geom& g, const char* base,
                std::initializer_list<const char*> src);
+    /* probe() without the name map: reads the format again over a linear probe() already mapped,
+     * for a flag set after that probe (plain_bf16_view), so reads_x / probed_i8 describe what
+     * declare() will declare. */
+    void classify(RadBuilder* b, Names& nm, const Geom& g, const char* base,
+                  std::initializer_list<const char*> src);
 
     /* `base` is the declared name without suffix ("blk.7.ffn_gate_up"); the logical weight is
      * `<base>.weight` with views `.weight` (codes) and `.scale`. `src` is one checkpoint name, or
@@ -1299,6 +1304,13 @@ inline int LinearFP8::probe(RadBuilder* b, Names& nm, const Geom& g, const char*
     const char* wn = nm.f("%s.weight", base);
     RAD_ARCH_TRY(map_linear(b, wn, src));
     mapped = true;
+    classify(b, nm, g, base, src);
+    return RAD_OK;
+}
+
+inline void LinearFP8::classify(RadBuilder* b, Names& nm, const Geom& g, const char* base,
+                                std::initializer_list<const char*> src) {
+    const char* wn = nm.f("%s.weight", base);
     RadEncoding enc{};
     const bool known = weight_enc(b, wn, &enc);
     const bool plain = known && rad_enc_is(&enc, "plain") && enc.n_planes == 1 &&
@@ -1314,7 +1326,6 @@ inline int LinearFP8::probe(RadBuilder* b, Names& nm, const Geom& g, const char*
     const bool rotated = known && (linear_is_paro_mxfp4(enc) || linear_is_paro_w5(enc) ||
                                    linear_is_paro_m2xfp4(enc));
     reads_x = g.w_bf16 || plain || view || probed_i8 || rotated || (known && linear_is_w4(enc));
-    return RAD_OK;
 }
 
 inline rad_op LinearFP8::decl_gemm_q(RadBuilder* b, int64_t lo, int64_t hi, int64_t group,

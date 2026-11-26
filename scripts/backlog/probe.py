@@ -6,7 +6,9 @@ arr60 (a ~60K-token arrival 2 s into one decoder, RAD_ARRIVE_S: S-10's "TTFT of 
 of decode"), tailN (a prompt of ~N characters), c1s (64 tok), c8s (48 tok), greedy (three prompts and one 5.7K arrival
 at temperature 0 with ignore_eos off: the text itself, as gen / chars / sha256, so two runs' answers
 compare byte for byte -- the merge bar's first clause), idle (a finished conversation's KV
-leaves VRAM for the experts and its prefix still resumes; RAD_IDLE_CHARS, RAD_IDLE_WAIT_S), long8
+leaves VRAM for the experts and its prefix still resumes; RAD_IDLE_CHARS, RAD_IDLE_WAIT_S), liveN
+(N decoders, /stats read while they all decode and again once they are done: M-11's gain, the
+window slots no sequence occupies), long8
 (the item's eight long conversations at once, then idle, demand and return; RAD_LONG8_CHARS), and
 longctx (eight ~46K-token sessions: a prefill wave of one token each, then the same eight prompts
 decoded 128 tokens, so all eight are at long context together: the shape notes/backlog/refs/notes/
@@ -14,7 +16,10 @@ longctx.md measured as N8 48K, where the stager overflows its ring -- longctx-pr
 the JSON), and lctxN (N sessions of RAD_LCTX_CHARS characters -- 190,000 is the 58,903-token
 conversation of notes/backlog/CARDS.md §1.3, so the default is a 60K session -- filled by a one-token
 wave and then decoded for RAD_LCTX_NTOK tokens: the long-context decode stamps of T-03, at one
-decoder as `lctx1` and at four as `lctx4`, with `lctxN-pre` / `lctxN-decode` in the JSON). The token
+decoder as `lctx1` and at four as `lctx4`, with `lctxN-pre` / `lctxN-decode` in the JSON), and stress (issue #251: RAD_STRESS_WAVES waves
+of eight requests at once, RAD_STRESS_CHARS characters of context and RAD_STRESS_NTOK tokens each, a
+fresh wave and then the same prompts again; failed requests and a server that stops are counted, not
+raised: `ok` / `err` / `server_dead`). The token
 counts are the ones the backlog's own runs measured on these phases, so a lane's
 ttft compares with the numbers in notes/backlog/."""
 import hashlib, json, sys, threading, time, urllib.request, os
@@ -194,6 +199,7 @@ def view(at):
             "to_host": mv.get("to_host"), "promoted": mv.get("promoted"), "dropped": mv.get("dropped"),
             "held_back": mv.get("held_back"), "restores": st.get("restores"),
             "pool_mib": round((p.get("bytes_used") or 0) / 2**20, 1),
+            "kv_loan": t.get("kv_loan") or {},
             "stored": [{k: s.get(k) for k in ("tokens", "idle_s", "on_device", "on_host", "resume_tokens")}
                        for s in o.get("sessions", [])]}
 def hits(fn):
@@ -248,6 +254,54 @@ def idle(chars):
     for x in v: print(json.dumps(x), flush=True)
     time.sleep(2)
     return o
+def loan_frag(v):
+    """The KV loan's headroom in MiB, from the /stats `kv_loan` object (M-15): `holes_mib` is free
+    blocks under the highest held one, which the loan may not cross and a compaction would recover;
+    `buffer_mib` is what the cache keeps in hand; `headroom_mib` is what the arbiter has not lent
+    yet. The blocks are the binding group's, so `block_bytes` turns them into VRAM."""
+    l = (v or {}).get("kv_loan") or {}
+    mib = (l.get("block_bytes") or 0) / 2**20
+    held, top = l.get("held") or 0, l.get("held_top") or 0
+    buf, live = l.get("buffer_blocks") or 0, l.get("live") or 0
+    return {"group": l.get("group"), "held": held, "held_top": top,
+            "holes_mib": round((top - held) * mib, 1),
+            "buffer_mib": round(buf * mib, 1),
+            "headroom_mib": round(max(0, live - top - buf) * mib, 1),
+            "live_mib": round(live * mib, 1),
+            "spare_tokens": l.get("spare_tokens"), "loan_tokens": l.get("loan_tokens")}
+
+def live(n, ntok=256):
+    """M-11: the loan at N live sequences -- the item's own point, "73-129 units at 1-4 live
+    sequences". Starts N decoders, reads /stats while they all decode (the loan ticks every 100 ms
+    and fills a slot only for a unit that is wanted, so a read 1.5 s in is settled), and again when
+    they are done: `expert_vram_units` and `slab_mib` against `lend_mib` at each point, the units
+    the window group's idle slots let the slab hold. `views` keeps the whole /stats and /sessions
+    reading at each of the three points."""
+    ps = [P[i] for i in (1, 3, 5, 7)][:n]
+    res = [None] * n
+    def w(i): res[i] = request(ps[i], ntok)
+    v = [view("start")]
+    t0 = time.time()
+    th = [threading.Thread(target=w, args=(i,)) for i in range(n)]
+    for t in th: t.start()
+    time.sleep(float(os.environ.get("RAD_LIVE_S", 1.5)))
+    v.append(view("live"))
+    for t in th: t.join()
+    v.append(view("end"))
+    wall = max(r["t1"] for r in res) - t0
+    o = {"name": f"live{n}", "clients": n, "gen": sum(r["gen"] for r in res), "wall": round(wall, 3),
+         "ttft": [round(r["ttft"], 3) for r in res],
+         "agg_tps": round(sum(r["gen"] for r in res) / wall, 1),
+         "sum_req_dec_tps": round(sum(r["dec"] for r in res), 1),
+         "expert_vram_units": {x["at"]: (x["expert_units"] or {}).get("vram") for x in v},
+         "slab_mib": {x["at"]: x["slab_mib"] for x in v},
+         "lend_mib": {x["at"]: x["lend_mib"] for x in v},
+         "starved_slab": {x["at"]: x["starved_slab"] for x in v}, "views": v}
+    print(json.dumps({k: x for k, x in o.items() if k != "views"}), flush=True)
+    for x in v: print(json.dumps(x), flush=True)
+    time.sleep(2)
+    return o
+
 def long8(chars, gen=32):
     """The item's multi-session case (M longctx, 8 sessions of ~50K tokens: 391K cached tokens): eight
     long conversations at once, then idle, then a decode-only request that asks the experts for the
@@ -268,6 +322,7 @@ def long8(chars, gen=32):
          "kv_mib": {x["at"]: x["kv_mib"] for x in v}, "host_mib": {x["at"]: x["host_mib"] for x in v},
          "expert_vram_units": {x["at"]: (x["expert_units"] or {}).get("vram") for x in v},
          "slab_mib": {x["at"]: x["slab_mib"] for x in v}, "lend_mib": {x["at"]: x["lend_mib"] for x in v},
+         "loan": {x["at"]: loan_frag(x) for x in v},
          "views": v, "waves": [a, r]}
     print(json.dumps({k: x for k, x in o.items() if k not in ("views", "waves")}), flush=True)
     for x in v: print(json.dumps(x), flush=True)
@@ -347,6 +402,36 @@ def lctx(n, chars, ntok):
     return [phase(f"lctx{n}-pre", ps, 1), phase(f"lctx{n}-decode", ps, ntok)]
 
 R = {"phases": []}
+def stress(waves, chars, ntok, clients=8):
+    """Sustained concurrent load (issue #251): `waves` waves of `clients` requests at once, each a
+    ~`chars`-character context decoded for `ntok` tokens. A wave's prompts are fresh (cold prefill
+    beside the others' decode) and the wave after it sends the same ones again (prefix hit, decode
+    at that context). A request that fails or a server that stops answering is counted,
+    not raised: `ok` / `err` and whether /health still answers are the result."""
+    ok = err = slow = 0; pr = []; t0 = time.time(); dead = False; wv = []; m0 = metrics(); m1 = {}
+    for wi in range(waves):
+        if wi % 2 == 0: pr = [long_prompt(chars, 300 + wi * clients + i, stamp=True) for i in range(clients)]
+        res = [None] * clients
+        def w(i):
+            try: res[i] = request(pr[i], ntok)
+            except Exception as e: res[i] = {"error": repr(e)[:120]}
+        th = [threading.Thread(target=w, args=(i,)) for i in range(clients)]
+        tw = time.time()
+        for t in th: t.start()
+        for t in th: t.join()
+        good = [r for r in res if "error" not in r and r["gen"] > 0]
+        ok += len(good); err += clients - len(good); slow += sum(1 for r in good if r["ttft"] > 30)
+        wv.append({"wave": wi, "ok": len(good), "wall": round(time.time() - tw, 2), "gen": sum(r["gen"] for r in good),
+                   "errors": [r["error"] for r in res if "error" in r][:2]})
+        print(json.dumps(wv[-1]), flush=True)
+        try: get("/health"); m1 = metrics()
+        except Exception: dead = True; break
+    o = {"name": "stress", "waves": len(wv), "of": waves, "clients": clients, "chars": chars, "ntok": ntok,
+         "ok": ok, "err": err, "slow": slow, "server_dead": dead, "wall": round(time.time() - t0, 1),
+         "steps": {k.split(":")[1]: m1[k] - m0.get(k, 0) for k in m1 if "engine_steps" in k and m1[k] != m0.get(k, 0)},
+         "per_wave": wv}
+    print(json.dumps({k: v for k, v in o.items() if k != "per_wave"}), flush=True)
+    return o
 def record(o):
     """One phase's result into the JSON. A composite phase (`longctx`, `long8`) keeps its summary entry
     as it always did, and now also records the waves it ran as phases of their own: the stamp readers
@@ -390,7 +475,12 @@ for ph in PH:
     elif ph.startswith("resume"):  # resumeN: a ~N-character session, then N-row turns resumed
         record(resume(int(ph[6:]), int(os.environ.get("RAD_RESUME_EXTRA", 900))))
     elif ph == "idle": record(idle(int(os.environ.get("RAD_IDLE_CHARS", 72000))))
+    elif ph == "nowarm": pass  # read above: no warmup requests
+    elif ph == "stress":  # issue #251: RAD_STRESS_WAVES waves of eight ~12K-token requests
+        R["phases"].append(stress(int(os.environ.get("RAD_STRESS_WAVES", 40)), int(os.environ.get("RAD_STRESS_CHARS", 39500)),
+                                  int(os.environ.get("RAD_STRESS_NTOK", 96))))
+    elif ph.startswith("live"): R["phases"].append(live(int(ph[4:])))
     elif ph == "long8": record(long8(int(os.environ.get("RAD_LONG8_CHARS", 140000))))
     else: sys.exit(f"probe.py: no phase '{ph}'; phases: c1 c1b c1s c2 c4 c8 c8s think pf2 pf6 pf6c pf8 pf20 "
-                  "greedy longctx lctxN stall1 stall4 arr60 tailN idle long8 resumeN nowarm")
+                  "greedy longctx lctxN stall1 stall4 arr60 tailN idle liveN long8 resumeN stress nowarm")
 json.dump(R, open(OUT, "w"), indent=1)

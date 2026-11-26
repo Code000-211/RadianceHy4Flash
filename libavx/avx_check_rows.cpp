@@ -58,16 +58,95 @@ static int ring_probe() {
 static const char* const kRingMemory = "io_uring ring memory refused (ENOMEM); the locked-memory "
                                        "limit is shared with this user's other processes";
 
-/* embed_lookup_q's init must refuse a process that cannot create an io_uring ring, and say why
- * (Docker's default seccomp profile returns EPERM for io_uring_setup). A child installs that
- * refusal as a seccomp filter; init must then refuse a bf16 gather (read through the ring), name
- * the Docker option on stderr, and accept an f32 gather (read as memory). This process must then be
- * accepted where a ring can be created and refused where it cannot, as in a build sandbox. */
-bool ngram_init_case(const Lib& lib) {
+/* A bf16 gather from a small table file in `dir`, as a process without io_uring serves it: every
+ * miss is a synchronous pread (avx_ngram.cpp: ring_sync_mode). Run in the child that refuses the
+ * ring, so it is the one place the fallback's reads are checked against the file's bytes. 0 when
+ * every row is exact, 1 when a call fails or a row differs, 4 when `dir` cannot do direct I/O (the
+ * gather opens its tables O_DIRECT, ring or not). */
+static int pread_gather(const RadKernelInfo* r, const std::string& dir) {
+    const int64_t n = 160, V = 8192, M = 256, rb = 2 * n;
+    std::string path = dir + "/rad-avx-check-pread.XXXXXX";
+    const int wfd = ::mkostemp(path.data(), O_CLOEXEC);
+    if (wfd < 0) return 1;
+    uint64_t x = 0x2545f4914f6cdd1dull;
+    auto rnd = [&x]() { x ^= x << 13; x ^= x >> 7; x ^= x << 17; return x; };
+    std::vector<uint64_t> words((size_t)(V * rb / 8));
+    for (auto& w : words) w = rnd();
+    const bool wrote = ::write(wfd, words.data(), words.size() * 8) == (ssize_t)(words.size() * 8) &&
+                       ::fsync(wfd) == 0;
+    ::close(wfd);
+    const int dfd = wrote ? ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECT) : -1;
+    if (dfd < 0) { ::unlink(path.c_str()); return wrote ? 4 : 1; }
+    ::close(dfd);
+    const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    void* map = fd < 0 ? MAP_FAILED : mmap(nullptr, (size_t)(V * rb), PROT_READ, MAP_SHARED, fd, 0);
+    if (fd >= 0) ::close(fd);
+    if (map == MAP_FAILED) { ::unlink(path.c_str()); return 1; }
+    const uint8_t* tab = static_cast<const uint8_t*>(map);
+
+    auto tensor = [](void* p, uint32_t dt, std::initializer_list<int64_t> shape) {
+        RadTensor t{};
+        t.data = p;
+        t.dtype = dt;
+        t.rank = (uint32_t)shape.size();
+        int i = 0;
+        for (int64_t s : shape) t.shape[i++] = s;
+        int64_t st = 1;
+        for (int k = (int)t.rank - 1; k >= 0; --k) { t.stride[k] = st; st *= t.shape[k]; }
+        return t;
+    };
+    std::vector<int32_t> ids((size_t)M);
+    std::vector<uint16_t> out((size_t)(M * n));
+    std::vector<RadTensor> ts = {
+        tensor(ids.data(), RAD_I32, {M}),
+        tensor(const_cast<uint8_t*>(tab), RAD_BF16, {V, n}),
+        tensor(nullptr, RAD_BF16, {1}),
+        tensor(out.data(), RAD_BF16, {M, n}),
+        tensor(nullptr, RAD_I32, {M}) };
+    RadParam ps[3] = {};
+    ps[0].key = "M";       ps[0].kind = RAD_P_INT; ps[0].ival = M;
+    ps[1].key = "n_embd";  ps[1].kind = RAD_P_INT; ps[1].ival = n;
+    ps[2].key = "n_vocab"; ps[2].kind = RAD_P_INT; ps[2].ival = V;
+    RadArgs a{};
+    a.t = ts.data(); a.n_t = (int)ts.size();
+    a.p = ps; a.n_p = 3;
+    a.rank = 0; a.world_size = 1;
+    int rc = 0;
+    /* Two calls over overlapping ids: the first misses everywhere, the second meets rows the first
+     * published to the cache, a repeat inside the call and padding. */
+    for (int c = 0; c < 2 && rc == 0; ++c) {
+        for (int64_t m = 0; m < M; ++m) {
+            const uint64_t v = rnd();
+            ids[(size_t)m] = v % 13 == 0 ? -1 : (m > 0 && v % 7 == 0) ? ids[(size_t)m - 1]
+                                                                       : (int32_t)((v >> 8) % 1024);
+        }
+        std::fill(out.begin(), out.end(), (uint16_t)0xdead);
+        if (r->launch(&a, nullptr) != RAD_OK) { rc = 1; break; }
+        for (int64_t m = 0; m < M && rc == 0; ++m) {
+            const int32_t id = ids[(size_t)m];
+            for (int64_t i = 0; i < n; ++i) {
+                uint16_t want = 0;
+                if (id >= 0) std::memcpy(&want, tab + ((int64_t)id * n + i) * 2, 2);
+                if (out[(size_t)(m * n + i)] != want) { rc = 1; break; }
+            }
+        }
+    }
+    ::unlink(path.c_str());
+    return rc;
+}
+
+/* embed_lookup_q's init must accept a process that cannot create an io_uring ring and say why and
+ * what it does instead (Docker's default seccomp profile returns EPERM for io_uring_setup): since
+ * the pread fallback (aa84ec2ad) the model starts there, its n-gram reads are only slower. A child
+ * installs that refusal as a seccomp filter; init must then accept a bf16 gather (read through the
+ * fallback) and an f32 one (read as memory), name the Docker option and the pread fallback on
+ * stderr, and a bf16 gather from a file must return the file's rows exactly. This process's init
+ * must be accepted whether a ring can be created here or not, as in a build sandbox. */
+bool ngram_init_case(const Lib& lib, const std::string& dir) {
     const char* what = "embed_lookup_q's init";
     const RadKernelInfo* r = lib.row("embed_lookup_q");
-    if (!r || !r->init) {
-        std::printf("  %s: the row has no init\n", what);
+    if (!r || !r->init || !r->launch) {
+        std::printf("  %s: the row has no init or no launch\n", what);
         return false;
     }
     RadParam bf16[2]{}, f32[2]{};
@@ -103,7 +182,10 @@ bool ngram_init_case(const Lib& lib) {
         const int a = r->init(bf16, 2, 0, 1, &inst);
         const int b = r->init(f32, 2, 0, 1, &inst);
         std::fflush(nullptr);
-        ::_exit(a == RAD_E_UNSUPPORTED && b == RAD_OK ? 0 : 1);
+        if (a != RAD_OK || b != RAD_OK) ::_exit(1);
+        const int g = pread_gather(r, dir);
+        std::fflush(nullptr);
+        ::_exit(g == 0 ? 0 : g == 4 ? 4 : 2);
     }
     ::close(out[1]);
     std::string said;
@@ -116,32 +198,32 @@ bool ngram_init_case(const Lib& lib) {
         return false;
     }
     bool ok = true;
-    if (WEXITSTATUS(ws) == 3) {
+    const int code = WEXITSTATUS(ws);
+    const bool named = said.find("--security-opt seccomp=unconfined") != std::string::npos &&
+                       said.find("pread") != std::string::npos;
+    if (code == 3) {
         std::printf("  %s, where io_uring is refused: SKIPPED -- no seccomp filter can be installed "
                     "here\n", what);
-    } else if (WEXITSTATUS(ws) != 0 ||
-               said.find("--security-opt seccomp=unconfined") == std::string::npos) {
+    } else if (code == 1 || code == 2 || !named) {
         std::printf("  %s, where io_uring is refused: FAIL -- %s; it said: %s\n", what,
-                    WEXITSTATUS(ws) ? "the statuses were wrong" : "the reason was not named",
+                    code == 1 ? "the init refused" : code == 2 ? "the pread gather was wrong"
+                                                               : "the reason or the fallback was not named",
                     said.c_str());
         ok = false;
     } else {
-        std::printf("  %s, where io_uring is refused: refused, naming the Docker option\n", what);
+        std::printf("  %s, where io_uring is refused: accepted, naming the Docker option and the pread "
+                    "fallback; %s\n", what,
+                    code == 4 ? ("the gather is SKIPPED -- " + dir + " cannot do direct I/O").c_str()
+                              : "a bf16 gather through pread returns the file's rows exactly");
     }
 
-    /* The init tests the ring once per process, so the probes bracket it. */
-    const int before = ring_probe();
+    /* The init tests the ring once per process; either way it accepts. */
+    const int here = ring_probe();
     void* inst = nullptr;
     const int st = r->init(bf16, 2, 0, 1, &inst);
-    const int after = ring_probe();
-    if (st == RAD_E_UNSUPPORTED && (before == ENOMEM || after == ENOMEM)) {
-        std::printf("  %s, in this process: SKIPPED -- %s\n", what, kRingMemory);
-        return ok;
-    }
-    const bool here = before == 0;
-    const bool right = here ? st == RAD_OK : st == RAD_E_UNSUPPORTED;
-    std::printf("  %s, in this process (io_uring %s): %s\n", what, here ? "available" : "refused",
-                right ? (here ? "accepted" : "refused") : "FAIL");
+    const bool right = st == RAD_OK;
+    std::printf("  %s, in this process (io_uring %s): %s\n", what, here == 0 ? "available" : "refused",
+                right ? "accepted" : "FAIL");
     return ok && right;
 }
 

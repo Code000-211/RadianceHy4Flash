@@ -32,6 +32,11 @@ enum {
      * silent buffered fallback makes the weight tier ~3x slower and is invisible in a profile.
      * For tests, which run on whatever /tmp is. */
     RAD_DIO_ALLOW_BUFFERED = 16,
+
+    /* Open buffered even where O_DIRECT works. A sweep that reads the container for the last time
+     * (--keep-container-cache) wants its pages in the page cache, and an O_DIRECT read never puts
+     * them there. The caller accepts the copy and the lower first-read rate for the later starts. */
+    RAD_DIO_BUFFERED = 32,
 };
 
 class DirectFile {

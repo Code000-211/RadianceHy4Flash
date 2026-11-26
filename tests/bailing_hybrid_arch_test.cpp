@@ -215,8 +215,6 @@ TEST(iq8r_container_declares_the_rotated_int8_trunk) {
                 } else {
                     std::snprintf(n, sizeof n, "blk.%d.ffn_gate_up_shexp.weight", l);
                     want[n] = { 2 * SH, 1536, 256, nq, 0 };
-                    std::snprintf(n, sizeof n, "blk.%d.ffn_down_shexp.weight", l);
-                    want[n] = { 1536, SH, 128, sq, 0 };
                 }
             }
             int q = 0;
@@ -234,8 +232,26 @@ TEST(iq8r_container_declares_the_rotated_int8_trunk) {
                 CHECK_EQ(pint(&o, "group"), x.group);
                 CHECK(in(o.reads, x.in));
             }
-            CHECK_EQ(q, 18 * 4 + 6 + 2 + 23 * 2);
+            CHECK_EQ(q, 18 * 4 + 6 + 2 + 23);
             for (const auto& [name, x] : want) CHECK_EQ(x.n, 1);
+
+            /* ---- the shared expert's down projection, a runtime-LoRA target module kind: the
+             * plain bf16 view site (LinearFP8::plain_bf16_view), a gemm_nt over the gated
+             * product's bf16 plane, which every layer's producer therefore writes. */
+            const rad_buf sx = buf(b, "shared_ff");
+            REQUIRE(sx != 0);
+            int sh_view = 0;
+            for (const auto& o : b.ops) {
+                if (o.op != "gemm_nt" || o.w.empty() ||
+                    wname(b, o.w[0]).find("ffn_down_shexp") == std::string::npos)
+                    continue;
+                ++sh_view;
+                CHECK_EQ(pint(&o, "N"), 1536);
+                CHECK_EQ(pint(&o, "K"), SH);
+                CHECK(in(o.reads, sx));
+                CHECK(!in(o.reads, sq));
+            }
+            CHECK_EQ(sh_view, 23);
 
             /* ---- the linears the recipe keeps bf16, over the norm's bf16 output (the query parts
              * over the LoRA's normed latent). */

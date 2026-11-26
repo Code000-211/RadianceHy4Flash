@@ -121,6 +121,7 @@ public:
                               const rad_weight* w, int n_w);
     int         op_resolved  (rad_op h) const;
     int         op_declared  (const char* op) const;
+    int         op_dropped   ();
     int         decl_name_map(const RadNameMap* m);
     int         declare_logits(rad_buf b);
     int         declare_scores(rad_buf hidden, rad_weight table);
@@ -219,6 +220,8 @@ private:
     std::vector<std::string> errors_;
     int  status_ = RAD_OK;
     bool finished_ = false;
+    /* The op the last decl_op recorded, for op_dropped; 0 when that call recorded none. */
+    size_t last_decl_ = 0;
 
     std::string scope_;
 

@@ -1104,6 +1104,9 @@ AVX_KERNEL(engram_ids) {
     const int64_t heads = p_int(a, "heads", 0), ngram = p_int(a, "ngram", 0),
                   pad = p_int(a, "pad", -1), msize = p_int(a, "map_size", 0),
                   image = p_int(a, "image", -1), video = p_int(a, "video", -1);
+    /* 0: the ids are hashed against the window and the window is left as it was, for the Engram
+     * layers that share another's history and are not the last of the step's. */
+    const bool advance = p_int(a, "advance", 1) != 0;
     if (heads < 1 || ngram < 2 || ngram > 8 || heads % (ngram - 1) || msize < 1) return RAD_E_SHAPE;
     if (pad < 0 || pad >= msize) return RAD_E_INVAL;
     const int64_t per = heads / (ngram - 1), ctx = ngram - 1;
@@ -1183,7 +1186,8 @@ AVX_KERNEL(engram_ids) {
         }
         /* The window after the step, by ple_conv's rule: a decode step (num_accepted present)
          * shifts the old ids down by one and appends every id it ran; otherwise every id commits
-         * and the last ctx land at offset zero. */
+         * and the last ctx land at offset zero. Only an `advance` issue moves it on. */
+        if (!advance) continue;
         if (nacc) {
             for (int64_t i = 0; i + 1 < ctx; ++i) st_int_dt(st.dtype, st.data, sb + i, prev[i + 1]);
             for (int64_t t = 0; t < T; ++t)
