@@ -1559,7 +1559,7 @@ void moe_gemm_q_kernel(R4D_MOEGQ_PARAMS) {
     uint16_t* __restrict__ Y, uint32_t T, uint32_t N, uint32_t n_expert, uint32_t G,            \
     uint32_t a_ld, uint32_t as_ld, uint32_t y_ld, uint32_t mode, const MoeTab tab
 template <int W4, bool I8 = false>
-__device__ __forceinline__ uint32_t moe_down_dec_body(const uint32_t j, R4D_MOEDD_PARAMS) {
+__device__ __forceinline__ void moe_down_dec_body(R4D_MOEDD_PARAMS) {
     constexpr bool UW = true;
     constexpr uint32_t FM = 16, FN = 64, FK = kFK, NTHR = 4 * kWave;
     constexpr uint32_t kSub = W4 == 3 ? 4u : (W4 == 2 || W4 == 4 || W4 == 5) ? 2u : 1u;
@@ -1583,7 +1583,7 @@ __device__ __forceinline__ uint32_t moe_down_dec_body(const uint32_t j, R4D_MOED
     const uint32_t tid = threadIdx.x, lane = tid % kWave, wave = tid / kWave;
     /* The block's columns: G 64-wide tiles from cg0, the last group cut at N. */
     const uint32_t cg0 = blockIdx.y * G * FN;
-    if (cg0 >= N) return 0u;            /* the launcher's grid has none; block-uniform */
+    if (cg0 >= N) return;               /* the launcher's grid has none; block-uniform */
     const uint32_t cend = cg0 + G * FN < N ? cg0 + G * FN : N;
     const uint32_t ng = (cend - cg0 + FN - 1) / FN;
 
@@ -1593,11 +1593,10 @@ __device__ __forceinline__ uint32_t moe_down_dec_body(const uint32_t j, R4D_MOED
         const uint32_t live = (uint32_t)off[n_expert];
         for (uint32_t r = live; r < T; ++r)
             for (uint32_t c = cg0 + tid; c < cend; c += NTHR) Y[(size_t)r * y_ld + c] = 0;
-        return 0u;
+        return;
     }
 
-    /* The tile: the j-th 16-row run tile in expert, then row, order (j is the block's, or one past
-     * the grid it serves in turn: moe_down_dec_kernel). Each thread holds NPT
+    /* The tile: the j-th 16-row run tile in expert, then row, order. Each thread holds NPT
      * consecutive experts' offsets plus the next; tiles are numbered by thread, then over the wave
      * (DPP) and the waves before it. Both barriers order LDS.
      *
@@ -1629,7 +1628,8 @@ __device__ __forceinline__ uint32_t moe_down_dec_body(const uint32_t j, R4D_MOED
         before += w < wave ? c : 0u;
         ntile += c;
     }
-    if (j >= ntile) return ntile;       /* fewer tiles than slots: block-uniform */
+    const uint32_t j = blockIdx.x;
+    if (j >= ntile) return;             /* fewer tiles than slots: block-uniform */
     if (j >= before && j < before + cnt) {
         uint32_t m = j - before;
         bool hit = false;
@@ -1673,7 +1673,7 @@ __device__ __forceinline__ uint32_t moe_down_dec_body(const uint32_t j, R4D_MOED
             if (n0 + c < N) Y[(size_t)(rs + x / FN) * y_ld + n0 + c] = 0;
         }
     }
-    if (!npm) return ntile;
+    if (!npm) return;
 
     /* Passes over (column tile, K block), K innermost. The last pass's successor is never
      * issued. */
@@ -1867,31 +1867,16 @@ __device__ __forceinline__ uint32_t moe_down_dec_body(const uint32_t j, R4D_MOED
         }
         cur = nxt;
     }
-    return ntile;
 }
 
 /* The kernel around the body, as moe_gemm_q_kernel around its own: CH `r4dchain` is the chained
- * form. The grid's run tiles are r4d_moe_run_grid's, not the bound: its gridDim.x - 1 tile blocks
- * serve tiles j, j + that, ... below the launch's count, each by the same body, so the bytes do
- * not depend on the grid. A barrier parts two tiles of a block (the body's LDS). WR is that walk;
- * a grid at the bound takes the form without it, the one-tile-a-block kernel's code. */
-template <int W4, bool I8, class CH, bool WR = false>
+ * form. */
+template <int W4, bool I8, class CH>
 __global__ __launch_bounds__(4 * kWave)
 void moe_down_dec_kernel(R4D_MOEDD_PARAMS) {
     if (CH::on) r4d_chain_wait();
-    if constexpr (!WR) {
-        moe_down_dec_body<W4, I8>(blockIdx.x, Aq, As, c_even, c_odd, c_2, c_3, off, Y, T, N,
-                                  n_expert, G, a_ld, as_ld, y_ld, mode, tab);
-    } else {
-        const uint32_t stride = gridDim.x - 1u;
-        for (uint32_t j = blockIdx.x;; j += stride) {
-            const uint32_t nt = moe_down_dec_body<W4, I8>(j, Aq, As, c_even, c_odd, c_2, c_3, off,
-                                                          Y, T, N, n_expert, G, a_ld, as_ld, y_ld,
-                                                          mode, tab);
-            if (j + stride >= nt) break;
-            __syncthreads();
-        }
-    }
+    moe_down_dec_body<W4, I8>(Aq, As, c_even, c_odd, c_2, c_3, off, Y, T, N, n_expert, G, a_ld,
+                              as_ld, y_ld, mode, tab);
     if (CH::on) r4d_chain_done();
 }
 #undef R4D_MOEDD_PARAMS
@@ -2757,16 +2742,20 @@ static inline long long r4d_moe_down_dec_g(long long T) {
     if (g_moe_down_dec_pin > 0) return g_moe_down_dec_pin;
     return T >= kMoeDownDecG4Rows ? 4 : T >= kMoeDownDecG2Rows ? 2 : 1;
 }
-/* The run-tile grids' tile blocks (moe_down_dec_kernel; r4d_moe_iqr.hip's decode grid). A pass's
- * tiles are bounded by min(T, n_expert) runs plus a tile per 16 rows, but a routed pass uses far
- * fewer experts, and every block past its tiles still pays the run search (the offsets' loads, a
- * scan, two barriers) before it finds none: at a DFly2 c8 verify (T 512) gate_up's 513 blocks a
- * column group found 120-305 tiles (DFly2 and no-spec on Hy4-flash, every launch counted), and
- * 512 more empty blocks a row cost the pass 2.5 ms. So the grid holds T / 2 + kRunGridBase tiles
- * when that is below the bound, above every count seen at every T of the band (the counts' maxima
- * run from 92 % of T at 96 rows to 47 % at 720); a launch with more tiles has its blocks serve
- * them in turn, the same bytes. Below 128 rows the bound is smaller and stands. A constant rule of
- * T, so recorded and live passes agree; pinnable for tests (g_moe_run_grid_pin). */
+/* The tile blocks of moe_gemm_iqr's decode grid (r4d_moe_iqr.hip). A pass's run tiles are bounded
+ * by min(T, n_expert) runs plus a tile per 16 rows, but a routed pass uses far fewer experts, and
+ * every block past its tiles still pays the run search (the offsets' loads, a scan, two barriers)
+ * before it finds none: at a DFly2 c8 verify (T 512) gate_up's 513 blocks a column group found
+ * 120-305 tiles (DFly2 and no-spec on Hy4-flash, every launch counted), and 512 more empty blocks
+ * a row cost the pass 2.5 ms. So the grid holds T / 2 + kRunGridBase tiles when that is below the
+ * bound, above every count seen at every T of the band (the counts' maxima run from 92 % of T at
+ * 96 rows to 47 % at 720); a launch with more tiles has its blocks serve them in turn, the same
+ * bytes. Below 128 rows the bound is smaller and stands. A constant rule of T, so recorded and live
+ * passes agree; pinnable for tests (g_moe_run_grid_pin).
+ *
+ * moe_down_dec_kernel keeps its bound: the same grid there was measured +0.2..0.5 ms a c8 verify
+ * pass slower (its empty blocks were never the cost -- 512 more a row did not show -- and the walk
+ * costs it 7-15 VGPRs and its SGPRs), notes/backlog/measurements/tight-grid.md. */
 constexpr long long kRunGridBase = 64;
 static int g_moe_run_grid_pin = 0;
 long long r4d_moe_run_grid(long long T, long long bound) {
@@ -3103,15 +3092,10 @@ static int moe_gemm_launch(const RadArgs* a, RadStream stream, int ncls = 2) {
         const long long g2 = r4d_moe_down_dec_g(T);
         if (!dn_dec && g_moe_down_dec_pin > 0) return R4D_NO(RAD_E_UNSUPPORTED);
         if (dn_dec && g2 > 0) {
-            /* r4d_moe_run_grid's blocks for the run tiles, which serve any more in turn */
-            const long long bound = std::min(T, n_expert) + (T + 15) / 16;
-            const unsigned slots  = (unsigned)r4d_moe_run_grid(T, bound);
-            const bool wrap = (long long)slots < bound;
+            const unsigned slots  = (unsigned)(std::min(T, n_expert) + (T + 15) / 16);
             const unsigned groups = (unsigned)((N + 64 * g2 - 1) / (64 * g2));
 #define R4D_MOE_DD(CH_)                                                                          \
-            emit_rc = wrap ? R4D_MOE_DD_EMIT(CH_, true) : R4D_MOE_DD_EMIT(CH_, false)
-#define R4D_MOE_DD_EMIT(CH_, WR_)                                                                \
-                      R4D_EMIT(stream, (moe_down_dec_kernel<W4, I8, CH_, WR_>),                  \
+            emit_rc = R4D_EMIT(stream, (moe_down_dec_kernel<W4, I8, CH_>),                       \
                                dim3(slots + 1u, groups), dim3(4 * kWave), 0,                     \
                                (const uint8_t*)Aq->data, (const float*)As->data, ce, co, c2, c3, \
                                (const int32_t*)off->data, (uint16_t*)Y->data,                    \
@@ -3299,8 +3283,8 @@ extern "C" void r4d_moe_gemm_pin_down_mt(int pin) {
 extern "C" void r4d_moe_gemm_pin_down_dec(int pin) {
     g_moe_down_dec_pin = pin < (int)kMoeDownDecMaxG ? pin : (int)kMoeDownDecMaxG;
 }
-/* The run-tile grids' tile blocks for tests: n > 0 that many (at most the bound), else the rule
- * (r4d_moe_run_grid). r4d_selftest compares the bytes across them. */
+/* moe_gemm_iqr's decode grid's tile blocks for tests: n > 0 that many (at most the bound), else
+ * the rule (r4d_moe_run_grid). r4d_selftest compares the bytes across them. */
 extern "C" void r4d_moe_gemm_pin_run_grid(int n) { g_moe_run_grid_pin = n > 0 ? n : 0; }
 
 /* The four-bit forms (an E4M3 scale per 64 or 32 of K for w4nl64a8h / w4nl32a8h, else a bf16
