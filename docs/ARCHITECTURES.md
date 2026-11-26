@@ -3446,8 +3446,9 @@ ihc_pre (hc_head), rmsnorm (output_norm), gather_rows, logits_gemm
 
   The three groups' geometry, per rank. All three are declared `rad_kv_group_replicated`
   (`hyv4flash.cpp:1213-1215`), so every rank holds the whole latent row and TP splits heads, not the
-  cache: the host mirror and the ring are priced a rank (design X-05 §5 prices the mirror at 13.8 GB
-  a rank, and §7 notes four ranks pin the same bytes four times). A row is `kv_lora + qk_rope` values
+  cache: the host mirror and the ring are priced a rank (design X-05 §3's ledger and §7 price the
+  mirror at 13.8 GB a rank, and §8's X-05c notes four ranks pin the same 13.8 GB four times).
+  A row is `kv_lora + qk_rope` values
   (latent 512 + rope 64 = 576; `latent_group`, `hyv4flash.cpp:811`) and the group's `head_dim` is half
   its row bytes (`hyv4flash.cpp:705`), so bf16 gives 1,152 B a token a layer:
 
