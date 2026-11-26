@@ -144,6 +144,7 @@ __device__ __forceinline__ void plan(RadW2Layer* L, const int32_t* cnt, PlanLds&
                 }
             }
         }
+        if (m == (uint8_t)RAD_W2_INPLACE && L->inplace_first) m = (uint8_t)RAD_W2_RESIDENT;
         L->mask[x] = m;
     }
     __syncthreads();

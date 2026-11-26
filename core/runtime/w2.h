@@ -36,6 +36,7 @@ struct W2Config {
     int    form = 0;
     int    spin = 0;
     int64_t gu_first = 0;
+    bool   inplace_first = false;     /* RADIANCE_W2_INPLACE_FIRST=1 */
 };
 /* From the environment (`get` is std::getenv, or a test's). */
 W2Config w2_config(const char* (*get)(const char*));

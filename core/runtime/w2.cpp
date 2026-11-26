@@ -37,6 +37,7 @@ W2Config w2_config(const char* (*get)(const char*)) {
              !std::strcmp(form, "inline3") ? 3 : !std::strcmp(form, "inline4") ? 4 : 0;
     c.spin = (int)std::clamp(num("RADIANCE_W2_SPIN", 0), 0.0, 1e6);
     c.gu_first = (int64_t)std::clamp(num("RADIANCE_W2_GU_FIRST", 0), 0.0, 64e6);
+    c.inplace_first = num("RADIANCE_W2_INPLACE_FIRST", 0) != 0.0;
     return c;
 }
 W2Config w2_config() {
@@ -383,6 +384,7 @@ void* Ctx::w2_layer(int layer, const rad_weight* first, int64_t n_place, int64_t
         L->form = (uint32_t)x.cfg.form;
         L->spin = (uint32_t)x.cfg.spin;
         L->gu_first = x.cfg.gu_first > 0 ? 1u : 0u;
+        L->inplace_first = x.cfg.inplace_first ? 1u : 0u;
         L->split = (uint64_t)x.cfg.gu_first;
         L->pools = x.pools;
         w2_fill_kmax(x.cfg, L->kmax);

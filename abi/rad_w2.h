@@ -138,7 +138,10 @@ typedef struct RadW2Layer {
      * expert re-reads the done word before it gives up and reads in place. `gu_first` 1: the
      * list copies every unit's first `split` bytes (the gate_up tables) before any unit's rest,
      * so the done word counts 2 n ranges. */
-    uint32_t        form, spin, gu_first, pad1;
+    uint32_t        form, spin, gu_first;
+    /* 1: a miss that is not posted stays in the first launch (read in place there, as without
+     * W2) instead of in the tail, where its link read is the layer's critical path. */
+    uint32_t        inplace_first;
     uint64_t        split;
     RadW2Pools      pools;
     /* The most units a layer's list may hold, by the number of distinct routed experts (which is
