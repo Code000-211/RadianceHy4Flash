@@ -1234,8 +1234,27 @@ RAM, and the VRAM it gave up went to the expert slab.
 |---|---|---|---|
 | Qwen3.8-Flash-Next (`qwen4exp_fp8`) | **yes** | bf16, i8 | sparse QSA; the measured path |
 | GLM-5.3-Flash (`glm5next`) | **yes** | bf16, fp8 | sparse MLA + DSA; declare and issue are tested, not served here |
+| Hy4-flash (`hyv4flash`) | **yes** | bf16 | sparse MLA + indexer; declared, linked, served on the mini model, its numbers below |
 | Qwen3.5/3.6/3.8 dense (`qwen35_*`, `qwen35moe_fp8`) | no | | dense attention reads the whole history every step |
 | all other architectures | no | | no streamed store and no `kv_resolve` |
+
+**Hy4-flash's numbers.** Only the twelve sparse layers' latent group streams (`kv_latent_sparse`); the
+30-layer sliding window (34,560 B a token, window 512, so 17.7 MB a sequence) and the indexer's keys
+(768 B a token, read whole every step — `rad_kv_group_dense_read`) stay on the card. Its row is latent
+512 + rope 64 = 576 bf16 values, so **13,824 B a token** a rank; its page is block 4 tokens =
+**55,296 B**, which is **4,608 B a layer**, and the group holds **829 MB at 60K a sequence** and
+**13.8 GB at 1M a sequence**
+([ARCHITECTURES.md](ARCHITECTURES.md), the caches of the architecture). The stage prices at one
+layer of the retained context, 1,152 B a token. Because the ring is raised to one decode step's
+selection, it is 512 blocks — 2,048 tokens — **per sequence slot**: at the default
+`max-num-seqs: 256` that is a **7.25 GB** ring (6.75 GiB) with no drafter and **43.5 GB** at DFly2's
+depth 5, and the stage over a 60K context is **17.7 GB**, which no card carries. **A streamed Hy4
+recipe must set `max-num-seqs` to the concurrency it serves** (at 4 the same ring is 648 MiB and the
+stage 264 MiB). The one measured point is `gpu-mini`, random weights: a 60,000-token prompt at
+`kv-resident: 32768`, 48 decode steps resolving 94 times with ~25,700 misses — 273 misses a resolve
+over 512 claims, a **53 % churn**, and output bit-identical to the resident run at TP1 and TP2. That
+is the mechanism working, not a number for the real model, and it is the only measurement this
+architecture has.
 
 **Measured.** Flash-Next, fp8 cache, 2x16 GB gfx1201 at TP2, one request, two cold starts a
 configuration, 2 048 tokens decoded:
