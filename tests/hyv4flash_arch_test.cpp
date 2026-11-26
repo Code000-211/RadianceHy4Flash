@@ -4238,3 +4238,136 @@ TEST(g3_junctions_write_the_codes_their_readers_take) {
     /* every junction that writes codes removes the quantiser behind it */
     CHECK(had_on < count_op(off.b, "had_quant_act_i8g"));
 }
+
+/* P-13 / F-19: the router's prefill projection on the bf16 WMMA tile, behind
+ * RADIANCE_HY4_ROUTER_WMMA and off unless asked. Every prefill path moves: the column split's part
+ * where that split is set up, and otherwise the replicated projection's own rows from
+ * GlmTp::kSplitRows up, which is the prefill path at one rank and at a world the expert count
+ * cannot split. The rows below that floor (decode, and a verify step that short) keep
+ * gemm_nt_f32, and so does an f32-stored router weight or a projection the tile's row does not
+ * serve (under the tile's 16 columns). */
+TEST(p13_the_prefill_router_takes_the_wmma_row_only_when_asked) {
+    /* The M bands (lo, hi) the bf16 router's ops of one kind declare. Layer 1's router is the bf16
+     * one; blk.2's is f32 and stays out of every count here. */
+    auto bands = [](const RadBuilder& b, const char* op) -> std::vector<std::pair<int64_t, int64_t>> {
+        std::vector<std::pair<int64_t, int64_t>> got;
+        for (const auto& o : b.ops) {
+            if (o.op != op || o.w.empty()) continue;
+            const auto& weight = b.weights.at(o.w[0] - 1);
+            if (weight.name.find(".glm_router.weight") == std::string::npos) continue;
+            if (weight.d.dtype != RAD_BF16) continue;
+            const RecParam* M = param(&o, "M");
+            if (M && M->kind == RAD_P_RANGE) got.emplace_back(M->ival, M->ihi);   /* always is */
+        }
+        return got;
+    };
+    /* The tile's one band: the prefill floor up to the declare's step size, over `n` columns. */
+    auto tile_band = [&](const RadBuilder& b, int64_t n) {
+        const auto got = bands(b, "gemm_nt_f32_wmma");
+        REQUIRE_EQ(got.size(), (size_t)1);
+        CHECK_EQ(got[0].first, 256);              /* GlmTp::kSplitRows: prefill rows only */
+        CHECK_EQ(got[0].second, 256);             /* the declare's max_tok */
+        const RecOp* o = find_op(b, "gemm_nt_f32_wmma");
+        REQUIRE(o != nullptr);
+        CHECK_EQ(pint(o, "weight_bf16"), 1);
+        CHECK_EQ(pint(o, "K"), 128);              /* n_embd, a whole number of 64-element stages */
+        CHECK_EQ(pint(o, "N"), n);
+    };
+
+    /* Off is the default and declares no such op at any world: the graph is the one without the
+     * row, the replicated projection covering every row from 1. */
+    unsetenv("RADIANCE_HY4_ROUTER_WMMA");
+    Declared off(bf16_encs, 2, 0, false, 128, 0, 0, 64);
+    REQUIRE_EQ(off.rc, RAD_OK);
+    CHECK_EQ(count_op(off.b, "gemm_nt_f32_wmma"), 0);
+    CHECK_EQ(bands(off.b, "gemm_nt_f32").size(), (size_t)2);   /* the unsplit and split ops */
+    Declared off1(bf16_encs, 1, 0, false, 128, 0, 0, 64);
+    REQUIRE_EQ(off1.rc, RAD_OK);
+    CHECK_EQ(count_op(off1.b, "gemm_nt_f32_wmma"), 0);
+    {
+        const auto got = bands(off1.b, "gemm_nt_f32");
+        REQUIRE_EQ(got.size(), (size_t)1);
+        CHECK_EQ(got[0].first, 1);
+        CHECK_EQ(got[0].second, 256);             /* every row, the prefill band included */
+    }
+
+    /* At two ranks the split takes the prefill rows, so the split part alone moves and the
+     * replicated projection keeps gemm_nt_f32 over every row it can still see. */
+    setenv("RADIANCE_HY4_ROUTER_WMMA", "1", 1);
+    Declared on(bf16_encs, 2, 0, false, 128, 0, 0, 64);
+    unsetenv("RADIANCE_HY4_ROUTER_WMMA");
+    REQUIRE_EQ(on.rc, RAD_OK);
+    tile_band(on.b, 32);                          /* 64 experts split over two ranks */
+    {
+        const auto got = bands(on.b, "gemm_nt_f32");
+        REQUIRE_EQ(got.size(), (size_t)1);
+        CHECK_EQ(got[0].first, 1);
+        CHECK_EQ(got[0].second, 256);
+    }
+
+    /* At one rank there is no split, so the replicated projection is the whole prefill path: the
+     * rows from the floor up move to the tile, over all 64 experts' columns, and gemm_nt_f32 keeps
+     * the band below them. */
+    setenv("RADIANCE_HY4_ROUTER_WMMA", "1", 1);
+    Declared one(bf16_encs, 1, 0, false, 128, 0, 0, 64);
+    auto decode = kit(one.b, { 1, 1 }, {});
+    auto prefill = kit(one.b, {}, { 256 });
+    unsetenv("RADIANCE_HY4_ROUTER_WMMA");
+    REQUIRE_EQ(one.rc, RAD_OK);
+    tile_band(one.b, 64);
+    {
+        const auto got = bands(one.b, "gemm_nt_f32");
+        REQUIRE_EQ(got.size(), (size_t)1);
+        CHECK_EQ(got[0].first, 1);
+        CHECK_EQ(got[0].second, 255);             /* below GlmTp::kSplitRows: the tile has the rest */
+    }
+
+    /* The floor is what keeps decode on today's kernel: a decode step issues the F32 row for both
+     * routers and never the tile's, and a prefill-sized step issues the tile's row where the router
+     * weight is bf16 (blk.1) and the F32 row where it is f32 (blk.2). */
+    auto ctxs = run_passes(one.b, hyv4flash::step, { decode.get(), prefill.get() }, 0, 1);
+    CHECK_PASSES(one.b, ctxs);
+    auto router_rows = [&](const RadCtx& c, const char* op) {
+        std::vector<int64_t> rows;
+        for (const auto& i : c.issues) {
+            const RecOp* o = one.b.op_of(i.op);
+            if (!o || o->op != op || o->w.empty()) continue;
+            const auto& weight = one.b.weights.at(o->w[0] - 1);
+            if (weight.name.find(".glm_router.weight") == std::string::npos) continue;
+            rows.push_back(i.n);
+        }
+        return rows;
+    };
+    CHECK_EQ(router_rows(*ctxs[0], "gemm_nt_f32").size(), (size_t)2);   /* blk.1 and blk.2 */
+    CHECK_EQ(router_rows(*ctxs[0], "gemm_nt_f32_wmma").size(), (size_t)0);
+    {
+        const auto f32 = router_rows(*ctxs[1], "gemm_nt_f32");
+        REQUIRE_EQ(f32.size(), (size_t)1);        /* blk.2's f32 router weight */
+        CHECK_EQ(f32[0], 256);
+        const auto tile = router_rows(*ctxs[1], "gemm_nt_f32_wmma");
+        REQUIRE_EQ(tile.size(), (size_t)1);       /* blk.1's bf16 router weight */
+        CHECK_EQ(tile[0], 256);
+    }
+
+    /* 36 experts over two ranks is 18 columns a rank, which the split cannot carry in whole
+     * 16-column slices: the replicated projection serves the prefill rows itself and moves too. */
+    setenv("RADIANCE_HY4_ROUTER_WMMA", "1", 1);
+    Declared odd(bf16_encs, 2, 0, false, 128, 0, 0, 36);
+    unsetenv("RADIANCE_HY4_ROUTER_WMMA");
+    REQUIRE_EQ(odd.rc, RAD_OK);
+    tile_band(odd.b, 36);                         /* every expert's columns, replicated */
+    {
+        const auto got = bands(odd.b, "gemm_nt_f32");
+        REQUIRE_EQ(got.size(), (size_t)1);
+        CHECK_EQ(got[0].first, 1);
+        CHECK_EQ(got[0].second, 255);
+    }
+
+    /* Eight experts over two ranks is four columns a rank: below the tile's 16, so it stays. */
+    setenv("RADIANCE_HY4_ROUTER_WMMA", "1", 1);
+    Declared narrow(bf16_encs, 2, 0, true);
+    unsetenv("RADIANCE_HY4_ROUTER_WMMA");
+    REQUIRE_EQ(narrow.rc, RAD_OK);
+    CHECK_EQ(count_op(narrow.b, "gemm_nt_f32_wmma"), 0);
+    CHECK_EQ(bands(narrow.b, "gemm_nt_f32").size(), (size_t)2);
+}

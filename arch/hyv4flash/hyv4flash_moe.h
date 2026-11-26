@@ -310,6 +310,10 @@ struct Ffn {
         c.swiglu_limit = s.swiglu_limit;
         c.router_k = s.n_embd;
         c.router_weight_bf16 = true;
+        /* P-13 / F-19: the prefill router's projection on the bf16 WMMA tile. LOSSY and off by
+         * default (a different f32 summation order on prefill rows only); RADIANCE_HY4_ROUTER_WMMA=1
+         * turns it on. */
+        c.router_wmma = router_wmma_on();
         c.no_reduce = 1;
         /* Only a layer inside --calib-layers taps, as the trunk's CalibFull::records; without it,
          * RADIANCE_CALIB_LAYERS decides (calib_layer_on). A layer outside keeps no per-expert Grams on

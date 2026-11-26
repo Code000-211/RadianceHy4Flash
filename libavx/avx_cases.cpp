@@ -151,6 +151,9 @@ std::vector<Case> build_cases() {
                 add("gemm_nt_f32", { HI("M", 4), HI("N", 32), HI("K", 129), HS("dtype", "bf16"),
                                      HI("weight_bf16", packed) });
         if (!std::strcmp(dt, "bf16"))
+            add("gemm_nt_f32_wmma", { HI("M", 5), HI("N", 24), HI("K", 192),
+                                      HS("dtype", "bf16"), HI("weight_bf16", 1) });
+        if (!std::strcmp(dt, "bf16"))
             for (const char* mode : { "absorb", "expand" })
                 add("mla_project", { HI("M", 3), HI("heads", 2), HI("head_dim", 17),
                                      HI("latent_dim", 31), HS("mode", mode), HS("dtype", "bf16") });

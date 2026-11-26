@@ -85,6 +85,11 @@ AVX_KERNEL(gemm_nt_f32) {
     return RAD_OK;
 }
 
+/* The prefill tile's row of the same projection (docs/OPS.md, gemm_nt_f32_wmma): the operands,
+ * the f32 accumulation and the output are gemm_nt_f32's, and only the summation order of the
+ * device tile differs, so the reference sums K ascending as it does there. */
+AVX_KERNEL(gemm_nt_f32_wmma) { return AVX_FN(avx_gemm_nt_f32)(a, stream); }
+
 AVX_KERNEL(router_sigmoid_topk) {
     if (!rad_args_have(a, 4)) return RAD_E_INVAL;
     const auto &lg = a->t[0], &bias = a->t[1], &ids = a->t[2], &w = a->t[3];

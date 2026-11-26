@@ -15,6 +15,13 @@ struct GlmRouter {
         /* Declare the projection weight as stored bf16 (gemm_nt_f32's `weight_bf16`) when its
          * stored encoding is bf16 or unknown; otherwise, or when false, it is declared f32. */
         bool weight_bf16 = false;
+        /* Run the prefill projection on the bf16 WMMA tile (gemm_nt_f32_wmma): the column split's
+         * part where that split is set up, and otherwise the replicated projection's own prefill
+         * rows. LOSSY: the same bf16 products and f32 accumulation, summed in the tile's order, so
+         * a near-tie routing pick can flip. Off by default; the rows below GlmTp::kSplitRows
+         * (decode, and a verify step that short) keep gemm_nt_f32 whatever it says
+         * (notes/backlog/lossy/P-13.md). */
+        bool wmma = false;
         double route_scale = 2.5;
     };
     struct Src {
@@ -27,7 +34,7 @@ struct GlmRouter {
     Config c{};
     Wire w{};
     rad_weight projection = 0, correction = 0;
-    rad_op op_project = 0, op_select = 0;
+    rad_op op_project = 0, op_project_tile = 0, op_select = 0;
     SplitF32Proj split{};
 
     int declare(RadBuilder* b, Names& nm, const Geom& geom, int layer, const char* name,
@@ -50,10 +57,23 @@ struct GlmRouter {
         correction = decl_w(b, cn, RAD_F32, { c.experts }, RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE,
                             grp_layer(layer));
         if (!projection || !correction) return RAD_E_INVAL;
-        op_project = declare_glm_projection(b, c.rows, c.experts, g.n_embd, projection, packed,
-                                            w.input, w.logits);
+        /* P-13 / F-19: with the switch on, the prefill band of the replicated projection runs on
+         * the bf16 tile too, which is the only prefill path at one rank and the one a world the
+         * expert count does not divide evenly keeps. Where the column split takes those rows, the
+         * band never runs, so it is not declared and the graph stays the split's own (the lane
+         * re-checks the split against this band, at one rank, with the switch on at both).
+         * gemm_nt_f32 keeps every row below GlmTp::kSplitRows in the op declared here, so decode
+         * and verify steps shorter than that do not move. */
+        const bool tile = c.wmma && c.rows >= GlmTp::kSplitRows &&
+                          !SplitF32Proj::columns_split(g.world, c.experts) &&
+                          glm_projection_tile_serves(g.n_embd, c.experts, packed);
+        op_project = declare_glm_projection(b, tile ? GlmTp::kSplitRows - 1 : c.rows, c.experts,
+                                            g.n_embd, projection, packed, w.input, w.logits);
+        if (tile)
+            op_project_tile = declare_glm_projection(b, c.rows, c.experts, g.n_embd, projection,
+                                                     packed, w.input, w.logits, true);
         RAD_ARCH_TRY(split.declare(b, nm, g, name, c.rows, c.experts, g.n_embd, projection, w.input,
-                                   w.logits, packed));
+                                   w.logits, packed, c.wmma));
         if (c.groups > 1)
             op_select =
                 rw(b,
@@ -76,12 +96,12 @@ struct GlmRouter {
         return op_project && op_select ? RAD_OK : RAD_E_INVAL;
     }
     void project(RadCtx* ctx, int64_t first, int64_t rows, int64_t output_first = 0) const {
-        if (split.takes(rows))
-            split.step(ctx, rows, brow_slice(w.input, first, rows, g.n_embd), projection,
-                       brow_slice(w.logits, output_first, rows, c.experts));
-        else
-            RAD_ISSUE_N(ctx, op_project, rows, brow_slice(w.input, first, rows, g.n_embd),
-                        RAD_W(projection), brow_slice(w.logits, output_first, rows, c.experts));
+        const RadOperand in = brow_slice(w.input, first, rows, g.n_embd);
+        const RadOperand out = brow_slice(w.logits, output_first, rows, c.experts);
+        if (split.takes(rows)) split.step(ctx, rows, in, projection, out);
+        else if (op_project_tile && rows >= GlmTp::kSplitRows)
+            RAD_ISSUE_N(ctx, op_project_tile, rows, in, RAD_W(projection), out);
+        else RAD_ISSUE_N(ctx, op_project, rows, in, RAD_W(projection), out);
     }
     void step(RadCtx* ctx, int64_t first, int64_t rows, int64_t output_first = 0) const {
         project(ctx, first, rows, output_first);

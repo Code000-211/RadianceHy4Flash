@@ -3551,6 +3551,9 @@ static const RadOpSchema kSchemas[] = {
            "Normalized Hadamard, BF16 boundary and power-of-two E4M3 quantization per query head."),
     SCHEMA("gemm_nt_f32", pGemmF32, oGemmNt,
            "BF16 activations times F32 or stored BF16 weights, F32 accumulation and output; preserves routing and index gate precision."),
+    SCHEMA("gemm_nt_f32_wmma", pGemmF32, oGemmNt,
+           "gemm_nt_f32's operands and F32 output on the BF16 WMMA prefill tile: the same products, "
+           "summed in the tile's order, so a routing score can land in a different last bit"),
     SCHEMA("swiglu_step", pSwigluClamped, oGateUp,
            "min(silu(gate),limit)*clamp(up,-limit,limit); gate is the first half."),
     SCHEMA("swiglu_clamped", pSwigluClamped, oGateUp,
@@ -5553,6 +5556,13 @@ static const RadConstraint cGemmNtF32[] = { C_GE("M", 1),         C_LE("M", 6553
                                             C_GE("N", 1),         C_LE("N", 512),
                                             C_GE("K", 1),         C_LE("K", 16384),
                                             C_IN("dtype", "bf16") };
+/* The routing projection on the prefill tile: one 128-row tile at least, K whole 64-element stages,
+ * and stored bf16 weights (the tile reads W as bf16; an f32 weight has the gemm_nt_f32 row). */
+static const RadConstraint cGemmNtF32Wmma[] = {
+    C_GE("M", 128),   C_LE("M", 65535),     C_GE("N", 16),        C_LE("N", 512),
+    C_GE("K", 64),    C_LE("K", 16384),     C_DIV("K", 64),       C_IN("dtype", "bf16"),
+    C_EQ("weight_bf16", 1)
+};
 static const RadConstraint cDsaScore[] = {
     C_GE("M", 1),      C_LE("M", 65535), C_EQ("n", 128),           C_EQ("heads", 32),
     C_GE("blocks", 1), C_GE("seqs", 1),  C_IN("dtype", "fp8_e4m3")
@@ -7592,6 +7602,13 @@ static const RadKernelInfo kKernels[] = {
   "N<=512, K<=16384; pitched rows", "bf16 input, f32 or bf16 weights, f32 output",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cGemmNtF32), NOTUNE,
   nullptr, nullptr, r4d_rad_gemm_nt_f32, nullptr, nullptr, nullptr,
+  r4d_shape_gemm_nt_f32 },
+{ "gemm_nt_f32_bf16_wmma", "gemm_nt_f32_wmma", "gemm",
+  "the routing projection at prefill row counts, on the BF16 WMMA tile",
+  "M>=128, N 16..512, K a multiple of 64 up to 16384; contiguous a / y, weight rows of K bf16",
+  "bf16 input, stored bf16 weights, F32 output, fp32 accumulate",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cGemmNtF32Wmma), NOTUNE,
+  nullptr, nullptr, r4d_rad_gemm_bf16_tiled_f32, nullptr, nullptr, nullptr,
   r4d_shape_gemm_nt_f32 },
 { "dsa_pool_fp8", "dsa_pool", "attn", "learned compressed index keys in wave-local registers",
   "n=128, ratio=4; pitched rows", "bf16 keys/gates, f32 position bias; FP8 codes and f32 scale",
