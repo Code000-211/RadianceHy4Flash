@@ -1,0 +1,38 @@
+# C-03 measurement, DFly2 coupled arm — the house config (hy4-u4-tp2-disk.yaml) with `log: debug`
+# so the step loop's 128-step phase line (`ranks`) is printed. The model, port, placement, host pool,
+# checkpoint interval, DFly2 keys and ngram placement are the house servers' unchanged; the only
+# difference from the served config is the log level, and it is the same on both arms.
+server:
+  host: 0.0.0.0
+  port: 8180
+  log: debug
+  kernels: libr4d,libavx,spechub
+memory:
+  gpu-headroom-mib: 128
+models:
+  qwen3.8-27b:
+    aliases: [qwen3.8-27b-local]
+    model: /home/ubuntu/models/radiance/hy4-flash-iqr-v4/hy4-flash-iqr-v4-u4.rad
+    tp: 2
+    placement: expert_tiered
+    host-pool-mib: 39000
+    ngram-placement: disk
+    max-model-len: 262144
+    max-num-batched-tokens: 2048
+    checkpoint-interval: 1984
+    max-num-seqs: 8
+    mm-max-patches: auto
+    vision-tower-placement: ram
+    prefix-resume: nearest
+    prefix-cache-mib: 16384
+    busy-prefill-chunk: auto
+    checkpoint-slots: 128
+    num-speculative-tokens: 5
+    draft-window: fixed
+    draft-coupling: on
+    draft-verify: traversal
+    draft-depth: adaptive
+    draft-depth-load: on
+    draft-depth-load-from: 1
+    draft-suffix: on
+    reasoning-effort-map: xhigh=max,medium=max,low=max

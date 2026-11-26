@@ -33,6 +33,7 @@ void RankBarrier::arrive_and_wait() {
      * the acquire load orders everything the releasing rank wrote before it flipped. */
     uint32_t g = gen_.load(std::memory_order_acquire);
     while (g == my_gen && !aborted_.load(std::memory_order_acquire)) {
+        parks_.fetch_add(1, std::memory_order_relaxed);
         gen_.wait(g, std::memory_order_acquire);
         g = gen_.load(std::memory_order_acquire);
     }

@@ -13,6 +13,11 @@
  * futex behind std::atomic::wait. A condvar round trip costs ~1-2 us in the best case and 10-100 us
  * whenever the waiter actually deschedules (notes/backlog/optimisation-backlog.md C-03), and a
  * DFly2 TP2 step crosses eight rounds.
+ *
+ * `parks()` counts the arrivals that ran out of spin and went to the futex, and `spin_budget()` is
+ * the bound the spin is held to; tests/rank_barrier_test.cpp reads both to hold the barrier to
+ * "spin briefly, then park" rather than "spin for the whole wait". The counter costs one relaxed
+ * add on the park path, which a step in a steady state does not take.
  */
 #pragma once
 #include "../rad_core.h"
@@ -37,6 +42,11 @@ public:
      * an exited rank can no longer complete; the engine must be able to exit (spec §17). */
     void abort();
 
+    /* The futex path: arrivals that ran out the spin and parked, and the spin bound in pauses.
+     * Read by the test that holds the barrier to a bounded spin rather than a whole wait. */
+    uint64_t parks() const { return parks_.load(std::memory_order_relaxed); }
+    static constexpr int spin_budget() { return kSpin; }
+
 private:
     /* Pauses a step thread should spin before parking. Every arrival here follows a device wait,
      * so the last rank is normally microseconds behind; ~2000 pauses is a few tens of microseconds
@@ -47,6 +57,7 @@ private:
     std::atomic<int>        waiting_{0};
     std::atomic<uint32_t>   gen_{0};
     std::atomic<bool>       aborted_{false};
+    std::atomic<uint64_t>   parks_{0};
 };
 
 }  /* namespace rad */

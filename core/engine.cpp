@@ -18,7 +18,6 @@
 #include "gen_config.h"
 #include "kvstream/stage.h"
 #include "place/rtrace.h"
-#include "runtime/thread_pin.h"
 #include "sample/accept.h"
 #include "sched/scheduler.h"
 #include "server/adapters.h"
@@ -3085,13 +3084,11 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
     for (int i = 0; i < cfg_.tp; ++i)
         rank_threads_.emplace_back([this, i] {
             EngineScope es(owner_, cfg_.served_model_name.c_str());
-            (void)pin_thread_to_ccd(i);
             rank_loop(i);
         });
     std::atomic<bool> stepped{false};
     std::thread stepper([this, &stepped] {
         EngineScope es(owner_, cfg_.served_model_name.c_str());
-        (void)pin_thread_to_ccd(cfg_.tp);
         if (gen_) gen_loop(); else step_loop();
         stepped.store(true, std::memory_order_release);
     });
