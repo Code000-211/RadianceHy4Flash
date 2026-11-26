@@ -4130,16 +4130,24 @@ TEST(g3_junctions_write_the_codes_their_readers_take) {
 
 /* P-11b. The buffer plan charges a transient the whole program when no op of the declared list
  * names it (core/build/rad_bufplan.cpp; `radiance --debug-graph` prints the ones it counts, with
- * the bytes), so each of them is arena the engine holds and never reads. The Hy4 plan declared six
- * such planes; it declares them only where a path that reads them is declared now. The list below
- * is what is left on purpose, a reason each: a new plane no op names fails this test by its name.
- *   moe.expert_ff -- the routed arm's bf16 product. The fused SwiGLU writes the codes the down
- *       projection reads (G-3a), but a layer inside --calib-layers keeps the unfused pair
- *       (fuse_clamped_i8, arch/common/rad_block_moe_fp8.h) and the plane is one for every MoE
- *       layer, so the wire declares it for all of them.
- *   moe.shared_ff -- the shared expert's, the same rule one block further (decl_gated_fold_iqr).
- *   ix.stage -- the indexer stages a closing group's raw keys through it; the step declares the op
- *       that names it only where that path is served, which the wire cannot know at declare time. */
+ * the bytes), so each of them is arena the engine holds and never reads. The Hy4 plan declared
+ * fourteen; six are gone with this change -- the dense MLP's bf16 product plane, declared now by
+ * the first layer that takes the unfused pair, and the Engram round trip's three planes, declared
+ * now by the first layer whose table is bf16 -- and the list below is what is left, a reason each,
+ * so a new plane no op names fails this test by its name.
+ *   moe.expert_ff.q / .s -- the routed arm's E4M3 product codes. An int8 arm's fused SwiGLU writes
+ *       the rotated int8 pair the down projection reads, so no op names them; MoeFP8's own rule
+ *       does ask for them (down_codebook_fp8 / down_supported,
+ *       arch/common/rad_block_moe_fp8.h), the mixed IQR-gate_up-behind-a-w6-down recipe with them.
+ *   moe.latent.q / .s -- the same for the latent linear: the gather's output is read as the rotated
+ *       int8 pair, and MoeFP8::declare refuses a wire whose latent carries no codes at all.
+ *   moe.shared_ff -- the shared expert's bf16 product, for the same unfused pair as the dense MLP's
+ *       was; the wire declares it because it cannot see the down projection's form there.
+ *   ix.stage -- the indexer stages a closing group's raw keys through it, and the step issues that
+ *       path only where the library does not serve the fused key side (qsa_work_pool_tail).
+ * The sampler's four candidate planes are arena for the whole program for the same reason, but the
+ * sampler declares its ops with no operand lists at all (core/sample/sampler.cpp), so this builder
+ * never sees them; making the plan name them is a core change. */
 namespace {
 
 std::string dead_join(const std::vector<std::string>& v) {
@@ -4179,13 +4187,13 @@ TEST(no_transient_is_declared_that_no_op_reads) {
         { "int8 trunk", int8_trunk_encs, 1, "ix.stage moe.shared_ff " },
         { "int8 experts",
           [](RadBuilder* b) { bf16_encs(b); b->encs[0].second = b->encs[1].second = enc_i8(true); },
-          1, "ix.stage moe.expert_ff moe.shared_ff " },
+          1, "ix.stage moe.expert_ff.q moe.expert_ff.s moe.latent.q moe.latent.s " },
         { "iqr experts",
           [](RadBuilder* b) {
               bf16_encs(b);
               b->encs[0].second = b->encs[1].second = enc_trellis(RAD_U4, true);
           },
-          1, "ix.stage moe.expert_ff moe.shared_ff " },
+          1, "ix.stage moe.expert_ff.q moe.expert_ff.s moe.latent.q moe.latent.s " },
         { "bf16, two ranks", bf16_encs, 2, "ix.stage " },
     };
     for (const Plan& p : plans) {

@@ -263,10 +263,13 @@ struct MoeWire {
             RAD_ARCH_TRY(lat.declare_qs(b, nm, gq, nm.f("moe.latent"), L));
             RAD_ARCH_TRY(w.hr.declare_qs(b, nm, gq, nm.f("moe.latent_rot"), L, 0, i8, !i8));
             w.hr.q8_fed = w.hr.q8_rot = i8;
-            /* `!i8` as for `hr` a line above: the fused SwiGLU writes the rotated int8 pair the
-             * down projection reads, and the E4M3 pair beside it is read by nothing an int8 model
-             * issues (P-11b). A codebook down projection behind a trellis gate_up keeps its pair. */
-            RAD_ARCH_TRY(w.eff.declare_qs(b, nm, gq, nm.f("moe.expert_ff"), F, T * k, i8, !i8));
+            /* P-11b tried to drop this E4M3 pair for an int8 arm: the fused SwiGLU writes the
+             * rotated int8 pair the down projection reads, so no op of the declared plan names it,
+             * and the plan dump counts it as arena. It stays: MoeFP8's own rule asks for it
+             * (`down_codebook_fp8` / `down_supported`, arch/common/rad_block_moe_fp8.h), which also
+             * carries the mixed recipe of an IQR gate_up behind a w6 down. Same finding as the
+             * latent's pair a few lines above -- the block is asked, the plan is not. */
+            RAD_ARCH_TRY(w.eff.declare_qs(b, nm, gq, nm.f("moe.expert_ff"), F, T * k, i8, true));
             w.eff.q8_fed = w.eff.q8_rot = i8;
         }
         return lat.x && routed && sgu && sff && sout && w.logits && w.ids && w.ew && w.eoff &&
