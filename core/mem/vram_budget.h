@@ -67,9 +67,9 @@ struct VramFacts {
     int64_t staging    = 0;   /* BatchBuilder::device_bytes(): the step slab and the media staging,
                                * and TierExec::device_bytes() when a KV tier is configured */
     /* Hardware queues this rank creates after `free` was read (compute stream, expert mover, and
-     * the second compute lane if declared), at `queue_bytes` each. Measured by creating one: the
-     * driver backs every queue with its own VRAM beside the engine's kernel-argument ring (33 MiB
-     * per queue on an R9700, 8x the ring). */
+     * the second compute lane if declared), at `queue_bytes` each. Measured by creating them
+     * (vram_queue_cost): the driver backs every queue with its own VRAM beside the engine's
+     * kernel-argument ring (35.4 MiB per queue on an R9700). */
     int     n_queues    = 0;
     int64_t queue_bytes = 0;
     int64_t queue_scratch = 0;   /* resident queue scratch (rad_dev_resident_scratch_bytes), once a card */
@@ -139,6 +139,20 @@ struct VramBudget {
     int64_t host_pinned = 0;          /* pinned host pools charged to that ledger */
     std::string report;       /* the block the engine prints at startup */
 };
+
+/* One hardware queue's VRAM, from free-VRAM readings taken before a probe and after each stream it
+ * opened (Engine::plan). A stream handed a kept queue (the AQL backend's spares) allocates nothing,
+ * so a drop of at most kKeptQueueSlack is not a queue; each larger drop is a fresh one. The cost is
+ * the smallest fresh drop: the runtime makes a one-time allocation with the first queue on a card
+ * that finds room for it (140 MiB on an R9700), and when that first queue was opened while the card
+ * was still full (the previous process's VRAM not yet released) it lands on a later one, at most
+ * once. Two fresh drops therefore always hold one clean reading. 0 when no drop was fresh. */
+struct QueueProbe {
+    int64_t bytes = 0;   /* one queue's VRAM */
+    int     fresh = 0;   /* the readings' fresh queues */
+};
+constexpr int64_t kKeptQueueSlack = 1LL << 20;
+QueueProbe vram_queue_cost(const std::vector<int64_t>& free_readings);
 
 /* Writes cfg.vram_weights_mib / cfg.vram_kv_mib, the one number every downstream consumer reads
  * (an uneven world's cheaper rank re-splits it with vram_budget_rank_split). Takes the smallest

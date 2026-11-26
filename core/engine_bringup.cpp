@@ -1947,17 +1947,39 @@ int Engine::plan() {
         for (auto& r : ranks_) {
             RAD_TRY(rad_dev_set(r->device));
             VramFacts f{};
-            /* One hardware queue's VRAM, measured as the difference between creating the first and
-             * the second queue (the runtime's one-time setup lands on the first, and is charged to
-             * `already held`). The compute stream, the mover's and a second lane are created after
-             * this reading, and the driver backs each with VRAM beyond its ring. */
+            /* One hardware queue's VRAM, measured as the drop in free VRAM over opening streams
+             * (vram_queue_cost). A stream handed one of the card's kept queues (the kernel inits'
+             * streams', on the AQL backend) allocates nothing, so the probe opens streams until two
+             * of them opened a fresh queue and takes the smaller drop. One fresh queue is not
+             * enough: the runtime makes a one-time allocation of 140 MiB with the first queue that
+             * finds room for it on the card, and a start that opened its first queues while the
+             * previous process's VRAM was still being released (a lane handing the cards on) found
+             * none, so the allocation landed here: one start in eight measured 175 MiB a queue,
+             * and the card lost ~300 expert slots (notes/backlog/measurements/vram-queue-probe.md).
+             * The compute stream, the mover's and a second lane are created after this reading
+             * and take these kept queues first. */
+            int probe_extra = 0;   /* kept queues past the two the probe used to leave (below) */
             {
-                RadStream q[2] = { nullptr, nullptr };
-                RadDeviceProps a{}, b{};
-                if (rad_stream_create(&q[0], 0) >= 0 && rad_dev_props(r->device, &a) >= 0 &&
-                    rad_stream_create(&q[1], 0) >= 0 && rad_dev_props(r->device, &b) >= 0)
-                    f.queue_bytes = std::max<int64_t>(a.vram_free - b.vram_free, 0);
-                for (RadStream s : q) if (s) rad_stream_destroy(s);
+                int open = 0, kept = 0;
+                dev_stream_counts(r->device, &open, &kept);
+                std::vector<RadStream> q;
+                std::vector<int64_t> rd;
+                RadDeviceProps p{};
+                if (rad_dev_props(r->device, &p) >= 0) rd.push_back(p.vram_free);
+                QueueProbe qp;
+                while (!rd.empty() && qp.fresh < 2 && (int)q.size() < kept + 2) {
+                    RadStream st = nullptr;
+                    if (rad_stream_create(&st, 0) < 0) break;
+                    q.push_back(st);
+                    if (rad_dev_props(r->device, &p) < 0) break;
+                    rd.push_back(p.vram_free);
+                    qp = vram_queue_cost(rd);
+                }
+                f.queue_bytes = qp.bytes;
+                for (RadStream st : q) rad_stream_destroy(st);
+                int kept_after = 0;
+                dev_stream_counts(r->device, &open, &kept_after);
+                probe_extra = std::max(kept_after - std::max(kept, 2), 0);
             }
             f.n_queues = 2 + (r->program.scratch_regions > 1 ? 1 : 0);
             f.queue_scratch = 0;   /* set below, once props are read */
@@ -1984,6 +2006,11 @@ int Engine::plan() {
             f.queue_scratch = rad_dev_resident_scratch_bytes(&props);
             f.capacity = props.vram_bytes;
             f.free     = props.vram_free;
+            /* The two-queue probe left max(kept, 2) kept queues on the card, inside this reading,
+             * and the budget has been split with them there. The queues this probe opens past
+             * that, for its second clean reading, are the engine's own streams' queues already
+             * (they take the kept ones first, and `n_queues` charges them): not counted twice. */
+            f.free += (int64_t)std::min(probe_extra, f.n_queues) * f.queue_bytes;
             /* And what of the memory `free` excludes is device code: the code objects this card has
              * loaded, each one whole from its module at its kernel's first launch (module_load in
              * core/device/aql.cpp). The receipt prints it beside `already held`, so a lane can say
