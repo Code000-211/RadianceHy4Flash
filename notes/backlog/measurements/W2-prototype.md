@@ -1,10 +1,16 @@
 # W2 prototype (issue #309, part of #307 / M-20): measurements
 
 Prototype of "Weg 2 with a per-layer budget" (`notes/backlog/design/M-20.md` §5-§7), behind `RADIANCE_W2`
-(default off). Code: `abi/rad_w2.h`, `libr4d/r4d_w2.h`, `core/runtime/w2.{h,cpp}`,
+(default off when measured below; on by default since the merge, see the dated line). Code: `abi/rad_w2.h`, `libr4d/r4d_w2.h`, `core/runtime/w2.{h,cpp}`,
 `arch/common/rad_block_moe_fp8.h`. Tools: `W2-tools/` (`w2ab.py`, `w2stamps.py`, `w2fit.py`, the rad-kbench patch).
 
-**Verdict: not merged.** The switch-off build is the base (same launches, same text, same speed). With the switch
+**2026-11-26: merged, default on since `ba10ee5e9`** (owner decision: nobody serves without the drafter, so the
+DFly2 c8 verify pass gain below is taken and the no-spec cost of the ring reservation, -0.1..-0.4 %, is accepted).
+`RADIANCE_W2=0` turns it off and gives the base launches. Follow-ups stay on #307 (late-unit causes, the post off
+the critical path, the ring reservation's cost); `W2-proposals.md` has the experiments of `w2-explore`, which are
+not merged.
+
+**Verdict (before the merge): not merged.** The switch-off build is the base (same launches, same text, same speed). With the switch
 on, greedy text is byte-identical and the routed block of a DFly2 c8 verify pass is 1.0-1.1 ms shorter (-3.2 %),
 the pass 0.7 ms (-1.5 %, 6 interleaved runs an arm), but that is a quarter of what the design modelled (-5 ms), tok/s
 at c8 does not resolve it (run-to-run +-5 %), and no-spec c1 / c8 are 0.25 % / 0.3 % slower with the switch on.
