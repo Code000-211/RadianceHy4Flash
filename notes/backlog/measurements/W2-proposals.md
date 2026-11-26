@@ -72,7 +72,7 @@ moving the tail earlier.
 
 ## 1. Setup, arms, method
 
-Trees: `/root/hy4/wt/w2` and (for the last knobs) `/root/hy4/wt/w2r-b`, both `w2-explore`; `runs/local/<tag>/`.
+Tree: `/root/hy4/wt/w2` (`w2-explore`; a second checkout of it ran the last knobs), `runs/local/<tag>/`.
 Every run is one server through `scripts/backlog/lane.sh local 'scripts/backlog/run.sh <tag> coupled03.yaml c8
 RADIANCE_AQL_STAMP=1 ...'` (`e` rounds: `greedy,c8` with `RADIANCE_LOG_STEPS=1`; no-spec: `nospec.yaml c1,c8`),
 all `server-exit=0`, arms interleaved. The verify pass is the 1191-record pass (1314 with the tail form).
@@ -343,11 +343,11 @@ Identity was checked on the cards with the form forced at every decode pass (`gr
 tail form, `inline`, `inline2` / `inline3` / `inline4` with gate_up-first lists, all the base's heads (`inline4`
 before its empty blocks' early exit was added; the wait, in-place-first and no-yield knobs were not rerun).
 
-Stamps and JSON are in `runs/local/` of the two trees (not committed). Greedy sha256 heads of every greedy run
+Stamps and JSON are in `runs/local/` of the tree (not committed). Greedy sha256 heads of every greedy run
 named above: `5b7a3975 / f55fe020 / 0075e702 / 8f60e420` (256 / 256 / 103 / 64 tokens), the base's.
 
 ```
-w2arms.py runs/local ../w2r-b/runs/local --runs   (normalised ms a verify pass; routed-fit / wall-fit = distance from the off line)
+w2arms.py runs/local --runs   (normalised ms a verify pass; routed-fit / wall-fit = distance from the off line)
 run          tok/s   miss    hit passes router ->gu_end ->dn_end tail routed wall routed-fit wall-fit
 e1-off       393.9  129.4 0.9847  43  1.24  22.67  10.98  0.00  35.40  49.17  -0.38  -0.40
 e1-on        395.2  129.7 0.9843  45  1.58  19.33  10.40  2.39  34.19  47.96  -1.61  -1.62
