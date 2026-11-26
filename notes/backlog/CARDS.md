@@ -409,28 +409,22 @@ A worker without access to the lanes can still do a card, and measures it as far
    - the raw lines of each run for the rows the bar names (not only a summary). Keep the file under 40 KB: the
      review reads the PR as text and refuses larger files.
    Numbers from your machine are compared with each other only, never with another machine's.
-4. Push a branch and open a PR whose title or body holds `Fixes #<issue>`. Title it `[measured] <item>: <subject>`
-   when the file covers the item's whole merge bar, `[needs testing] <item>: <subject>` when it does not (no GPU).
-5. **Write `/done` as a comment on the item's issue** (not on the PR): only that starts the review, and only the PR's
-   author can. After every push you want reviewed, write `/done` again. A PR gets at most three review rounds, so
-   push your fixes and the measurement together where you can.
-6. The review reads the PR's diff and files and the issue's title and body, nothing else. It checks the code and the
-   measurement file: the rows are the ones §2 asks for, before and after come from one machine, the raw lines carry
-   the numbers. When both hold it approves and the PR merges at once. When only the measurement is missing, the issue
-   gets the label `ready-for-testing` (§6.1).
+4. Open the PR from `.github/PULL_REQUEST_TEMPLATE.md` with `Fixes #<issue>`, titled `[measured] <item>: <subject>` when
+   the file covers the item's whole merge bar, `[needs testing] <item>: <subject>` when it does not (no GPU). How the
+   review starts, the comment forms and the rounds are in `AGENTS.md`.
+5. The review checks the code and the measurement file: the rows are the ones §2 asks for, before and after come from
+   one machine, the raw lines carry the numbers. The merge also needs a measurement the server accepted for the head:
+   a `## Measurement` comment on the issue by a registered measurer who is not the PR's author, or a run of the test
+   lane, or the owner's `no-measurement` label. When only the measurement is missing, the issue gets
+   `ready-for-testing` (§6.1).
 
 ### 6.1 Testing a `ready-for-testing` issue
 
-No lane on the Moebius server measures anything. Anyone with a free GPU can measure a change that waits on the label
-`ready-for-testing`, without writing code:
-
-1. Check out the PR's head and its merge base (`git merge-base origin/<base> <head>`).
-2. Measure both as step 3 above says.
-3. Post the result as a comment on the issue, starting with a `## Measurement` heading.
-
-For an own card, the board picks it up within the hour: the Reviewer checks it, and the change merges, or the issue is
-told what is missing. For a PR from outside, the PR's author commits the posted measurement as
-`notes/backlog/measurements/<item>.md` and writes `/done`; the board reminds them on the issue.
+Anyone on the measurers list with a free GPU can measure a change that waits on `ready-for-testing`, without writing
+code: check out the PR's head and its merge base (`git merge-base origin/<base> <head>`), measure both as step 3 says,
+and post the result on the issue in the form of `.github/moebius/measurement.md`. The server checks the form and the
+commits and starts the next review round by itself. The test lane `r9700` (the local pair) also measures approved
+changes, at kernel level only (`rad-kbench`); end-to-end rows still come from a measurer.
 
 Items whose whole value is a measurement (marked "lane required" in their issue) need a lane from the start. Lossy items
 keep §3.
