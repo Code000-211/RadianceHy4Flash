@@ -105,9 +105,9 @@ TEST(an_index_taken_over_from_an_earlier_prompt_equals_a_fresh_one) {
 }
 
 /* The costs the scheduler pays under its lock, printed for the record: the build at the first
- * token (before), a chunk's advance and the stash copy (after). */
+ * token (before), a chunk's advance and the stash copy (after); 65536 is D-7's 64K row. */
 TEST(perf_suffix_index_costs) {
-    for (int64_t n : { (int64_t)20000, (int64_t)200000 }) {
+    for (int64_t n : { (int64_t)20000, (int64_t)65536, (int64_t)200000 }) {
         const auto p = code_like(n, 5);
         std::vector<int32_t> o{ 17 };
         int32_t buf[8];
