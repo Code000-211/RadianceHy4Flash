@@ -2048,6 +2048,28 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
             rad_issue(c_, op_gu, o_, w2_count((int)(sizeof o_ / sizeof *o_), tail, split_on), rows);
         }
     };
+    /* w2-explore, RADIANCE_W2_FORM=inline: one gate_up and one down launch (the kernels number
+     * the posted experts' tiles last and read them from the ring), no tail. The gate_up launch
+     * takes the tail's system-scope acquire (a ring of ordinary device memory). */
+    static const bool w2_inline = [] {
+        const char* v = std::getenv("RADIANCE_W2_FORM");
+        return v && !std::strcmp(v, "inline");
+    }();
+    if (w2p && w2_inline) rad_expert_w2_tail(c_);
+    {
+        /* w2-explore: where a unit's four tables sit from its gate_up codes (RADIANCE_W2_GU_FIRST's
+         * split is the down codes' offset). */
+        static bool w2_dbg = std::getenv("RADIANCE_W2_DEBUG") != nullptr;
+        if (w2p && w2_dbg) {
+            w2_dbg = false;
+            const char* p0 = (const char*)rad_weight_ptr(c_, w_gu[0]);
+            std::fprintf(stderr, "W2 unit layout (place 0, layer %d): gate_up scales %+lld, down codes %+lld, "
+                         "down scales %+lld\n", layer,
+                         (long long)((const char*)rad_weight_ptr(c_, w_gus[0]) - p0),
+                         (long long)((const char*)rad_weight_ptr(c_, w_dn[0]) - p0),
+                         (long long)((const char*)rad_weight_ptr(c_, w_dns[0]) - p0));
+        }
+    }
     issue_gu(w2p ? 1 : 0);
     if (shared && !sh_first)
         shared_up(c_, T, r0, rows,
@@ -2101,7 +2123,7 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
         }
     };
     issue_dn(w2p ? 1 : 0);
-    if (w2p) {
+    if (w2p && !w2_inline) {
         /* W2's tail: the misses' gate_up, the quantiser over the pass again (it rewrites the
          * resident rows' codes with the same bytes) and the misses' down, behind the resident
          * experts' down (the `w2` operand orders them) so the copies had the link and the window

@@ -1981,12 +1981,15 @@ int Engine::plan() {
                 f.prefetch = xp_device_bytes(wf.expert_unit_max, nl);
             } else if (wf.routed && wf.expert_unit_max > 0 && !cfg_.deterministic && w2_config().on &&
                        (cfg_.placement == "auto" || cfg_.placement == "expert_tiered") &&
-                       rad_xp_supported(r->device)) {
-                /* W2's ring and control blocks (core/runtime/w2.h), where its switch is on. */
+                       (w2_ab() == 1 || rad_xp_supported(r->device))) {
+                /* W2's ring and control blocks (core/runtime/w2.h), where its switch is on.
+                 * w2-explore: RADIANCE_W2_AB separates the idle cost: `reserve` (1) reserves and
+                 * opens nothing, `queue` (2) opens the second DMA queue and reserves nothing,
+                 * `noreserve` (3) runs W2 out of the headroom. */
                 int64_t nl = r->program.meta.n_layers;
                 for (const WeightInfo& w : r->program.weights)
                     if (w.decl.group.expert >= 0) nl = std::max(nl, (int64_t)w.decl.group.layer + 1);
-                f.prefetch = w2_device_bytes(wf.expert_unit_max, nl);
+                if (w2_ab() < 2) f.prefetch = w2_device_bytes(wf.expert_unit_max, nl);
             }
             RadDeviceProps props{};
             rad_dev_props(r->device, &props);
@@ -5384,7 +5387,7 @@ int Engine::start() {
      * wide passes, the misses' whole units copied meanwhile on the prefetch's DMA queue (which the
      * TP1 prefetch above does not share: one of the two is on). Every rank plans and copies its
      * own half. */
-    if (const W2Config w2c = w2_config(); w2c.on && !cfg_.deterministic)
+    if (const W2Config w2c = w2_config(); w2c.on && !cfg_.deterministic && w2_ab() != 1 && w2_ab() != 2)
         for (auto& r : ranks_) {
             if (r->ctx.xp_on()) continue;
             RAD_TRY(rad_dev_set(r->device));

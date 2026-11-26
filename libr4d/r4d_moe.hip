@@ -1584,18 +1584,23 @@ __device__ __forceinline__ void moe_down_dec_body(R4D_MOEDD_PARAMS, const RadW2L
     __shared__ float    s_as[FM];
     __shared__ float    s_ws[kSub * FN];
     __shared__ uint32_t s_rc[NTHR / kWave];
+    __shared__ uint32_t s_rcb[NTHR / kWave];
     __shared__ uint32_t s_sel[3];
 
     const uint32_t tid = threadIdx.x, lane = tid % kWave, wave = tid / kWave;
+    /* w2-explore, the inline form (r4d_moe_iqr.hip's): the block's column group and tile are
+     * renumbered behind the search. */
+    bool inl = false;
+    if constexpr (W2) inl = w2->form == 1u && !(mode & kModeW2Tail);
     /* The block's columns: G 64-wide tiles from cg0, the last group cut at N. */
-    const uint32_t cg0 = blockIdx.y * G * FN;
-    if (cg0 >= N) return;               /* the launcher's grid has none; block-uniform */
-    const uint32_t cend = cg0 + G * FN < N ? cg0 + G * FN : N;
-    const uint32_t ng = (cend - cg0 + FN - 1) / FN;
+    uint32_t cg0 = blockIdx.y * G * FN;
+    if (!inl && cg0 >= N) return;       /* the launcher's grid has none; block-uniform */
+    uint32_t cend = cg0 + G * FN < N ? cg0 + G * FN : N;
+    uint32_t ng = (cend - cg0 + FN - 1) / FN;
 
     /* The last block owns no run: it zeroes every column of the rows past the live count (dropped
      * slots, or protected experts' rows their own GEMM writes afterwards). */
-    if (blockIdx.x == gridDim.x - 1) {
+    if (!inl && blockIdx.x == gridDim.x - 1) {
         if constexpr (W2) { if (mode & kModeW2Tail) return; }
         const uint32_t live = (uint32_t)off[n_expert];
         for (uint32_t r = live; r < T; ++r)
@@ -1619,28 +1624,89 @@ __device__ __forceinline__ void moe_down_dec_body(R4D_MOEDD_PARAMS, const RadW2L
         const uint32_t o = x <= n_expert ? raw : 0u;
         ov[k] = o < T ? o : T;
     }
-    uint32_t nt[NPT], cnt = 0;
+    uint32_t nt[NPT], cnt = 0, cntb = 0, pm = 0;
 #pragma unroll
     for (uint32_t k = 0; k < NPT; ++k) {
         nt[k] = tid * NPT + k < n_expert ? (ov[k + 1] - ov[k] + FM - 1) / FM : 0u;
         /* W2's tail numbers the misses' tiles alone: its grid holds no more. */
         if constexpr (W2) {
             if ((mode & kModeW2Tail) && !r4d_w2::in_tail(w2, tid * NPT + k)) nt[k] = 0u;
+            if (inl && r4d_w2::posted(w2, tid * NPT + k)) {
+                pm |= 1u << k;
+                cntb += nt[k];
+                continue;
+            }
         }
         cnt += nt[k];
     }
     const uint32_t inc = (uint32_t)wave_incl_scan_i32((int32_t)cnt, lane);
     if (lane == kWave - 1) s_rc[wave] = inc;
+    uint32_t incb = 0;
+    if constexpr (W2) {
+        if (inl) {
+            incb = (uint32_t)wave_incl_scan_i32((int32_t)cntb, lane);
+            if (lane == kWave - 1) s_rcb[wave] = incb;
+        }
+    }
     lds_barrier();
-    uint32_t before = inc - cnt, ntile = 0;
+    uint32_t before = inc - cnt, ntile = 0, beforeb = incb - cntb, ntb = 0;
 #pragma unroll
     for (uint32_t w = 0; w < NTHR / kWave; ++w) {
         const uint32_t c = s_rc[w];
         before += w < wave ? c : 0u;
         ntile += c;
+        if constexpr (W2) {
+            if (inl) {
+                const uint32_t cb = s_rcb[w];
+                beforeb += w < wave ? cb : 0u;
+                ntb += cb;
+            }
+        }
     }
-    const uint32_t j = blockIdx.x;
-    if (j >= ntile) return;             /* fewer tiles than slots: block-uniform */
+    uint32_t j = blockIdx.x;
+    if constexpr (W2) {
+        if (inl) {
+            /* r4d_moe_iqr.hip's renumbering: the other experts' tiles a column group at a time,
+             * then the posted experts', then a block a column group for the rows past the live
+             * count. */
+            const uint32_t gy = gridDim.y, lin = blockIdx.y * gridDim.x + blockIdx.x;
+            uint32_t by;
+            bool useb = false, zero = false;
+            if (lin < ntile * gy) {
+                by = lin / ntile;
+                j = lin - by * ntile;
+            } else if (lin < (ntile + ntb) * gy) {
+                const uint32_t m = lin - ntile * gy;
+                by = m / ntb;
+                j = m - by * ntb;
+                useb = true;
+            } else if (lin < (ntile + ntb + 1u) * gy) {
+                by = lin - (ntile + ntb) * gy;
+                zero = true;
+            } else {
+                return;
+            }
+            by = (uint32_t)__builtin_amdgcn_readfirstlane((int)by);
+            cg0 = by * G * FN;
+            if (cg0 >= N) return;
+            cend = cg0 + G * FN < N ? cg0 + G * FN : N;
+            ng = (cend - cg0 + FN - 1) / FN;
+            if (zero) {
+                const uint32_t live = (uint32_t)off[n_expert];
+                for (uint32_t r = live; r < T; ++r)
+                    for (uint32_t c = cg0 + tid; c < cend; c += NTHR) Y[(size_t)r * y_ld + c] = 0;
+                return;
+            }
+            if (useb) {
+                before = beforeb;
+                cnt = cntb;
+            }
+#pragma unroll
+            for (uint32_t q = 0; q < NPT; ++q)
+                if ((((pm >> q) & 1u) != 0u) != useb) nt[q] = 0u;
+        }
+    }
+    if (!inl && j >= ntile) return;     /* fewer tiles than slots: block-uniform */
     if (j >= before && j < before + cnt) {
         uint32_t m = j - before;
         bool hit = false;
@@ -1671,9 +1737,9 @@ __device__ __forceinline__ void moe_down_dec_body(R4D_MOEDD_PARAMS, const RadW2L
     const uint16_t* Wsp0 = (const uint16_t*)wtab_at(C.s, C.s_s0, e >> cshift);
     if constexpr (W2) {
         const bool tail = (mode & kModeW2Tail) != 0u;
-        if (!r4d_w2::mine(w2, e, tail)) return;       /* the table entries are loaded beside it */
-        if (tail) {
-            Wp0  = (const uint8_t*)r4d_w2::where(w2, e, Wp0);
+        if (!inl && !r4d_w2::mine(w2, e, tail)) return;   /* the table entries are loaded beside it */
+        if (tail || inl) {
+            Wp0  = (const uint8_t*)r4d_w2::where(w2, e, Wp0, nullptr, inl ? w2->spin : 0u);
             Wsp0 = (const uint16_t*)r4d_w2::where(w2, e, Wsp0);
         }
     }
@@ -3106,7 +3172,13 @@ static int moe_gemm_launch(const RadArgs* a, RadStream stream, int ncls = 2) {
         const long long g2 = r4d_moe_down_dec_g(T);
         if (!dn_dec && g_moe_down_dec_pin > 0) return R4D_NO(RAD_E_UNSUPPORTED);
         if (dn_dec && g2 > 0) {
-            const unsigned slots  = (unsigned)(std::min(T, n_expert) + (T + 15) / 16);
+            /* w2-explore, RADIANCE_X_GRID_PAD=n: n more blocks along x that find no tile (what an
+             * empty block of the run-tile grid costs the launch). */
+            static const unsigned grid_pad = [] {
+                const char* v = std::getenv("RADIANCE_X_GRID_PAD");
+                return v ? (unsigned)std::strtoul(v, nullptr, 10) : 0u;
+            }();
+            const unsigned slots  = (unsigned)(std::min(T, n_expert) + (T + 15) / 16) + grid_pad;
             const unsigned groups = (unsigned)((N + 64 * g2 - 1) / (64 * g2));
 #define R4D_MOE_DD(CH_)                                                                          \
             emit_rc = R4D_EMIT(stream, (moe_down_dec_kernel<W4, I8, CH_>),                       \

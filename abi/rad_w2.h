@@ -56,7 +56,7 @@
 /* A group's done word: the post's number above its low RAD_W2_DONE_BITS bits, which count the
  * units of that post's list that have landed (the DMA list writes it behind every unit). Unit j of
  * post `seq` is on the card once the word is rad_w2_done(seq, j + 1) or more of the same post. */
-#define RAD_W2_DONE_BITS 4
+#define RAD_W2_DONE_BITS 5
 #define RAD_W2_DONE(seq, landed) (((uint32_t)(seq) << RAD_W2_DONE_BITS) + (uint32_t)(landed))
 
 /* `mask[x]` of place x (the index the layer's expert offsets and weight tables use). */
@@ -127,6 +127,15 @@ typedef struct RadW2Layer {
     RadW2Stats*     stats;
     uint32_t        n_expert;             /* places the plan looks at (the regular experts) */
     uint32_t        group;
+    /* w2-explore. `form` 0: the prototype's (resident launches, then the tail's). 1, "inline": one
+     * gate_up and one down launch whose blocks are renumbered so that every tile of a posted
+     * (copied) expert runs behind every other tile, reading the ring where the unit has landed
+     * and the pool in place otherwise; no tail launch. `spin`: how often a block of a posted
+     * expert re-reads the done word before it gives up and reads in place. `gu_first` 1: the
+     * list copies every unit's first `split` bytes (the gate_up tables) before any unit's rest,
+     * so the done word counts 2 n ranges. */
+    uint32_t        form, spin, gu_first, pad1;
+    uint64_t        split;
     RadW2Pools      pools;
     /* The most units a layer's list may hold, by the number of distinct routed experts (which is
      * what sets the window from the router's end to the resident down GEMM's end). */

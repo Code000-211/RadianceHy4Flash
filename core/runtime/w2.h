@@ -31,10 +31,19 @@ struct W2Config {
      * RADIANCE_W2_RING=uncached takes uncached device memory instead, as the prefetch's ring,
      * which needs no acquire. */
     bool   ring_cached = true;
+    /* w2-explore (abi/rad_w2.h RadW2Layer::form / spin / gu_first): RADIANCE_W2_FORM=inline,
+     * RADIANCE_W2_SPIN=<polls>, RADIANCE_W2_GU_FIRST=<bytes of a unit's gate_up part>. */
+    int    form = 0;
+    int    spin = 0;
+    int64_t gu_first = 0;
 };
 /* From the environment (`get` is std::getenv, or a test's). */
 W2Config w2_config(const char* (*get)(const char*));
 W2Config w2_config();
+
+/* w2-explore: RADIANCE_W2_AB = reserve (1) / queue (2) / noreserve (3), else 0: which part of the
+ * switch's idle cost a run carries (engine_bringup.cpp). */
+int w2_ab();
 
 /* The budget table a layer's control block carries: out[d] = the longest list that lands inside
  * the window of a layer routing d distinct experts, d in [0, RAD_W2_MAX_EXPERT]. */

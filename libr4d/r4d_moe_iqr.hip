@@ -250,7 +250,10 @@ __device__ __forceinline__ void moe_iqr_body(R4D_MOEIQR_PARAMS) {
     auto red = [&](uint32_t w) { return (float*)(s_tr + w * kTrBytes); };
     const uint32_t tid = threadIdx.x, lane = tid & (kWave - 1);
     const uint32_t wave = __builtin_amdgcn_readfirstlane(tid / kWave);
-    const uint32_t ycol0 = blockIdx.y * kCols;
+    /* w2-explore, the inline form: the block's column group `by` and its tile are renumbered
+     * behind the search (every posted expert's tile behind every other tile of the launch). */
+    uint32_t by = blockIdx.y, ycol0 = blockIdx.y * kCols;
+    bool inl = false;
     /* Rows [ra, rb) of the block's columns, zeroed: dropped slots, which no run owns. */
     auto zero_rows = [&](uint32_t ra, uint32_t rb) {
         for (uint32_t x = tid; x < (rb - ra) * kCols; x += NTHR)
@@ -287,7 +290,10 @@ __device__ __forceinline__ void moe_iqr_body(R4D_MOEIQR_PARAMS) {
         constexpr uint32_t NPT = kMaxExpert / NTHR;
         static_assert(NPT * NTHR == kMaxExpert && NPT <= 16, "a thread's experts in one round");
         __shared__ uint32_t s_rc[NW];
-        if (blockIdx.x == gridDim.x - 1u) {
+        __shared__ uint32_t s_rcb[NW];
+        if constexpr (W2) inl = ((const RadW2Layer*)map)->form == 1u && !(mode & kModeW2Tail);
+        uint32_t bx = blockIdx.x;
+        if (!inl && blockIdx.x == gridDim.x - 1u) {
             /* W2: the first pass zeroed them */
             if constexpr (W2) { if (mode & kModeW2Tail) return; }
             const uint32_t live = (uint32_t)off[n_expert];
@@ -301,7 +307,9 @@ __device__ __forceinline__ void moe_iqr_body(R4D_MOEIQR_PARAMS) {
             const uint32_t o = x <= n_expert ? (uint32_t)off[x] : T;
             ov[k] = o < T ? o : T;
         }
-        uint32_t nt[NPT], cnt = 0;
+        /* Inline: `cnt` counts the thread's tiles of experts that were not posted, `cntb` those
+         * of posted ones (bit q of `pm`: its q-th expert is posted). */
+        uint32_t nt[NPT], cnt = 0, cntb = 0, pm = 0;
 #pragma unroll
         for (uint32_t k = 0; k < NPT; ++k) {
             nt[k] = tid * NPT + k < n_expert ? (ov[k + 1] - ov[k] + kRows - 1u) / kRows : 0u;
@@ -309,23 +317,77 @@ __device__ __forceinline__ void moe_iqr_body(R4D_MOEIQR_PARAMS) {
             if constexpr (W2) {
                 if ((mode & kModeW2Tail) && !r4d_w2::in_tail((const RadW2Layer*)map, tid * NPT + k))
                     nt[k] = 0u;
+                if (inl && r4d_w2::posted((const RadW2Layer*)map, tid * NPT + k)) {
+                    pm |= 1u << k;
+                    cntb += nt[k];
+                    continue;
+                }
             }
             cnt += nt[k];
         }
         const uint32_t inc = (uint32_t)wave_incl_scan_i32((int32_t)cnt, lane);
         if (lane == kWave - 1) s_rc[wave] = inc;
+        uint32_t incb = 0;
+        if constexpr (W2) {
+            if (inl) {
+                incb = (uint32_t)wave_incl_scan_i32((int32_t)cntb, lane);
+                if (lane == kWave - 1) s_rcb[wave] = incb;
+            }
+        }
         lds_barrier();
-        uint32_t before = inc - cnt, ntile = 0;
+        uint32_t before = inc - cnt, ntile = 0, beforeb = incb - cntb, ntb = 0;
 #pragma unroll
         for (uint32_t w = 0; w < NW; ++w) {
             const uint32_t c = s_rc[w];
             ntile += c;
             if (w < wave) before += c;
+            if constexpr (W2) {
+                if (inl) {
+                    const uint32_t cb = s_rcb[w];
+                    ntb += cb;
+                    if (w < wave) beforeb += cb;
+                }
+            }
         }
-        if (blockIdx.x >= ntile) return;
-        if (blockIdx.x >= before && blockIdx.x < before + cnt) {
-            /* the thread's (blockIdx.x - before)-th tile: its expert and the tile's first row */
-            uint32_t rem = blockIdx.x - before, k = 0;
+        bool useb = false;
+        if constexpr (W2) {
+            if (inl) {
+                /* The launch's blocks in dispatch order (x fastest): the other experts' tiles a
+                 * column group at a time, then the posted experts' the same way, then a block a
+                 * column group that zeroes the dropped slots' rows. */
+                const uint32_t gy = gridDim.y, lin = blockIdx.y * gridDim.x + blockIdx.x;
+                if (lin < ntile * gy) {
+                    by = lin / ntile;
+                    bx = lin - by * ntile;
+                } else if (lin < (ntile + ntb) * gy) {
+                    const uint32_t m = lin - ntile * gy;
+                    by = m / ntb;
+                    bx = m - by * ntb;
+                    useb = true;
+                } else if (lin < (ntile + ntb + 1u) * gy) {
+                    by = lin - (ntile + ntb) * gy;
+                    ycol0 = by * kCols;
+                    const uint32_t live = (uint32_t)off[n_expert];
+                    if (live < T) zero_rows(live, T);
+                    return;
+                } else {
+                    return;
+                }
+                by = __builtin_amdgcn_readfirstlane(by);
+                ycol0 = by * kCols;
+                if (useb) {
+                    before = beforeb;
+                    cnt = cntb;
+                }
+#pragma unroll
+                for (uint32_t q = 0; q < NPT; ++q)
+                    if ((((pm >> q) & 1u) != 0u) != useb) nt[q] = 0u;
+            }
+        }
+        if (!inl && bx >= ntile) return;
+        if (bx >= before && bx < before + cnt) {
+            /* the thread's (bx - before)-th tile: its expert and the tile's first row */
+            uint32_t rem = bx - before, k = 0;
             bool hit = false;
 #pragma unroll
             for (uint32_t q = 0; q < NPT; ++q) {
@@ -361,13 +423,13 @@ __device__ __forceinline__ void moe_iqr_body(R4D_MOEIQR_PARAMS) {
         /* the table entries beside the mask byte, not behind it */
         const void* pw = C.w[e >> cshift];
         const void* ps = C.s[e >> cshift];
-        if (!r4d_w2::mine(L, e, tail)) return;
-        if (tail) {
+        if (!inl && !r4d_w2::mine(L, e, tail)) return;
+        if (tail || inl) {
             bool ring = false;
-            pw = r4d_w2::where(L, e, pw, &ring);
+            pw = r4d_w2::where(L, e, pw, &ring, inl ? L->spin : 0u);
             ps = r4d_w2::where(L, e, ps);
             /* One count a posted unit: gate_up's block of the run's first tile and columns. */
-            if (!a_sorted && tid == 0u && blockIdx.y == 0u && s_sel[3] == 0u &&
+            if (!a_sorted && tid == 0u && by == 0u && s_sel[3] == 0u &&
                 (uint32_t)L->mask[e] >= RAD_W2_COPY0 && L->stats)
             {
                 atomicAdd(ring ? &L->stats->landed : &L->stats->late, 1u);
@@ -584,7 +646,7 @@ __device__ __forceinline__ void moe_iqr_body(R4D_MOEIQR_PARAMS) {
     /* A wave whose tile is all of its K (KW 1) takes TPW tiles in turn: the run search and the
      * rows above are paid once for them, which a narrow-K projection (two or three units a tile)
      * otherwise pays as a third of its work. */
-    for (uint32_t tw = 0; tw < TPW; ++tw) tile((blockIdx.y * RTB + rtb) * TPW + tw);
+    for (uint32_t tw = 0; tw < TPW; ++tw) tile((by * RTB + rtb) * TPW + tw);
 }
 
 /* The kernel around the body, whose blocks return where their work ends: CH `r4dchain` is the
@@ -987,9 +1049,14 @@ int moe_iqr_launch(const RadArgs* a, RadStream stream, int ncls) {
          * r rows is ceil(r / 16) tiles, and a run of one row is one, so the T rows over at most
          * min(T, n_expert) experts make at most (T + 15 * min(T, n_expert)) / 16 tiles. One block
          * past them zeroes the dropped slots' rows. */
+        /* w2-explore, RADIANCE_X_GRID_PAD (r4d_moe.hip's). */
+        static const uint32_t grid_pad = [] {
+            const char* v = std::getenv("RADIANCE_X_GRID_PAD");
+            return v ? (uint32_t)std::strtoul(v, nullptr, 10) : 0u;
+        }();
         g.gx = (uint32_t)((((uint64_t)T + (uint64_t)(kRows - 1) * (T < n_expert ? T : n_expert)) /
                            kRows) +
-                          1u);
+                          1u) + grid_pad;
         /* The band's one launch has a chained form; the run map's two launches stay plain. */
         g.chain = r4d_geti_or(a, "chain", 0) != 0;
         if (w2t && w2t->data) { g.w2 = w2t->data; g.w2_tail = true; }

@@ -32,10 +32,20 @@ W2Config w2_config(const char* (*get)(const char*)) {
     c.win_us_expert = std::clamp(num("RADIANCE_W2_WIN_US_EXPERT", c.win_us_expert), 0.0, 1e6);
     const char* ring = get("RADIANCE_W2_RING");
     c.ring_cached = !(ring && !std::strcmp(ring, "uncached"));
+    const char* form = get("RADIANCE_W2_FORM");
+    c.form = form && !std::strcmp(form, "inline") ? 1 : 0;
+    c.spin = (int)std::clamp(num("RADIANCE_W2_SPIN", 0), 0.0, 1e6);
+    c.gu_first = (int64_t)std::clamp(num("RADIANCE_W2_GU_FIRST", 0), 0.0, 64e6);
     return c;
 }
 W2Config w2_config() {
     return w2_config([](const char* k) -> const char* { return std::getenv(k); });
+}
+
+int w2_ab() {
+    const char* v = std::getenv("RADIANCE_W2_AB");
+    if (!v) return 0;
+    return !std::strcmp(v, "reserve") ? 1 : !std::strcmp(v, "queue") ? 2 : !std::strcmp(v, "noreserve") ? 3 : 0;
 }
 
 void w2_fill_kmax(const W2Config& cfg, uint8_t* out) {
@@ -284,7 +294,7 @@ void Ctx::w2_serve(W2State& x) {
             continue;
         }
         const uint32_t seq = next++;
-        uint64_t src[RAD_W2_MAX_COPY], dst[RAD_W2_MAX_COPY], bytes[RAD_W2_MAX_COPY];
+        uint64_t src[2 * RAD_W2_MAX_COPY], dst[2 * RAD_W2_MAX_COPY], bytes[2 * RAD_W2_MAX_COPY];
         /* The post's stores cross the link in no promised order: it is whole once the sum over
          * what is read is the sum the plan wrote. A post the plan left a job out of (the unit moved
          * under it) never is, and is dropped. */
@@ -299,7 +309,7 @@ void Ctx::w2_serve(W2State& x) {
             x.dropped.fetch_add(1, std::memory_order_relaxed);
             continue;
         }
-        const int n = (int)snap.n;
+        int n = (int)snap.n;
         const uint32_t g = snap.group;
         bool got = g < RAD_W2_GROUPS;
         for (int i = 0; i < n && got; ++i) {
@@ -308,6 +318,18 @@ void Ctx::w2_serve(W2State& x) {
             bytes[i] = snap.jobs[i].bytes;
             const uint64_t r0 = (uint64_t)(uintptr_t)x.ring, r1 = r0 + (uint64_t)RAD_W2_GROUPS * RAD_W2_MAX_COPY * x.slot;
             if (!bytes[i] || bytes[i] > x.slot || dst[i] < r0 || dst[i] + bytes[i] > r1) got = false;
+        }
+        /* w2-explore, RADIANCE_W2_GU_FIRST: every unit's first `split` bytes (its gate_up tables),
+         * then every unit's rest; the done word counts the 2 n ranges (r4d_w2::where). */
+        if (const uint64_t split = (uint64_t)x.cfg.gu_first; got && split) {
+            for (int i = 0; i < n; ++i) {
+                if (bytes[i] <= split) { got = false; break; }
+                src[n + i] = src[i] + split;
+                dst[n + i] = dst[i] + split;
+                bytes[n + i] = bytes[i] - split;
+                bytes[i] = split;
+            }
+            if (got) n *= 2;
         }
         if (!got || rad_xp_behind(x.device) > kW2Behind) {
             x.dropped.fetch_add(1, std::memory_order_relaxed);
@@ -357,6 +379,10 @@ void* Ctx::w2_layer(int layer, const rad_weight* first, int64_t n_place, int64_t
         L->stats = x.stats;
         L->n_expert = (uint32_t)n_place;
         L->group = (uint32_t)g;
+        L->form = (uint32_t)x.cfg.form;
+        L->spin = (uint32_t)x.cfg.spin;
+        L->gu_first = x.cfg.gu_first > 0 ? 1u : 0u;
+        L->split = (uint64_t)x.cfg.gu_first;
         L->pools = x.pools;
         w2_fill_kmax(x.cfg, L->kmax);
         /* Once per layer, at an issue: this host wait is off the step path, and off the tape. */

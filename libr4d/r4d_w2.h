@@ -171,6 +171,12 @@ __device__ __forceinline__ bool in_tail(const RadW2Layer* L, uint32_t x) {
     return x < RAD_W2_MAX_EXPERT && L->mask[x] != RAD_W2_RESIDENT;
 }
 
+/* w2-explore, the inline form (RadW2Layer::form 1): whether place x's unit was posted. Its tiles
+ * are numbered behind every other expert's. */
+__device__ __forceinline__ bool posted(const RadW2Layer* L, uint32_t x) {
+    return x < RAD_W2_MAX_EXPERT && L->mask[x] >= RAD_W2_COPY0;
+}
+
 /* What a routed GEMM's block does with its expert `e` (a place) under W2. `tail` false is the
  * first pass: true (run it) for a resident expert. `tail` true: true for a miss. */
 __device__ __forceinline__ bool mine(const RadW2Layer* L, uint32_t e, bool tail) {
@@ -182,7 +188,7 @@ __device__ __forceinline__ bool mine(const RadW2Layer* L, uint32_t e, bool tail)
  * unit was posted, its list has landed and `p` still lies in the pool slot the copy was made from;
  * `p` itself otherwise (RAD_W2_DONE: the units of a list land one by one). Block-uniform (every thread of a block asks about the same expert). */
 __device__ __forceinline__ const void* where(const RadW2Layer* L, uint32_t e, const void* p,
-                                             bool* from_ring = nullptr) {
+                                             bool* from_ring = nullptr, uint32_t spin = 0u) {
     if (from_ring) *from_ring = false;
     const uint32_t m = e < RAD_W2_MAX_EXPERT ? (uint32_t)L->mask[e] : 0u;
     if (m < RAD_W2_COPY0) return p;
@@ -195,10 +201,16 @@ __device__ __forceinline__ const void* where(const RadW2Layer* L, uint32_t e, co
      * post's and counts past it. */
     const uint32_t seq = L->seq;
     if (!seq) return p;
-    const uint32_t d = sys_load(L->done);
-    if ((d >> RAD_W2_DONE_BITS) != (seq & (0xffffffffu >> RAD_W2_DONE_BITS)) ||
-        (d & ((1u << RAD_W2_DONE_BITS) - 1u)) <= j)
-        return p;
+    /* w2-explore, `gu_first`: the list copies every unit's first `split` bytes, then every
+     * unit's rest, so a pointer past the split has landed n ranges later. */
+    const uint32_t need = j + (L->gu_first && u - base >= L->split ? L->n_copy : 0u);
+    for (uint32_t it = 0u;; ++it) {
+        const uint32_t d = sys_load(L->done);
+        if ((d >> RAD_W2_DONE_BITS) == (seq & (0xffffffffu >> RAD_W2_DONE_BITS)) &&
+            (d & ((1u << RAD_W2_DONE_BITS) - 1u)) > need)
+            break;
+        if (it >= spin) return p;
+    }
     if (from_ring) *from_ring = true;
     return (const void*)(dst + (u - base));
 }
