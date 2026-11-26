@@ -749,6 +749,10 @@ struct Junction {
     const ActFP8* codes_if() const { return op && codes.q8 ? &codes : nullptr; }
     /* Whether the second lane may take this junction's reduction (the narrow twin exists). */
     bool pipe_ok() const { return op_reduce_ov != 0; }
+    /* Every buffer an issue of this junction reads or writes (0 where absent): what the pipelined
+     * prefill names to the planner, since its pieces run on the second lane (#282: the last
+     * layer's `xn` is `final_hidden`, and the codes pair, were left out). */
+    std::vector<rad_buf> bufs() const { return { a, b, post, h, xn, y, x, codes.q8, codes.s8 }; }
 
     /* `a` the block's output (`b` the addend in front, 0 for none), `w_post` its sandwich norm's
      * gain; `next` the next connection (0 for tail 0) and `w_next` the next block's input norm,
@@ -862,7 +866,9 @@ struct Junction {
      * `beside` picks the narrow reduction (op_reduce_ov), which is the only form allowed on that
      * lane; the fused `op_ar` never runs here (it takes the whole band, so it is only for a small
      * T). Nothing in the chain steps outside a row, so a piece's rows are the same numbers as the
-     * whole step's. */
+     * whole step's -- every operand the whole step's issue carries, the G-3b codes too: the
+     * linears behind the junction read them in place of their own quantiser, so a piece that left
+     * them out had those linears read stale codes (#282). */
     void step(RadCtx* c, int64_t r0, int64_t rows, bool beside) const {
         if (rows <= 0) return;
         auto row = [&](rad_buf v, int64_t pitch) { return brow_slice(v, r0, rows, pitch); };
@@ -872,7 +878,8 @@ struct Junction {
                         tail ? RAD_W(fn) : RAD_NONE, tail ? RAD_W(scale) : RAD_NONE,
                         tail ? RAD_W(base) : RAD_NONE, tail ? RAD_W(w_next) : RAD_NONE,
                         xn ? row(xn, n) : RAD_NONE, y ? row(y, n) : RAD_NONE,
-                        x ? row(x, n) : RAD_NONE);
+                        x ? row(x, n) : RAD_NONE, codes.q8 ? row(codes.q8, n) : RAD_NONE,
+                        codes.s8 ? row(codes.s8, n / codes.g8) : RAD_NONE);
         };
         if (op_ar && rows <= ar_rows && !beside) { issue(op_ar, B); return; }
         if (world > 1) {
