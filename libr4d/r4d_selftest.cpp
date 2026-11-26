@@ -8145,6 +8145,26 @@ static void iqr_dual_case(const Plugin& pl, const IqrCase& f, int64_t M, int64_t
     dfree_all();
 }
 
+/* The run-tile grids' tiles at these offsets over T output rows: each run, clamped to T, in
+ * 16-row tiles from its own first row (r4d_moe.hip's moe_down_dec numbering). */
+static int64_t moe_run_tiles(const std::vector<int32_t>& off, int64_t ne, int64_t T) {
+    int64_t n = 0;
+    for (int64_t e = 0; e < ne; ++e) {
+        const int64_t a = std::min<int64_t>(off[(size_t)e], T);
+        const int64_t b = std::min<int64_t>(off[(size_t)e + 1], T);
+        if (b > a) n += (b - a + 15) / 16;
+    }
+    return n;
+}
+/* Tile-block counts for the run-tile grids' pin (r4d_moe_gemm_pin_run_grid): one, two and three
+ * blocks serving every tile in turn, one fewer than the tiles, as many, and one more. */
+static std::vector<int> moe_grid_pins(int64_t ntile) {
+    std::vector<int> v;
+    for (const int64_t g : { (int64_t)1, (int64_t)2, (int64_t)3, ntile - 1, ntile, ntile + 1 })
+        if (g >= 1 && std::find(v.begin(), v.end(), (int)g) == v.end()) v.push_back((int)g);
+    return v;
+}
+
 /* moe_gemm_iqr against the dense IQR GEMM over the same expert buffers. Every expert is an IQR
  * weight (the computed trellis under one f32 scale a row, `run` rows a trellis run), in two classes
  * of their own rows and K; the routing is random with `drop` trailing dropped slots. The grouped
@@ -8327,6 +8347,32 @@ static void moe_iqr_case(const Plugin& pl, const MoeIqrShape& sh) {
     if (rq != RAD_OK) { ok(nm, false, "rc " + std::to_string(rq)); dfree_all(); return; }
     std::vector<uint16_t> y((size_t)(Tr * N));
     st_memcpy(y.data(), d_y, y.size() * 2, hipMemcpyDeviceToHost);
+
+    /* The decode band's run-tile grid at fewer tile blocks than the launch has tiles (a block
+     * serving several in turn), at as many and at one more: byte for byte the rule's launch. */
+    using GridPinFn = void (*)(int);
+    const GridPinFn pin_grid = (GridPinFn)dlsym(pl.h, "r4d_moe_gemm_pin_run_grid");
+    if (2 * Tr <= 3 * E) {
+        const int64_t ntile = moe_run_tiles(off, E, Tr);
+        if (!pin_grid) ok((std::string(nm) + ": run-tile grid pins").c_str(), false, "no pin");
+        for (const int g : pin_grid ? moe_grid_pins(ntile) : std::vector<int>()) {
+            std::vector<uint16_t> poison((size_t)(Tr * N), h_to_bf16(77.0f));
+            st_memcpy(d_y, poison.data(), poison.size() * 2, hipMemcpyHostToDevice);
+            pin_grid(g);
+            const int rg = launch(r, ts, ps);
+            pin_grid(0);
+            std::vector<uint16_t> yg((size_t)(Tr * N));
+            st_memcpy(yg.data(), d_y, yg.size() * 2, hipMemcpyDeviceToHost);
+            int64_t diff = 0;
+            for (size_t i = 0; i < y.size(); ++i) diff += yg[i] != y[i];
+            ok((std::string(nm) + ": " + std::to_string(g) + " tile blocks for " +
+                std::to_string(ntile) + " tiles, byte for byte").c_str(),
+               rg == RAD_OK && diff == 0,
+               rg != RAD_OK ? "rc " + std::to_string(rg)
+                            : std::to_string(diff) + " of " + std::to_string(y.size()) +
+                                  " outputs differ from the rule's grid");
+        }
+    }
 
     /* The reference, a run's rows at a time through the dense row over the same buffers. */
     std::vector<float> want((size_t)(Tr * N), 0.0f);
@@ -26980,9 +27026,11 @@ static void moe_down_dec_case(const Plugin& pl, const MoeDnShape& sh, const char
 
         /* One pinned launch into stale bytes, returning its output and its last dispatch. `pins`
          * is (form, the sorted operand's decode kernel: -1 the (tile, run) form, 0 the rule, n
-         * its column tiles). */
+         * its column tiles); `grid` the run-tile grid's tile blocks (0 the rule). */
+        using GridPinFn = void (*)(int);
+        const GridPinFn pin_grid = (GridPinFn)dlsym(pl.h, "r4d_moe_gemm_pin_run_grid");
         auto run = [&](const int (&pins)[2], std::vector<uint16_t>* got,
-                       const void** fn = nullptr) {
+                       const void** fn = nullptr, int grid = 0) {
             {
                 std::vector<uint16_t> junk((size_t)(Tr * N), 0x7f7fu);
                 st_memcpy(d_y, junk.data(), junk.size() * 2, hipMemcpyHostToDevice);
@@ -26991,11 +27039,13 @@ static void moe_down_dec_case(const Plugin& pl, const MoeDnShape& sh, const char
             a.scratch_bytes = pins[0] == 3 ? 0 : map_bytes;
             pl.pin_moe(pins[0]);
             pl.pin_ddec(pins[1]);
+            if (pin_grid) pin_grid(grid);
             int rc = RAD_OK;
             const void* last = last_dispatch(pl, r, a, &rc);
             st_stream_sync(nullptr);
             pl.pin_moe(0);
             pl.pin_ddec(0);
+            if (pin_grid) pin_grid(0);
             if (fn) *fn = last;
             got->assign((size_t)(Tr * N), 0);
             st_memcpy(got->data(), d_y, got->size() * 2, hipMemcpyDeviceToHost);
@@ -27074,6 +27124,49 @@ static void moe_down_dec_case(const Plugin& pl, const MoeDnShape& sh, const char
             for (size_t i = 0; i < got.size(); ++i) diff += got[i] != base[i];
             ok(label.c_str(), diff == 0, std::to_string(diff) + " of " + std::to_string(Tr * N) +
                                          " elements differ from the (tile, run) form");
+        }
+
+        /* The down kernel's run-tile grid at fewer tile blocks than the launch has tiles (a block
+         * serving several in turn), at as many and at one more, under the rule's column tiles and
+         * at one: each against the (tile, run) form's bytes. */
+        {
+            const int64_t ntile = moe_run_tiles(off, ne, Tr);
+            if (!pin_grid) ok((what + " decode form, run-tile grid pins").c_str(), false, "no pin");
+            for (const int dn : { 0, 1 })
+                for (const int g : pin_grid ? moe_grid_pins(ntile) : std::vector<int>()) {
+                    const std::string label = what + " decode form, down kernel at " +
+                                              (dn ? "one column tile" : "the rule's column tiles") +
+                                              ", " + std::to_string(g) + " tile blocks for " +
+                                              std::to_string(ntile) + " tiles";
+                    const int pins[2] = { 2, dn };
+                    std::vector<uint16_t> got;
+                    const int rc = run(pins, &got, nullptr, g);
+                    if (rc != RAD_OK) { ok(label.c_str(), false, "launch rc=" + std::to_string(rc)); continue; }
+                    int64_t diff = 0;
+                    for (size_t i = 0; i < got.size(); ++i) diff += got[i] != base[i];
+                    ok(label.c_str(), diff == 0, std::to_string(diff) + " of " +
+                                                 std::to_string(Tr * N) +
+                                                 " elements differ from the (tile, run) form");
+                }
+        }
+
+        /* No tile at all (no routed row): every row zero, whatever the grid. */
+        {
+            const std::vector<int32_t> none((size_t)(ne + 1), 0);
+            st_memcpy(d_o, none.data(), none.size() * 4, hipMemcpyHostToDevice);
+            for (const int g : { 0, 1, 3 }) {
+                const std::string label = what + " decode form, down kernel, no routed row, " +
+                                          (g ? std::to_string(g) + " tile blocks" : "the rule's grid");
+                const int pins[2] = { 2, 0 };
+                std::vector<uint16_t> got;
+                const int rc = run(pins, &got, nullptr, g);
+                if (rc != RAD_OK) { ok(label.c_str(), false, "launch rc=" + std::to_string(rc)); continue; }
+                int64_t nz = 0;
+                for (const uint16_t v : got) nz += v != 0;
+                ok(label.c_str(), nz == 0, std::to_string(nz) + " of " + std::to_string(Tr * N) +
+                                           " elements not zero");
+            }
+            st_memcpy(d_o, off.data(), off.size() * 4, hipMemcpyHostToDevice);
         }
 
         /* The output seven rows short: Y declared at Tr - 7 rows over the same buffer with the
@@ -38927,6 +39020,8 @@ static void device_phase(const Plugin& pl) {
                 /* the run-tile grid: a decode step's rows */
                 { "decode gate/up", 4, 16, 128, 64, 4, 3, 768, 512, 2560, 2560, 2, false, 0 },
                 { "decode gate/up, a dropped slot", 4, 16, 128, 64, 4, 3, 768, 512, 2560, 2560, 2, false, 1 },
+                /* no tile at all: every slot dropped, the grid's blocks find none */
+                { "verify gate/up, every slot dropped", 4, 16, 128, 512, 4, 64, 512, 256, 1280, 1280, 2, false, 256 },
                 { "decode down", 4, 16, 256, 64, 4, 3, 2560, 2560, 512, 256, 1, true, 0 },
                 { "verify gate/up, runs of several rows", 4, 16, 128, 16, 4, 6, 768, 512, 2560, 2560, 2, false, 2 },
                 { "verify down", 3, 16, 256, 16, 4, 6, 2560, 2560, 512, 256, 1, true, 2 },

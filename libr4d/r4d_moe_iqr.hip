@@ -61,6 +61,9 @@ int r4d_moe_blockmap_emit(RadStream s, const int32_t* off, uint32_t n_expert, ui
                           uint32_t fm, uint32_t cap, uint32_t* map);
 /* Whether T sorted rows over n_expert experts are served by the decode grid. */
 bool r4d_moe_in_decode_band(long long T, long long n_expert);
+/* The run-tile grid's tile blocks at T sorted rows, for a launch whose tile count is at most
+ * `bound`: a block serves the tiles past them in turn. */
+long long r4d_moe_run_grid(long long T, long long bound);
 
 namespace {
 
@@ -221,7 +224,7 @@ __device__ __forceinline__ void dot_run(const Ctx& c, uint32_t rt, uint32_t kph,
     uint32_t T, uint32_t fy, uint32_t n_expert, uint32_t inv_k, uint32_t x_ld, uint32_t xs_ld,    \
     uint32_t y_ld, uint32_t mode, uint32_t run_tiles, uint32_t inv_ft
 template <class F, uint32_t KW, uint32_t RTB, bool MAP, uint32_t NT, uint32_t TPW, bool PK = false>
-__device__ __forceinline__ void moe_iqr_body(R4D_MOEIQR_PARAMS) {
+__device__ __forceinline__ uint32_t moe_iqr_body(const uint32_t bx, R4D_MOEIQR_PARAMS) {
     using D = Dec<F>;
     static_assert(D::MAD && F::SC == kRowF32 && F::LRB == 0,
                   "the routed kernel reads a computed trellis under one f32 scale a row");
@@ -249,14 +252,14 @@ __device__ __forceinline__ void moe_iqr_body(R4D_MOEIQR_PARAMS) {
     };
 
     /* ---- the block's run: expert e, sorted rows [rs, re). */
-    uint32_t e, rs, re;
+    uint32_t e, rs, re, ntiles = 0u;
     if constexpr (MAP) {
-        if (blockIdx.x >= map[0]) return;
-        e = map[1 + 2 * blockIdx.x];
-        rs = map[2 + 2 * blockIdx.x];
+        if (bx >= map[0]) return 0u;
+        e = map[1 + 2 * bx];
+        rs = map[2 + 2 * bx];
         if (e == kTail) {
             zero_rows(rs, rs + kRows * NT < T ? rs + kRows * NT : T);
-            return;
+            return 0u;
         }
         if constexpr (PK) {
             /* a packed entry: the expert, and the entry's rows above it */
@@ -273,15 +276,16 @@ __device__ __forceinline__ void moe_iqr_body(R4D_MOEIQR_PARAMS) {
          * decoded once and not twice. Each thread holds NPT consecutive experts' offsets and the
          * next, clamped to T; it counts its own run tiles, the threads before it in its wave scan
          * them and the waves before it read the per-wave counts from LDS after one barrier, so the
-         * thread holding tile `blockIdx.x` hands over its expert and the tile's rows. The last
-         * block owns no run: it zeroes the dropped slots' rows, past the live count. */
+         * thread holding tile `bx` hands over its expert and the tile's rows. The last block owns
+         * no run: it zeroes the dropped slots' rows, past the live count. The tile count is
+         * returned, for the kernel's walk over the tiles past the grid (moe_iqr_kernel). */
         constexpr uint32_t NPT = kMaxExpert / NTHR;
         static_assert(NPT * NTHR == kMaxExpert && NPT <= 16, "a thread's experts in one round");
         __shared__ uint32_t s_rc[NW];
         if (blockIdx.x == gridDim.x - 1u) {
             const uint32_t live = (uint32_t)off[n_expert];
             if (live < T) zero_rows(live, T);
-            return;
+            return 0u;
         }
         uint32_t ov[NPT + 1];
 #pragma unroll
@@ -306,10 +310,11 @@ __device__ __forceinline__ void moe_iqr_body(R4D_MOEIQR_PARAMS) {
             ntile += c;
             if (w < wave) before += c;
         }
-        if (blockIdx.x >= ntile) return;
-        if (blockIdx.x >= before && blockIdx.x < before + cnt) {
-            /* the thread's (blockIdx.x - before)-th tile: its expert and the tile's first row */
-            uint32_t rem = blockIdx.x - before, k = 0;
+        ntiles = ntile;
+        if (bx >= ntile) return ntile;
+        if (bx >= before && bx < before + cnt) {
+            /* the thread's (bx - before)-th tile: its expert and the tile's first row */
+            uint32_t rem = bx - before, k = 0;
             bool hit = false;
 #pragma unroll
             for (uint32_t q = 0; q < NPT; ++q) {
@@ -545,19 +550,30 @@ __device__ __forceinline__ void moe_iqr_body(R4D_MOEIQR_PARAMS) {
      * rows above are paid once for them, which a narrow-K projection (two or three units a tile)
      * otherwise pays as a third of its work. */
     for (uint32_t tw = 0; tw < TPW; ++tw) tile((blockIdx.y * RTB + rtb) * TPW + tw);
+    return ntiles;
 }
 
 /* The kernel around the body, whose blocks return where their work ends: CH `r4dchain` is the
  * chained form (r4d_chain.h), every block waiting before its first read and adding once after
- * its last write. Eight token tiles a block hold 237 registers: six waves a SIMD. */
+ * its last write. Eight token tiles a block hold 237 registers: six waves a SIMD.
+ *
+ * The run-tile grid (not MAP) is sized for a pass's usual tile count, not for the bound
+ * (r4d_moe_run_grid, r4d_moe.hip): its G = gridDim.x - 1 tile blocks serve tiles x, x + G,
+ * x + 2 G, ... below the launch's count, each by the same body as one block a tile would, so the
+ * bytes do not depend on G. A barrier parts two tiles of a block (the body's LDS). */
 template <class F, uint32_t KW, uint32_t RTB, bool MAP, uint32_t NT, uint32_t TPW, class CH,
           bool PK = false>
 __global__ __launch_bounds__(KW * RTB * kWave) R4D_WAVES(NT > 4u ? 6 : 8)
 void moe_iqr_kernel(R4D_MOEIQR_PARAMS) {
     if (CH::on) r4d_chain_wait();
-    moe_iqr_body<F, KW, RTB, MAP, NT, TPW, PK>(X, XS, c_0, c_1, c_2, c_3, sorted, off, Y, map, T, fy,
-                                           n_expert, inv_k, x_ld, xs_ld, y_ld, mode, run_tiles,
-                                           inv_ft);
+    const uint32_t stride = gridDim.x - 1u;
+    for (uint32_t bx = blockIdx.x;; bx += stride) {
+        const uint32_t nt = moe_iqr_body<F, KW, RTB, MAP, NT, TPW, PK>(
+            bx, X, XS, c_0, c_1, c_2, c_3, sorted, off, Y, map, T, fy, n_expert, inv_k, x_ld,
+            xs_ld, y_ld, mode, run_tiles, inv_ft);
+        if (MAP || bx + stride >= nt) break;
+        __syncthreads();
+    }
     if (CH::on) r4d_chain_done();
 }
 #undef R4D_MOEIQR_PARAMS
@@ -923,11 +939,12 @@ int moe_iqr_launch(const RadArgs* a, RadStream stream, int ncls) {
         g.map = nullptr;
         /* The runs' 16-row tiles, numbered in expert order from each run's own first row: a run of
          * r rows is ceil(r / 16) tiles, and a run of one row is one, so the T rows over at most
-         * min(T, n_expert) experts make at most (T + 15 * min(T, n_expert)) / 16 tiles. One block
+         * min(T, n_expert) experts make at most (T + 15 * min(T, n_expert)) / 16 tiles. The grid
+         * holds r4d_moe_run_grid's blocks for them, which serve any more in turn, and one block
          * past them zeroes the dropped slots' rows. */
-        g.gx = (uint32_t)((((uint64_t)T + (uint64_t)(kRows - 1) * (T < n_expert ? T : n_expert)) /
-                           kRows) +
-                          1u);
+        const long long bound = (T + (long long)(kRows - 1) * (T < n_expert ? T : n_expert)) /
+                                (long long)kRows;
+        g.gx = (uint32_t)r4d_moe_run_grid(T, bound) + 1u;
         /* The band's one launch has a chained form; the run map's two launches stay plain. */
         g.chain = r4d_geti_or(a, "chain", 0) != 0;
     } else {
