@@ -98,6 +98,11 @@ PartialUtf8 decode_utf8(const std::string& src, PartialUtf8 partial_start,
     uint32_t value    = partial_start.value;
     int      n_remain = partial_start.n_remain;
 
+    /* Only well-formed UTF-8 is a character (Unicode Table 3-7): a byte that is not a lead, a
+     * missing continuation byte, an overlong form (C0, C1, E0 80-9F, F0 80-8F), a surrogate
+     * (ED A0-BF) or a code point past U+10FFFF (F4 90-BF, F5-FF) is an invalid sequence, and so
+     * the whole piece is, as for a stray continuation byte. Each step is checked against the
+     * range of the sequence's state before the piece or at its head (utf8_may_go_on). */
     while (*pos != 0 && n_remain > 0) {
         const uint8_t next_byte = (uint8_t)*pos;
         if ((next_byte >> 6) != 2) {
@@ -107,6 +112,10 @@ PartialUtf8 decode_utf8(const std::string& src, PartialUtf8 partial_start,
         value = (value << 6) + (next_byte & 0x3F);
         ++pos;
         --n_remain;
+        if (!utf8_may_go_on(partial_start, PartialUtf8{ value, n_remain })) {
+            cps.push_back(0);
+            return PartialUtf8{ 0, -1 };
+        }
     }
     if (partial_start.n_remain > 0 && n_remain == 0) cps.push_back(value);
 
@@ -114,18 +123,26 @@ PartialUtf8 decode_utf8(const std::string& src, PartialUtf8 partial_start,
         const uint8_t first_byte = (uint8_t)*pos;
         const uint8_t highbits   = first_byte >> 4;
         n_remain = lookup[highbits] - 1;
-        if (n_remain < 0) {
+        const uint8_t mask = n_remain < 0 ? 0 : (uint8_t)((1 << (7 - n_remain)) - 1);
+        value = first_byte & mask;
+        uint32_t lo, hi;
+        const PartialUtf8 head{ value, n_remain };
+        if (n_remain < 0 || !utf8_range(head, &lo, &hi)) {
             cps.clear();
             cps.push_back(0);
-            return PartialUtf8{ 0, n_remain };
+            return PartialUtf8{ 0, -1 };
         }
-        const uint8_t mask = (uint8_t)((1 << (7 - n_remain)) - 1);
-        value = first_byte & mask;
         ++pos;
         while (*pos != 0 && n_remain > 0) {
-            value = (value << 6) + ((uint8_t)*pos & 0x3F);
+            const uint8_t next_byte = (uint8_t)*pos;
+            value = (value << 6) + (next_byte & 0x3F);
             ++pos;
             --n_remain;
+            if ((next_byte >> 6) != 2 || !utf8_may_go_on(head, PartialUtf8{ value, n_remain })) {
+                cps.clear();
+                cps.push_back(0);
+                return PartialUtf8{ 0, -1 };
+            }
         }
         if (n_remain == 0) cps.push_back(value);
     }
