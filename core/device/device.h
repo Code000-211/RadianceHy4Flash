@@ -169,6 +169,12 @@ extern "C" void    rad_dev_free_uncached(void* p);
  * rad_dev_last_error() on a backend without it or a failure. */
 extern "C" void*   rad_dev_map_file(int fd, int64_t foff, int64_t bytes);
 
+/* Page size advice for the next anonymous pinned allocations (pin_pieces): 0 = MADV_HUGEPAGE (the
+ * default), 1 = MADV_NOHUGEPAGE, so the pool's bytes sit on 4 KiB pages. Set by the host pool
+ * around its own allocation only (RADIANCE_HOST_POOL_PAGES=4k); every other pinned range keeps
+ * huge pages. A process-wide flag read by the AQL backend, set during single-threaded bring-up. */
+namespace rad { inline std::atomic<int> g_pin_small_pages{0}; }
+
 /* A gate on a stream: the stream stops at the point rad_stream_gate enqueues and goes on once the
  * host calls rad_gate_open. Everything enqueued behind the gate meanwhile is then ready at once, so
  * the device runs it back to back however long the host took to submit it. For timing a batch of

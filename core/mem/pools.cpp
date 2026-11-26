@@ -10,6 +10,11 @@ namespace rad {
 
 /* ------------------------------------------------------------------ allocators */
 
+bool host_pool_small_pages(const char* v) {
+    return v && (!std::strcmp(v, "4k") || !std::strcmp(v, "4K") || !std::strcmp(v, "4096") ||
+                 !std::strcmp(v, "small"));
+}
+
 namespace {
 
 class DeviceAllocator final : public MemAllocator {
@@ -224,7 +229,17 @@ int Pools::configure(const Config& cfg, int64_t vram_capacity,
      * the link and so need a kernel-addressable base: with hipHostMallocDefault,
      * rad_dev_device_ptr returns null in Mover::init and Site::DeviceZeroCopy experts get an
      * unusable pointer. On the host backend all memory kinds are the same aligned pages. */
-    if ((s = host_   .init("host_pool",   hp, RAD_MEM_HOST_MAPPED, host)) < 0) st = s;
+    /* RADIANCE_HOST_POOL_PAGES=4k puts this pool on 4 KiB pages (MADV_NOHUGEPAGE) instead of THP:
+     * measured on the 2-card host, pages of 4 KiB spread a copy's bytes over more DRAM channels,
+     * which the SDMA reads of both cards share (measurements/reg4k.md). Only this pool; the
+     * Engram table copies, read by CPU gathers, keep huge pages. */
+    const char* pg = std::getenv("RADIANCE_HOST_POOL_PAGES");
+    const bool small_pages = host_pool_small_pages(pg);
+    if (small_pages) g_pin_small_pages.store(1, std::memory_order_relaxed);
+    s = host_.init("host_pool", hp, RAD_MEM_HOST_MAPPED, host);
+    g_pin_small_pages.store(0, std::memory_order_relaxed);
+    if (small_pages) RAD_INFO("host pool: 4 KiB pages (RADIANCE_HOST_POOL_PAGES=4k)");
+    if (s < 0) st = s;
 
     fit_report_  = weights_.report();
     fit_report_ += kv_.report();
