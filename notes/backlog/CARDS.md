@@ -60,9 +60,16 @@ scripts/backlog/lane.sh --env iks-A               # what a lane exports: port, m
   cmake -S . -B build -G Ninja -DCMAKE_CXX_COMPILER=/opt/rocm/llvm/bin/clang++ \
         -DCMAKE_HIP_COMPILER=/opt/rocm-repeatable/lib/llvm/bin/clang++ -DCMAKE_HIP_COMPILER_ROCM_ROOT=/opt/rocm \
         -DCMAKE_HIP_FLAGS=--rocm-path=/opt/rocm -DRAD_HIP_VOPD_REPEATABLE=ON \
-        -DRAD_WITH_HIP=ON -DRAD_GPU_TARGETS=gfx1201
+        -DRAD_WITH_HIP=ON -DRAD_GPU_TARGETS=gfx1201 -DCMAKE_MODULE_LINKER_FLAGS=-Wl,--build-id
   cmake --build build --target radiance -j 32
   ```
+  Two findings of a whole-tree build with the tests (`ctest -LE 'gpu|oot'`) on this host. ROCm's LLD links
+  without a build id unless asked, and the kernel libraries are CMake `MODULE`s, so the module flag above is
+  what gives `libref.so` and the other plugins one: without it `kbench_test` and `kbench_mutant_test` fail
+  (rad-kbench caches code by build id; `CMAKE_SHARED_LINKER_FLAGS` alone does not reach the plugins).
+  FFmpeg is installed under `/opt/ffmpeg`, outside pkg-config's default path: configure with
+  `PKG_CONFIG_PATH=/opt/ffmpeg/lib/pkgconfig` in the environment, otherwise the default `RAD_WITH_FFMPEG=AUTO`
+  builds without it and `images_test`, `videos_test` and `convert_test` fail.
   Check a configured tree with `grep -E 'CMAKE_HIP_COMPILER:|RAD_HIP_VOPD_REPEATABLE' build/CMakeCache.txt`. Both
   arms of an A/B are built the same way; numbers from a tree built with the stock compiler (VOPD off) are not
   comparable with this one's.
