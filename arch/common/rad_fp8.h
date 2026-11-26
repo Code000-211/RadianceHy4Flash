@@ -709,7 +709,11 @@ inline int GateQuantFP8::declare(RadBuilder* b, const Geom& g, rad_buf gate_up, 
                { gate_up }, { a.x });
         return op ? RAD_OK : RAD_E_INVAL;
     }
-    if (!gate_up || !a.x || !a.cq() || !a.cs() || n <= 0) return RAD_E_INVAL;
+    /* The bf16 plane is asked for only where an op of this gate names it: a gate that writes the
+     * codes alone (the fused gate of a rotated int8 model, gated_had_quant_i8g) leaves it out of
+     * the write list below, and an architecture that declares no plane for that form passes 0
+     * (P-11b: the plane was arena nothing read, and refusing it here turned the fused gate off). */
+    if (!gate_up || !a.cq() || !a.cs() || n <= 0) return RAD_E_INVAL;
     /* Rotated codes feed a four-bit expert, which reads E4M3 only. */
     if (rot && a.q8_fed) return RAD_E_INVAL;
     /* Rotated int8 codes (ActFP8::q8_rot) feed a down projection stored at i8a8h:
@@ -723,8 +727,10 @@ inline int GateQuantFP8::declare(RadBuilder* b, const Geom& g, rad_buf gate_up, 
                                RAD_INT("group", a.cg()), RAD_STR("dtype", g.dtype),
                                RAD_STR("act", act_name)),
                     RAD_NOWEIGHTS);
-    /* The rotated op's chain, which writes the bf16 plane whether or not a consumer asked. */
-    if (!op && rot && std::strcmp(act_name, "silu") == 0) {
+    /* The rotated op's chain, which writes the bf16 plane whether or not a consumer asked: the one
+     * form here that reads the plane, so it is asked for with `a.x` (P-11b). A gate that got the
+     * codes-only row above never comes here. */
+    if (!op && rot && a.x && std::strcmp(act_name, "silu") == 0) {
         want_x = true;
         op = rw(b, RAD_OP(b, "silu_mul",
                    RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("n", n), RAD_STR("dtype", g.dtype)),
