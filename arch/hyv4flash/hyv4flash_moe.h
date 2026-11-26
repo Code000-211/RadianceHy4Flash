@@ -44,7 +44,7 @@ struct GatedMlp {
     int declare(RadBuilder* b, Names& nm, const Geom& g, const Shape& s, int l, const char* gu_name,
                 const char* dn_name, const char* mp, int64_t ff_w, rad_buf x, rad_buf y,
                 rad_buf gu_buf, rad_buf ff_buf, const Lin* feed = nullptr,
-                const ActFP8* in_codes = nullptr) {
+                const ActFP8* in_codes = nullptr, rad_buf* ff_slot = nullptr) {
         gu = gu_buf;
         ff = ActFP8{};
         ff.x = ff_buf;
@@ -82,6 +82,14 @@ struct GatedMlp {
                 ff.x = ff_buf;
                 act = GateQuantFP8{};
             }
+        }
+        /* The product plane (P-11b): only the unfused pair reads or writes it, so it is declared
+         * here, where the form is settled, and once for the model -- `ff_slot` is the model's, and
+         * the first layer that needs the plane declares it for every later one. */
+        if (!gfuse && ff_slot && !*ff_slot) {
+            *ff_slot = decl_b(b, nm.f("dense_ff"), RAD_BF16, { g.max_tok, ff_w });
+            if (!*ff_slot) return RAD_E_INVAL;
+            ff.x = *ff_slot;
         }
         if (!gfuse) RAD_ARCH_TRY(act.declare(b, g, gu, ff, ff_w, "silu"));
         /* The fold: gate_up, the gate and the codes of the product in one epilogue (the rule every
@@ -249,10 +257,17 @@ struct MoeWire {
             Geom gq = g;
             gq.w_bf16 = false;
             const bool i8 = arm == kArmI8;
-            RAD_ARCH_TRY(lat.declare_qs(b, nm, gq, nm.f("moe.latent"), L));
+            /* The latent's E4M3 pair (P-11b): the routed GEMMs read the rotated int8 pair `hr`, so
+             * for an int8 arm nothing is left to read it -- the comment above called it a
+             * prepared-input check, and no op of the plan names it. A codebook arm still reads it,
+             * so only the int8 arm declares none (declare_qs takes no both-empty form). */
+            if (!i8) RAD_ARCH_TRY(lat.declare_qs(b, nm, gq, nm.f("moe.latent"), L));
             RAD_ARCH_TRY(w.hr.declare_qs(b, nm, gq, nm.f("moe.latent_rot"), L, 0, i8, !i8));
             w.hr.q8_fed = w.hr.q8_rot = i8;
-            RAD_ARCH_TRY(w.eff.declare_qs(b, nm, gq, nm.f("moe.expert_ff"), F, T * k, i8, true));
+            /* `!i8` as for `hr` a line above: the fused SwiGLU writes the rotated int8 pair the
+             * down projection reads, and the E4M3 pair beside it is read by nothing an int8 model
+             * issues (P-11b). A codebook down projection behind a trellis gate_up keeps its pair. */
+            RAD_ARCH_TRY(w.eff.declare_qs(b, nm, gq, nm.f("moe.expert_ff"), F, T * k, i8, !i8));
             w.eff.q8_fed = w.eff.q8_rot = i8;
         }
         return lat.x && routed && sgu && sff && sout && w.logits && w.ids && w.ew && w.eoff &&
@@ -390,7 +405,7 @@ struct Ffn {
 
     /* `in_codes` (G-3b): the rotated int8 codes of `x` the junction in front writes. */
     int declare(RadBuilder* b, Names& nm, const Shape& s, const Geom& geom, int l, rad_buf x,
-                rad_buf y, const MoeWire& wire, rad_buf dense_gu, rad_buf dense_ff,
+                rad_buf y, const MoeWire& wire, rad_buf dense_gu, rad_buf* dense_ff,
                 rad_buf dense_out, MoeFP8::Src* src, const ActFP8* in_codes = nullptr) {
         g = geom;
         layer = l;
@@ -412,7 +427,7 @@ struct Ffn {
             mo = dense_out;
             RAD_ARCH_TRY(mlp.declare(b, nm, g, s, l, nm.f("blk.%d.ffn_gate_up", l),
                                      nm.f("blk.%d.ffn_down", l), mp, s.n_ff_r, xf, mo, dense_gu,
-                                     dense_ff));
+                                     dense_ff ? *dense_ff : 0, nullptr, nullptr, dense_ff));
             sum = mo;
             post_src = nm.ckpt("%s.post_fc2_norm.weight", mp);
         } else {

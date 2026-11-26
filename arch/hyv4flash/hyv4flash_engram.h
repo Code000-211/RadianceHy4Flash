@@ -86,9 +86,16 @@ struct EngramWire {
                        RAD_DOMAIN_HOST);
         mask = decl_b(b, nm.f("eg.mask"), RAD_I32, { T });
         raw = decl_b(b, nm.f("eg.rows"), RAD_BF16, { T, W }, RAD_BUF_TRANSIENT, RAD_DOMAIN_HOST);
-        q = decl_b(b, nm.f("eg.rows.q"), RAD_F8E4M3, { T * H, HD });
-        qs = decl_b(b, nm.f("eg.rows.s"), RAD_F32, { T * H, 1 });
-        rt = decl_b(b, nm.f("eg.rows.rt"), RAD_BF16, { T, W });
+        /* The round trip's three planes (P-11b): `quant_act_fp8` and `dequant` name them only when
+         * the rows go through an E4M3 round trip (Engram::roundtrip), and a model whose table is
+         * already E4M3 -- hy4-flash-bf16-f32, the served u3 -- asks for none. Declared beside the
+         * wire they took arena the whole program for nothing, so they follow the model's own
+         * `engram_fp8`; a bf16 table still gets them. */
+        if (s.engram_fp8) {
+            q = decl_b(b, nm.f("eg.rows.q"), RAD_F8E4M3, { T * H, HD });
+            qs = decl_b(b, nm.f("eg.rows.s"), RAD_F32, { T * H, 1 });
+            rt = decl_b(b, nm.f("eg.rows.rt"), RAD_BF16, { T, W });
+        }
         e = decl_b(b, nm.f("eg.normed"), RAD_BF16, { T, W });
         key = decl_b(b, nm.f("eg.key"), RAD_BF16, { T, s.hc * s.n_embd });
         val = decl_b(b, nm.f("eg.value"), RAD_BF16, { T, s.n_embd });
@@ -97,7 +104,8 @@ struct EngramWire {
             before = decl_b(b, nm.f("eg.before"), RAD_BF16, { T, s.hc * s.n_embd }, RAD_BUF_PERSIST);
             m1 = decl_b(b, nm.f("eg.minus_one"), RAD_BF16, { T, s.hc * s.n_embd }, RAD_BUF_PERSIST);
         }
-        return ids && ahead && mask && raw && q && qs && rt && e && key && val &&
+        return ids && ahead && mask && raw && e && key && val &&
+               (!s.engram_fp8 || (q && qs && rt)) &&
                        (!taps_on() || (before && m1))
                    ? RAD_OK
                    : RAD_E_INVAL;
