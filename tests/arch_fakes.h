@@ -1283,6 +1283,32 @@ std::vector<const RadCtx*> view(const std::vector<std::unique_ptr<RadCtx>>& v) {
     return p;
 }
 
+/* Ctx::lane1_ rule 3 (abi/rad_runtime.h): every buffer an issue on the second lane reads or
+ * writes is named to rad_buf_concurrent, or lives the whole program anyway (PERSIST, DERIVED, no
+ * declared use). The planner packs transients from one linear order, so an unnamed transient the
+ * second lane touches may share bytes with one lane 0 uses at the same time (#282). One finding a
+ * buffer, by name. */
+std::vector<std::string> lane1_unnamed(const RadBuilder& b, const std::vector<const RadCtx*>& passes) {
+    const std::vector<Live> L = liveness(b);
+    const std::set<rad_buf> conc(b.concurrent.begin(), b.concurrent.end());
+    std::set<rad_buf> seen;
+    std::vector<std::string> bad;
+    for (const RadCtx* c : passes)
+        for (const RecIssue& is : c->issues) {
+            if (is.lane != 1) continue;
+            for (const RadOperand& od : is.opd) {
+                if (od.kind != RAD_OPK_BUF || od.handle == 0 || od.handle > b.bufs.size()) continue;
+                const rad_buf h = od.handle;
+                if (!L[h].transient || !L[h].planned || conc.count(h) || !seen.insert(h).second)
+                    continue;
+                const RecOp* o = b.op_of(is.op);
+                bad.push_back("'" + b.bufs[h - 1].name + "' is touched on lane 1 (" +
+                              (o ? o->op : std::string("?")) + ") and not named concurrent");
+            }
+        }
+    return bad;
+}
+
 /* The lint as a check: every finding is printed, and the step passes only with none. */
 size_t report_lint(const std::vector<std::string>& f) {
     for (size_t i = 0; i < f.size() && i < 12; ++i) fprintf(stderr, "    lint: %s\n", f[i].c_str());

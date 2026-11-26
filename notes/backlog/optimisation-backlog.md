@@ -526,11 +526,19 @@ Round 5: the block rule has arms of its own. `dual_block_rows` says in which blo
 - Change: `hyv4flash_common.h:188-200` declares `rope` (one `sincosf` a (token, head, pair)); `r4d_model_bf16.hip:1530-1541`, `r4d_rows.cpp:7384`.
 - Verify: kbench; harness parity.
 
-#### K-50 `mla_expand_gate` at prefill: stage the token block once a head; lift the 64-row cap of the had_quant fusion
+#### K-50 `mla_expand_gate` at prefill: stage the token block once a head
 - Area kernel · BI · Gain prefill +0.5-1 % · Conf medium · Effort M
-- Change: `r4d_mla_kv_bf16.hip:330-365, 530`: each of a head's 16 column-tile workgroups re-reads the same 64 x 512 bf16 token block (1.07 GB of L2 a call at 32 heads). `kFuseRows 64` (`hyv4flash_attn.h:133, 466, 648`): give `kv_expand_gate_quant` an MB axis and lift the cap (removes a 33.5 MB round trip + one quantiser a layer-step).
-- Why: M (§2.4): `mla_expand_gate` 42 x 504 us = 21.2 ms (3.7 %) + its quantiser 42 x ~46 us.
+- Split 2026-11-25 (#60, owner): this item is part 1 only; part 2, the 64-row cap of the had_quant fusion, is K-50b (#266).
+- Change: `r4d_mla_kv_bf16.hip:330-365, 530`: each of a head's 16 column-tile workgroups re-reads the same 64 x 512 bf16 token block (1.07 GB of L2 a call at 32 heads). Stage it once a head (`kv_expand_staged`).
+- Why: M (§2.4): `mla_expand_gate` 42 x 504 us = 21.2 ms (3.7 %).
 - Verify: `tests/r4d_emu/test_mla_kv.cpp`; kbench `mla_expand_gate` (48 cases).
+
+#### K-50b `mla_expand_gate` at prefill: lift the 64-row cap of the had_quant fusion
+- Area kernel · BI · Gain prefill (the quantiser of K-50's basis) · Conf medium · Effort M · Deps K-50
+- Split from K-50 on 2026-11-25 (#60, owner): part 2 of the item.
+- Change: `kFuseRows 64` (`hyv4flash_attn.h:133, 466, 648`): give `kv_expand_gate_quant` an MB axis (more than one token tile a workgroup) and lift the cap, so prefill chunks above 64 rows keep the fused quantiser (removes a 33.5 MB round trip + one quantiser a layer-step).
+- Why: M (§2.4): the quantiser after `mla_expand_gate`, 42 x ~46 us.
+- Verify: `tests/r4d_emu/test_mla_kv.cpp`; kbench `mla_expand_gate` and `kv_expand_gate_quant` above 64 rows.
 
 #### K-51 Small-N trunk GEMMs at prefill run 4x below `attn_output`'s rate: tile arm / global decode claim
 - Closed, without code (`notes/backlog/closed/K-51.md`): the premise does not reproduce -- `gemm_iqr_tiled` at the item's own Verify pair is 83.0 us against 516.0 (77.6 against 99.8 TMAC/s: 1.29x, and 1.24x against the same-K 3072 shape), not 4x, and the audit's 0.36 ms a call at 18 TMAC/s is 4.3x the row's own launch of the same shape. The second location was built and measured: a claim of half a part along K (16 units an N tile, so at the served chunk's 16 M bands every block decodes rather than eight of them) ties the merge base on one card, interleaved (83.0 against 82.1 us min, 84.5 against 87.9 median at N 1024 K 3072 M 2048; 516.0 against 517.2 at 3072/8192/2048), because the eight parts already decode in parallel and the wait they hold the other half for is under 1 % of the call; the whole decode is 6.8 us of 83.0 (`gemm_iqr_tiled` against `gemm_i8a8_tiled` 76.2 at the same shape) and nothing at all at N 3072 (516.0 against 541.7: at large N the 5-bit code read wins back more than the decode costs). The tile arm cannot help either: q_a's grid is 2 blocks a CU of a 3-block, 24-wave occupancy (240 VGPR, 19460 B LDS, 6 waves a SIMD), entirely resident at 16 of 24 waves, and a 64-wide N tile keeps the same 16 waves -- the header's own record has that arm tying ("8 x 1 waves (256x64)"). The Verify's open question is answered: `kv_a` (N 576) is `gemm_bf16_nt_tiled` and `index_head` (N 16) `gemm_bf16_nt_m64` at every M (`debug-graph` on the real container, and the same keys in the `profile-ops` table), so neither reaches an IQR tile. No served figure is claimed: `RADIANCE_AQL_STAMP=1` wrote 195592 rows of the model load and warm-up and none inside the probe's window, `profile-ops` inflates `ms_step` 15x and mixes the run's two requests, and the local lane cannot start on this host (`ngram ram` needs 116 GiB against 102-104 available).

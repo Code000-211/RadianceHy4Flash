@@ -688,6 +688,18 @@ static RadParam PS(const char* k, const char* v) {
     RadParam p; std::memset(&p, 0, sizeof(p));
     p.key = k; p.kind = RAD_P_STR; p.sval = v; return p;
 }
+/* The test's own arguments with one parameter more on top -- the pin rad-tune would write (K-59's
+ * axis cases). RadArgs names its parameter array by pointer, so `keep` is the caller's and must
+ * outlive the launch. */
+static RadArgs args_with(const std::vector<RadParam>& ps, const RadArgs& a, const char* name,
+                         long long v, std::vector<RadParam>& keep) {
+    keep = ps;
+    keep.push_back(PI(name, v));
+    RadArgs a2 = a;
+    a2.p = keep.data();
+    a2.n_p = (int)keep.size();
+    return a2;
+}
 /* A real-valued parameter, RAD_P_F64 as in the schemas (docs/OPS.md). This file calls launches
  * directly with no declare to catch a kind mismatch, so a string would silently fall back to the
  * shim's default. */
@@ -3621,6 +3633,46 @@ static void moe_gather_at(const Plugin& pl, const RadKernelInfo* r, const MoeGat
         ok(label.c_str(), diff == 0,
            std::to_string(diff) + " of " + std::to_string(M * n) +
                " differ from a column a thread" + first);
+    }
+
+    /* K-59's `form` axis: the same choice the hook pins, read from the launch's parameters, and a
+     * value the forms do not name refused rather than read as the rule. */
+    {
+        auto run_axis = [&](long long form, std::vector<uint16_t>& out) -> int {
+            std::vector<uint16_t> junk((size_t)(M * n), 0x7f7fu);
+            st_memcpy(d_y, junk.data(), junk.size() * 2, hipMemcpyHostToDevice);
+            std::vector<RadParam> p2;
+            RadArgs a2 = args_with(ps, a, "form", form, p2);
+            const int rc = r->launch(&a2, nullptr);
+            const hipError_t he = (hipError_t)st_stream_sync(nullptr);
+            if (rc == RAD_OK && he != hipSuccess) return RAD_E_DEVICE;
+            out.assign((size_t)(M * n), 0u);
+            st_memcpy(out.data(), d_y, out.size() * 2, hipMemcpyDeviceToHost);
+            return rc;
+        };
+        std::vector<uint16_t> ax;
+        if (const int rc = run_axis(1, ax); rc != RAD_OK) {
+            ok(("moe_gather, the form axis, a column a thread" + at).c_str(), false,
+               "rc=" + std::to_string(rc));
+        } else {
+            int64_t diff = 0;
+            for (size_t i = 0; i < ax.size(); ++i) diff += ax[i] != base[i];
+            ok(("moe_gather, the form axis, a column a thread, byte for byte" + at).c_str(),
+               diff == 0, std::to_string(diff) + " of " + std::to_string(M * n) +
+                              " differ from the pinned form");
+        }
+        if (const int rc = run_axis(2, ax); sh.wide && !f32 && rc == RAD_OK) {
+            int64_t diff = 0;
+            for (size_t i = 0; i < ax.size(); ++i) diff += ax[i] != base[i];
+            ok(("moe_gather, the form axis, a wave a token, byte for byte" + at).c_str(),
+               diff == 0, std::to_string(diff) + " of " + std::to_string(M * n) +
+                              " differ from the pinned form");
+        }
+        {
+            const int rc = run_axis(7, ax);
+            ok(("moe_gather, a form the forms do not name" + at + " is refused").c_str(),
+               rc == RAD_E_INVAL, "rc=" + std::to_string(rc));
+        }
     }
 
     if (M >= 2048 && sh.wide && !f32) {
@@ -8637,6 +8689,57 @@ static void moe_iqr_pack_case(const Plugin& pl, int64_t Mtok, bool down, int B =
                !entries ? "no map in the scratch"
                         : std::to_string(with_rows) + " of " + std::to_string(entries) +
                               " entries carry a row count (the run map was built)");
+        }
+    }
+    /* K-59's `map` axis (rad-tune's): the same two maps reached by the parameter, with the test hook
+     * off, and the map built is the one the axis named -- the run map (four tiles, no row counts in
+     * its entries) at 4, the packed one (eight tiles, row counts) at 8 -- over the run map's bytes. */
+    {
+        auto run_axis = [&](long long m, std::vector<uint16_t>& out, int64_t& entries,
+                            int64_t& with_rows, int& rca) {
+            std::vector<RadParam> p2;
+            RadArgs a2 = args_with(ps, a, "map", m, p2);
+            st_memcpy(d_y, poison.data(), poison.size() * 2, hipMemcpyHostToDevice);
+            rca = r->launch(&a2, (RadStream) nullptr);
+            const bool fine = rca == RAD_OK && st_stream_sync(nullptr) == hipSuccess;
+            if (fine) {
+                st_memcpy(out.data(), d_y, out.size() * 2, hipMemcpyDeviceToHost);
+                map_rows(entries, with_rows);
+            } else {
+                entries = with_rows = 0;
+            }
+            return fine;
+        };
+        for (const long long m : { 4LL, 8LL }) {
+            const std::string what = std::string(nm) + ": the map axis takes " +
+                                     (m == 8 ? "the packed map at eight tiles" : "the run map at four tiles");
+            std::vector<uint16_t> y2((size_t)(Tr * N));
+            int64_t entries = 0, with_rows = 0;
+            int rca = 0;
+            if (!run_axis(m, y2, entries, with_rows, rca)) {
+                ok(what.c_str(), false, "launch failed rc " + std::to_string(rca));
+                continue;
+            }
+            int64_t diff = 0, first = -1;
+            for (size_t i = 0; i < y2.size(); ++i)
+                if (y2[i] != y0[i]) { if (first < 0) first = (int64_t)i; ++diff; }
+            const bool want_rows = m == 8;
+            ok(what.c_str(), diff == 0 && entries > 0 && (with_rows > 0) == want_rows,
+               diff ? std::to_string(diff) + " of " + std::to_string(y2.size()) +
+                          " elements differ from the run map's, first row " +
+                          std::to_string(first / N) + " column " + std::to_string(first % N)
+                    : std::to_string(with_rows) + " of " + std::to_string(entries) +
+                          " entries carry a row count (" + (want_rows ? "the run" : "the packed") +
+                          " map was built)");
+        }
+        /* A value the axis does not name is refused, not read as the rule: a misspelt
+         * RADIANCE_TUNE= must not look like a pin that took. */
+        {
+            std::vector<RadParam> p3;
+            RadArgs a3 = args_with(ps, a, "map", 3, p3);
+            const int rc3 = r->launch(&a3, (RadStream) nullptr);
+            ok((std::string(nm) + ": a map value the axis does not name is refused").c_str(),
+               rc3 == RAD_E_INVAL, "rc=" + std::to_string(rc3));
         }
     }
     /* `split` (a checkpoint inside the step): with each expert's slots ascending, as the router's
@@ -20121,6 +20224,60 @@ static void moe_down_mt_case(const Plugin& pl, int64_t Mtok) {
                       std::to_string(first / N) + " column " + std::to_string(first % N)
                 : "the 32-row block's bytes");
     }
+    /* K-59's `dmt` axis (rad-tune's): the two M tiles a block reached by the parameter with the test
+     * hook off, over the 32-row block's bytes, and a value that is neither refused rather than taken
+     * as the rule. */
+    {
+        auto run_axis = [&](long long dm, std::vector<uint16_t>& out, int& rca) {
+            std::vector<RadParam> p2;
+            RadArgs a2 = args_with(ps, a, "dmt", dm, p2);
+            st_memcpy(d_y, poison.data(), poison.size() * 2, hipMemcpyHostToDevice);
+            rca = r->launch(&a2, (RadStream) nullptr);
+            const bool fine = rca == RAD_OK && st_stream_sync(nullptr) == hipSuccess;
+            if (fine) st_memcpy(out.data(), d_y, out.size() * 2, hipMemcpyDeviceToHost);
+            return fine;
+        };
+        for (const long long dm : { 2LL, 4LL }) {
+            const std::string what = std::string(nm) + ": the dmt axis takes " +
+                                     std::to_string(dm) + " M tiles a block";
+            std::vector<uint16_t> y2((size_t)(Tr * N));
+            int rca = 0;
+            if (!run_axis(dm, y2, rca)) {
+                ok(what.c_str(), false, "launch failed rc " + std::to_string(rca));
+                continue;
+            }
+            int64_t diff = 0;
+            for (size_t i = 0; i < y2.size(); ++i) diff += y2[i] != y0[i];
+            ok(what.c_str(), diff == 0,
+               diff ? std::to_string(diff) + " of " + std::to_string(y2.size()) +
+                          " elements differ from the 32-row block's"
+                    : "the 32-row block's bytes");
+        }
+        std::vector<uint16_t> y2((size_t)(Tr * N));
+        int rca = 0;
+        run_axis(8, y2, rca);
+        ok((std::string(nm) + ": the dmt axis at eight tiles is refused").c_str(),
+           rca == RAD_E_UNSUPPORTED, "rc " + std::to_string(rca) + " for a value that is neither 2 nor 4");
+    }
+    /* K-59: what the axis is worth at this shape -- the two blocks, three rounds each, the order
+     * rotated so a clock ramp falls on both. */
+    {
+        auto us_of = [&](long long dm) {
+            std::vector<RadParam> p2;
+            RadArgs a2 = args_with(ps, a, "dmt", dm, p2);
+            return st_time_us([&](int) { r->launch(&a2, (RadStream) nullptr); }, 8, nullptr);
+        };
+        std::vector<double> u2, u4;
+        for (int round = 0; round < 3; ++round) {
+            if (round & 1) { u4.push_back(us_of(4)); u2.push_back(us_of(2)); }
+            else           { u2.push_back(us_of(2)); u4.push_back(us_of(4)); }
+        }
+        auto med = [](std::vector<double> v) { std::sort(v.begin(), v.end()); return v[v.size() / 2]; };
+        const double m2 = med(u2), m4 = med(u4);
+        std::printf("  dmt timing\tdmt 2 %8.1f us  dmt 4 %8.1f us  (dmt 4 is %+.1f%%)\n", m2, m4,
+                    100.0 * (m4 - m2) / m2);
+        std::fflush(stdout);
+    }
     dfree_all();
 }
 
@@ -26403,6 +26560,18 @@ static void moe_w4_gemm(const Plugin& pl, int64_t Tr, const MoeW4Shape& sh, int 
      * the sorted operand). */
     const bool fk2 = !sh.sorted_a && g64 && sh.K0 % 256 == 0 && sh.K1 % 256 == 0;
     moe_dec_variants(pl, r, a, d_y, (size_t)(Tr * N), fk2, what);
+    /* K-59's `dmt` axis: only the w4nl64a8i8h dtype's launch builds both M tiles a block of the
+     * 256-column down tile, so every other dtype of these rows -- and a shape whose down tile is
+     * not wide -- refuses the pin rather than taking the rule as if it were the pin. */
+    if ((act8 && dt != std::string("w4nl64a8i8h")) || w8 || (act8 && !dn_wide)) {
+        std::vector<RadParam> pd = ps;
+        pd.push_back(PI("dmt", 4));
+        RadArgs ad = a;
+        ad.p = pd.data(); ad.n_p = (int)pd.size();
+        const int rc = r->launch(&ad, nullptr);
+        ok((what + ": the dmt axis is refused").c_str(), rc == RAD_E_UNSUPPORTED,
+           "rc=" + std::to_string(rc));
+    }
     if (!four) return;
 
     /* The same experts as four classes by number mod 4 (`moe_gemm_q_mod4`): each parity table read
@@ -26468,6 +26637,46 @@ static void moe_w4_gemm(const Plugin& pl, int64_t Tr, const MoeW4Shape& sh, int 
     moe_aligned_down_tile(pl, r4, a4, d_y, d_map, map_bytes, (size_t)(Tr * N), two_cls[1],
                           dn_wide, ne, what4);
     moe_dec_variants(pl, r4, a4, d_y, (size_t)(Tr * N), fk2, what4);
+    /* K-59's `dmt` axis on the four-class twin, the shape where both M tiles a block are built:
+     * the 64-row block's bytes against the rule's, through this row's own launcher. */
+    if (act8 == 1 && dn_wide && !two_cls[0].empty()) {
+        std::vector<RadParam> p4d = ps4;
+        p4d.push_back(PI("dmt", 4));
+        RadArgs a4d = a4;
+        a4d.p = p4d.data(); a4d.n_p = (int)p4d.size();
+        a4d.scratch = d_map; a4d.scratch_bytes = map_bytes;
+        {
+            std::vector<uint16_t> junk((size_t)(Tr * N), 0x7f7fu);
+            st_memcpy(d_y, junk.data(), junk.size() * 2, hipMemcpyHostToDevice);
+        }
+        const int rc = r4->launch(&a4d, nullptr);
+        st_stream_sync(nullptr);
+        if (rc != RAD_OK) {
+            ok((what4 + ": the dmt axis at four").c_str(), false, "launch rc=" + std::to_string(rc));
+        } else {
+            std::vector<uint16_t> got((size_t)(Tr * N));
+            st_memcpy(got.data(), d_y, got.size() * 2, hipMemcpyDeviceToHost);
+            int64_t diff = 0;
+            for (size_t i = 0; i < got.size(); ++i) diff += got[i] != two_cls[0][i];
+            ok((what4 + ": the dmt axis at four, the 64-row block, byte for byte" +
+                " with the rule").c_str(),
+               diff == 0, std::to_string(diff) + " of " + std::to_string(Tr * N) +
+                             " elements differ");
+        }
+    }
+    /* A value the axis does not name is refused on the shape that does read it, not read as the
+     * rule (the misspelt-pin case the review named). */
+    if (act8 == 1 && dn_wide && !two_cls[0].empty()) {
+        std::vector<RadParam> p4x = ps4;
+        p4x.push_back(PI("dmt", 8));
+        RadArgs a4x = a4;
+        a4x.p = p4x.data(); a4x.n_p = (int)p4x.size();
+        a4x.scratch = d_map; a4x.scratch_bytes = map_bytes;
+        const int rc = r4->launch(&a4x, nullptr);
+        st_stream_sync(nullptr);
+        ok((what4 + ": a dmt value the tile does not name is refused").c_str(),
+           rc == RAD_E_UNSUPPORTED, "rc=" + std::to_string(rc));
+    }
 }
 
 static void moe_w6_cases(const Plugin& pl) {
@@ -39002,6 +39211,7 @@ static void device_phase(const Plugin& pl) {
             moe_w4_gemm(pl, 8, { "small mixed down", 256, 256, 128, 128, 1, 3, true }, 0, false,
                         false, 8, 1);
             /* a large prefill pass: the down tile's 64-row block against the 32-row block */
+            moe_down_mt_case(pl, 2048);
             moe_down_mt_case(pl, 4096);
             moe_down_mt_case(pl, 8192);
         }
