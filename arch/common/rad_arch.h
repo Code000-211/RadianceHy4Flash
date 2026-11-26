@@ -677,6 +677,17 @@ inline rad_op rw(RadBuilder* b, rad_op h,
     return h;
 }
 
+/* A fused op the plugin can do without: `h` as declared when it resolved, else 0, with the
+ * unresolved op marked dropped (rad_op_dropped) so the tools do not count it as a hole. Wrap the
+ * declaration directly -- the drop answers the last rad_decl_op -- and declare the fallback (the
+ * unfused chain) wherever this returns 0. A library that does not declare the op at all records
+ * nothing, and the drop is then refused harmlessly. */
+inline rad_op optional_op(RadBuilder* b, rad_op h) {
+    if (h != RAD_NULL_HANDLE && rad_op_resolved(b, h)) return h;
+    rad_op_dropped(b);
+    return RAD_NULL_HANDLE;
+}
+
 /* ---- A weight read into the on-die cache beside a collective (libr4d `prefetch`, docs/OPS.md).
  * At decode heights a GEMM streams its weight once from memory, and a collective in front of it
  * leaves the card's memory idle for its round trip. prefetch_beside issues `op`, a `prefetch` of

@@ -37,6 +37,10 @@ using namespace avx;
 #define HY4_PAR_DYN(work)
 #endif
 
+/* The latent sinks' folded rotary needs this level's own `rope` (avx_attn.cpp); every level's object
+ * library links every kernel source, so this is the same level. */
+extern "C" int AVX_FN(avx_rope)(const RadArgs*, RadStream);
+
 namespace {
 
 /* [rows, heads*width] read as [rows, heads, width] when it is declared the narrow way. */
@@ -397,6 +401,75 @@ void mla_sink_one(const MlaSink& c, int64_t r, int64_t head, int64_t bt_row, int
 
 bool sinks_ok(const RadTensor& s, int64_t H) { return s.rank == 1 && numel(&s) >= H; }
 
+/* The rotary folded into a latent sink, or nothing: with the optional `rope_pos` operand the sink's
+ * `q_rope` holds the projection's raw columns and this level's own `rope` rotates them before the
+ * score, so those rows need no `rope` launch (libref/ref_hy4.cpp's sink_rope is the same fold).
+ * `pos` is [rows] or [n_comp, rows] -- a view of the caller's positions, which may carry a whole
+ * step's. gptj's adjacent pairings only: the device kernel turns the fragment a lane holds, and a
+ * pairing that reaches half a head away is refused rather than half applied.
+ * The rotary is this level's own `rope` (avx_attn.cpp), declared below. */
+int sink_rope(const RadArgs* a, int nt, const RadTensor& src, int64_t rows, int64_t H, int64_t R,
+              std::vector<uint16_t>* buf, RadTensor* dst) {
+    const RadTensor* p = rad_arg_in(a, nt);
+    if (!p || !p->data) return RAD_OK; /* q_rope arrives rotated */
+    if (p->dtype != RAD_I32) return RAD_E_DTYPE;
+    const char* mode = p_str(a, "rope_mode", "gptj");
+    if (std::strcmp(mode, "gptj") != 0 && std::strcmp(mode, "imrope_gptj") != 0)
+        return RAD_E_UNSUPPORTED;
+    RadTensor pv = *p;
+    if (p->rank >= 2) {
+        if (p->stride[1] != 1 || p->shape[1] < rows) return RAD_E_SHAPE;
+        pv.shape[1] = rows;
+    } else {
+        if (numel(p) < rows) return RAD_E_SHAPE;
+        pv.shape[0] = rows;
+    }
+    buf->assign((size_t)(rows * H * R), 0);
+    RadTensor q{};
+    q.data = buf->data();
+    q.dtype = RAD_BF16;
+    q.rank = 3;
+    q.shape[0] = rows;
+    q.shape[1] = H;
+    q.shape[2] = R;
+    q.stride[0] = H * R;
+    q.stride[1] = R;
+    q.stride[2] = 1;
+    float* scr = scratch_f32((size_t)R);
+    for (int64_t r = 0; r < rows; ++r)
+        for (int64_t h = 0; h < H; ++h) {
+            const float* row = in_row(&src, r * src.stride[0] + h * src.stride[1], R, scr);
+            out_row(&q, (r * H + h) * R, R, row);
+        }
+    /* The rope op's own geometry, [rows, heads * width] (as libref's sink_rope explains). */
+    RadTensor qe = q;
+    qe.rank = 2;
+    qe.shape[0] = rows;
+    qe.shape[1] = H * R;
+    qe.stride[0] = H * R;
+    qe.stride[1] = 1;
+    RadParam rp[8];
+    int np = 0;
+    rp[np++] = RAD_INT("head_dim", R);
+    rp[np++] = RAD_INT("n_head", H);
+    rp[np++] = RAD_INT("n_head_kv", 0);
+    rp[np++] = RAD_F64("theta", p_f32(a, "rope_theta", 10000.0f));
+    rp[np++] = RAD_F64("scale", p_f32(a, "rope_scale", 1.0f));
+    rp[np++] = RAD_STR("mode", mode);
+    const char* sec = p_str(a, "rope_sections", nullptr);
+    if (sec && *sec) rp[np++] = RAD_STR("sections", sec);
+    RadTensor rt[2] = { qe, pv };
+    RadArgs ra{};
+    ra.t = rt;
+    ra.n_t = 2;
+    ra.p = rp;
+    ra.n_p = np;
+    const int st = AVX_FN(avx_rope)(&ra, RadStream{});
+    if (st != RAD_OK) return st;
+    *dst = q;
+    return RAD_OK;
+}
+
 }  // namespace
 
 /* mla_attn_paged with a window and a sink. Sequence s owns rows [cu[s], cu[s+1]); its context after
@@ -422,6 +495,11 @@ AVX_KERNEL(mla_attn_paged_sink) {
         return RAD_E_SHAPE;
     const int64_t n_seq = numel(&su), rows = q.shape[0];
     if (cuv(&cu, 0) != 0 || cuv(&cu, n_seq) != rows || bt.shape[0] < n_seq) return RAD_E_SHAPE;
+    std::vector<uint16_t> qrbuf;
+    RadTensor qrf = qr;
+    const int rst = sink_rope(a, 8, qr, rows, H, R, &qrbuf, &qrf);
+    if (rst != RAD_OK) return rst;
+    qr = qrf;
     const MlaSink c{ &q, &qr, &kv, &bt, &o, L, R, bs, scale };
     const int64_t ctx_max = bt.shape[1] * bs;
     HY4_PAR_DYN(rows * H * (L + R) * std::min<int64_t>(ctx_max, 4096))
@@ -457,6 +535,11 @@ AVX_KERNEL(mla_attn_sel_sink) {
         o.shape[0] != q.shape[0] || o.shape[1] != H || o.shape[2] != L || !sinks_ok(sinks, H))
         return RAD_E_SHAPE;
     const int64_t rows = q.shape[0];
+    std::vector<uint16_t> qrbuf;
+    RadTensor qrf = qr;
+    const int rst = sink_rope(a, 7, qr, rows, H, R, &qrbuf, &qrf);
+    if (rst != RAD_OK) return rst;
+    qr = qrf;
     const MlaSink c{ &q, &qr, &kv, &bt, &o, L, R, bs, scale };
     const int64_t ctx_max = bt.shape[1] * bs;
     HY4_PAR_DYN(rows * H * (L + R) * std::min<int64_t>(ctx_max, 4096))
@@ -1021,6 +1104,9 @@ AVX_KERNEL(engram_ids) {
     const int64_t heads = p_int(a, "heads", 0), ngram = p_int(a, "ngram", 0),
                   pad = p_int(a, "pad", -1), msize = p_int(a, "map_size", 0),
                   image = p_int(a, "image", -1), video = p_int(a, "video", -1);
+    /* 0: the ids are hashed against the window and the window is left as it was, for the Engram
+     * layers that share another's history and are not the last of the step's. */
+    const bool advance = p_int(a, "advance", 1) != 0;
     if (heads < 1 || ngram < 2 || ngram > 8 || heads % (ngram - 1) || msize < 1) return RAD_E_SHAPE;
     if (pad < 0 || pad >= msize) return RAD_E_INVAL;
     const int64_t per = heads / (ngram - 1), ctx = ngram - 1;
@@ -1100,7 +1186,8 @@ AVX_KERNEL(engram_ids) {
         }
         /* The window after the step, by ple_conv's rule: a decode step (num_accepted present)
          * shifts the old ids down by one and appends every id it ran; otherwise every id commits
-         * and the last ctx land at offset zero. */
+         * and the last ctx land at offset zero. Only an `advance` issue moves it on. */
+        if (!advance) continue;
         if (nacc) {
             for (int64_t i = 0; i + 1 < ctx; ++i) st_int_dt(st.dtype, st.data, sb + i, prev[i + 1]);
             for (int64_t t = 0; t < T; ++t)

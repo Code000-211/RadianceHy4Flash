@@ -8,3 +8,6 @@ __pycache__/
 .cache/
 
 /runs/
+
+# per-user tool state (gh, etc.) must never be committed
+.local/

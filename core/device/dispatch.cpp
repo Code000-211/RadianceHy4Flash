@@ -105,6 +105,9 @@ static const DeviceBackend* select_backend() {
     RAD_INFO("device: built with HIP but no device is visible -- using the host backend");
     g_host_beside_hip = *host_backend();
     g_host_beside_hip.code_mark = aql_code_registered;
+    /* The code objects of a host run beside HIP are the AQL backend's: they load on the card when
+     * a device kernel runs there, and they hold VRAM while it does. */
+    g_host_beside_hip.code_resident = aql_code_resident;
     const DeviceBackend* b = &g_host_beside_hip;
 #else
     const DeviceBackend* b = host_backend();
@@ -900,6 +903,10 @@ int     dev_code_runs(size_t from, size_t to, int device, std::string* why) {
     const int r = dev()->code_runs(from, to, device, buf, (int)sizeof buf);
     if (why) *why = buf;
     return r;
+}
+int     dev_code_resident(int device, int64_t* bytes, int* modules) {
+    if (!dev()->code_resident) return RAD_E_UNSUPPORTED;
+    return dev()->code_resident(device, bytes, modules);
 }
 
 }  /* namespace rad */

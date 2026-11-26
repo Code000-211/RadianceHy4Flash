@@ -159,6 +159,10 @@ private:
     Counter c_draft_refills_, c_draft_refill_tokens_;
     Counter c_lookup_proposals_, c_lookup_held_, c_lookup_held_drafts_, c_lookup_held_hits_;
     Counter c_suffix_steps_, c_suffix_rows_, c_suffix_accepted_, c_ahead_refused_suffix_hot_;
+    Counter c_suffix_global_, c_suffix_global_busy_, c_suffix_adopted_, c_suffix_global_credited_;
+    Counter c_disk_written_, c_disk_admitted_, c_disk_rejected_, c_disk_deferred_, c_disk_paged_in_;
+    Counter c_disk_compactions_;
+    Gauge   g_disk_hour_, g_disk_entries_, g_disk_snaps_, g_disk_bytes_, g_disk_loaded_;
     Counter c_attn_cached_, c_linear_cached_, c_checkpoints_;
     Counter c_prefix_queries_;
     Counter c_prefix_evict_, c_prefix_ckpt_evict_;

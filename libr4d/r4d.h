@@ -704,6 +704,10 @@ void r4d_gemm_i8a8_pin_split_waves(int waves);
 // matrix form (which refuses a shape it is not built for). The two sum in different orders, so
 // r4d_selftest --perfqsa compares them to a tolerance.
 void r4d_qsa_score_pin_form(int form);
+// Test hook: pins the indexer score's (idx_score) form. 0 is the launcher's rule (row-tiled from
+// 256 rows), 1 the per-row form, 2 the row-tiled form. Bit-identical; r4d_selftest compares them
+// and --perfidx times both.
+void r4d_idx_score_pin_form(int form);
 // Test hook: pins the QSA selection's form. 0 is the launcher's rule, 1 the single-workgroup
 // kernel, 2 the wide-launch (three-pass) kernel; the split path keeps its own rule. The pinned
 // forms are bit-identical, and r4d_selftest compares them.

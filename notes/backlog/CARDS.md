@@ -50,13 +50,29 @@ scripts/backlog/lane.sh --env iks-A               # what a lane exports: port, m
   (default `<lane lock dir>` = `/tmp/radiance-lanes`, `RAD_LANE_LOCK_DIR` overrides) is what a local lane run holds
   for its whole run.
 - **The local lane serves `<tree>/build/bin/radiance`**, so that tree is built once. Here the build needs ROCm's
-  clang++ as the host compiler: the host's GCC 13 rejects the compound literals in `abi/rad_runtime.h`, and a
-  whole-tree build stops on the narrowing errors in `tests/museglimmer_test.cpp`, which the lane does not use.
+  clang++ as the host compiler: the host's GCC 13 rejects the compound literals in `abi/rad_runtime.h`.
+  Device code is compiled with **radiance's own HIP compiler**, the one the Dockerfile builds and ships:
+  ROCm 10.1's clang over the libLLVM rebuilt with `docker/llvm-vopd-pairing.patch`, installed on this host as
+  `/opt/rocm-repeatable`. Stock clang 24 pairs VOPD non-repeatably (two compiles of the same code can differ in
+  `.text` and speed), so CMake turns VOPD off on it (`rad_hip_repeatable`, 1.4-3.5 % on the fp8 prefill tiles);
+  the patched one keeps VOPD on and repeatable. Build exactly as the image does:
   ```sh
   cmake -S . -B build -G Ninja -DCMAKE_CXX_COMPILER=/opt/rocm/llvm/bin/clang++ \
-        -DRAD_WITH_HIP=ON -DRAD_GPU_TARGETS=gfx1201
+        -DCMAKE_HIP_COMPILER=/opt/rocm-repeatable/lib/llvm/bin/clang++ -DCMAKE_HIP_COMPILER_ROCM_ROOT=/opt/rocm \
+        -DCMAKE_HIP_FLAGS=--rocm-path=/opt/rocm -DRAD_HIP_VOPD_REPEATABLE=ON \
+        -DRAD_WITH_HIP=ON -DRAD_GPU_TARGETS=gfx1201 -DCMAKE_MODULE_LINKER_FLAGS=-Wl,--build-id
   cmake --build build --target radiance -j 32
   ```
+  Two findings of a whole-tree build with the tests (`ctest -LE 'gpu|oot'`) on this host. ROCm's LLD links
+  without a build id unless asked, and the kernel libraries are CMake `MODULE`s, so the module flag above is
+  what gives `libref.so` and the other plugins one: without it `kbench_test` and `kbench_mutant_test` fail
+  (rad-kbench caches code by build id; `CMAKE_SHARED_LINKER_FLAGS` alone does not reach the plugins).
+  FFmpeg is installed under `/opt/ffmpeg`, outside pkg-config's default path: configure with
+  `PKG_CONFIG_PATH=/opt/ffmpeg/lib/pkgconfig` in the environment, otherwise the default `RAD_WITH_FFMPEG=AUTO`
+  builds without it and `images_test`, `videos_test` and `convert_test` fail.
+  Check a configured tree with `grep -E 'CMAKE_HIP_COMPILER:|RAD_HIP_VOPD_REPEATABLE' build/CMakeCache.txt`. Both
+  arms of an A/B are built the same way; numbers from a tree built with the stock compiler (VOPD off) are not
+  comparable with this one's.
 - **`run.sh <tag> <cfg.yaml> <phases> [ENV=VAL ...] [-- radiance args]`** one server in the lane, `probe.py`
   against it, then it is stopped. Everything lands in `runs/<lane>/<tag>/`: the lane's rendered config
   (`<cfg>.yaml` with the lane's port, model, host pool and `ngram-placement`), `server.log`, `run.out`, `<tag>.json`.
@@ -81,10 +97,18 @@ scripts/backlog/lane.sh --env iks-A               # what a lane exports: port, m
   `RAD_IDLE_WAIT_S` s, a decode-only request that makes the experts ask for VRAM back, the same prefix again
   (the resume) and a cold prefill of the same size, with `/stats` and `/sessions` read at each step: the
   host tier's `prefix-cache-mib` check, X-01) and `long8` (the item's multi-session case: eight
-  conversations of `RAD_LONG8_CHARS` characters at once, then the same idle, demand and return passes).
+  conversations of `RAD_LONG8_CHARS` characters at once, then the same idle, demand and return passes), and
+  `lctxN` (`N` conversations of `RAD_LCTX_CHARS` characters — the default 190,000 is the 58,903-token
+  conversation of §1.3 — filled by a one-token wave and then decoded for `RAD_LCTX_NTOK` tokens: the long-context
+  decode stamps at one and four decoders, `lctx1` and `lctx4`, whose two waves land in the JSON as their own
+  phases).
   `greedy` is the merge bar's first clause: three prompts and a 5.7K arrival at temperature 0 with
   `ignore_eos` off, each as `gen` / `chars` / `sha256` of the text itself, so two arms' JSON compare byte for
-  byte (S-01b).
+  byte (S-01b). `stress` is sustained concurrent load (issue #251): `RAD_STRESS_WAVES` waves (40) of eight
+  requests at once, `RAD_STRESS_CHARS` characters of context each (39,500: ~12K tokens) decoded for
+  `RAD_STRESS_NTOK` tokens (96), a fresh wave and then the same eight prompts again; it counts failed requests
+  and a server that stops (`ok` / `err` / `server_dead`) instead of raising, so a run that hangs still writes
+  its JSON. Run it on one iks lane at a time: two lanes under it leave the host 3 GiB of memory.
   Both `idle` and `long8` read the experts' side of the same views, because that is what the freed VRAM is for:
   `expert_units` and `slab_mib` are the residency and the lent VRAM the experts hold, `lend_mib` the most
   the KV pool lets them borrow, and `routed` / `routed_res` the demand's hit rate. It prints each phase as JSON and writes
@@ -95,11 +119,19 @@ scripts/backlog/lane.sh --env iks-A               # what a lane exports: port, m
 - **`bench.py <port> <tag> <out-dir>`** the served benchmark (decode, prefill, cold/warm, `--reps`, `--temp`), and
   **`prompts.py`** holds the prompts and the code corpus both tools send: they are read from the tree the tools sit
   in (`RAD_SRC` overrides), never from a copy on the measuring host, so a lane's prompt is the same text everywhere.
-- **`layer.py <stamps.csv> <probe.json> <phase> <rec> [<li>]`**, **`agg.py <stamps.csv> <probe.json> [--top N]`**,
+  The 5.7K arrival of `greedy` is cut from that corpus, so two arms on **different trees** send different text as soon as
+  the change adds, removes or edits a file the walk reads (`libr4d/`, `arch/hyv4flash/`, `core/`, `libavx/` …), and the bar's
+  byte comparison then fails on the prompt, not on the arms: a cross-tree A/B pins one corpus for both arms with
+  `RAD_SRC=<one tree>` (K-24 lost a measurement round to this). The three fixed `greedy` prompts are unaffected.
+- **`layer.py <stamps.csv> <probe.json> <phase> <rec> [<li>]`**, **`agg.py <stamps.csv> <probe.json> [--top N] [--match RE]`**,
   **`attr.py <stamps.csv> <probe.json> [--top N]`**: the per-layer and per-op tables from a run's stamps. They are
   plain CPU tools over those two files (run them as `python3 scripts/backlog/agg.py …`; they are 644 in the tree),
   so they run wherever the files are: on the lane, or here over a file copied back from iks with `scp
-  iks:moebius-gpu/<name>/src/runs/<lane>/<tag>/<tag>.stamps.csv .`. They need a demangler, and iks has no
+  iks:moebius-gpu/<name>/src/runs/<lane>/<tag>/<tag>.stamps.csv .`. They read the phases that carry a stamped
+  window; a composite phase (`longctx`, `idle`, `long8`) and a gap probe (`stallN`) carry none, so they are named
+  and skipped, and the waves the composite ran are what the tables come from. `agg.py --match RE` prints only the
+  kernels of that name and their sum per step — the read of one term, e.g. `--match 'qsa_select|idx_score'` for
+  K-25's two terms at long context. They need a demangler, and iks has no
   `c++filt`: `demangle.py` takes `c++filt` or `llvm-cxxfilt` from `PATH`, else the `llvm-cxxfilt` next to the
   compiler the tree was built with (`build/CMakeCache.txt`), which is where the ROCm SDK keeps it. The iks trees'
   `runs/` are not kept between calls (the tree is unpacked fresh each call), so copy back what a card needs.
@@ -324,7 +356,7 @@ but the tier, which is what the A/B measures.
 Merge when all three hold:
 
 1. The output is byte-identical, or inside the item's stated bound (ORD / PF; see the field key at the top of the backlog's §3).
-2. The kernel, op or step the item targets is measurably faster in ms (AQL stamps, rad-kbench or profile-ops) on its lane.
+2. The kernel, op or step the item targets is measurably faster in ms (AQL stamps, rad-kbench or profile-ops), before and after on one machine (§6 step 3).
 3. End-to-end tok/s or TTFT is not worse beyond noise.
 
 A kernel gain whose end-to-end effect is inside noise still merges: gains compound.
@@ -355,7 +387,7 @@ design agent: Opus 5.5, thinking medium.
 
 ## 6. Working from outside (no lane)
 
-A worker without access to the lanes can still do a card:
+A worker without access to the lanes can still do a card, and measures it as far as their own hardware allows:
 
 1. Write the change and its tests.
 2. Run what needs no GPU:
@@ -366,8 +398,33 @@ A worker without access to the lanes can still do a card:
    - the plugin lints (`hyv4flash_arch_test`)
    - the scheduler tests (`sched_test`)
    - every ctest that runs without a card
-3. Push a branch and open a PR titled `[needs lane]`. List in it the GPU checks from the item's "Verify" part, and the stamps
-   or kbench rows that the merge bar needs.
-4. A lane run here measures the PR (before / after on one lane) and merges or closes it by §2.
+3. With a GPU, measure the change yourself: before (the PR's merge base) and after (your code commit) on the same
+   machine, same settings, at least three runs each, interleaved. Take the rows the item's merge bar (§2) names: the
+   stamps, `rad-kbench` or `profile-ops` rows of the targeted kernel, op or step, and the output parity (§2.1). Write
+   them to `notes/backlog/measurements/<item>.md` (for example `K-47.md`) and commit that file to the PR, with:
+   - the commit ids of before and after (after is the commit of the code you measured; the commit that adds this file
+     comes on top of it and changes nothing else),
+   - who measured, the GPUs (model, count, TP), power cap, ROCm / driver version,
+   - the container and the `ngram-placement` you ran with (any placement is fine on your machine),
+   - the raw lines of each run for the rows the bar names (not only a summary). Keep the file under 40 KB: the
+     review reads the PR as text and refuses larger files.
+   Numbers from your machine are compared with each other only, never with another machine's.
+4. Open the PR from `.github/PULL_REQUEST_TEMPLATE.md` with `Fixes #<issue>`, titled `[measured] <item>: <subject>` when
+   the file covers the item's whole merge bar, `[needs testing] <item>: <subject>` when it does not (no GPU). How the
+   review starts, the comment forms and the rounds are in `AGENTS.md`.
+5. The review checks the code and the measurement file: the rows are the ones §2 asks for, before and after come from
+   one machine, the raw lines carry the numbers. The merge also needs a measurement the server accepted for the head:
+   a `## Measurement` comment on the issue by a registered measurer who is not the PR's author, or a run of the test
+   lane, or the owner's `no-measurement` label. When only the measurement is missing, the issue gets
+   `ready-for-testing` (§6.1).
 
-Items whose whole value is a measurement (marked "lane required" in their issue) need a lane from the start.
+### 6.1 Testing a `ready-for-testing` issue
+
+Anyone on the measurers list with a free GPU can measure a change that waits on `ready-for-testing`, without writing
+code: check out the PR's head and its merge base (`git merge-base origin/<base> <head>`), measure both as step 3 says,
+and post the result on the issue in the form of `.github/moebius/measurement.md`. The server checks the form and the
+commits and starts the next review round by itself. The test lane `r9700` (the local pair) also measures approved
+changes, at kernel level only (`rad-kbench`); end-to-end rows still come from a measurer.
+
+Items whose whole value is a measurement (marked "lane required" in their issue) need a lane from the start. Lossy items
+keep §3.

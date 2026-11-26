@@ -64,6 +64,7 @@ struct RecOp {
     std::vector<rad_buf>    reads, writes;
     bool                    resolved = true;
     bool                    uses_declared = false;   /* rad_op_reads/writes were called */
+    bool                    dropped = false;         /* rad_op_dropped: its fallback runs */
 };
 struct RecMap {
     std::string              declared;
@@ -106,6 +107,7 @@ struct RadBuilder {
      * vocabulary); every other op is undeclared. */
     const std::set<std::string>* vocab = nullptr;
     std::vector<std::string> asked_undeclared;   /* what a real engine would refuse */
+    size_t                   last_decl = 0;      /* 1-based op the last rad_decl_op recorded */
     bool declared(const std::string& op) const {
         return vocab ? vocab->count(op) != 0 : undeclared.count(op) == 0;
     }
@@ -180,6 +182,9 @@ struct RadCtx {
     int             world = 1;
     std::vector<RecIssue> issues;
     std::vector<int>      routed_layers;
+    /* Each report's RadRouting::expert_count: the buffer it points into (fake_buf_of; 0 for a
+     * pointer that is no buffer's) and the byte offset into it. */
+    std::vector<std::pair<rad_buf, int64_t>> routed_counts;
     std::string           step_fail;
     int                   lane = 0;     /* where the next issue goes */
     std::vector<RecJoin>  joins;
@@ -231,6 +236,7 @@ extern "C" rad_buf rad_decl_buffer(RadBuilder* b, const char* name, const RadBuf
 
 extern "C" rad_op rad_decl_op(RadBuilder* b, const char* op, const RadParam* params, int n_params,
                               const rad_weight* weights, int n_weights) {
+    b->last_decl = 0;
     if (!b->declared(op)) {
         b->asked_undeclared.push_back(op);
         return RAD_NULL_HANDLE;
@@ -253,6 +259,7 @@ extern "C" rad_op rad_decl_op(RadBuilder* b, const char* op, const RadParam* par
         if (p.key == "dtype" && b->refuse_dtype.count({r.op, p.sval})) dtype_refused = true;
     r.resolved = b->refuse.count(r.op) == 0 && !dtype_refused;
     b->ops.push_back(r);
+    b->last_decl = b->ops.size();
     /* Declare always completes. An unresolved op is RAD_NULL_HANDLE, an error only if the plugin
      * issues it (rad_builder.h). */
     return r.resolved ? (rad_op)b->ops.size() : RAD_NULL_HANDLE;
@@ -280,6 +287,13 @@ extern "C" int rad_op_resolved(RadBuilder* b, rad_op h) {
 
 extern "C" int rad_op_declared(RadBuilder* b, const char* op) {
     return op && b->declared(op);
+}
+
+/* As the builder's: only the op the last rad_decl_op recorded, and only an unresolved one. */
+extern "C" int rad_op_dropped(RadBuilder* b) {
+    if (b->last_decl == 0 || b->ops[b->last_decl - 1].resolved) return RAD_E_STATE;
+    b->ops[b->last_decl - 1].dropped = true;
+    return RAD_OK;
 }
 
 extern "C" rad_kvgroup rad_decl_kv_group(RadBuilder* b, const char* name,
@@ -603,11 +617,6 @@ extern "C" int             rad_ctx_wgp_count(RadCtx*) { return 32; }
 /* The context itself, so a copy issued on the step's stream is recorded in it (rad_memcpy_async). */
 extern "C" RadStream       rad_stream(RadCtx* c)     { return (RadStream)c; }
 extern "C" int             rad_stream_sync(RadStream s) { (void)s; return RAD_OK; }
-extern "C" int rad_route_report(RadCtx* c, int layer, const RadRouting* r) {
-    (void)r;
-    c->routed_layers.push_back(layer);
-    return RAD_OK;
-}
 extern "C" int rad_route_table(RadBuilder* b, rad_buf table) {
     if (!b || table == 0) return RAD_E_INVAL;
     b->route_table = table;
@@ -647,6 +656,17 @@ static rad_buf fake_buf_of(const void* p, size_t n_bufs) {
     if ((u & ~(kFakeBufTag - 1)) != kFakeBufTag) return 0;
     const uintptr_t h = (u & (kFakeBufTag - 1)) >> kFakePtrShift;
     return h >= 1 && h <= n_bufs ? (rad_buf)h : 0;
+}
+extern "C" int rad_route_report(RadCtx* c, int layer, const RadRouting* r) {
+    c->routed_layers.push_back(layer);
+    rad_buf h = 0;
+    int64_t off = 0;
+    if (r && r->expert_count && c->b) {
+        h = fake_buf_of(r->expert_count, c->b->bufs.size());
+        if (h) off = (int64_t)((uintptr_t)r->expert_count - (uintptr_t)rad_buf_ptr(c, h));
+    }
+    c->routed_counts.push_back({ h, off });
+    return RAD_OK;
 }
 /* Pinned host memory a plugin fills itself (qwen4exp_fp8's piece bounds, the calibration tap's
  * staging), as host memory; nothing else is handed out. */

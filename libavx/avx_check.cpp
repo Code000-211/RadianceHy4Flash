@@ -761,7 +761,7 @@ int main(int argc, char** argv) {
     /* Run before any gather: the case forks, best done before the gather's threads exist. */
     if (gather) {
         std::printf("\n");
-        if (!ngram_init_case(lib)) rc = 1;
+        if (!ngram_init_case(lib, self_dir(argv[0]))) rc = 1;
     }
     std::vector<std::string> declined_ops;
     for (int lvl = lo; lvl <= hi; ++lvl) {

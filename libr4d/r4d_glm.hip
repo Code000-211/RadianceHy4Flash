@@ -17,20 +17,23 @@ namespace {
 __device__ __forceinline__ float weight_f32(float v) { return v; }
 __device__ __forceinline__ float weight_f32(uint16_t v) { return bf16_to_f32(v); }
 
+// One wave's R x C tile of the sums: the k loop and the butterfly, with no early return and no
+// store. It is a function of its own because of what the compiler makes of it (K-10's lane run,
+// notes/backlog/measurements/K-10.md): written inline in the body below, the eight-row form with
+// a stored-bf16 weight -- the served routers' form at verify heights, 17 to 63 rows -- ran 2.8 to
+// 3.6 times longer than with an f32 weight (60 to 140 us against 22 to 48 at N 512, K 3072, on a
+// R9700); split out like this the two weights cost the same. The bytes are the same either way.
 template <int R, int C, int U, class W>
 __device__ __forceinline__ void
-    gemm_nt_f32_tile_body(const uint16_t* x, const W* w, float* y, long xp, long wp, long yp,
-                          int m, int n, int k) {
-    const int lane = threadIdx.x & 31, c0 = (blockIdx.x * 4 + (threadIdx.x >> 5)) * C,
-              r0 = blockIdx.y * R;
-    if (c0 >= n) return;
+    gemm_nt_f32_tile_sums(const uint16_t* x, const W* w, float (&sum)[R][C], long xp, long wp,
+                          int m, int n, int k, int c0, int r0) {
+    const int lane = threadIdx.x & 31;
     const uint16_t* xr[R];
     const W* wc[C];
 #pragma unroll
     for (int q = 0; q < R; ++q) xr[q] = x + (long)(r0 + q < m ? r0 + q : m - 1) * xp;
 #pragma unroll
     for (int c = 0; c < C; ++c) wc[c] = w + (long)(c0 + c < n ? c0 + c : n - 1) * wp;
-    float sum[R][C];
 #pragma unroll
     for (int q = 0; q < R; ++q)
 #pragma unroll
@@ -71,6 +74,17 @@ __device__ __forceinline__ void
 #pragma unroll
             for (int mask = 16; mask; mask >>= 1) sum[q][c] += __shfl_xor(sum[q][c], mask, 32);
         }
+}
+
+template <int R, int C, int U, class W>
+__device__ __forceinline__ void
+    gemm_nt_f32_tile_body(const uint16_t* x, const W* w, float* y, long xp, long wp, long yp,
+                          int m, int n, int k) {
+    const int lane = threadIdx.x & 31, c0 = (blockIdx.x * 4 + (threadIdx.x >> 5)) * C,
+              r0 = blockIdx.y * R;
+    if (c0 >= n) return;
+    float sum[R][C];
+    gemm_nt_f32_tile_sums<R, C, U, W>(x, w, sum, xp, wp, m, n, k, c0, r0);
     if (lane) return;
 #pragma unroll
     for (int q = 0; q < R; ++q)
@@ -78,6 +92,98 @@ __device__ __forceinline__ void
 #pragma unroll
             for (int c = 0; c < C; ++c)
                 if (c0 + c < n) y[(long)(r0 + q) * yp + c0 + c] = sum[q][c];
+}
+
+/* The staged form for prefill heights. A workgroup's four waves share R rows and take C columns
+ * each; the R rows' x is widened to f32 once into LDS, KC values of k at a time, so a step of k
+ * costs a wave C weight loads from memory and R reads of LDS for R x C FMAs (the tile form above:
+ * R + C loads from memory). Lane l still folds k = l, l+32, ... ascending with fmaf, chunk after
+ * chunk, then the same butterfly: byte-identical to every tile form. VX 8 stages x 16 bytes at a
+ * time (x 16-byte aligned, its pitch and K multiples of 8), VX 1 one value at a time. Waves whose
+ * columns lie past N stage and wait like the others and store nothing. */
+template <int R, int C, int KC, int VX, class W>
+__device__ __forceinline__ void
+    gemm_nt_f32_lds_body(const uint16_t* x, const W* w, float* y, long xp, long wp, long yp,
+                         int m, int n, int k) {
+    static_assert(KC % 128 == 0 && (R * KC) % (128 * VX) == 0, "a stage is whole vectors a thread");
+    __shared__ float xs[R][KC];
+    /* c0 is the wave's own: read it as a scalar so the column bases are scalar registers. */
+    const int lane = threadIdx.x & 31,
+              c0 = __builtin_amdgcn_readfirstlane((blockIdx.x * 4 + (threadIdx.x >> 5)) * C),
+              r0 = blockIdx.y * R;
+    const bool live = c0 < n;
+    const W* wc[C];
+#pragma unroll
+    for (int c = 0; c < C; ++c) wc[c] = w + (long)(c0 + c < n ? c0 + c : n - 1) * wp;
+    float sum[R][C];
+#pragma unroll
+    for (int q = 0; q < R; ++q)
+#pragma unroll
+        for (int c = 0; c < C; ++c) sum[q][c] = 0;
+    for (int kc = 0; kc < k; kc += KC) {
+        if (kc) __syncthreads();
+#pragma unroll
+        for (int i = 0; i < R * KC / (128 * VX); ++i) {
+            const int v = (int)threadIdx.x + 128 * i, q = v / (KC / VX), kk = (v % (KC / VX)) * VX;
+            const uint16_t* xr = x + (long)(r0 + q < m ? r0 + q : m - 1) * xp + kc + kk;
+            if (VX == 8) {
+                if (kc + kk < k) {
+                    const r4d_u32x4 p = *(const r4d_u32x4*)xr;
+#pragma unroll
+                    for (int e = 0; e < 4; ++e) {
+                        xs[q][kk + 2 * e] = __builtin_bit_cast(float, p[e] << 16);
+                        xs[q][kk + 2 * e + 1] = __builtin_bit_cast(float, p[e] & 0xffff0000u);
+                    }
+                }
+            } else {
+                /* A pass of the 128 threads covers part of one row: its base is a scalar. */
+                const int qs = 128 * i / KC, ks = 128 * i % KC + (int)threadIdx.x;
+                const uint16_t* xb = x + (long)(r0 + qs < m ? r0 + qs : m - 1) * xp;
+                if (kc + ks < k)
+                    xs[qs][ks] = bf16_to_f32(*(const uint16_t*)((const char*)xb +
+                                                                (uint32_t)(kc + ks) * 2u));
+            }
+        }
+        __syncthreads();
+        if (!live) continue;
+        const int steps = k - kc >= KC ? KC / 32 : (k - kc + 31) / 32;
+#pragma unroll 1
+        for (int s = 0; s < steps; ++s) {
+            const int j = kc + 32 * s + lane;
+            if (j >= k) continue;
+            float weight[C];
+#pragma unroll
+            for (int c = 0; c < C; ++c)
+                weight[c] = weight_f32(*(const W*)((const char*)wc[c] + (uint32_t)j * sizeof(W)));
+#pragma unroll
+            for (int q = 0; q < R; ++q) {
+                const float v = xs[q][32 * s + lane];
+#pragma unroll
+                for (int c = 0; c < C; ++c) sum[q][c] = fmaf(v, weight[c], sum[q][c]);
+            }
+        }
+    }
+    if (!live) return;
+    /* A row's C butterflies, then its stores: all R x C at once hold a second tile of registers. */
+#pragma unroll
+    for (int q = 0; q < R; ++q) {
+#pragma unroll
+        for (int c = 0; c < C; ++c) {
+#pragma unroll
+            for (int mask = 16; mask; mask >>= 1) sum[q][c] += __shfl_xor(sum[q][c], mask, 32);
+        }
+        if (!lane && r0 + q < m)
+#pragma unroll
+            for (int c = 0; c < C; ++c)
+                if (c0 + c < n) y[(long)(r0 + q) * yp + c0 + c] = sum[q][c];
+        __builtin_amdgcn_sched_barrier(0);
+    }
+}
+template <int R, int C, int KC, int VX, class W>
+__global__ void __launch_bounds__(128)
+    gemm_nt_f32_lds_kernel(const uint16_t* x, const W* w, float* y, long xp, long wp, long yp,
+                           int m, int n, int k) {
+    gemm_nt_f32_lds_body<R, C, KC, VX>(x, w, y, xp, wp, yp, m, n, k);
 }
 
 /* CH `r4dchain`: the chained forms of this file's kernels (r4d_chain.h). Each body keeps its early
@@ -103,6 +209,20 @@ int gemm_f32_tile(RadStream stream, const RadTensor& x, const RadTensor& w, cons
     return chain ? R4D_GF32(r4dchain, float) : R4D_GF32(R4dUnchained, float);
 #undef R4D_GF32
 }
+template <int R, int C, int KC>
+int gemm_f32_lds(RadStream stream, const RadTensor& x, const RadTensor& w, const RadTensor& y,
+                 long n, long k) {
+    const long m = x.shape[0];
+    const bool v8 = ((uintptr_t)x.data & 15) == 0 && x.stride[0] % 8 == 0 && k % 8 == 0;
+#define R4D_GF32L(VX_, W_)                                                                             \
+    R4D_EMIT(stream, (gemm_nt_f32_lds_kernel<R, C, KC, VX_, W_>),                                     \
+             dim3((unsigned)((n + 4 * C - 1) / (4 * C)), (unsigned)((m + R - 1) / R)), dim3(128),  \
+             0, (const uint16_t*)x.data, (const W_*)w.data, (float*)y.data, x.stride[0],        \
+             w.stride[0], y.stride[0], (int)m, (int)n, (int)k)
+    if (w.dtype == RAD_BF16) return v8 ? R4D_GF32L(8, uint16_t) : R4D_GF32L(1, uint16_t);
+    return v8 ? R4D_GF32L(8, float) : R4D_GF32L(1, float);
+#undef R4D_GF32L
+}
 int gemm_f32_body(const RadArgs* a, RadStream stream) {
     if (!a || a->n_t < 3) return RAD_E_INVAL;
     const auto &x = a->t[0], &w = a->t[1], &y = a->t[2];
@@ -121,12 +241,20 @@ int gemm_f32_body(const RadArgs* a, RadStream stream) {
      * N 36; 8x4 holds at every width. Below 64 rows the steps of k in flight decide: 2x2 with 16
      * steps is 2 to 2.5 times as fast as one step at N 288 up to 16 rows, and about 3 times at N 32
      * at every count below 64; at N 288 from 17 rows 8x1 with 8 steps is faster.
-     * A projection of a few columns has too few waves for wide tiles at any M. */
+     * A projection of a few columns has too few waves for wide tiles at any M.
+     * At prefill heights (the router: N 128 a rank at TP4, 256 at TP2, 512 at TP1) the staged 8x8
+     * form: x read from LDS as f32, a step of k 8 weight loads for 64 FMA where 8x4 has 12 loads
+     * for 32. Staging x costs a fixed share a workgroup, so the narrower N needs more rows before it
+     * pays: from 256 rows at N 512, 384 at N 256 and 768 at N 128 (below those 8x4 was as fast or
+     * faster on gfx1201). It holds 16 waves a SIMD like 8x4 (8 KiB of LDS a workgroup); 16x8 and
+     * 16x4 drop to 8. Decode and verify heights keep the forms above. */
     const long rows = x.shape[0];
     const bool ch = r4d_geti_or(a, "chain", 0) != 0 && rows <= 64;   /* decode heights */
     if (n <= 8) return gemm_f32_tile<4, 1>(stream, x, w, y, n, k, ch);
     if (rows <= 16 || (rows < 64 && n < 128)) return gemm_f32_tile<2, 2, 16>(stream, x, w, y, n, k, ch);
     if (rows < 64) return gemm_f32_tile<8, 1, 8>(stream, x, w, y, n, k, ch);
+    const long lds_rows = n >= 512 ? 256 : n >= 256 ? 384 : 768;   /* where staging x pays */
+    if (n >= 128 && rows >= lds_rows) return gemm_f32_lds<8, 8, 256>(stream, x, w, y, n, k);
     return gemm_f32_tile<8, 4>(stream, x, w, y, n, k, ch);
 }
 // router_sigmoid_topk in one wave per row: p = sigmoid(logit), the top_k largest ranks p + bias

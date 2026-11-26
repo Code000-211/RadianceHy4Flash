@@ -589,8 +589,8 @@ static const RadOperandSpec oGdnConvRecurrentUpdateHad[] = {
 
 /* The control vector's projection (r4d_hc_bf16.hip, with the other gated-residual kernels): a bf16
  * stream, one unit f32 direction for every stream, an int32 switch per row. */
-static const RadParamSpec pHcProject[] = { P_INT("M"), P_INT("n"), P_INT("hc"), P_F64("scale"),
-                                           P_STR("dtype") };
+static const RadParamSpec pHcProject[] = { P_INT("M"), P_INT("n"), P_INT("hc"), P_INTO("vsep"),
+                                           P_F64("scale"), P_STR("dtype") };
 static const RadOperandSpec oHcProject[] = {
     { "h", RAD_OPD_INOUT, 0 }, { "v", RAD_OPD_IN, 0 }, { "on", RAD_OPD_IN, 0 },
 };
@@ -720,7 +720,7 @@ static const RadOperandSpec oMlaKvSplit[] = {
 };
 static const RadParamSpec pEngramIds[] = {
     P_INT("M"), P_INT("heads"), P_INT("ngram"), P_INT("pad"), P_INT("map_size"),
-    P_INTO("image"), P_INTO("video"),
+    P_INTO("image"), P_INTO("video"), P_INTO("advance"),
 };
 static const RadOperandSpec oEngramIds[] = {
     {"tok", RAD_OPD_IN, 0}, {"state", RAD_OPD_INOUT, 0}, {"cu", RAD_OPD_IN, 0},
@@ -1693,6 +1693,38 @@ static const RadOperandSpec oIdxPoolGatedFp8[] = {
     { "q",     RAD_OPD_OUT,    1 },
     { "scale", RAD_OPD_OUT,    1 },
 };
+/* K-24: the indexer's key side in one op -- qsa_work's work list, idx_pool_gated's pool and the
+ * rows qsa_tail_store would store, from one scan of the step. Its operand list is qsa_work's gather
+ * and the pool's arithmetic joined at `stage`/`page`/`pos` (which it fills in LDS instead of in
+ * global), and `state` is INOUT because the tail is written here too. `work`, `ring` and `seqs` are
+ * qsa_work's and qsa_tail_store's; the rest is the pool's. */
+static const RadParamSpec pQsaWorkPoolTail[] = {
+    P_INT("M"), P_INT("n"), P_INT("ratio"), P_INT("ring"), P_INT("seqs"),
+    P_INT("rotary_dim"), P_F64("eps"), P_F64("theta"), P_STR("mode"), P_STRO("sections"),
+    P_INTO("block_size"), P_STR("dtype"),
+    /* A capacity: the launch is as wide as `page` (r4d_qsa_work_bf16.hip); past the real count an
+     * item reports page -1. */
+    { "work", RAD_P_INT, RAD_OPTIONAL, RAD_PROLE_CAPACITY },
+};
+static const RadOperandSpec oQsaWorkPoolTail[] = {
+    { "k",     RAD_OPD_IN,     0 },
+    { "pos",   RAD_OPD_IN,     0 },
+    { "cu",    RAD_OPD_IN,     0 },
+    /* INOUT: the gather reads the rows of the tokens before this chunk, the store writes the
+     * rows of the ones that close nothing. */
+    { "state", RAD_OPD_INOUT,  0 },
+    { "sidx",  RAD_OPD_IN,     0 },
+    { "bt",    RAD_OPD_IN,     0 },
+    { "wv",    RAD_OPD_WEIGHT, 0 },
+    { "wg",    RAD_OPD_WEIGHT, 0 },
+    { "ape",   RAD_OPD_WEIGHT, 0 },
+    { "gain",  RAD_OPD_WEIGHT, 0 },
+    { "rope",  RAD_OPD_IN,     1 },
+    { "page",  RAD_OPD_OUT,    0 },
+    { "bpos",  RAD_OPD_OUT,    0 },
+    { "nc",    RAD_OPD_OUT,    0 },
+    { "cache", RAD_OPD_INOUT,  1 },
+};
 static const RadParamSpec pIdxScore[] = {
     P_INT("M"), P_INT("n"), P_INT("heads"), P_INT("blocks"), P_INT("seqs"), P_STR("dtype"),
 };
@@ -2196,7 +2228,9 @@ static const RadParamSpec pMlaAttnPagedSink[] = { P_INT("M"),          P_INT("he
                                                   P_INT("latent_dim"), P_INT("rope_dim"),
                                                   P_INT("block_size"), P_INT("window"),
                                                   P_F64("scale"),      P_STR("dtype"),
-                                                  P_INTO("stable") };
+                                                  P_INTO("stable"),    P_F64O("rope_theta"),
+                                                  P_F64O("rope_scale"), P_STRO("rope_mode"),
+                                                  P_STRO("rope_sections") };
 static const RadOperandSpec oMlaAttnPagedSink[] = { { "q", RAD_OPD_IN, 0 },
                                                     { "q_rope", RAD_OPD_IN, 0 },
                                                     { "kv", RAD_OPD_IN, 0 },
@@ -2204,19 +2238,23 @@ static const RadOperandSpec oMlaAttnPagedSink[] = { { "q", RAD_OPD_IN, 0 },
                                                     { "seqused", RAD_OPD_IN, 0 },
                                                     { "cu_seqlens", RAD_OPD_IN, 0 },
                                                     { "sinks", RAD_OPD_WEIGHT, 0 },
-                                                    { "out", RAD_OPD_OUT, 0 } };
+                                                    { "out", RAD_OPD_OUT, 0 },
+                                                    { "rope_pos", RAD_OPD_IN, 1 } };
 static const RadParamSpec pMlaAttnSelSink[] = { P_INT("M"),          P_INT("heads"),
                                                 P_INT("latent_dim"), P_INT("rope_dim"),
                                                 P_INT("blocks"),     P_INT("block_size"),
                                                 P_F64("scale"),      P_STR("dtype"),
-                                                P_INTO("stable") };
+                                                P_INTO("stable"),    P_F64O("rope_theta"),
+                                                P_F64O("rope_scale"), P_STRO("rope_mode"),
+                                                P_STRO("rope_sections") };
 static const RadOperandSpec oMlaAttnSelSink[] = { { "q", RAD_OPD_IN, 0 },
                                                   { "q_rope", RAD_OPD_IN, 0 },
                                                   { "kv", RAD_OPD_IN, 0 },
                                                   { "bt", RAD_OPD_IN, 0 },
                                                   { "length", RAD_OPD_IN, 0 },
                                                   { "sinks", RAD_OPD_WEIGHT, 0 },
-                                                  { "out", RAD_OPD_OUT, 0 } };
+                                                  { "out", RAD_OPD_OUT, 0 },
+                                                  { "rope_pos", RAD_OPD_IN, 1 } };
 static const RadOperandSpec oMlaAttn[] = { { "q", RAD_OPD_IN, 0 },
                                            { "kv", RAD_OPD_IN, 0 },
                                            { "bt", RAD_OPD_IN, 0 },
@@ -3491,7 +3529,11 @@ static const RadOpSchema kSchemas[] = {
            "q_rope.rope_j); out = sum exp(s_j) latent_j / (sum exp(s_j) + exp(sink[h])): the sink joins the "
            "softmax once and carries no value. No visible key gives zero. `stable` 1 (optional, default 0) "
            "asks that a row's bytes not depend on the launch (M, its other rows); a row-independent "
-           "kernel ignores it."),
+           "kernel ignores it. `rope_pos` (optional) is the rotary's positions, indexed by the row of "
+           "this launch (the operand is this launch's rows, a view of a whole step's array): with it "
+           "the fragment is turned here from q_rope's raw columns (`rope_theta`, `rope_scale`, "
+           "`rope_mode` gptj or imrope_gptj, `rope_sections`), so the rows need no `rope` launch; "
+           "without it q_rope arrives rotated."),
     SCHEMA("mla_attn_sel_sink", pMlaAttnSelSink, oMlaAttnSelSink,
            "mla_attn's per-query page table and visible length with a rotary part and a sink: tokens "
            "[0, length[r]) of table row bt[r]. The score, the sink and `stable` are "
@@ -3948,7 +3990,8 @@ static const RadOpSchema kSchemas[] = {
            "ngram_ids' window of committed ids. With `ahead_ids` present, `tok` holds the following "
            "prompt of the last sequence past the step's rows (numel(ahead_ids) / heads tokens, positions "
            "continuing its last), and their ids land in `ahead_ids` (a read-ahead hint); the window written "
-           "back is the step's own."),
+           "back is the step's own. `advance` 0 (default 1) reads the window and leaves it as it was, so "
+           "layers sharing one history hash the window a step opened with."),
     SCHEMA("engram_norm", pEngramNorm, oEngramNorm,
            "One rms norm a head over the gathered rows: y[i] = round(gain[i] * x[i] * rsqrt(mean_head(x^2) + "
            "eps)). eps is a parameter: 0.0078125 (HF in bf16) or 1.19e-7."),
@@ -3971,10 +4014,11 @@ static const RadOpSchema kSchemas[] = {
            "the block-scaled fp8 form of the block input and its Hadamard-rotated twin."),
     SCHEMA("hc_project", pHcProject, oHcProject,
            "the control vector's projection (llama.cpp's `--cvec-mode project`): for each of the "
-           "hc streams of a row whose `on` flag is 1, h[s] -= scale * (h[s] . v) * v, v that "
-           "layer's unit direction -- the same v for every stream -- and scale its stored norm. A "
-           "row whose flag is 0 is neither read nor written, so an unprojected request's stream is "
-           "the stock model's."),
+           "hc streams of a row whose `on` flag is 1, h[s] -= scale * (h[s] . v_s) * v_s, v_s that "
+           "layer's unit direction for stream s -- one direction for every stream when `vsep` is "
+           "0, or a per-stream table [hc, n] when `vsep` is n -- and scale its stored norm. A row "
+           "whose flag is 0 is neither read nor written, so an unprojected request's stream is the "
+           "stock model's."),
     SCHEMA("hc_write", pHcPlain, oHcWrite,
            "the write half: h[s] += inj[s] * y, into the UNNORMED stream."),
     SCHEMA("mtp_enter", pMtpEnter, oMtpEnter,
@@ -4119,6 +4163,11 @@ static const RadOpSchema kSchemas[] = {
            "column reported so a rank's slice reports global ids, and `pairs` is the [M, R, 2] "
            "(int32 id, float value) plane an all_gather moves; a slot the row could not fill "
            "reports id -1 there and column 0 in `idx`, which is the unsharded contract unchanged."),
+    SCHEMA("cast_row_topk", pRowTopk, oRowTopk,
+           "row_topk over an f32 plane rounded to bf16, as `cast` f32 -> bf16 rounds it (to "
+           "nearest even, the cast's NaN rule included): the bytes of `cast` then row_topk at "
+           "dtype bf16, without the cast's launch or its bf16 plane. `dtype` is the plane's, f32; "
+           "`val` reports the rounded values."),
     SCHEMA("row_topk_merge", pRowTopkMerge, oRowTopkMerge,
            "the R largest of world_size all-gathered per-rank candidate sets, in the same "
            "descending (idx, val) form the single-rank top-R produces. `gathered` is "
@@ -4272,6 +4321,17 @@ static const RadOpSchema kSchemas[] = {
            "`rotary_dim` channels rotated as adjacent pairs at the group's first position (mode "
            "gptj, or imrope_gptj with `sections`, pos [3, W]) and rounded again. Written to "
            "cache[page[w]] and/or out[w]."),
+    SCHEMA("qsa_work_pool_tail", pQsaWorkPoolTail, oQsaWorkPoolTail,
+           "qsa_work, idx_pool_gated and qsa_tail_store over one step in one launch, for the "
+           "exact (bf16) key path: the blocks that became complete gather their `ratio` raw keys "
+           "out of THIS step's `k` and out of the `state` tail exactly as qsa_work does, the pool "
+           "reads them straight out of shared memory (the same arithmetic, r4d_idx_pool_body.h), "
+           "and the chunk's last `ring` tokens are stored into the tail on the way. `page`, "
+           "`bpos` and `nc` are qsa_work's and `cache` is the pool's, byte for byte. THE TAIL IS "
+           "STORED HERE ONLY WHILE THE CHUNK'S ROW COUNT IS <= ring - ratio + 1: a longer chunk "
+           "could write a row its own gather still has to read, so it is left to qsa_tail_store, "
+           "which the caller issues under the same bound. The fp8 and int8 indexers and a tapped "
+           "step keep the three ops, since they read qsa_work's staged keys."),
     SCHEMA("idx_pool_gated_i8", pIdxPoolGated, oIdxPoolGatedFp8,
            "idx_pool_gated_fp8's key (f32, no bf16 rounding, the 128-wide Hadamard times n^-0.5) as "
            "symmetric INT8 codes at an f32 scale max(amax, 1e-4) / 127, nearest even, clamped to "
@@ -5707,6 +5767,10 @@ static const RadConstraint cMoeGatherQ8[] = {
 static const RadConstraint cRowTopK[] = {
     C_DIV("N", 8), C_GE("M", 1), C_GE("R", 1), C_LE("R", 32), C_IN("dtype", "bf16"),
 };
+/* cast_row_topk: row_topk's over the f32 plane `cast` would narrow. */
+static const RadConstraint cCastRowTopK[] = {
+    C_DIV("N", 8), C_GE("M", 1), C_GE("R", 1), C_LE("R", 32), C_IN("dtype", "f32"),
+};
 static const RadConstraint cRowTopKMerge[] = {
     C_GE("M", 1), C_GE("R", 1), C_LE("R", 32), C_GE("world_size", 1), C_IN("dtype", "bf16"),
 };
@@ -5903,6 +5967,14 @@ static const RadConstraint cQsaSelect[] = { C_GE("blocks", 1), C_GE("topk", 1), 
 static const RadConstraint cIdxPoolGated[] = {
     C_EQ("n", 128), C_EQ("ratio", 4), C_GE("rotary_dim", 2), C_LE("rotary_dim", 128),
     C_DIV("rotary_dim", 2), C_IN("mode", "gptj imrope_gptj"), C_IN("dtype", "bf16"),
+};
+/* K-24's fused key side: cIdxPoolGated's arithmetic, qsa_work's gather and qsa_tail_store's copy,
+ * so the key width, the group size and the rotary width are the pool's and the rest is open (the
+ * real sequence count comes off cu_seqlens at issue). */
+static const RadConstraint cQsaWorkPoolTail[] = {
+    C_EQ("n", 128), C_EQ("ratio", 4), C_GE("rotary_dim", 2), C_LE("rotary_dim", 128),
+    C_DIV("rotary_dim", 2), C_IN("mode", "gptj imrope_gptj"), C_GE("ring", 4), C_GE("seqs", 1),
+    C_GE("work", 1), C_IN("dtype", "bf16"),
 };
 /* One wave scores a row against 16 keys with the 16 heads as the WMMA's rows; the grid's key axis
  * is 64 keys a workgroup and 16 bits wide. */
@@ -6716,6 +6788,24 @@ static const RadConstraint cNemotronRope64[] = { C_IN("dtype", "bf16"), C_GE("M"
 static const RadConstraint cNemotronRope128[] = { C_IN("dtype", "bf16"), C_GE("M", 1), C_LE("M", 2147483647), C_EQ("head_dim",128) };
 static const RadConstraint cNemotronAttn64[] = { C_IN("dtype", "bf16"), C_GE("M", 1), C_LE("M", 2147483647), C_EQ("head_dim",64), C_EQ("causal",0) };
 static const RadConstraint cNemotronAttn128[] = { C_IN("dtype", "bf16"), C_GE("M", 1), C_LE("M", 2147483647), C_EQ("head_dim",128), C_EQ("causal",0) };
+
+/* attn_kv_sink_h256's only axis: the query rows a workgroup (128: 16 waves, 512 threads; 64: 8
+ * waves, 256). A workgroup reads window + bq - 1 keys, of which each of its rows sees `window`, so
+ * at window 512 the share read and masked falls from 20 % to 11 % with 64 rows; the narrower
+ * workgroup moves a row's key tile grid with it, so the axis trades a little arithmetic for time
+ * rather than time alone. Both points stay inside this op's prefill bound against libref, which is
+ * why the axis is legal (perf.md §1, E4); tests/r4d_emu/test_attn_kv_sink.cpp runs both and the two
+ * against each other. The default is the 128-row tile: on one lane (iks, one R9700 at the 210 W cap,
+ * gfx1201, `--perfkvsink 20` in both orders) 64 rows is 4.4-8.8 % faster at window 512 (8.0 % at
+ * 64 heads M 1024, 4.4 % at M 2048) and 2.7-5.3 % slower where every row's mask is the same (window
+ * 0, the dense layers; the one M 512 point there is inside the lane's spread), while the 128-row
+ * point is the pre-change kernel to within the lane's 2 % spread; so the tuner picks it per shape
+ * and the dense path keeps 128. `notes/backlog/closed/K-56b.md` carries the rows and the commands. */
+static const int64_t kAkvSinkBq[] = { 64, 128 };
+static const RadTunable tAttnKvSink[] = {
+  { "bq", kAkvSinkBq, NELEM(kAkvSinkBq), 128, "query rows a workgroup: 128 (16 waves) or 64 (8 waves)" },
+};
+
 static const RadKernelInfo kKernels[] = {
 { "gemm_bf16_pixtral_patch", "gemm_nt", "gemm", "RGB 14x14 patch projection with ordered f32 dots",
   "K=588, M<=INT_MAX, N<=INT_MAX, pitched bf16 rows", "bf16",
@@ -7200,7 +7290,8 @@ static const RadKernelInfo kKernels[] = {
 { "gemm_bf16_nt_bias_tiled", "gemm_nt_bias", "gemm",
   "biased GEMM C = res + act(A @ W^T + bias) over 64-deep K tiles, the K tail staged as zeros, "
   "the activation and residual in the store: from 32 blocks of 128x128 the weight read straight "
-  "into registers and the activation staged through LDS, below that both staged at 64x64",
+  "into registers and the activation staged through LDS, below that both staged at 64x64; at "
+  "decode heights (M <= 64) either form in its chained form",
   "any M, N; K a multiple of 8; A rows 16-byte aligned; `res` may be the output itself",
   "bf16 A / W / C / res, bf16 or f32 bias, fp32 accumulate, three RNE roundings in the store",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
@@ -8186,12 +8277,12 @@ R4D_WINSINK_ROW(128, 16, i8kv, i8, cWinH128G16I8, "int8 (an f16 scale of K and o
 
 /* attn_kv_sink: Hy4-flash's non-absorbed prefill over kv_b-expanded keys and values
  * (r4d_attn_kv_sink_h256.hip). head_dim 256 for keys and values alike, any window, any heads up to
- * the grid's 65535. */
+ * the grid's 65535. `bq` is its only axis (tAttnKvSink above). */
 { "attn_kv_sink_h256", "attn_kv_sink", "attn",
   "dense causal WMMA attention over separate key and value rows, a window and a sink a head",
-  "head_dim=256 (keys and values), heads<=65535, any window, ragged cu_q/cu_k, 128 query rows a workgroup",
+  "head_dim=256 (keys and values), heads<=65535, any window, ragged cu_q/cu_k, bq 64 or 128 query rows a workgroup",
   "bf16 q/k/v/out (16-byte aligned rows), f32 sinks; bf16 Q.K, f16 P.V, f32 softmax",
-  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cAttnKvSink), NOTUNE,
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cAttnKvSink), ROW(tAttnKvSink), nullptr,
   nullptr, nullptr, r4d_rad_attn_kv_sink_h256, nullptr, nullptr, nullptr,
   r4d_shape_attn_kv_sink },
 
@@ -9939,11 +10030,22 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
 
 { "rowtopk_bf16", "row_topk", "select",
   "exact per-row top-R of a bf16 matrix, descending, ties to the lower column",
-  "any M, N a multiple of 8, R <= 32; two launches, caller-sized partial buffer",
+  "any M, N a multiple of 8, R <= 32; one launch at R <= 16 (stage 2 in the last wave), two "
+  "above; caller-sized partial buffer",
   "bf16 in, f32 values + i32 columns out",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cRowTopK), ROW(tTopk), nullptr,
   nullptr, nullptr, r4d_rad_rowtopk, r4d_rad_rowtopk_scratch, nullptr, nullptr,
+  r4d_shape_row_topk },
+
+{ "cast_rowtopk_f32", "cast_row_topk", "select",
+  "rowtopk_bf16 over an f32 matrix rounded to bf16 as it is read: cast f32 -> bf16 then row_topk, "
+  "in one or two launches and no bf16 plane",
+  "rowtopk_bf16's: any M, N a multiple of 8, R <= 32; one launch at R <= 16, two above",
+  "f32 in, f32 values (bf16-rounded) + i32 columns out",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cCastRowTopK), ROW(tTopk), nullptr,
+  nullptr, nullptr, r4d_rad_cast_rowtopk, r4d_rad_rowtopk_scratch, nullptr, nullptr,
   r4d_shape_row_topk },
 
 { "logit_rerank_i8", "logit_rerank", "select",
@@ -10159,6 +10261,26 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   ROW(cIdxPoolGated), NOTUNE,
   nullptr, nullptr, r4d_rad_idx_pool_gated, nullptr, nullptr, nullptr,
   nullptr },
+
+/* K-24: the three above joined -- qsa_work's gather, this pool and the tail's store -- so a decode
+ * step is one launch where it was three. One workgroup an item of the work list, four from 16
+ * items up. Nothing rounded differently: the same gather, the same shared arithmetic and the same
+ * row copy, hence the same bytes. It declares that chain (r4d_fuse_qsa_work_pool_tail), so a caller
+ * runs the three unfused ops beside it and memcmps the result -- over the row's own tail bound,
+ * where the kernel leaves the store to the caller, the chain declines the geometry instead. */
+{ "qsa_work_pool_tail_bf16", "qsa_work_pool_tail", "attn",
+  "the indexer's key side in one launch: gather the blocks this step completes out of `k` and the "
+  "tail state, pool each into its group key, and park the chunk's last `ring` keys in the tail",
+  "n 128, ratio 4, any even rotary_dim up to 128, mode gptj or imrope_gptj; any declared sequence "
+  "maximum (the real count comes off cu_seqlens at issue); `work` is a HOST bound and slots past "
+  "the real count report page -1; the tail is stored here only while a chunk's rows are <= "
+  "ring - ratio + 1",
+  "bf16 keys, an i32 position, cu_seqlens and a block table in; a bf16 tail in and out, an i32 "
+  "page, first-token position and count out, f32 wv/wg/ape and the pool's bf16 cache page",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cQsaWorkPoolTail), NOTUNE,
+  nullptr, nullptr, r4d_rad_qsa_work_pool_tail, nullptr, nullptr, nullptr,
+  r4d_shape_qsa_work_pool_tail, nullptr, r4d_fuse_qsa_work_pool_tail },
 
 /* The Hy4-flash indexer's score: 16 heads of relu(q . key) per group key, one wave a row against 16
  * keys on WMMA (heads as the tile's rows), summed in libref's order. */
@@ -12100,7 +12222,7 @@ extern "C" int rad_kernel_chain(int i) {
          * selector */
         "sample_temp_f32", "sample_topk_f32", "sample_merge_topk_f32", "sample_pick_f32",
         "ar_gather_4rank", "gemm_w8a8_nt_m64", "rowtopk_bf16", "rowtopk_merge",
-        "dflash_select_bf16", "dflash_tree_bf16",
+        "cast_rowtopk_f32", "dflash_select_bf16", "dflash_tree_bf16",
         /* the weight read beside a collective (its blocks add before reading, r4d_prefetch.hip) */
         "prefetch",
         /* Flash-Next's decode pass: the connection's fused read, the fused router and the

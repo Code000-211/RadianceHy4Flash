@@ -9,13 +9,24 @@
 // query fragments are the A operand (loaded once a row), the 16 keys the B operand, read straight
 // into registers in fragment order, and eight WMMA steps give D[head][key]. A lane then holds one
 // key against eight heads (8 * half + e): relu, times w_h and the sum over e run in the lane, and
-// one lane exchange adds the two halves, which is the order the reference states. A workgroup is
-// four waves on 64 consecutive keys of one row: grid (M, ceil(columns / 64)). Rows do not interact,
-// so a row's bytes are independent of M and of the other rows.
+// one lane exchange adds the two halves, which is the order the reference states.
+//
+// Two forms run that same chain on the same fragments, so their bytes are equal (r4d_selftest and
+// tests/r4d_emu compare them):
+//  - per row (decode heights): a workgroup is four waves on 64 consecutive keys of one row, grid
+//    (M, ceil(columns / 64)). Every (row, group) reads its 256-byte key and the row's query again.
+//  - row-tiled (prefill, M >= kTileRows): a workgroup is eight waves on 16 rows x 128 keys, grid
+//    (ceil(M / 16), ceil(columns / 128)). A wave keeps its 16 keys' fragments in registers across
+//    the rows and reloads them only where the rows' sequence changes; the rows' queries are staged
+//    in LDS eight at a time. About 48 bytes a (row, group) in place of 512 at a long prefill.
+// In both a wave whose keys all lie past its row's `nc` stores -inf without loading or multiplying.
+// Rows do not interact, so a row's bytes are independent of M, of the form and of the other rows.
 //
 // Dot products run through WMMA, so a score is not bit-equal to libref's f32 sum; the order of the
 // head sums is. A key past `nc[seq]`, without a page, or with a page outside the cache scores
-// -inf, as does every column past the table. The op does no causal work (qsa_select does).
+// -inf, as does every column past the table. The op does no causal work (qsa_select does): a
+// causal skip would leave future columns unscored, which libref and the other backends score, so
+// it needs the op's contract changed first (docs/OPS.md).
 //
 // Returns a RAD status rather than throwing, for the reason given in r4d_gemm_fp8a8.hip.
 
@@ -27,6 +38,7 @@
 #include "r4d_gdn_wmma.h"
 
 #include <hip/hip_runtime.h>
+#include <climits>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -39,6 +51,42 @@ constexpr int kHeads   = 16;
 constexpr int kKS      = kN / 16;       /* WMMA K steps */
 constexpr int kWaves   = 4;
 constexpr int kKeysWg  = kWaves * 16;   /* keys a workgroup */
+/* The row-tiled form. */
+constexpr int kTRows   = 16;            /* rows a workgroup */
+constexpr int kTStage  = 8;             /* rows staged in LDS at once */
+constexpr int kTWaves  = 8;
+constexpr int kTKeys   = kTWaves * 16;  /* keys a workgroup */
+constexpr int kTQP     = kN + 8;        /* a head's LDS pitch (shorts): the 32 lanes' 8-byte reads
+                                           fall on distinct banks; a multiple of 4 for fragP */
+constexpr int kTileRows = 256;          /* the launcher's rule: tiled from this many rows */
+
+int g_idx_score_form = 0;   /* r4d_idx_score_pin_form */
+
+/* The row's sequence: cu is nondecreasing, so a binary search for the last cu[i] <= m; -1 when m
+ * is in none. */
+__device__ __forceinline__ int idx_seq_of(const int32_t* __restrict__ cu, int nseq, int m) {
+    int lo = 0, hi = nseq;
+    while (hi - lo > 1) {
+        const int mid = (lo + hi) >> 1;
+        if (cu[mid] <= m) lo = mid; else hi = mid;
+    }
+    return (m >= cu[lo] && m < cu[lo + 1]) ? lo : -1;
+}
+
+/* D[head 8 * half + e][key col] to the score: relu, the head weight and the in-lane sum, e
+ * ascending, then the first half of the heads plus the second. Every lane must be active. */
+__device__ __forceinline__ float idx_head_sum(v8f acc, const unsigned short* gp, int half,
+                                              float wscale) {
+    float s = 0.0f;
+#pragma unroll
+    for (int e = 0; e < 8; ++e) {
+        const float w = bf16_to_f32(gp[e]) * wscale;
+        const float d = acc[e];
+        s = s + w * (d < 0.0f ? 0.0f : d);
+    }
+    const float other = swap16(s);
+    return half == 0 ? s + other : other + s;
+}
 
 #define IDX_SCORE_PARAMS                                                                        \
     const unsigned short* __restrict__ q, const unsigned short* __restrict__ gate,             \
@@ -46,7 +94,39 @@ constexpr int kKeysWg  = kWaves * 16;   /* keys a workgroup */
     const int32_t* __restrict__ cu, const int32_t* __restrict__ nc, float* __restrict__ out,    \
     int nseq, int cols, int out_cols, int pages, long q_ld, long gate_ld, long key_ld,          \
     long bt_ld, long out_ld, float wscale
-__device__ __forceinline__ void idx_score_body(IDX_SCORE_PARAMS) {
+
+/* The row's sequence and the page of this lane's column, found before the step's keys: `cu` and
+ * `bt` are uploaded by the host (input operands, and no op of a pass writes an input), so a chained
+ * workgroup reads them in front of its wait and the poll covers the binary search's dependent round
+ * trips (K-29). `nc` is qsa_work's, so it stays behind the acquire; it is a lane-shared address but
+ * the compiler serves it with one global_load_b32, not a scalar load (tests/chain_scalar_audit.py on
+ * the gfx1201 assembly, which is a ctest of its own -- `chain_scalar_audit`, tests/CMakeLists.txt --
+ * and so re-checks this on every build), so the wait's vector-cache acquire is the whole acquire it
+ * needs. */
+struct IdxScoreMeta {
+    int b;      /* this lane's key column */
+    int seq;    /* the row's sequence, -1 when the row is not in one */
+    int page;   /* the column's key page; read only when `live` */
+    bool live;  /* `b` is inside the table's columns and the row is in a sequence */
+};
+
+__device__ __forceinline__ IdxScoreMeta idx_score_meta(IDX_SCORE_PARAMS) {
+
+    const int lane = threadIdx.x & (kWave - 1), wave = threadIdx.x >> 5;
+    const int col = lane & 15;
+    const int m  = (int)blockIdx.x;
+    IdxScoreMeta s = { 0, -1, -1, false };
+    const int b0 = (int)blockIdx.y * kKeysWg + wave * 16;
+    s.b = b0 + col;
+    if (b0 >= out_cols) return s;      /* wave-uniform: the body writes nothing either */
+
+    s.seq = idx_seq_of(cu, nseq, m);
+    /* In bounds whenever it is read: `cols` is the block table's column count (or the row's). */
+    if (s.seq >= 0 && s.b < cols) { s.page = bt[(size_t)s.seq * bt_ld + s.b]; s.live = true; }
+    return s;
+}
+
+__device__ __forceinline__ void idx_score_body(IDX_SCORE_PARAMS, const IdxScoreMeta& meta) {
 
     const int lane = threadIdx.x & (kWave - 1), wave = threadIdx.x >> 5;
     const int half = lane >> 4, col = lane & 15;
@@ -54,18 +134,16 @@ __device__ __forceinline__ void idx_score_body(IDX_SCORE_PARAMS) {
     const int b0 = (int)blockIdx.y * kKeysWg + wave * 16;
     if (b0 >= out_cols) return;          /* wave-uniform; nothing below synchronises */
 
-    /* The row's sequence: cu is nondecreasing, so a binary search for the last cu[i] <= m. */
-    int lo = 0, hi = nseq;
-    while (hi - lo > 1) {
-        const int mid = (lo + hi) >> 1;
-        if (cu[mid] <= m) lo = mid; else hi = mid;
-    }
-    const int seq = (m >= cu[lo] && m < cu[lo + 1]) ? lo : -1;
+    const int seq = meta.seq;
     const int nlive = seq < 0 ? 0 : (nc[seq] < cols ? nc[seq] : cols);
+    const int b = meta.b;
+    if (b0 >= nlive) {                   /* wave-uniform: no key of this wave is live */
+        if (half == 0 && b < out_cols) out[(size_t)m * out_ld + b] = -INFINITY;
+        return;
+    }
 
     /* The key of this lane's column: its page, or page 0 (always present) when it has none. */
-    const int b = b0 + col;
-    const int page = (b < nlive) ? bt[(size_t)seq * bt_ld + b] : -1;
+    const int page = (meta.live && b < nlive) ? meta.page : -1;
     const bool ok  = page >= 0 && page < pages;
 
     /* A operand: head `col`'s query row. B operand: the key. Same fragment layout for both. */
@@ -83,27 +161,87 @@ __device__ __forceinline__ void idx_score_body(IDX_SCORE_PARAMS) {
 #pragma unroll
     for (int ks = 0; ks < kKS; ++ks) acc = mma(qf[ks], kf[ks], acc);
 
-    /* D[head 8 * half + e][key col]: relu, the head weight and the in-lane sum, e ascending. */
-    const unsigned short* gp = gate + (size_t)m * gate_ld + 8 * half;
-    float s = 0.0f;
-#pragma unroll
-    for (int e = 0; e < 8; ++e) {
-        const float w = bf16_to_f32(gp[e]) * wscale;
-        const float d = acc[e];
-        s = s + w * (d < 0.0f ? 0.0f : d);
-    }
-    /* The first half of the heads plus the second. */
-    const float other = swap16(s);
-    const float total = half == 0 ? s + other : other + s;
+    const float total = idx_head_sum(acc, gate + (size_t)m * gate_ld + 8 * half, half, wscale);
     if (half == 0 && b < out_cols) out[(size_t)m * out_ld + b] = ok ? total : -INFINITY;
+}
+
+/* The row-tiled form. No wave returns early: all reach the staging barriers. */
+__device__ __forceinline__ void idx_tile_body(IDX_SCORE_PARAMS, int M) {
+    __shared__ unsigned short qs[kTStage * kHeads * kTQP];
+    __shared__ int sh_seq[kTRows];
+
+    const int t = threadIdx.x, lane = t & (kWave - 1), wave = t >> 5;
+    const int half = lane >> 4, col = lane & 15;
+    const int m0 = (int)blockIdx.x * kTRows;
+    const int b0 = (int)blockIdx.y * kTKeys + wave * 16, b = b0 + col;
+    if (t < kTRows) sh_seq[t] = m0 + t < M ? idx_seq_of(cu, nseq, m0 + t) : -1;
+
+    /* The keys of the sequence last loaded (kseq), wave-uniform. */
+    int kseq = INT_MIN, nlive = 0;
+    bool ok = false;
+    v8bf kf[kKS];
+    constexpr int kRowWords = kHeads * kN / 4;   /* 8-byte words a row's query */
+    for (int r0 = 0; r0 < kTRows && m0 + r0 < M; r0 += kTStage) {
+        __syncthreads();   /* the previous stage read; sh_seq written */
+        for (int i = t; i < kTStage * kRowWords; i += kTWaves * kWave) {
+            const int r = i / kRowWords, e = (i % kRowWords) * 4;
+            if (m0 + r0 + r < M)
+                *(uint2*)&qs[(r * kHeads + e / kN) * kTQP + e % kN] =
+                    *(const uint2*)(q + (size_t)(m0 + r0 + r) * q_ld + e);
+        }
+        __syncthreads();
+        if (b0 >= out_cols) continue;    /* wave-uniform */
+        for (int r = 0; r < kTStage && m0 + r0 + r < M; ++r) {
+            const int m = m0 + r0 + r, seq = sh_seq[r0 + r];
+            if (seq != kseq) {
+                kseq = seq;
+                nlive = seq < 0 ? 0 : (nc[seq] < cols ? nc[seq] : cols);
+                if (b0 < nlive) {
+                    /* This lane's key: its page, or page 0 (always present) when it has none. */
+                    const int page = b < nlive ? bt[(size_t)seq * bt_ld + b] : -1;
+                    ok = page >= 0 && page < pages;
+                    const unsigned short* kp = key + (size_t)(ok ? page : 0) * key_ld + 4 * half;
+#pragma unroll
+                    for (int ks = 0; ks < kKS; ++ks) kf[ks] = fragP(kp + ks * 16);
+                }
+            }
+            float* const o = out + (size_t)m * out_ld + b;
+            if (b0 >= nlive) {           /* wave-uniform */
+                if (half == 0 && b < out_cols) *o = -INFINITY;
+                continue;
+            }
+            const unsigned short* qp = qs + (r * kHeads + col) * kTQP + 4 * half;
+            v8f acc;
+#pragma unroll
+            for (int e = 0; e < 8; ++e) acc[e] = 0.0f;
+#pragma unroll
+            for (int ks = 0; ks < kKS; ++ks) acc = mma(fragP(qp + ks * 16), kf[ks], acc);
+            const float total =
+                idx_head_sum(acc, gate + (size_t)m * gate_ld + 8 * half, half, wscale);
+            if (half == 0 && b < out_cols) *o = ok ? total : -INFINITY;
+        }
+    }
 }
 
 template <class CH>
 __global__ __launch_bounds__(kWaves * kWave)
 void idx_score_kernel(IDX_SCORE_PARAMS) {
-    if (CH::on) r4d_chain_wait();
+    /* K-29: the row's sequence and column page in front of the wait, which then covers their reads
+     * (see IdxScoreMeta). */
+    const IdxScoreMeta meta = idx_score_meta(q, gate, key, bt, cu, nc, out, nseq, cols, out_cols,
+                                            pages, q_ld, gate_ld, key_ld, bt_ld, out_ld, wscale);
+    if (CH::on) r4d_chain_wait_vec();
     idx_score_body(q, gate, key, bt, cu, nc, out, nseq, cols, out_cols, pages, q_ld, gate_ld,
-                   key_ld, bt_ld, out_ld, wscale);
+                   key_ld, bt_ld, out_ld, wscale, meta);
+    if (CH::on) r4d_chain_done();
+}
+
+template <class CH>
+__global__ __launch_bounds__(kTWaves * kWave)
+void idx_score_tile_kernel(IDX_SCORE_PARAMS, int M) {
+    if (CH::on) r4d_chain_wait();
+    idx_tile_body(q, gate, key, bt, cu, nc, out, nseq, cols, out_cols, pages, q_ld, gate_ld,
+                  key_ld, bt_ld, out_ld, wscale, M);
     if (CH::on) r4d_chain_done();
 }
 #undef IDX_SCORE_PARAMS
@@ -111,6 +249,9 @@ void idx_score_kernel(IDX_SCORE_PARAMS) {
 }  // namespace
 
 // ============================================================== the plugin ABI entry point
+
+// Test hook (r4d.h): 0 the launcher's rule, 1 the per-row form, 2 the row-tiled form.
+extern "C" void r4d_idx_score_pin_form(int form) { g_idx_score_form = form; }
 
 enum { IS_Q = 0, IS_GATE = 1, IS_K = 2, IS_BT = 3, IS_CU = 4, IS_NC = 5, IS_SCORE = 6 };
 
@@ -169,15 +310,28 @@ extern "C" int r4d_rad_idx_score(const RadArgs* a, RadStream stream) {
     const long long out_cols = o->shape[1];
     if (out_cols > (1ll << 20)) return R4D_NO(RAD_E_SHAPE);
     const float wscale = (float)(std::pow((double)H, -0.5) * std::pow((double)n, -0.5));
-    const unsigned gy = (unsigned)((out_cols + kKeysWg - 1) / kKeysWg);
     const bool chain = r4d_geti_or(a, "chain", 0) != 0;
+    const bool tiled = g_idx_score_form == 2 || (g_idx_score_form == 0 && M >= kTileRows);
+#define R4D_ISC_ARGS                                                                            \
+    (const unsigned short*)r4d_p(q), (const unsigned short*)r4d_p(g),                           \
+        (const unsigned short*)r4d_p(k), (const int32_t*)r4d_p(bt), (const int32_t*)r4d_p(cu),  \
+        (const int32_t*)r4d_p(nc), (float*)r4d_wp(o), (int)nseq, (int)cols, (int)out_cols,      \
+        (int)pages, (long)q->stride[0], (long)g->stride[0], (long)key_ld, (long)bt->stride[0],  \
+        (long)o->stride[0], wscale
+    if (tiled) {
+        const dim3 grid((unsigned)((M + kTRows - 1) / kTRows),
+                        (unsigned)((out_cols + kTKeys - 1) / kTKeys));
+#define R4D_ISC(CH_)                                                                            \
+    R4D_EMIT(stream, (idx_score_tile_kernel<CH_>), grid, dim3(kTWaves * kWave), 0, R4D_ISC_ARGS, \
+             (int)M)
+        return chain ? R4D_ISC(r4dchain) : R4D_ISC(R4dUnchained);
+#undef R4D_ISC
+    }
+    const unsigned gy = (unsigned)((out_cols + kKeysWg - 1) / kKeysWg);
 #define R4D_ISC(CH_)                                                                            \
     R4D_EMIT(stream, (idx_score_kernel<CH_>), dim3((unsigned)M, gy), dim3(kWaves * kWave), 0,   \
-             (const unsigned short*)r4d_p(q), (const unsigned short*)r4d_p(g),                  \
-             (const unsigned short*)r4d_p(k), (const int32_t*)r4d_p(bt),                        \
-             (const int32_t*)r4d_p(cu), (const int32_t*)r4d_p(nc), (float*)r4d_wp(o),           \
-             (int)nseq, (int)cols, (int)out_cols, (int)pages, (long)q->stride[0],               \
-             (long)g->stride[0], (long)key_ld, (long)bt->stride[0], (long)o->stride[0], wscale)
+             R4D_ISC_ARGS)
     return chain ? R4D_ISC(r4dchain) : R4D_ISC(R4dUnchained);
 #undef R4D_ISC
+#undef R4D_ISC_ARGS
 }

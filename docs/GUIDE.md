@@ -849,7 +849,11 @@ expert slab and the KV cache:
   with virtual memory management), the experts keep on the card what the pinned host pool cannot
   hold, plus one expert unit of packing slack. The cache takes the rest, up to what it could ever
   address (`max-num-seqs` x `max-model-len`), and lends every block no live request holds back
-  to the expert slab in place. The prefill staging region comes out of the cache's side.
+  to the expert slab in place. The prefill staging region comes out of the cache's side. A
+  sliding-window group pages one window per sequence slot, so the slots no request occupies go the
+  same way, on a loan of their own: what one such group can spare is sized by slots, not by the
+  token axis the other groups lend on, and a request needing one of those blocks takes it back
+  before it runs.
 - **Without a lender** (`deterministic`, an explicit `placement: all_vram` or `layer_offload`, or
   no virtual memory management), the experts come first and the cache keeps one `max-model-len`
   sequence.
@@ -1005,6 +1009,17 @@ the pinned total is twice the table: set `amdgpu.no_system_mem_limit=1` (the cap
 and 1.5 GiB) or the second pin can be refused. The kernel charges the tmpfs pages to the memory
 cgroup of the engine that filled them.
 
+A tmpfs holds the file on huge pages only where `shmem_enabled` allows them
+(`/sys/kernel/mm/transparent_hugepage/shmem_enabled`, `never` by default), so a plain `/dev/shm`
+leaves the table on 4 KiB pages: mount the directory's tmpfs with `huge=always`, or set
+`shmem_enabled=advise`. The gather reads 96-byte rows at random, so the page size is a cost of the
+cards' TLB and the driver's mapping rather than of the bandwidth; what the pages buy is startup,
+where the file is filled and pinned a whole range at a time -- on two R9700 at TP2 a reused file on a
+huge-page tmpfs answered in 22.5 s against 36 s for `ram`, while the same reuse on a 4 KiB tmpfs
+answered in 36.7 s, the same as `ram`. A container cannot ask for them itself
+(`docker run --tmpfs` refuses `huge=`, `--shm-size` sets a size and no page size, and the sysfs
+knob is the host's), so the mount belongs on the host and the directory is passed in from there.
+
 `ngram-placement: disk=DIR` reads the table from its own file, `DIR/ngram-<id>.bin`, instead of from
 the container: a table on a faster or separate drive (an Optane beside a model on a large NVMe, or a
 model on a hard disk with its table on an SSD) at no host memory. The first start fills the file from
@@ -1013,6 +1028,17 @@ always complete); later starts check samples of it against the container and reu
 `ram=DIR`'s, so a file never serves another model; remove the file to have it filled again. Reads go
 to it as `disk` reads the container, through the row cache with direct I/O, so `DIR`'s filesystem must
 support `O_DIRECT` (tmpfs since Linux 6.6 does, but a tmpfs is what `ram` is for).
+
+`keep-container-cache: true` leaves the container's pages in the page cache after the load instead
+of dropping every range behind the read, so the next start reads the container at memory speed
+rather than from the drive. The load reads the container buffered for it (an O_DIRECT read never
+fills the page cache), so the first start pays the copy and the buffered rate; every later start
+reads from memory. It is off by default and only kept when `MemAvailable` after the load's pins
+leaves the whole container plus `memory.host-headroom-mib` free, so a table placed in host memory or
+a host KV tier is never taken from; when the RAM is not there the startup line says so and the pages
+are dropped as usual. The pages are reclaimable, but they are the same spare host RAM a bigger
+`host-mib` pool, `prefix-cache-mib` or `--kv-resident` would take: spend it on the one that pays for
+the workload, and do not ask for all of them.
 
 **`weights-disk-tier`** serves a model larger than the card and the host pool together, with every
 step paced by the drive. A routed expert that fits neither lives only in the container. Before each
@@ -1997,6 +2023,39 @@ nodes, grown over the block the drafter was trained at. A request with a grammar
 tools) speculates on a tree too: each row is masked against the grammar after its own ancestors.
 `draft-coupling: on` samples one path, so a coupled drafter proposes the chain.
 
+**The suffix index, built as the prompt is.** The index a suffix lookup reads covers the whole history
+(prompt and output). It is built a prefill chunk at a time, at each chunk's commit, rather than all at once
+at the first token under the scheduler's lock (0.19 us a token: 37-44 ms at 200K tokens, a stall for every
+sequence once a turn). A prompt of 4096 tokens or more leaves a copy of its finished index behind (2.2 ms at
+200K tokens, at most 16 copies and 512 MiB); the next request whose prompt starts with the same tokens (the
+conversation's next turn, typically a prefix-cache hit) takes it over at admission and indexes only what it
+adds. The contents are exactly a build from nothing (`tests/suffix_test.cpp`); the costs on the host, 200K
+tokens of code-like text: 43.9 ms at the first token before, now at most 5.3 ms in any one chunk of 8192
+(1.4 ms the first). `radiance:suffix_adopted_total` counts take-overs.
+
+**A global suffix cache: `draft-suffix-global-mib: N`.** SuffixDecoding's second tree: earlier responses
+across requests (default 256 MiB with `draft-suffix: on`; 0 off). For every context of `draft-suffix-min-match` to three more tokens it
+counts how often each token followed in the responses held; a proposal follows the most frequent follower of
+the longest context seen and is scored by the same frequency rule (`count(context, token) / (count(context) +
+1)`, the +1 so a context seen once is not a certainty). The step verifies the global chain instead of the
+request's own when it expects more accepted tokens than that chain and than the head's verifies accept on
+average. Responses join after their request ends: copied into a queue, indexed by a worker thread a few
+hundred positions per hold of its lock; a lookup only tries the lock, so it never waits. Past N MiB the
+responses with the lowest LRFU score come out again: a response's score is its insertion plus one for
+every verify that accepted rows of a chain it led to (the context's latest response), halving every
+`prefix-cache-lrfu-half-life-s`; uncredited, that is the oldest. With `prefix-cache-dir` set the credited
+responses are saved when idle (`prefix-cache-flush-s`), and at a stop also those of the last
+`prefix-cache-dir-active-s`, to `DIR/<served-model-name>.suffix`, keyed by the vocabulary and context
+lengths, checksummed and renamed into place, and re-indexed in the background after a restart.
+`radiance:suffix_global_credited_total` counts the credits. Lossless as the
+per-request chain is. Measured on Flash-Next at TP2 (`num-speculative-tokens: 7`, coupled chain, adaptive
+depth), eight code-writing chat prompts a round: sampled at T=1.0 with a new seed each round, the responses
+share too little and the head's own chain is better (neutral after the gate: 357.5 vs 358.6 tok/s); the same
+prompts again at T=0 (an agent's retry), +3.2% (343.6 vs 332.9), the global chains' rows accepted 84%. The
+verify window (7 rows on Flash-Next) bounds what a recurring response can save. `/metrics`:
+`radiance:suffix_global_total`, `suffix_global_busy_total`.
+
+
 **A shorter block under load: `draft-short-from: N`.** A block drafter's block is paid for by
 every drafting sequence, whatever each one verifies. At one sequence a long block pays; at many, its
 drafter rows and its weaker first positions cost more than the extra drafts bring. A drafter that also
@@ -2187,7 +2246,8 @@ VRAM copy. Its VRAM can then be given up at no cost, and is, as soon as somethin
 expert slab's loan, or a request the pool cannot otherwise serve). A conversation that returns
 before that resumes from VRAM; one that returns after is restored from host memory and keeps its host
 copy, so its next turn copies only what that turn added. A full host tier drops its least recently
-used conversations. Nothing is written to a drive.
+used conversations. Nothing is written to a drive at runtime; `prefix-cache-dir` (below) writes the
+cache at a stop and reads it back after a restart.
 
 A restore is one of the requests VRAM is given up for. The cache keeps a quarter of the pool free
 after each turn, and a returning conversation larger than that takes the VRAM copies of other
@@ -2250,6 +2310,83 @@ models:
   conversation's block ids and cannot move to a host slot (`docs/KV-STREAMING.md` §3.8).
 - `prefix-cache-ttl: S`: seconds an unused conversation is kept (default 3600); `0` keeps it until
   the memory is wanted.
+- `prefix-cache-dir: DIR` keeps the cache across restarts (off by default; needs `prefix-cache-mib`).
+  At runtime nothing changes: the cache lives in VRAM, the host tier and the snapshot store as above.
+  On a clean stop (SIGTERM, `stopping: draining in-flight requests`) every entry with a host copy and
+  every committed snapshot that earned it (below) is written to `DIR/<served-model-name>.<key>/`;
+  with `prefix-cache-flush-s: S` (default 600, `0` only at a stop) what is new is also written
+  whenever the server is idle and S seconds have passed, so a crash loses little. At the next start only
+  the index is read (tens of milliseconds); an entry's bytes and the snapshot a hit resumes from are
+  read into host memory when a request's chain reaches them, just before the restore, and the turn
+  then resumes without a prefill. `prefix-cache-dir-mib: N` bounds the directory (default: the host
+  tier plus the snapshot store). A host copy or snapshot the directory also holds is given up for
+  room before anything else, and read back on a hit.
+
+  What goes to disk is chosen by an LRFU score (combined recency and frequency: every reference
+  adds one, and the sum halves every `prefix-cache-lrfu-half-life-s`, default 21600). An entry's
+  references are its publish and every lookup that reuses it; a snapshot's, its save and every
+  hit that resumes from it. The cap keeps the highest scores, so a conversation reused all day
+  outlives a newer one used once. *Admission*: a new entry or snapshot is written only once it
+  was reused, or when it belongs to a conversation of `prefix-cache-dir-long-tokens` or more
+  (default 32768; a snapshot at or past that depth), or, at a clean stop, when it was used in the
+  last `prefix-cache-dir-active-s` seconds (default 3600; `0` writes only what earned it), so the
+  conversations in progress resume. Single questions and benchmarks never reach the disk.
+  Nothing on disk is rewritten unless its bytes changed; segments are append-only and compaction
+  (one rewrite of everything) runs only when dead bytes are over half (and 256 MiB), at most once
+  an hour, never at a stop, and only within the budget. *Write budget*:
+  `prefix-cache-dir-write-mib-per-hour` (default 4096, `0` unbounded) is a token bucket of one hour
+  for the idle flushes; what does not fit waits for a later flush (counted as deferred), the
+  chain's start first. The write at a clean stop is not held to it but counts against it.
+  `/metrics`: `radiance:prefix_store_written_bytes_total`, `prefix_store_written_bytes_last_hour`,
+  `prefix_store_admitted_total`, `prefix_store_rejected_total`, `prefix_store_deferred_total`,
+  `prefix_store_paged_in_total`, `prefix_store_hit_rate` (entries read back over entries indexed
+  at startup), `prefix_store_entries`, `prefix_store_snapshots`, `prefix_store_bytes`,
+  `prefix_store_compactions_total`.
+
+  The global suffix cache (`draft-suffix-global-mib`) keeps its file in the same directory,
+  `DIR/<served-model-name>.suffix`, under its own key (the vocabulary), so a rebuild that
+  invalidates the KV store leaves it valid.
+  **The directory holds conversation content (KV and token ids) unencrypted**; startup says so.
+
+  Safety: the files are only read by an engine that would compute the same bytes. The key is a
+  hash of a text listing the container (path, size, mtime, the hash of its first and last MiB),
+  every executable file mapped into the process (binary, plugins, ROCm, libm: path, size, mtime,
+  inode), the tuning files, the `RADIANCE_*`/`R4D_*`/`RAD_*`/`HSA_*`/`HIP_*` environment, the
+  options that change what a step computes (KV dtype, `tp`, `tp-wire`, placement, rotary scaling,
+  chunk size, checkpoint interval, `prefix-resume`, control vectors, adapters, ...), the cards, and
+  the KV, slot and snapshot geometry of every rank. A directory of this model under another key
+  (a rebuild, another option) is discarded at startup, naming the first line that differs:
+
+  ```
+  prefix store: /srv/kv/pcache/flashnext.b4d4... was written under another key and is discarded:
+  'code .../bin/radiance size=264880552 ...' was 'code .../bin/radiance size=264879736 ...'
+  ```
+
+  Every payload carries a 64-bit checksum checked on every read (a mismatch drops the entry: a
+  miss, never a wrong hit); segments and the index are written to a temporary file, synced and
+  renamed, the index last, so a crash or a full disk at any point leaves the previous store; a
+  short or foreign segment loses its items only; leftover temporary files and unreferenced
+  segments are removed at startup. A restored hit is bit-identical to an in-memory one: Flash-Next
+  at TP2, a follow-up turn after a restart answered with the same text and the same top-5
+  logprobs as the same follow-up in the process that computed the history.
+
+  Flash-Next at TP2 (i8 KV, 14.7 KiB a token plus 115.7 MiB a snapshot), a code conversation's
+  follow-up turn, time to first token:
+
+  | history | cold prefill | after a restart, from disk (cold / page cache) | in memory |
+  |---|---|---|---|
+  | 16K tokens | 2.03 s | 0.31 s | 0.09 s |
+  | 64K tokens | 7.64 s | 0.63 s / 0.37 s | 0.13 s |
+  | 120K tokens | 14.55 s | 1.30 s / 0.62 s | 0.19 s |
+
+  The disk read is most of it (1.81 GiB for 120K tokens in 0.84 s from a cold cache). Writing the
+  three histories (5.65 GiB) took 4.7 s; the index of 50K entries loads in 0.02 s, the key in
+  0.02 s. Flint (sliding-window snapshots, 16-token entries) persists the same way, the window
+  riding in its snapshot: 48K tokens 3.94 s cold, 0.74 s from disk, 0.08 s in memory, the same
+  text and logprobs. Limits: an entry still only in VRAM at the stop (the host tier full) is not
+  written; the `/sessions` rows of restored conversations reappear on their next turn; a model
+  whose KV group streams (`kv-resident`) has no host copy and is not persisted; a page-in runs on
+  the step thread under the scheduler's lock, so a running batch waits for it.
 
 **What a slot holds under tensor parallelism.** One host slot holds the whole engine's entry: each
 rank's shard of every cached group, end to end, so a slot is as many entries wide as there are
@@ -2267,7 +2404,8 @@ compares, logging `kv tiers: the replicated groups of ... differ between rank 0 
 a rank holds other bytes. Sharded groups (a GQA model's K/V heads) are unaffected and still take a
 window per rank.
 
-Restoring a 200K-token turn costs a copy over PCIe; recomputing it costs minutes.
+Restoring a 200K-token turn costs a copy over PCIe; recomputing it costs minutes. With
+`prefix-cache-dir` it survives a restart too (above).
 
 On a hybrid model the recurrent state matters as much as the attention blocks: restoring the blocks
 alone re-runs every linear layer over the whole transcript, which hit-rate counters still report as a
@@ -2597,10 +2735,12 @@ models:
 
 ### 4.10 Control vectors
 
-A **control vector** is a small GGUF file holding one direction per layer; applied while the model
-runs, it removes each token's residual-stream component along that direction. radiance implements
-llama.cpp's `--cvec-mode project` operation (`hc_project`, `docs/OPS.md`) for architectures whose
-plugin declares it; today that is `qwen4exp` (Qwen3.8-Flash-Next).
+A **control vector** is a small GGUF file holding one or more directions per layer; applied while
+the model runs, it removes each token's residual-stream component along those directions. radiance
+implements llama.cpp's `--cvec-mode project` operation (`hc_project`, `docs/OPS.md`) for
+architectures whose plugin declares it: `qwen4exp` (Qwen3.8-Flash-Next) and `hyv4flash`
+(Hy4-flash). `hyv4flash` has four hyper-connection streams per residual, and its package may carry
+**one direction per stream** (§4.10.1).
 
 **`control-vector: off` or `control-vector: on` loads one** (`disabled`, the default, is the same
 as the key unset). Without it nothing is read, the graph declares no projection op, a request that asks
@@ -2611,7 +2751,20 @@ them on. With the key the engine looks, in order, at:
 1. `<container without its extension>.control-vector.gguf` beside the model,
 2. `control-vector.gguf` in the container's directory (one file for a directory of quants), then
 3. `<home>/vectors/<architecture>-control-vector.gguf` for each `server.radiance-home`. radiance ships
-   `qwen4exp-control-vector.gguf` there (`data/vectors/`, installed into every plugin home).
+   `qwen4exp-control-vector.gguf` and `hyv4flash-control-vector.gguf` there (`data/vectors/`,
+   installed into every plugin home).
+
+**Directions per layer, and per stream.** A `direction.<l>` tensor is F32 and exactly the model's
+width. One row (`[n_embd]`) is a single direction; `[n_embd, k]` is k directions, applied as k
+chained projections, which removes the k-dimensional subspace they span (they should be
+orthonormal; the loader warns when they are not). A package may also set
+`controlvector.per_stream: true` (an I64), which declares that the rows are grouped by the model's
+hyper-connection streams: `rank` then counts direction GROUPS, each group holding one direction per
+stream, and stream s of group k is projected against its own row at `(((l*rank)+k)*hc + s)*n_embd`.
+The four Hy4 streams carry the refusal signal differently (their directions overlap at a cosine of
+0.1 to 0.6), so a package that averages them into one direction is materially weaker; §4.10.1 has
+the measurements. A per-stream package is applied only where the architecture declares chained
+projections; another architecture refuses it by name rather than steering one direction of k.
 
 The startup is refused, naming the reason, when the key is set and the architecture plugin does
 not apply control vectors, no file is found, or the file does not fit: its
@@ -2684,6 +2837,47 @@ changes; the stock column is a separate boot of 1.9.0). First generated token, 2
 Seventeen of eighteen policy prompts flip from a refusal opening to content; neutral prompts move
 by 0.002-0.003 nats.
 
+### 4.10.1 The Hy4-flash refusal package (per-stream)
+
+`hyv4flash` declares one projection per group per layer and carries four hyper-connection streams,
+so its package is `controlvector.per_stream: true` with `rank = 4 * groups`. radiance ships one,
+`data/vectors/hyv4flash-control-vector.gguf` (41 layers, 8 rows each, 4.0 MB), which lookup path 3
+finds when no file sits beside the container. It is the publisher's recipe
+(`huggingface.co/alesha-pro/Hy4-flash-Uncensored-GGUF`) run on the taps of the quant this host
+serves, not on their FP8 weights: per layer, per stream, `mean(harmful) - mean(harmless)` at the
+last prompt token, the harmless-mean span projected out, two groups over four framings
+(`N,NA|H,HA`: thinking off/on, with and without a coding-agent system prompt), orthonormalised
+within a stream. The sidecar `data/vectors/hyv4flash-control-vector.json` records the samples and
+the measurements below.
+
+Measured on this box (HarmBench-320, stock weights, nothing on disk changed):
+
+| | stock | package |
+|---|---:|---:|
+| refusals (audited genuine attempts of 320) | 313 | **111** |
+| strict grader | 294 | 54 |
+| first-token refusal mass, 8 hard prompts | 0.656 | 0.164 |
+| KL vs stock, mean / median / p99 | — | 0.20 / 0.08 / 1.9 |
+| top-1 agreement | — | 0.81 |
+| perplexity ratio | — | 1.06 |
+| benign capability, 28 tasks | 19/19 | 19/19 |
+
+The cost is visible on adversarial prompts: ~26% of the complied answers run past a 1024-token cap
+(an eval setting, not the model's 262144), ~9% leak chain-of-thought or a stray reasoning tag into
+the visible answer, and ~13% loop on lyrics. Ordinary work is unaffected.
+
+The table is the publisher's package on these weights. The shipped file is our derivation of the
+same recipe, and the two are within noise of each other on every measure taken: first-token refusal
+mass 0.167 against 0.164, KL 0.199 / 0.082 against 0.197 / 0.082, and 29 refusals of the publisher's
+held-out 146 against 28. Either is fine to ship; ours is the one that can be re-derived and re-tuned
+here.
+
+To use it: keep `control-vector: off` as the deployment default (as this host does), then either
+flip the dashboard's **Control vector** switch (`POST /admin/control-vector {"enabled": true}`),
+or send `"control_vector": true` on one request, or name the model `hy4-flash:uncensored`
+(`control-vector-variant: uncensored`). All three are the same switch; the field wins over the
+default for that request, and the variant name is refused together with `"control_vector": false`.
+
 ### 4.11 Every key
 
 `radiance --help` prints these, by level. A key written here as `server.KEY` or `memory.KEY` belongs
@@ -2735,6 +2929,7 @@ switch is set with `true`. The fleet's own keys (a model's `aliases`, `priority`
 | `memory.host-headroom-mib: N` | 4096 | host RAM left free for the system when startup pins host memory, kept for the unpooled allocations, staging and page cache (§4.3). A snapshot store's floor takes back the shortfall from it, down to 1 GiB, rather than come up with none (`checkpoint-slots`, §4.8) |
 | `embedding-placement: WHERE` | ram | `ram` or `vram`: the token embedding pinned in host memory beside `host-pool-mib` and read in place, or on the card (§4.3) |
 | `ngram-placement: WHERE` | auto | `auto`, `vram`, `ram` or `disk`: an n-gram table on the card, as a copy in RAM made at load and read by the card, or read from the container (§4.3); `ram=DIR` shares the RAM copy between engines, `disk=DIR` reads the table from its own file in `DIR` |
+| `keep-container-cache: true` | off | keep the container in the page cache after the load (the load reads it buffered for that) so later starts read it at memory speed rather than from disk; only when `MemAvailable` after the load's pins leaves the container plus `memory.host-headroom-mib` free. The first start is slower; the pages are the same spare host RAM a bigger `host-mib` pool, `prefix-cache-mib` or `--kv-resident` takes, so spend it on one (§4.3) |
 | `vision-tower-placement: WHERE` | vram | `vram` or `ram`: the encoder towers (vision, and audio where a model has one) on the card, or pinned in host memory beside `host-pool-mib` and read in place once an image (§4.3) |
 | `weights-disk-tier: true` | off | read weights that fit neither VRAM nor the host pool from the container (O_DIRECT); routed experts a layer at a time |
 

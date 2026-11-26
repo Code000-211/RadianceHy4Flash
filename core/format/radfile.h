@@ -69,7 +69,7 @@ public:
     /* Drop the blob from the page cache and this process's page tables, so a container larger
      * than RAM does not leave the cache full of pages nothing will read. Only the blob: the tables
      * are small and read constantly. The ranges named to keep_cached() are left alone, on whole
-     * pages. Advisory; the kernel may decline either way. */
+     * pages. Advisory; the kernel may decline either way. Does nothing while keep_pages(true). */
     void drop_blob_cache() const;
     /* Names [p, p + n) as read through the mapping for the engine's life (the mapped tier: an
      * n-gram table), so no drop_blob_cache() frees its pages: a gather from dropped pages starts
@@ -80,8 +80,16 @@ public:
     /* Drop one range of the blob behind a single forward cursor. A buffered front-to-back read of
      * a container larger than RAM otherwise builds reclaim pressure that slows the read itself.
      * Correct only for one cursor moving in one direction with no revisits; with several, one
-     * would drop what another is about to read. */
+     * would drop what another is about to read. Does nothing while keep_pages(true). */
     void drop_range(int64_t off, int64_t bytes) const;
+
+    /* --keep-container-cache (B-04): leave the pages the load reads in the page cache, so the next
+     * start reads the container at memory speed rather than from disk. The engine turns it on only
+     * when the RAM after the load's pins leaves the container plus the host margin free; the pages
+     * are reclaimable, so a later use of that RAM takes them back. Off by default: both drop
+     * functions then free each range behind the read. */
+    void keep_pages(bool keep) { keep_pages_ = keep; }
+    bool keep_pages() const { return keep_pages_; }
 
     /* pread `bytes` at `off` into `dst`, bypassing the mapping. For loads: an async copy from
      * pageable memory goes through the HIP runtime's own staging, which degrades as a load
@@ -160,6 +168,7 @@ private:
     uint8_t*    base_ = nullptr;
     int64_t     size_ = 0;
     std::vector<std::pair<int64_t, int64_t>> keep_;   /* keep_cached: (blob offset, bytes) */
+    bool        keep_pages_ = false;                  /* keep_pages: the drops below do nothing */
     int         fd_   = -1;
 
     const RadFileHeader*  hdr_  = nullptr;
@@ -189,6 +198,12 @@ bool rad_blob_range(const uint8_t* base, int64_t size, const void* p, int64_t n,
  * the whole blob gives no ranges. */
 std::vector<std::pair<int64_t, int64_t>> rad_keep_complement(
     int64_t tables, int64_t size, std::vector<std::pair<int64_t, int64_t>> keep);
+
+/* The ranges drop_blob_cache frees: rad_keep_complement(tables, size, keep), or none while
+ * `keep_all` (keep_pages, --keep-container-cache: the whole container stays in the page cache so a
+ * restart reads it at memory speed). */
+std::vector<std::pair<int64_t, int64_t>> rad_drop_ranges(
+    int64_t tables, int64_t size, std::vector<std::pair<int64_t, int64_t>> keep, bool keep_all);
 
 /* ================================================================== writer */
 /* Streaming writer: the blob is never held in RAM (a checkpoint may be 100 GB). The tables

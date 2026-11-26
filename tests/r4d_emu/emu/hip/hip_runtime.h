@@ -125,6 +125,8 @@ inline T atomicMin(T* p, T v) { const T o = *p; if (v < o) *p = v; return o; }
 template <class T>
 inline T atomicMax(T* p, T v) { const T o = *p; if (v > o) *p = v; return o; }
 template <class T>
+inline T atomicOr(T* p, T v) { const T o = *p; *p = o | v; return o; }
+template <class T>
 inline T atomicCAS(T* p, T expect, T v) { const T o = *p; if (o == expect) *p = v; return o; }
 template <class T>
 inline T atomicExch(T* p, T v) { const T o = *p; *p = v; return o; }
@@ -200,6 +202,10 @@ emu_v8s emu_load_tr_b128(const void* p);
 int emu_cvt_pk_fp8(float a, float b, int old, bool hi);
 #define __builtin_amdgcn_cvt_pk_fp8_f32(a, b, old, hi) emu_cvt_pk_fp8((a), (b), (old), (hi))
 extern int emu_last_block;     /* threads a block of the last grid had: which kernel ran */
+/* Nonzero runs a block's fibers from the last thread to the first between barriers. A kernel's
+ * result may not depend on the order its threads reach an LDS atomic in, and on the card that
+ * order is not fixed; a test runs both orders and compares (test_sample.cpp). */
+extern int emu_reverse_order;
 
 /* Blocks run one after another on one OS thread, so a fence orders nothing that is not already in
  * order and an atomic is a plain read-modify-write. Enough for the split-K arrival pattern

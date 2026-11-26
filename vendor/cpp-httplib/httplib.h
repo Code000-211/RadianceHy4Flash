@@ -2024,6 +2024,13 @@ public:
   virtual bool wait_writable() const = 0;
   virtual bool is_peer_alive() const { return wait_writable(); }
 
+  // The caller has just seen this stream writable -- the content loops wait
+  // before each chunk and then write it. Lets that write skip its own wait,
+  // which would ask the kernel a question that was answered a moment ago.
+  // Consumed by that write. LOCAL CHANGE (radiance): the response loops below
+  // set it, SocketStream::write() and SSLSocketStream::write() consume it.
+  virtual void set_writable_hint() {}
+
   virtual ssize_t read(char *ptr, size_t size) = 0;
   virtual ssize_t write(const char *ptr, size_t size) = 0;
   virtual void get_remote_ip_and_port(std::string &ip, int &port) const = 0;

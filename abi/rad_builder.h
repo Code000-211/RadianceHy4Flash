@@ -328,10 +328,22 @@ static inline int rad_build_slot(const RadBuildCtx* c) { return c->slot_base + c
  * steered exactly when its `scales` entry is nonzero, so a plugin asks that and cannot disagree
  * with the loader. */
 typedef struct RadControlVector {
-    const float* dir;        /* device, [n_layers, n_embd] f32, unit rows */
+    const float* dir;        /* device, [n_layers, rank, n_embd] f32, unit rows */
     const float* scales;     /* host,    [n_layers]     f32, |d_l| * user scale; 0 = not steered */
     int64_t      n_embd;
     int64_t      n_layers;
+    /* Directions per layer. `dir` holds layer l's direction k at ((l*rank)+k)*n_embd. 1 is the
+     * single-direction package every 2.2 release wrote; 0 is treated as 1 so a package built
+     * against the older struct steers exactly as it did. Trailing and zero-defaulted. */
+    int64_t      rank;
+    /* 1: `dir` is per-stream: `rank` still counts the rows of a layer, and they form rank / hc
+     * GROUPS of one direction per hyper-connection stream ([n_layers, rank/hc, hc, n_embd]), so
+     * stream s of group k is at ((l*rank) + k*hc + s)*n_embd and a kernel must project stream s
+     * against its own vector. 0:
+     * one direction per group, applied to every stream (the pre-45 behaviour). The four streams of
+     * this architecture carry the refusal signal differently (cosines 0.1-0.6), which is why the
+     * published refusal vector is per-stream. Trailing and zero-defaulted. */
+    int64_t      per_stream;
 } RadControlVector;
 
 /* ================================================================== weights */
@@ -621,6 +633,15 @@ int rad_op_resolved(RadBuilder* b, rad_op h);
  * kernel is not (rad_op_resolved). A plugin asks this first for a fused op only an optional
  * library defines, and emits the chain when the answer is 0. Additive export. */
 int rad_op_declared(RadBuilder* b, const char* op);
+
+/* The op the last rad_decl_op declared did not resolve, and the plugin declares its fallback (the
+ * unfused chain) in its place: the op is dropped. The plugin holds no handle to it, so it is never
+ * issued; it stays in the op list by name (the graph dump shows it), and what counts holes leaves
+ * it out -- the engine's device holes (Program::device_holes), the reference-kernel gate and
+ * rad-convert's dead-op count (Program::dead_ops). An unresolved op the plugin does not drop is
+ * still a hole. Call it right after the declaration it answers. RAD_OK, or RAD_E_STATE when the
+ * last rad_decl_op recorded no op, resolved, or declare has finished. Additive export. */
+int rad_op_dropped(RadBuilder* b);
 
 /* ================================================================== checkpoint name map */
 /* The plugin owns the map from checkpoint tensor names to declared weight names, including

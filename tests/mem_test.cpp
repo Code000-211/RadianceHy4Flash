@@ -14,6 +14,7 @@
 #include "mem/prefix.h"
 #include "mem/vram_budget.h"
 #include "mem/kvtier.h"
+#include "mem/pcstore.h"
 #include "device/device.h"
 #include "plugin/registry.h"
 #include "runtime/tierexec.h"
@@ -686,6 +687,53 @@ TEST(resident_queue_scratch_is_charged_with_the_hardware_queues) {
     vram_budget_need({ f }, &need1, &want1);
     CHECK_EQ(need1 - need0, 160LL << 20);
     CHECK_EQ(want1 - want0, 160LL << 20);
+}
+
+/* What of "already held" is device code: the code objects resident on the card, each one loaded
+ * whole from its module at its kernel's first launch. M-14 measures it, because libr4d carries the
+ * integer-expert forms a given quantization never launches and each of them still loads whole. It
+ * is a report line and not a term: the bytes are already inside what `free` excludes, so naming
+ * them must not move the split. */
+TEST(the_receipt_says_what_of_the_held_memory_is_device_code) {
+    Config c = small_config();
+    c.vram_weights_mib = 0;
+    c.vram_kv_mib      = 0;
+    c.gpu_headroom_mib = 96;
+    VramFacts f{};
+    f.capacity   = 32LL << 30;
+    f.free       = f.capacity - (512LL << 20);
+    f.arena      = 144LL << 20;
+    f.staging    = 98LL << 20;
+    f.statics    = 2LL << 30;
+    f.experts    = 200LL << 30;
+    f.kv_ceiling = 100LL << 30;
+    VramBudget none;
+    CHECK_OK(vram_budget_resolve(c, { f }, &none));
+    CHECK_EQ(none.code_bytes, 0ll);
+    CHECK(none.report.find("of which code") == std::string::npos);   /* a backend with nothing to say */
+
+    /* Cards that have loaded code say so, and the worst rank's figure is the one printed, as with
+     * every fold here. */
+    Config c1 = small_config();
+    c1.vram_weights_mib = 0;
+    c1.vram_kv_mib      = 0;
+    c1.gpu_headroom_mib = 96;
+    VramFacts a = f, b = f;
+    a.code_bytes   = (40LL << 20) + 100 * 1024;
+    a.code_modules = 61;
+    b.code_bytes   = (110LL << 20) + 600 * 1024;   /* what libr4d's 121 gfx1201 modules weigh */
+    b.code_modules = 121;
+    VramBudget got;
+    CHECK_OK(vram_budget_resolve(c1, { a, b }, &got));
+    CHECK_EQ(got.code_bytes, b.code_bytes);
+    CHECK_EQ(got.code_modules, 121);
+    CHECK(got.report.find("of which code") != std::string::npos);
+    CHECK(got.report.find("121 code module(s) resident") != std::string::npos);
+
+    /* Measuring changes nothing: the same split as the card that could not say. */
+    CHECK_EQ(got.claimable, none.claimable);
+    CHECK_EQ(got.kv, none.kv);
+    CHECK_EQ(got.experts, none.experts);
 }
 
 TEST(the_smallest_card_binds_and_a_short_one_refuses_by_name) {
@@ -3771,6 +3819,37 @@ struct Lender {
     int64_t bs() const { return kv.plan(G_FULL)->block_size; }
 };
 
+/* A cache with a sliding window beside a full group, the shape M-11 lends from: the window's pool
+ * is one window per sequence slot, so with fewer sequences live the top of its carve is unused.
+ * 512 tokens of window at a 16-token block are 32 blocks a slot, and one step (256 tokens) is 16
+ * more: four slots (max_seqs) and one step are 212 blocks. */
+enum : int32_t { W_FULL = 1, W_WIN = 2 };
+
+static std::vector<KVGroupInfo> windowed_groups() {
+    std::vector<KVGroupInfo> g;
+    g.push_back(null_group());
+    g.push_back(paged_group("latent", RAD_KV_FULL, 2, 16, { 0, 1 }));
+    g.push_back(paged_group("latent_sliding", RAD_KV_WINDOW, 2, 16, { 0, 1 }, /*window=*/512));
+    return g;
+}
+
+struct WindowLender {
+    Pools     pools;
+    KVManager kv;
+    Config    cfg = small_config();
+
+    int build() {
+        cfg.vram_kv_mib      = 64;
+        cfg.max_tok          = 256;
+        cfg.max_seqs         = 4;
+        cfg.checkpoint_slots = 0;
+        int s = configure_pools(pools, cfg);
+        if (s < 0) return s;
+        return kv.configure(windowed_groups(), cfg, pools.kv());
+    }
+    int64_t bs(int32_t g) const { return kv.plan(g)->block_size; }
+};
+
 TEST(a_new_cache_lends_nothing_and_hands_out_its_whole_carve) {
     Lender e;
     CHECK_OK(e.build());
@@ -3811,6 +3890,61 @@ TEST(an_idle_cache_lends_all_but_its_buffer) {
     CHECK_OK(e.kv.set_loan(0));
     CHECK_EQ(e.kv.live_blocks(G_FULL), all);
     CHECK_EQ(e.kv.free_blocks(G_FULL), all - 1);
+}
+
+/* spare_tokens() is one number, so a reader cannot tell a pool packed to its top from one whose
+ * free blocks sit under a held one: both lend nothing there. These name the pieces -- where the
+ * loan stops, what the pool holds under it and what the buffer keeps -- so a measurement can.
+ * The gap `held_top - held` is what a compaction that moved the held blocks down would recover. */
+TEST(the_spare_a_loan_reaches_is_reported_piece_by_piece) {
+    Lender e;
+    CHECK_OK(e.build());
+    const int64_t all = e.kv.total_blocks(G_FULL);
+    const int64_t bs  = e.bs();
+
+    /* Idle: nothing held, so the loan reaches all but the buffer. */
+    const KVManager::SpareSplit idle = e.kv.spare_split();
+    CHECK_EQ(idle.group, (int32_t)G_FULL);
+    CHECK_EQ(idle.block_tokens, bs);
+    CHECK_EQ(idle.block_bytes, e.kv.plan(G_FULL)->bytes_per_block);
+    CHECK_EQ(idle.n_blocks, all);
+    CHECK_EQ(idle.held, 0);
+    CHECK_EQ(idle.held_top, 0);
+    CHECK(idle.buffer_blocks > 0);          /* the chunk floor, kept so a request needs no recall */
+    CHECK_EQ(idle.live, all);
+    CHECK_EQ(idle.spare_tokens, (all - idle.buffer_blocks) * bs);
+    CHECK_EQ(idle.loan_tokens, 0);
+
+    /* Hold the low half: the mark is just past the highest held block (rounded up to a bucket of
+     * the held histogram), and the spare is everything above it less the buffer. */
+    std::vector<int32_t> got;
+    for (int64_t i = 0; i < all / 2; ++i) {
+        int32_t b = -1;
+        CHECK_OK(e.kv.reserve_block(G_FULL, &b));
+        got.push_back(b);
+    }
+    const KVManager::SpareSplit half = e.kv.spare_split();
+    CHECK_EQ(half.held, (int64_t)got.size());
+    CHECK(half.held_top >= half.held);
+    CHECK_EQ(half.held_top, e.kv.held_top_blocks(G_FULL));
+    CHECK_EQ(half.spare_tokens, (all - half.held_top - half.buffer_blocks) * bs);
+
+    /* A block released under the top is a hole: unheld, and still unlendable, because the loan
+     * may not reach past the block above it. The split says so where one number cannot. */
+    e.kv.release_block(G_FULL, got[0]);
+    const KVManager::SpareSplit hole = e.kv.spare_split();
+    CHECK_EQ(hole.held, half.held - 1);
+    CHECK_EQ(hole.held_top, half.held_top);
+    CHECK(hole.held_top - hole.held > 0);
+    CHECK_EQ(hole.spare_tokens, half.spare_tokens);
+    CHECK_EQ(e.kv.spare_tokens(), half.spare_tokens);
+
+    /* The loan the arbiter set is reported beside it, so /stats can read both marks at once. */
+    CHECK_OK(e.kv.set_loan(hole.spare_tokens));
+    const KVManager::SpareSplit lent = e.kv.spare_split();
+    CHECK_EQ(lent.loan_tokens, hole.spare_tokens);
+    CHECK_EQ(lent.live, all - hole.spare_tokens / bs);
+    CHECK_EQ(e.kv.live_blocks(G_FULL), lent.live);
 }
 
 TEST(a_block_something_holds_is_never_lent) {
@@ -3885,17 +4019,17 @@ TEST(admission_reports_only_recoverable_external_capacity_as_a_fleet_wait) {
     CHECK(!waiting);                              /* no future grant can exceed the full carve */
     e.kv.set_flex_room(tokens);
     bool deny = true;
-    e.kv.set_fleet_reclaim([&](int64_t, bool* pending) {
+    e.kv.set_fleet_reclaim([&](int32_t, int64_t, bool* pending) {
         if (deny) { if (pending) *pending = true; return (int)RAD_E_FULL; }
         return (int)RAD_OK;
     });
     CHECK_EQ(e.kv.ensure(1, tokens, -1, &waiting), RAD_E_FULL);
     CHECK(waiting);                               /* allowance was optimistic; actual grant denied */
-    e.kv.set_fleet_reclaim([](int64_t, bool*) { return (int)RAD_E_NOMEM; });
+    e.kv.set_fleet_reclaim([](int32_t, int64_t, bool*) { return (int)RAD_E_NOMEM; });
     CHECK_EQ(e.kv.ensure(1, tokens, -1, &waiting), RAD_E_NOMEM);
     CHECK(!waiting);                              /* a backing failure is an operational error */
     deny = false;
-    e.kv.set_fleet_reclaim([&](int64_t, bool*) { return (int)RAD_OK; });
+    e.kv.set_fleet_reclaim([&](int32_t, int64_t, bool*) { return (int)RAD_OK; });
     CHECK_OK(e.kv.ensure(1, tokens, -1, &waiting));
     CHECK(!waiting);
 }
@@ -3910,7 +4044,7 @@ TEST(a_request_past_the_mark_takes_the_loan_back) {
 
     int calls = 0;
     int64_t asked = -1;
-    e.kv.set_reclaim([&](int64_t t) { ++calls; asked = t; return (int)RAD_OK; });
+    e.kv.set_reclaim([&](int32_t, int64_t t) { ++calls; asked = t; return (int)RAD_OK; });
 
     /* Longer than the cache keeps, well within its carve. */
     const int64_t tokens = (idle + all) / 2 * e.bs();
@@ -3940,7 +4074,7 @@ TEST(a_recall_the_slab_cannot_make_refuses_the_request) {
     CHECK_OK(e.kv.set_loan(e.kv.spare_tokens()));
     const int64_t idle = e.kv.live_blocks(G_FULL);
     const int64_t loan = e.kv.loan_tokens();
-    e.kv.set_reclaim([](int64_t) { return (int)RAD_E_DEVICE; });
+    e.kv.set_reclaim([](int32_t, int64_t) { return (int)RAD_E_DEVICE; });
 
     CHECK_OK(e.kv.add_sequence(1));
     CHECK(e.kv.ensure(1, (idle + all) / 2 * e.bs()) < 0);
@@ -3989,6 +4123,141 @@ TEST(a_follower_takes_the_leaders_mark) {
     CHECK_OK(lead.kv.set_loan(0));
     CHECK_OK(fol.kv.follow(lead.kv));
     CHECK_EQ(fol.kv.live_blocks(G_FULL), fol.kv.total_blocks(G_FULL));
+}
+
+/* ================================================================== the window loan (M-11)
+ *
+ * A sliding-window group's pool holds one window per sequence slot, so the slots no sequence
+ * occupies are VRAM nothing can reach: it is carved for a maximum number of sequences that a
+ * decode run at one to four sequences never reaches. It lends those blocks on a loan of its own,
+ * because the number the FULL groups lend on is a token axis that runs out across the whole carve
+ * while the window's spare is sized by slots, and one number cannot mark both.
+ */
+
+TEST(a_window_group_lends_the_slots_no_sequence_occupies) {
+    WindowLender e;
+    CHECK_OK(e.build());
+    const int64_t all = e.kv.total_blocks(W_WIN);
+    const int64_t bs = e.bs(W_WIN);
+    CHECK(all > 0);
+    CHECK(e.kv.win_lendable(W_WIN));
+    CHECK(!e.kv.lendable(W_WIN));     /* its own loan, not the FULL groups' */
+    CHECK(!e.kv.win_lendable(W_FULL));
+
+    /* Idle, it lends every slot but the buffer it keeps for a step. */
+    const int64_t spare = e.kv.spare_window_tokens();
+    CHECK(spare > 0);
+    CHECK_EQ(spare % bs, 0ll);
+    CHECK_OK(e.kv.set_window_loan(spare));
+    CHECK_EQ(e.kv.window_loan_tokens(), spare);
+    const int64_t live = e.kv.live_blocks(W_WIN);
+    CHECK(live > 0);
+    CHECK(live < all);
+    CHECK_EQ(all - live, spare / bs);
+    CHECK_EQ(e.kv.free_blocks(W_WIN), live);
+
+    /* Two numbers: the FULL arbiter moving its loan does not move the window's mark. */
+    CHECK_OK(e.kv.set_loan(e.kv.spare_tokens()));
+    CHECK_EQ(e.kv.live_blocks(W_WIN), live);
+    CHECK_OK(e.kv.set_loan(0));
+    CHECK_EQ(e.kv.live_blocks(W_WIN), live);
+    /* And the window's moving does not move a FULL group. */
+    const int64_t full_live = e.kv.live_blocks(W_FULL);
+    CHECK_OK(e.kv.set_window_loan(0));
+    CHECK_EQ(e.kv.live_blocks(W_FULL), full_live);
+    CHECK_EQ(e.kv.live_blocks(W_WIN), all);
+}
+
+/* A restore reserves a named block id; one above the window's mark is a block the slab is holding.
+ * The same refusal as for a FULL group, or the restore writes over weights in use. */
+TEST(a_named_window_block_above_the_mark_is_refused) {
+    WindowLender e;
+    CHECK_OK(e.build());
+    CHECK_OK(e.kv.set_window_loan(e.kv.spare_window_tokens()));
+    const int64_t live = e.kv.live_blocks(W_WIN);
+    CHECK(live < e.kv.total_blocks(W_WIN));
+    CHECK_EQ(e.kv.reserve_specific_block(W_WIN, (int32_t)live), RAD_E_STATE);
+    CHECK_OK(e.kv.reserve_specific_block(W_WIN, (int32_t)live - 1));
+}
+
+/* A window block a sequence holds is never lent, and the spare the cache reports stays below the
+ * highest held block even when a sequence's window is only partly full. */
+TEST(a_window_block_a_sequence_holds_is_never_lent) {
+    WindowLender e;
+    CHECK_OK(e.build());
+    const int64_t all = e.kv.total_blocks(W_WIN);
+    const int64_t bs = e.bs(W_WIN);
+    CHECK_OK(e.kv.add_sequence(1));
+    CHECK_OK(e.kv.ensure(1, 40 * bs));     /* a window and a part: the table fills to its cap */
+    const int64_t held = e.kv.held_top_blocks(W_WIN);
+    CHECK(held > 0);
+
+    const int64_t spare = e.kv.spare_window_tokens();
+    CHECK(spare > 0);
+    CHECK(spare < all * bs);
+    CHECK(all - spare / bs >= held);
+    CHECK_OK(e.kv.set_window_loan(spare));
+    CHECK(e.kv.live_blocks(W_WIN) >= held);
+
+    /* Pushing the mark down onto a held block is refused, and moves nothing. */
+    const int64_t before = e.kv.live_blocks(W_WIN);
+    CHECK_EQ(e.kv.set_window_loan((all - held + 1) * bs), RAD_E_STATE);
+    CHECK_EQ(e.kv.live_blocks(W_WIN), before);
+    CHECK_EQ(e.kv.window_loan_tokens(), spare);
+}
+
+/* A request needing a block the window lent asks for it back through the hook, and takes its own
+ * loan back: the FULL groups' mark and loan answer for nothing. */
+TEST(a_window_request_past_the_mark_takes_its_own_loan_back) {
+    WindowLender e;
+    CHECK_OK(e.build());
+    const int64_t bs = e.bs(W_WIN);
+    const int64_t win_spare = e.kv.spare_window_tokens();
+    CHECK_OK(e.kv.set_window_loan(win_spare));
+    const int64_t full_live = e.kv.live_blocks(W_FULL);
+    const int64_t win_live = e.kv.live_blocks(W_WIN);
+
+    int calls = 0;
+    int32_t group = -1;
+    int64_t asked = -1;
+    e.kv.set_reclaim([&](int32_t g, int64_t t) { ++calls; group = g; asked = t; return (int)RAD_OK; });
+
+    /* A sequence whose window is past what the cache kept asks for it back: one recall, on the
+     * window group, for its own loan. */
+    CHECK_OK(e.kv.add_sequence(1));
+    CHECK_OK(e.kv.ensure(1, 40 * bs));
+    CHECK_EQ(calls, 1);
+    CHECK_EQ(group, W_WIN);
+    CHECK(asked >= 0 && asked < win_spare);
+    CHECK_EQ(e.kv.window_loan_tokens(), asked);
+    CHECK(e.kv.live_blocks(W_WIN) > win_live);
+    CHECK_EQ(e.kv.block_table(1, W_WIN).size(), (size_t)(40));
+
+    /* The FULL group answered for nothing: its own loan is where it was, and this cache lends no
+     * FULL group at all. */
+    CHECK_EQ(e.kv.loan_tokens(), 0ll);
+    CHECK_EQ(e.kv.live_blocks(W_FULL), full_live);
+
+    /* With the sequence's window held, the spare is smaller again, and lending it is one tick's
+     * work: the mark the recall left is what the cache now reports. */
+    const int64_t spent = e.kv.spare_window_tokens();
+    CHECK(spent < win_spare);
+    CHECK_OK(e.kv.set_window_loan(spent));
+    CHECK_EQ(e.kv.live_blocks(W_WIN) >= e.kv.held_top_blocks(W_WIN), true);
+}
+
+/* A follower takes the leader's window mark in both directions, as it does the FULL groups'. */
+TEST(a_follower_takes_the_leaders_window_mark) {
+    WindowLender lead, fol;
+    CHECK_OK(lead.build());
+    CHECK_OK(fol.build());
+    CHECK_OK(lead.kv.set_window_loan(lead.kv.spare_window_tokens()));
+    CHECK_OK(fol.kv.follow(lead.kv));
+    CHECK_EQ(fol.kv.window_loan_tokens(), lead.kv.window_loan_tokens());
+    CHECK_EQ(fol.kv.live_blocks(W_WIN), lead.kv.live_blocks(W_WIN));
+    CHECK_OK(lead.kv.set_window_loan(0));
+    CHECK_OK(fol.kv.follow(lead.kv));
+    CHECK_EQ(fol.kv.live_blocks(W_WIN), fol.kv.total_blocks(W_WIN));
 }
 
 /* ================================================================== the snapshot store */
@@ -5537,7 +5806,7 @@ TEST(a_restore_reserves_its_whole_chain_against_one_recall) {
     CHECK_OK(e.kv.set_loan(e.kv.spare_tokens()));
     const int64_t idle = e.kv.live_blocks(G_FULL);
     int calls = 0;
-    e.kv.set_reclaim([&](int64_t) { ++calls; return (int)RAD_OK; });
+    e.kv.set_reclaim([&](int32_t, int64_t) { ++calls; return (int)RAD_OK; });
 
     const int64_t want = (idle + all) / 2;
     std::vector<int32_t> got;
@@ -6470,7 +6739,7 @@ struct KVRun {
         if (s < 0) return s;
         s = kv.configure(every_kind_groups(), cfg, pools.kv());
         if (s < 0) return s;
-        kv.set_reclaim([](int64_t) { return (int)RAD_OK; });
+        kv.set_reclaim([](int32_t, int64_t) { return (int)RAD_OK; });
         return RAD_OK;
     }
     uint64_t pick() { return live[(size_t)r.below(live.size())]; }
@@ -6788,6 +7057,27 @@ struct KVRun {
                 ++seen[t > 0 ? "loan" : "loan back"];
             }
             if (t == spare && rc != RAD_OK) { fail("the spare figure could not be lent"); return; }
+
+            /* The window groups lend on a loan of their own (M-11), with the same contract. */
+            const int64_t w_spare = kv.spare_window_tokens();
+            const uint64_t whow = r.below(4);
+            const int64_t w = whow == 0 ? 0 : whow == 1 ? (int64_t)r.below(2000) : w_spare;
+            what = fmt("set_window_loan %lld (spare %lld)", (long long)w, (long long)w_spare);
+            const int64_t wloan0 = kv.window_loan_tokens(), wlive0 = kv.live_blocks(HG_WIN);
+            const int wrc = kv.set_window_loan(w);
+            if (wrc == RAD_E_STATE) {
+                if (kv.window_loan_tokens() != wloan0 || kv.live_blocks(HG_WIN) != wlive0) {
+                    fail("a refused window loan moved the mark"); return;
+                }
+                ++seen["window loan refused"];
+            } else if (wrc != RAD_OK) {
+                fail(fmt("set_window_loan returned %s", rad_strerror(wrc))); return;
+            } else {
+                ++seen[w > 0 ? "window loan" : "window loan back"];
+            }
+            if (w == w_spare && wrc != RAD_OK) {
+                fail("the window spare figure could not be lent"); return;
+            }
         }
     }
 };
@@ -6807,7 +7097,8 @@ TEST(kv_invariants_hold_over_random_interleavings_of_every_mutation) {
     for (const char* k : { "ensure", "ensure refused", "rollback", "fork", "fork refused", "adopt",
                            "free", "preempt", "make_room", "preempted for room", "trim_window",
                            "window slid", "copy-on-write", "reserve", "reserve specific", "release",
-                           "loan", "loan back", "loan refused" }) {
+                           "loan", "loan back", "loan refused", "window loan", "window loan back",
+                           "window loan refused" }) {
         if (run.seen[k] <= 0) fprintf(stderr, "    no '%s' in the run\n", k);
         CHECK(run.seen[k] > 0);
     }
@@ -6817,6 +7108,7 @@ TEST(kv_invariants_hold_over_random_interleavings_of_every_mutation) {
     for (const auto& h : run.held) run.kv.release_block(h.first, h.second);
     run.held.clear();
     CHECK_OK(run.kv.set_loan(0));
+    CHECK_OK(run.kv.set_window_loan(0));
     for (int32_t g : { (int32_t)HG_FULL, (int32_t)HG_WIN })
         CHECK_EQ(run.kv.free_blocks(g), run.kv.total_blocks(g));
     for (int32_t g : { (int32_t)HG_LIN, (int32_t)HG_CONV })
@@ -8378,6 +8670,297 @@ TEST(an_entry_with_a_streamed_group_is_never_demoted) {
     CHECK_EQ(f.kv.block_refcount(cg[0], 0), 0);
     CHECK_EQ(f.kv.block_refcount(cg[1], 0), 0);
     f.pc.set_tiers(nullptr);
+}
+
+
+/* ================================================================== the store on disk */
+
+/* A clean stop that admits everything used lately: the tests' plain flush. */
+static PcPolicy all_admit() {
+    PcPolicy p;
+    p.final = true;
+    p.active_s = (int64_t)1 << 30;
+    return p;
+}
+static PcPolicy idle_flush(int64_t long_tokens = 0, int64_t budget = -1) {
+    PcPolicy p;
+    p.final = false;
+    p.long_tokens = long_tokens;
+    p.opts.write_budget = budget;
+    return p;
+}
+static PrefixStore::Config store_cfg(const std::string& dir, const TierFixture& x) {
+    PrefixStore::Config sc;
+    sc.dir = dir; sc.name = "m"; sc.key_text = "k\n"; sc.entry_bytes = 1024;
+    sc.snap_bytes = x.f.ck.enabled() ? x.f.ck.slot_bytes() : 0; sc.block_tokens = 16;
+    return sc;
+}
+
+/* A conversation's entries and snapshot go to disk at a stop and come back, byte for byte, into
+ * a fresh cache: lazily, only when a prompt's chain reaches them. */
+TEST(a_restarted_cache_pages_a_conversation_back_byte_for_byte) {
+    const std::string dir = radtest::tmp_path("pcache_restart");
+    (void)std::system(("rm -rf '" + dir + "'").c_str());
+    const auto prompt = tok_run(7600, 336);
+    auto keys = chain_of(prompt);
+    keys.resize(20);                                    /* the published blocks */
+    std::vector<std::vector<unsigned char>> want_e;
+    std::vector<unsigned char> want_s;
+    PrefixStore::Config sc;
+    {
+        TierFixture x;
+        CHECK_OK(x.build(/*with_linear=*/true, /*ckpt_slots=*/4));
+        publish(x.f, 1, prompt, 320);
+        const int32_t snap = ckpt_at(x.f, 1, keys, 320);
+        x.f.kv.free_sequence(1);
+        const auto jobs = copy_now(x.t);
+        REQUIRE_EQ(jobs.size(), 20u);
+        /* The host copies and the snapshot, as distinct patterns. */
+        for (const TierJob& j : jobs) {
+            unsigned char* p = static_cast<unsigned char*>(x.t.host_ptr(j.host_slot));
+            for (int i = 0; i < 1024; ++i) p[i] = (unsigned char)(j.key.lo * 7 + (uint64_t)i);
+        }
+        for (const BlockHash& k : keys) {
+            IdleTiers::PersistView v;
+            REQUIRE(x.t.persist_view(k, &v));
+            const unsigned char* p = static_cast<unsigned char*>(x.t.host_ptr(v.host_slot));
+            want_e.emplace_back(p, p + 1024);
+        }
+        unsigned char* sp = static_cast<unsigned char*>(x.f.ck.at(snap));
+        for (int64_t i = 0; i < x.f.ck.slot_bytes(); ++i) sp[i] = (unsigned char)(i * 13 + 5);
+        want_s.assign(sp, sp + x.f.ck.slot_bytes());
+        sc.dir = dir;
+        sc.name = "m";
+        sc.key_text = "test key\n";
+        sc.entry_bytes = 1024;
+        sc.snap_bytes = x.f.ck.slot_bytes();
+        sc.block_tokens = 16;
+        PrefixStore st;
+        CHECK_OK(st.open(sc));
+        PcFlush f;
+        CHECK_OK(pc_flush_cache(x.f.pc, x.t, &x.f.ck, st, all_admit(), &f));
+        CHECK_EQ(f.written_items, 21ll);
+        /* A second flush with nothing new writes nothing. */
+        PcFlush g;
+        CHECK_OK(pc_flush_cache(x.f.pc, x.t, &x.f.ck, st, all_admit(), &g));
+        CHECK_EQ(g.written_items, 0ll);
+        CHECK_EQ(g.kept_items, 21ll);
+    }
+    TierFixture y;
+    CHECK_OK(y.build(true, 4));
+    PrefixStore st;
+    CHECK_OK(st.open(sc));
+    int64_t ns = 0;
+    CHECK_EQ(pc_import(y.f.pc, st, &ns), 20ll);
+    CHECK_EQ(ns, 1ll);
+    CHECK_EQ(y.t.arena().used_slots(), 0ll);             /* nothing read yet */
+    CHECK_EQ(y.f.pc.lookup(prompt, {}).n_attn_tokens, 0);
+    /* Another prompt's chain reads nothing. */
+    PcPageIn none;
+    CHECK_OK(pc_page_in(y.f.pc, y.t, &y.f.ck, st, tok_run(100, 64), {}, &none));
+    CHECK_EQ(none.entries, 0ll);
+    PcPageIn r;
+    CHECK_OK(pc_page_in(y.f.pc, y.t, &y.f.ck, st, prompt, {}, &r));
+    CHECK_EQ(r.entries, 20ll);
+    CHECK(r.snap);
+    CHECK_EQ(y.f.pc.restorable_from(prompt, {}).size(), 20u);
+    for (size_t b = 0; b < keys.size(); ++b) {
+        IdleTiers::PersistView v;
+        REQUIRE(y.t.persist_view(keys[b], &v));
+        REQUIRE(v.host_slot >= 0);
+        CHECK(std::memcmp(y.t.host_ptr(v.host_slot), want_e[b].data(), 1024) == 0);
+    }
+    /* Promote the chain as the engine does, then the lookup resumes at the snapshot. */
+    for (const BlockHash& k : keys) {
+        TierJob j;
+        REQUIRE(y.t.plan_promote(k, &j));
+        for (int32_t g : y.f.pc.entry_groups()) {
+            int32_t blk = -1;
+            REQUIRE(y.f.kv.reserve_block(g, &blk) == RAD_OK);
+            j.blocks.push_back(blk);
+        }
+        j.started = true;
+        y.t.report(j, true);
+        CHECK_OK(y.f.pc.rebind(k, j.blocks));
+    }
+    const CacheHit h = y.f.pc.lookup(prompt, {});
+    CHECK_EQ(h.n_attn_tokens, 320);
+    CHECK_EQ(h.n_linear_tokens, 320);
+    REQUIRE(h.checkpoint_slot >= 0);
+    CHECK(std::memcmp(y.f.ck.at(h.checkpoint_slot), want_s.data(), want_s.size()) == 0);
+    /* Paged-in records are known to be on disk: the next flush writes nothing. */
+    PcFlush f;
+    CHECK_OK(pc_flush_cache(y.f.pc, y.t, &y.f.ck, st, all_admit(), &f));
+    CHECK_EQ(f.written_items, 0ll);
+    CHECK_EQ(f.kept_items, 21ll);
+}
+
+/* A snapshot the store holds gives up its slot to a newer one without being lost, and a host
+ * copy the store holds gives up its arena slot the same way. */
+TEST(store_held_copies_are_demoted_to_disk_not_lost) {
+    const std::string dir = radtest::tmp_path("pcache_demote");
+    (void)std::system(("rm -rf '" + dir + "'").c_str());
+    TierFixture x;
+    CHECK_OK(x.build(true, /*ckpt_slots=*/1));
+    const auto a = tok_run(1000, 336);
+    const auto ka = chain_of(a);
+    publish(x.f, 1, a, 320);
+    (void)ckpt_at(x.f, 1, ka, 320);
+    x.f.kv.free_sequence(1);
+    (void)copy_now(x.t);
+    PrefixStore::Config sc;
+    sc.dir = dir; sc.name = "m"; sc.key_text = "k\n"; sc.entry_bytes = 1024;
+    sc.snap_bytes = x.f.ck.slot_bytes(); sc.block_tokens = 16;
+    PrefixStore st;
+    CHECK_OK(st.open(sc));
+    CHECK_OK(pc_flush_cache(x.f.pc, x.t, &x.f.ck, st, all_admit(), nullptr));
+    /* A second conversation needs the only snapshot slot. */
+    x.f.pc.begin_step();
+    const auto b = tok_run(5000, 336);
+    const auto kb = chain_of(b);
+    int32_t s = -1;
+    CHECK_OK(x.f.pc.reserve_checkpoint(2, 320, kb[19], &s));
+    x.f.pc.commit_checkpoint(kb[19]);
+    /* The first snapshot is on disk only now, and a page-in brings it back. */
+    PrefixCache::PageIn plan;
+    x.f.pc.plan_page_in(a, {}, &plan);
+    CHECK(plan.has_snap);
+    CHECK_EQ(plan.snap_pos, 320ll);
+}
+
+
+/* Admission: an idle flush writes only what earned it. A conversation nobody came back to stays
+ * off the disk; once a lookup reuses it, the next flush writes it, and only it. */
+TEST(an_idle_flush_admits_only_what_was_reused_or_long) {
+    const std::string dir = radtest::tmp_path("pcache_admit");
+    (void)std::system(("rm -rf '" + dir + "'").c_str());
+    TierFixture x;
+    CHECK_OK(x.build(true, 4));
+    const auto a = tok_run(1000, 336), b = tok_run(5000, 336);
+    publish(x.f, 1, a, 320);
+    (void)ckpt_at(x.f, 1, chain_of(a), 320);
+    publish(x.f, 2, b, 320);
+    x.f.kv.free_sequence(1);
+    x.f.kv.free_sequence(2);
+    (void)copy_now(x.t);
+    PrefixStore st;
+    CHECK_OK(st.open(store_cfg(dir, x)));
+    PcFlush f0;
+    CHECK_OK(pc_flush_cache(x.f.pc, x.t, &x.f.ck, st, idle_flush(), &f0));
+    CHECK_EQ(f0.written_items, 0ll);
+    CHECK_EQ(f0.rejected, 41ll);                       /* 40 entries and a snapshot */
+    /* The first conversation comes back: its prefix and snapshot are reused. */
+    x.f.pc.begin_step();
+    const CacheHit h = x.f.pc.lookup(a, {});
+    CHECK_EQ(h.n_linear_tokens, 320);
+    PcFlush f1;
+    CHECK_OK(pc_flush_cache(x.f.pc, x.t, &x.f.ck, st, idle_flush(), &f1));
+    CHECK_EQ(f1.written_items, 21ll);
+    CHECK_EQ(f1.rejected, 20ll);
+    CHECK(st.has_entry(chain_of(a)[0]) && !st.has_entry(chain_of(b)[0]));
+    /* Nothing new: nothing written, nothing rewritten. */
+    PcFlush f2;
+    CHECK_OK(pc_flush_cache(x.f.pc, x.t, &x.f.ck, st, idle_flush(), &f2));
+    CHECK_EQ(f2.written_items, 0ll);
+    CHECK_EQ(f2.kept_items, 21ll);
+    /* A long conversation needs no reuse (here: 320 tokens is long). */
+    PcFlush f3;
+    CHECK_OK(pc_flush_cache(x.f.pc, x.t, &x.f.ck, st, idle_flush(320), &f3));
+    CHECK_EQ(f3.written_items, 20ll);
+    /* And the stop admits what was in use lately. */
+    TierFixture y;
+    CHECK_OK(y.build(true, 4));
+    publish(y.f, 3, a, 320);
+    y.f.kv.free_sequence(3);
+    (void)copy_now(y.t);
+    const std::string dir2 = dir + "_stop";
+    (void)std::system(("rm -rf '" + dir2 + "'").c_str());
+    PrefixStore s2;
+    CHECK_OK(s2.open(store_cfg(dir2, y)));
+    PcPolicy stop;
+    stop.final = true;
+    stop.active_s = 3600;
+    PcFlush f4;
+    CHECK_OK(pc_flush_cache(y.f.pc, y.t, &y.f.ck, s2, stop, &f4));
+    CHECK_EQ(f4.written_items, 20ll);
+    PcPolicy none = stop;
+    none.active_s = 0;
+    TierFixture z;
+    CHECK_OK(z.build(true, 4));
+    publish(z.f, 4, b, 320);
+    z.f.kv.free_sequence(4);
+    (void)copy_now(z.t);
+    PcFlush f5;
+    CHECK_OK(pc_flush_cache(z.f.pc, z.t, &z.f.ck, s2, none, &f5));
+    CHECK_EQ(f5.written_items, 0ll);
+}
+
+/* The write budget holds an idle flush to its bytes; what it defers is written by the next. */
+TEST(the_write_budget_defers_what_does_not_fit_and_loses_nothing) {
+    const std::string dir = radtest::tmp_path("pcache_budget");
+    (void)std::system(("rm -rf '" + dir + "'").c_str());
+    TierFixture x;
+    CHECK_OK(x.build(false, 0));
+    const auto a = tok_run(1000, 336);
+    publish(x.f, 1, a, 320);
+    x.f.kv.free_sequence(1);
+    (void)copy_now(x.t);
+    (void)x.f.pc.lookup(a, {});
+    PrefixStore st;
+    CHECK_OK(st.open(store_cfg(dir, x)));
+    PcFlush f1, f2, f3;
+    CHECK_OK(pc_flush_cache(x.f.pc, x.t, nullptr, st, idle_flush(0, 8 * 1024 + 100), &f1));
+    CHECK_EQ(f1.written_items, 8ll);
+    CHECK(f1.written_bytes <= 8 * 1024 + 100);
+    CHECK_EQ(f1.deferred, 12ll);
+    /* The first eight are the chain's start: a deferred chain still resumes as far as it got. */
+    CHECK(st.has_entry(chain_of(a)[0]) && st.has_entry(chain_of(a)[7]) && !st.has_entry(chain_of(a)[8]));
+    CHECK_OK(pc_flush_cache(x.f.pc, x.t, nullptr, st, idle_flush(0, 8 * 1024), &f2));
+    CHECK_EQ(f2.written_items, 8ll);
+    CHECK_OK(pc_flush_cache(x.f.pc, x.t, nullptr, st, idle_flush(0, 0), &f3));
+    CHECK_EQ(f3.written_items, 0ll);
+    CHECK_EQ(f3.deferred, 4ll);
+    CHECK_EQ(st.n_entries(), 16ll);
+}
+
+/* The cap keeps the highest LRFU score: a conversation reused often outlives a newer one used
+ * once, which plain LRU would have kept instead. */
+TEST(the_store_cap_keeps_the_conversation_reused_most) {
+    const std::string dir = radtest::tmp_path("pcache_lrfu");
+    (void)std::system(("rm -rf '" + dir + "'").c_str());
+    TierFixture x;
+    CHECK_OK(x.build(false, 0));
+    const auto a = tok_run(1000, 336), b = tok_run(5000, 336);
+    publish(x.f, 1, a, 320);
+    x.f.kv.free_sequence(1);
+    for (int i = 0; i < 4; ++i) (void)x.f.pc.lookup(a, {});
+    publish(x.f, 2, b, 320);
+    x.f.kv.free_sequence(2);
+    (void)x.f.pc.lookup(b, {});                      /* newer, used once */
+    (void)copy_now(x.t);
+    PrefixStore::Config sc = store_cfg(dir, x);
+    sc.cap_bytes = 20 * 1024;                        /* one conversation */
+    PrefixStore st;
+    CHECK_OK(st.open(sc));
+    CHECK_OK(pc_flush_cache(x.f.pc, x.t, nullptr, st, all_admit(), nullptr));
+    CHECK(st.has_entry(chain_of(a)[19]));
+    CHECK(!st.has_entry(chain_of(b)[0]));
+    /* The scores survive a restart: what comes back is ordered the same. */
+    PrefixStore r;
+    CHECK_OK(r.open(sc));
+    REQUIRE_EQ(r.loaded_entries().size(), 20u);
+    CHECK_EQ(r.loaded_entries()[0].score.hits, 4u);
+}
+
+TEST(the_lrfu_score_halves_every_half_life_and_adds_one_a_reference) {
+    PcScore s;
+    s.ref(0, 3600.0, false);
+    CHECK(s.crf == 1.0f && s.hits == 0u);
+    CHECK_NEAR(s.at(3600 * 1000, 3600.0), 0.5, 1e-6);
+    s.ref(3600 * 1000, 3600.0, true);
+    CHECK_NEAR(s.crf, 1.5, 1e-6);
+    CHECK_EQ(s.hits, 1u);
+    CHECK_NEAR(s.at(3 * 3600 * 1000, 3600.0), 0.375, 1e-6);
 }
 
 RAD_TEST_MAIN()

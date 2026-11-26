@@ -1849,9 +1849,10 @@ TEST(json_schema_grammars_admit_exactly_their_instances) {
 
 /* Whatever a walk through the engine's masks writes is valid against the schema: random admitted
  * tokens until the parse is complete, then parsed with a JSON parser and checked against the
- * keywords by hand. The walk leaves out the pieces upstream's decoder reads leniently (an inner
- * NUL ends a piece early; a byte that never occurs in UTF-8 is taken as a lead), whose bytes are
- * not the characters the grammar saw. Seeded; the failing text is printed. */
+ * keywords by hand. The walk leaves out the pieces with an inner NUL, which the decoder reads as
+ * ending there, so their bytes are not the characters the grammar saw. Bytes that never occur in
+ * UTF-8 stay in: the decoder refuses them, so the masks never admit them. Seeded; the failing text
+ * is printed. */
 TEST(json_schema_walks_write_only_valid_instances) {
     auto bv = bpe_like(67, 1500);
     const std::string schema =
@@ -1878,8 +1879,7 @@ TEST(json_schema_walks_write_only_valid_instances) {
                 id = pick_admitted(m, *bv, rng);
                 if (id < 0 || bv->v.is_eog(id)) break;
                 bool lenient = bv->nul[(size_t)id] != 0;
-                for (unsigned char ch : bv->v.token_piece(id))
-                    lenient = lenient || ch == 0 || ch == 0xC0 || ch == 0xC1 || ch >= 0xF5;
+                for (unsigned char ch : bv->v.token_piece(id)) lenient = lenient || ch == 0;
                 if (!lenient) break;
                 id = -1;
             }
@@ -1913,6 +1913,97 @@ TEST(json_schema_walks_write_only_valid_instances) {
         if (!ok) fprintf(stderr, "    seed %llu wrote %s\n", (unsigned long long)seed, show_piece(text).c_str());
     }
     CHECK(finished > 60);
+}
+
+/* The JSON-schema walk above once wrote `"s":"bion\xf0\x85\xaa\x8d"` (seed 69): F0 85 is the head
+ * of an overlong four-byte form of U+5A8D, which the string's `[^"\\\x7F\x00-\x1F]` admitted as
+ * a character. Only well-formed UTF-8 is a character (Unicode Table 3-7), whether the sequence comes
+ * whole in one piece or a byte at a time: after the head F0 the masks admit 90-BF only, and every
+ * ill-formed form is refused (overlong C0 / E0 80-9F / F0 80-8F, a surrogate ED A0-BF, a code
+ * point past U+10FFFF, a missing continuation byte), while the well-formed neighbours of each go
+ * through. The oracle reads the pieces with the same decoder, so masks are compared with it too. */
+TEST(json_schema_strings_admit_only_well_formed_utf8) {
+    auto bv = bpe_like(67, 1500);
+    const char* bad[] = { "\xf0\x85\xaa\x8d", "\xf0\x8f\xbf\xbf", "\xc0\xaf", "\xc1\xbf",
+                          "\xe0\x9f\xbf", "\xed\xa0\x80", "\xed\xbf\xbf", "\xf4\x90\x80\x80",
+                          "\xf5\x80\x80\x80", "\xff", "\xe4\xb8" "a" };
+    const char* good[] = { "\xf0\x90\x80\x80", "\xf0\x9f\x98\x80", "\xc2\x80", "\xdf\xbf",
+                           "\xe0\xa0\x80", "\xed\x9f\xbf", "\xee\x80\x80", "\xf4\x8f\xbf\xbf" };
+    for (const char* p : bad) bv->add(p);
+    for (const char* p : good) bv->add(p);
+    for (const char* p : { "\x85\xaa\x8d", "\x9f\x98\x80", "\xa0\x80", "\x9f\xbf" }) bv->add(p);
+    const std::string schema =
+        R"({"type":"object","properties":{"n":{"type":"integer","minimum":-20,"maximum":300},)"
+        R"("s":{"type":"string","minLength":1,"maxLength":5},)"
+        R"("t":{"type":"array","items":{"enum":["x","y"]},"maxItems":2}},"required":["n","s"],)"
+        R"("additionalProperties":false})";
+    std::string gbnf, err;
+    REQUIRE(grammar_from_json_schema(schema, "root", &gbnf, &err) >= 0);
+    const int64_t n_words = bitmask_words(bv->v.n_tokens());
+    std::vector<uint32_t> m((size_t)n_words), a((size_t)n_words), b((size_t)n_words);
+    Tally t;
+    /* The grammar inside the string's value, after `bion` as seed 69 had it. */
+    auto at_string = [&](std::unique_ptr<GbnfGrammar>* g) {
+        REQUIRE(GbnfGrammar::create(gbnf, "root", &bv->v, false, {}, {}, g, &err) >= 0);
+        const std::vector<int32_t> ids = bv->tokenize("{\"n\":\n            91,\"s\":\"bion");
+        REQUIRE(!ids.empty());
+        for (int32_t id : ids) REQUIRE((*g)->accept_token(id) >= 0);
+    };
+    auto admits = [&](GbnfGrammar& g, const std::string& piece) -> bool {
+        if (g.fill_mask(m.data(), n_words) < 0) return false;
+        return has(m, bv->by_piece.at(piece));
+    };
+    for (const char* p : bad) {
+        std::unique_ptr<GbnfGrammar> g;
+        at_string(&g);
+        CHECK(!admits(*g, p));
+        if (admits(*g, p)) fprintf(stderr, "    admitted %s whole\n", show_piece(p).c_str());
+        compare(*g, bv->v, a, b, t, std::string("before ") + show_piece(p));
+        /* A byte at a time: some byte of the sequence is never admitted. */
+        const std::string s(p);
+        bool refused = false;
+        for (size_t k = 0; k < s.size() && !refused; ++k) {
+            const std::string one = s.substr(k, 1);
+            refused = !admits(*g, one);
+            if (!refused) {
+                REQUIRE(g->accept_token(bv->by_piece.at(one)) >= 0);
+                compare(*g, bv->v, a, b, t, show_piece(s.substr(0, k + 1)));
+            }
+        }
+        CHECK(refused);
+        if (!refused) fprintf(stderr, "    admitted %s a byte at a time\n", show_piece(p).c_str());
+    }
+    for (const char* p : good) {
+        std::unique_ptr<GbnfGrammar> g;
+        at_string(&g);
+        CHECK(admits(*g, p));
+        const std::string s(p);
+        bool all = true;
+        for (size_t k = 0; k < s.size() && all; ++k) {
+            const std::string one = s.substr(k, 1);
+            all = admits(*g, one);
+            if (all) REQUIRE(g->accept_token(bv->by_piece.at(one)) >= 0);
+            compare(*g, bv->v, a, b, t, show_piece(s.substr(0, k + 1)));
+        }
+        CHECK(all);
+        if (!all) fprintf(stderr, "    refused %s a byte at a time\n", show_piece(p).c_str());
+        CHECK(!g->partial().n_remain);
+    }
+    /* The continuations that finish F0 as seed 69 did, and the ones that finish it well. */
+    {
+        std::unique_ptr<GbnfGrammar> g;
+        at_string(&g);
+        REQUIRE(g->accept_token(bv->by_piece.at("\xf0")) >= 0);
+        CHECK(!admits(*g, "\x85\xaa\x8d"));
+        CHECK(!admits(*g, "\x85"));
+        CHECK(!admits(*g, "\x8f"));
+        CHECK(admits(*g, "\x90"));
+        CHECK(admits(*g, "\x9f\x98\x80"));
+        CHECK(admits(*g, "\xbf"));
+        compare(*g, bv->v, a, b, t, "after F0");
+    }
+    report("well-formed UTF-8 in a schema string", t);
+    CHECK_EQ(t.mismatches, 0);
 }
 
 RAD_TEST_MAIN()

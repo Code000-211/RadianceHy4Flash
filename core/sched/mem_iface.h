@@ -14,6 +14,7 @@
 #include <functional>
 #include "mem/prefix.h"
 #include "mem/seqwindow.h"
+#include "metrics.h"
 #include "rad_core.h"
 #include "mm/processor.h"
 
@@ -117,6 +118,11 @@ struct IKVManager {
     virtual int64_t held_blocks(int32_t group) const = 0;
     /* KVManager::held_top_blocks; a manager that cannot answer says the whole row. */
     virtual int64_t held_top_blocks(int32_t group) const { (void)group; return INT64_MAX; }
+
+    /* KVManager::SpareSplit in the scheduler's terms: the pieces of the loan's headroom for the
+     * group that lends least, in that group's blocks (see SchedMetrics::kv_spare). It reports only
+     * and decays nothing, so metrics may ask it every tick. */
+    virtual KvSpareSplit kv_spare_split() const { return KvSpareSplit{}; }
 
     /* The pool in bytes, the only unit that sums across groups. Asked of the manager because its
      * plan knows whether a group counts blocks or states. */
@@ -464,6 +470,20 @@ struct KVBinding final : IKVManager {
     int64_t total_blocks(int32_t g) const override  { return m->total_blocks(g); }
     int64_t held_blocks(int32_t g) const override   { return m->held_blocks(g); }
     int64_t held_top_blocks(int32_t g) const override { return m->held_top_blocks(g); }
+    KvSpareSplit kv_spare_split() const override {
+        const KVManager::SpareSplit s = m->spare_split();
+        KvSpareSplit o;
+        o.group         = s.group;
+        o.block_tokens  = s.block_tokens;
+        o.block_bytes   = s.block_bytes;
+        o.held          = s.held;
+        o.held_top      = s.held_top;
+        o.buffer_blocks = s.buffer_blocks;
+        o.live          = s.live;
+        o.spare_tokens  = s.spare_tokens;
+        o.loan_tokens   = s.loan_tokens;
+        return o;
+    }
     int64_t pool_bytes(int32_t g) const override      { return m->pool_bytes(g); }
     int64_t pool_bytes_used(int32_t g) const override { return m->pool_bytes_used(g); }
     int64_t pool_bytes_carved(int32_t g) const override { return m->pool_bytes_carved(g); }
