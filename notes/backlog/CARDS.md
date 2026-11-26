@@ -50,8 +50,7 @@ scripts/backlog/lane.sh --env iks-A               # what a lane exports: port, m
   (default `<lane lock dir>` = `/tmp/radiance-lanes`, `RAD_LANE_LOCK_DIR` overrides) is what a local lane run holds
   for its whole run.
 - **The local lane serves `<tree>/build/bin/radiance`**, so that tree is built once. Here the build needs ROCm's
-  clang++ as the host compiler: the host's GCC 13 rejects the compound literals in `abi/rad_runtime.h`, and a
-  whole-tree build stops on the narrowing errors in `tests/museglimmer_test.cpp`, which the lane does not use.
+  clang++ as the host compiler: the host's GCC 13 rejects the compound literals in `abi/rad_runtime.h`.
   Device code is compiled with **radiance's own HIP compiler**, the one the Dockerfile builds and ships:
   ROCm 10.1's clang over the libLLVM rebuilt with `docker/llvm-vopd-pairing.patch`, installed on this host as
   `/opt/rocm-repeatable`. Stock clang 24 pairs VOPD non-repeatably (two compiles of the same code can differ in
