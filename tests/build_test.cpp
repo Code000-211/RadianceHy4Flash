@@ -256,6 +256,10 @@ TEST(a_transient_no_op_names_is_charged_and_named) {
     const rad_buf out[1] = { named };
     CHECK_OK(rad_op_writes(&b, gemm, out, 1));
 
+    /* A second op behind the first: with one op the whole program and one op's use are the same
+     * span, and the charge would read as an ordinary long use rather than as the absence of one. */
+    CHECK(decl_gemm(b, decl_w(b, "blk.1.ffn_gate.weight")) == 2);
+
     /* A PERSIST plane nothing names is not waste: it lives for the whole program by definition, and
      * it sits outside the packed arena. Read off the range alone the two are the same buffer. */
     RadBufDecl pd = d;

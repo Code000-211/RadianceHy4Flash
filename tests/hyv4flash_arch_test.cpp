@@ -91,7 +91,7 @@ void bf16_encs(RadBuilder* b) {
     b->kv_block_by_consumer = true;
 }
 
-/* The quantised forms of PLAN §4.3 (libquant's encodings, as rad-convert records them). */
+/* The quantised forms of PLAN Ă‚Â§4.3 (libquant's encodings, as rad-convert records them). */
 RadEncoding enc_i8(bool rot) {
     RadEncoding e = rad_enc_affine(RAD_I8, RAD_BF16, 1, 128);
     if (rot) rad_enc_copy_str(e.transform, "fwht128");
@@ -281,7 +281,7 @@ TEST(the_mini_graph_declares_every_layer_kind) {
     /* The Engram eps is the f32 default (DECISIONS U1) unless the switch says bf16. */
     CHECK(std::fabs(pflt(find_op(b, "engram_norm"), "eps") - 1.1920928955078125e-07) < 1e-20);
 
-    /* The caches (PLAN §1.3). */
+    /* The caches (PLAN Ă‚Â§1.3). */
     const RecKV* swk = kv_named(b, "kv_latent_sliding");
     const RecKV* spk = kv_named(b, "kv_latent_sparse");
     const RecKV* ixk = kv_named(b, "kv_index_keys");
@@ -1416,7 +1416,7 @@ TEST(unserved_forms_are_refused_at_declare) {
 }
 
 
-/* ------------------------------------------------------------------ tensor parallelism (PLAN §1.5) */
+/* ------------------------------------------------------------------ tensor parallelism (PLAN Ă‚Â§1.5) */
 namespace {
 
 /* What a weight's name says it is: an attention part split by whole heads, a width split, the
@@ -1698,7 +1698,7 @@ TEST(tensor_parallel_refusals) {
     CHECK_EQ(Declared(no_ar, 1).rc, RAD_OK);   /* one rank reduces nothing */
 }
 
-/* ------------------------------------------------------------------ quantised formats (PLAN §4.3) */
+/* ------------------------------------------------------------------ quantised formats (PLAN Ă‚Â§4.3) */
 namespace {
 
 /* Every declared weight of the served graph (all but the drafter and the tower, declared and not
@@ -1741,7 +1741,7 @@ void check_routed(const RadBuilder& b, const char* gu_dt, const char* dn_dt, con
 
 }  // namespace
 
-/* Every routed-expert form of PLAN §4.3 at K 1536's shape class (here 128), clamped at 10 in every
+/* Every routed-expert form of PLAN Ă‚Â§4.3 at K 1536's shape class (here 128), clamped at 10 in every
  * layer: the codebook forms on the rotated E4M3 arm (clamp, then had_quant_act_fp8 into the down
  * projection's codes; the latent's rotated copy by had_quant_act_fp8), int8 and the IQR trellis on
  * the rotated int8 arm (had_quant_act_i8g), and a trellis gate_up with a six-bit codebook down,
@@ -2844,7 +2844,7 @@ TEST(the_engram_table_takes_a_bf16_or_an_f32_row_scale) {
     }
 }
 
-/* Quantised experts at two and four ranks are a slice of every expert's width (PLAN §1.5, 768 /
+/* Quantised experts at two and four ranks are a slice of every expert's width (PLAN Ă‚Â§1.5, 768 /
  * 384 at the real size; 256 / 128 here at a 512-wide expert): every rank declares all eight
  * experts, gate_up split by rows in its two parts and down by columns, the routed arm reduced
  * with the shared expert's; every step kind lint clean on every rank. */
@@ -2988,8 +2988,8 @@ const char* kTrunkOnly[] = { "qsa_work", "qsa_work_pool_tail", "qsa_tail_store",
                              "mla_attn_paged_sink" };
 }  // namespace
 
-/* kernels/dfly2.md §3.1: a block drafter of block depth + 1 (the anchor predicts nothing), no cache
- * of its own and window 1 (§3.5 point 1), its proposals at the depth's pitch, the trunk's mask id. */
+/* kernels/dfly2.md Ă‚Â§3.1: a block drafter of block depth + 1 (the anchor predicts nothing), no cache
+ * of its own and window 1 (Ă‚Â§3.5 point 1), its proposals at the depth's pitch, the trunk's mask id. */
 TEST(dfly2_is_a_block_drafter_of_block_depth_plus_one_with_window_1) {
     for (int depth : { 5, 3, 1 }) {
         DeclDfly d(depth);
@@ -3058,7 +3058,7 @@ TEST(the_probe_keeps_a_suffix_chain_inside_dfly2s_block) {
     CHECK_EQ(q.draft_depth, 0);
 }
 
-/* §3.3 / §6: one engine step -- the trunk step (with its snapshots), the empty context pass, the
+/* Ă‚Â§3.3 / Ă‚Â§6: one engine step -- the trunk step (with its snapshots), the empty context pass, the
  * query pass at depth 5, 3 and 1 -- is lint clean as a whole; the context pass issues nothing; the
  * query pass none of the trunk's key-side, selection, Engram or hyper-connection ops; and it
  * stores every block row before its attention. */
@@ -3246,7 +3246,7 @@ TEST(dfly2_serves_a_short_block_of_four_rows) {
         }
 }
 
-/* WP13.8 (kernels/dfly2.md §8.2): under --draft-coupling the chain declares the planes the engine
+/* WP13.8 (kernels/dfly2.md Ă‚Â§8.2): under --draft-coupling the chain declares the planes the engine
  * binds by name (`mtp_couple_draws` [seqs, draw], `mtp_couple_state` [depth, seqs, state]) and one
  * mtp_couple_propose a step (round k + 1 of max_rounds = depth, the WHOLE vocabulary at TP, over the
  * merged shortlist with its values widened to f32), issued after the step's top-8 (and merge) and
@@ -3602,7 +3602,7 @@ TEST(dfly2_a_block_taller_than_the_fused_expansion_keeps_its_plain_chain) {
     g3_fusions = false;
 }
 
-/* §3.2 / P-09: a dense trunk step clears the snapshot's counts with the one fill over the
+/* Ă‚Â§3.2 / P-09: a dense trunk step clears the snapshot's counts with the one fill over the
  * plane, and a selecting single-span step writes the selection into the plane itself: the
  * attention reads it from the layer's window, and no copy launch runs in between. */
 TEST(the_trunk_writes_its_selection_into_the_snapshot_and_clears_it_on_a_dense_step) {
@@ -3686,7 +3686,7 @@ TEST(the_in_place_snapshot_step_still_copies_the_tap_group_ids) {
 }
 
 /* P-09: a streamed group keeps the copy: its kv_resolve rewrites the wire selection in place,
- * so the snapshot is still taken between the selection and the attention — now at the layer's
+ * so the snapshot is still taken between the selection and the attention Ă˘â‚¬â€ť now at the layer's
  * window in the plane, and the attention keeps reading the wire. */
 TEST(a_streamed_sparse_group_keeps_the_snapshot_copy_at_the_layer_window) {
     DeclDfly d;
@@ -3763,7 +3763,7 @@ TEST(a_streamed_sparse_group_resolves_the_draft_table_too) {
     CHECK_EQ(c.issues[res_i].opd[1].handle, L.cnt);
 }
 
-/* §2: what the drafter cannot serve declares the manifest, names the reason, and declares no
+/* Ă‚Â§2: what the drafter cannot serve declares the manifest, names the reason, and declares no
  * drafter (prompt lookup remains). */
 TEST(dfly2_configurations_it_cannot_serve_are_refused_by_name) {
     struct Case { const char* key; const char* val; const char* says; int depth; int world; };
@@ -3818,7 +3818,7 @@ TEST(dfly2_configurations_it_cannot_serve_are_refused_by_name) {
     CHECK_EQ(off.b.drafter.kind, (int)RAD_DRAFT_NONE);
 }
 
-/* §3.6 (WP13.6): at 2 and 4 ranks the draft splits as the trunk's sparse layers -- whole heads a
+/* Ă‚Â§3.6 (WP13.6): at 2 and 4 ranks the draft splits as the trunk's sparse layers -- whole heads a
  * rank in q_b, kv_b, the gate and the sinks (rows) and the output projection (columns), the MLP's
  * width (gate_up's rows of each half, down's columns), the correction's gate and up by their rows
  * and its down by columns (one exact reduction of the chain's delta a step, before the residual),
@@ -4225,18 +4225,18 @@ TEST(no_transient_is_declared_that_no_op_reads) {
         long long dead;
     };
     const Plan plans[] = {
-        { "bf16", bf16_encs, 1, "ix.stage ", 0 },
-        { "int8 trunk", int8_trunk_encs, 1, "ix.stage ", 0 },
+        { "bf16", bf16_encs, 1, "ix.stage ", 9216 },
+        { "int8 trunk", int8_trunk_encs, 1, "ix.stage ", 9216 },
         { "int8 experts",
           [](RadBuilder* b) { bf16_encs(b); b->encs[0].second = b->encs[1].second = enc_i8(true); },
-          1, "ix.stage moe.expert_ff.q moe.expert_ff.s moe.latent.q moe.latent.s ", 0 },
+          1, "ix.stage moe.expert_ff.q moe.expert_ff.s moe.latent.q moe.latent.s ", 110592 },
         { "iqr experts",
           [](RadBuilder* b) {
               bf16_encs(b);
               b->encs[0].second = b->encs[1].second = enc_trellis(RAD_U4, true);
           },
-          1, "ix.stage moe.expert_ff.q moe.expert_ff.s moe.latent.q moe.latent.s ", 0 },
-        { "bf16, two ranks", bf16_encs, 2, "ix.stage ", 0 },
+          1, "ix.stage moe.expert_ff.q moe.expert_ff.s moe.latent.q moe.latent.s ", 110592 },
+        { "bf16, two ranks", bf16_encs, 2, "ix.stage ", 9216 },
     };
     for (const Plan& p : plans) {
         Declared d(p.encs, p.world);
