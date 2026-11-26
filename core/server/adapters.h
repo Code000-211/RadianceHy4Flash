@@ -93,6 +93,19 @@ inline SchedMetrics bridge_metrics(const rad::SchedMetrics& m) {
     o.kv_resident_blocks = m.kv_resident_blocks;
     o.kv_stream_misses = m.kv_stream_misses;
     o.kv_stream_bytes_in = m.kv_stream_bytes_in;
+    /* The loan's pieces, and the name of the group they are counted in, so a reader of /stats need
+     * not map an index onto the `kv` array that only /metrics carries. */
+    if (m.kv_spare.group >= 0) {
+        o.kv_loan.group         = m.kv_spare.group < m.n_kv_groups ? m.kv[m.kv_spare.group].name : "";
+        o.kv_loan.block_tokens  = m.kv_spare.block_tokens;
+        o.kv_loan.block_bytes   = m.kv_spare.block_bytes;
+        o.kv_loan.held          = m.kv_spare.held;
+        o.kv_loan.held_top      = m.kv_spare.held_top;
+        o.kv_loan.buffer_blocks = m.kv_spare.buffer_blocks;
+        o.kv_loan.live          = m.kv_spare.live;
+        o.kv_loan.spare_tokens  = m.kv_spare.spare_tokens;
+        o.kv_loan.loan_tokens   = m.kv_spare.loan_tokens;
+    }
 
     /* vLLM's gpu_prefix_cache_hit_rate means attention caching. The linear-checkpoint hit
      * rate has a different granularity (spec §7.3) and is reported separately, not averaged
@@ -130,6 +143,14 @@ inline SchedMetrics bridge_metrics(const rad::SchedMetrics& m) {
     o.lookup_held_drafts = m.lookup_held_drafts; o.lookup_held_hits = m.lookup_held_hits;
     o.suffix_steps = m.suffix_steps;             o.suffix_rows = m.suffix_rows;
     o.suffix_accepted = m.suffix_accepted;
+    o.suffix_global = m.suffix_global;  o.suffix_global_busy = m.suffix_global_busy;
+    o.suffix_adopted = m.suffix_adopted;
+    o.suffix_global_credited = m.suffix_global_credited;
+    o.disk_written_bytes = m.disk.written_bytes; o.disk_written_hour = m.disk.written_hour;
+    o.disk_admitted = m.disk.admitted; o.disk_rejected = m.disk.rejected;
+    o.disk_deferred = m.disk.deferred; o.disk_entries = m.disk.entries;
+    o.disk_snaps = m.disk.snaps; o.disk_bytes = m.disk.bytes; o.disk_loaded = m.disk.loaded;
+    o.disk_paged_in = m.disk.paged_in; o.disk_compactions = m.disk.compactions;
     o.linear_hit_rate = m.linear_hit_rate;
     o.attn_cached_tokens = m.attn_cached_tokens;
     o.linear_cached_tokens = m.linear_cached_tokens;

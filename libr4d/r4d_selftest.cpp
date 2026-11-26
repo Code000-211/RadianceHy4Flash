@@ -24264,6 +24264,25 @@ static void f32_forms(const Plugin& pl, int64_t M, int64_t N, int64_t K, int ite
         std::printf("  %-8s %9.1f us  %7.1f GB/s  %6.2f TFLOP/s\n", "rule", us,
                     bytes / (us * 1e3), flop / (us * 1e6));
         ts[1].data = d_w;
+        /* The same shape with the weight stored bf16, as the served routers hold it: the W =
+         * uint16_t instantiation of the same tile forms, half the weight bytes a copy. */
+        std::vector<uint16_t> pw(w.size());
+        for (size_t i = 0; i < w.size(); ++i) pw[i] = h_to_bf16(w[i]);
+        for (int c = 0; c < copies; ++c)
+            st_memcpy((uint8_t*)d_w + (size_t)c * (wbytes / 2), pw.data(), wbytes / 2,
+                      hipMemcpyHostToDevice);
+        ts[1].dtype = RAD_BF16;
+        ps.push_back(PI("weight_bf16", 1));
+        a.p = ps.data();
+        a.n_p = (int)ps.size();
+        if (r->launch(&a, nullptr) == RAD_OK && st_stream_sync(nullptr) == hipSuccess) {
+            const double us16 = st_time_us([&](int i) {
+                ts[1].data = (uint8_t*)d_w + (size_t)(i % copies) * (wbytes / 2);
+                r->launch(&a, nullptr);
+            }, iters, nullptr);
+            std::printf("  %-8s %9.1f us  (bf16 weight)\n", "rule16", us16);
+        }
+        ts[1].data = d_w;
     }
 }
 
@@ -36164,13 +36183,15 @@ static void hy4_mla_row_front_case(const Plugin& pl) {
 
 /* engram_ids: prefill and decode forms, a document start inside the chunk, ids at and past the
  * map, pad / image / video tokens, a slot permutation with a dropped slot, i32 and i64 ids, and the
- * window after the step. Everything is an integer, so everything is exact. */
+ * window after the step -- and forms 4 and 5, the same two with `advance` 0, where the window is an
+ * input that must come back untouched (the Engram layers that share a history hash it without
+ * committing the step). Everything is an integer, so everything is exact. */
 static void hy4_engram_ids_case(const Plugin& pl) {
     if (!sel("engram_ids_i32")) return;
     const int64_t heads = 16, ngram = 3, ctx = ngram - 1, pad = 120002, msize = 120818,
                   image = 120815, video = 120816;
-    for (int form = 0; form < 4; ++form) {
-        const bool decode = form & 1, wide = form & 2;
+    for (int form = 0; form < 6; ++form) {
+        const bool decode = form & 1, wide = form & 2, adv = form >= 4;
         const int64_t S = 4, W = decode ? 5 : 2;
         const std::vector<int64_t> T_s = decode ? std::vector<int64_t>{ 3, 1, 4, 2 }
                                                 : std::vector<int64_t>{ 5, 1, 9, 3 };
@@ -36186,7 +36207,7 @@ static void hy4_engram_ids_case(const Plugin& pl) {
         });
         ops.push_back(hy_opd(RAD_I32, { 6, W }));
         hy_fill(ops[1], [&](int64_t) { return (double)rng.r((uint32_t)msize); });
-        ops[1].out = true;
+        ops[1].out = !adv;
         std::vector<int32_t> cu = { 0 };
         for (int64_t t : T_s) cu.push_back(cu.back() + (int32_t)t);
         ops.push_back(hy_opd(RAD_I32, { S + 1 }));
@@ -36224,10 +36245,12 @@ static void hy4_engram_ids_case(const Plugin& pl) {
         ops[10].out = ops[11].out = true;
         std::vector<RadParam> ps = { PI("M", M), PI("heads", heads), PI("ngram", ngram), PI("pad", pad),
                                      PI("map_size", msize), PI("image", image), PI("video", video) };
+        if (adv) ps.push_back(PI("advance", 0));
         (void)ctx;
         hy_check(pl, "engram_ids_i32",
-                 fmt("engram_ids vs libref, to the bit: %s step, ids %s, 4 sequences (slots 4 0 -1 2)",
-                     decode ? "decode" : "prefill", wide ? "i64" : "i32"), ps, ops);
+                 fmt("engram_ids vs libref, to the bit: %s step, ids %s, 4 sequences (slots 4 0 -1 2)%s",
+                     decode ? "decode" : "prefill", wide ? "i64" : "i32",
+                     adv ? ", advance 0 (the window left as it was)" : ""), ps, ops);
     }
 }
 

@@ -658,11 +658,14 @@ struct Walk {
     const TokenTrie* trie = nullptr;
     uint32_t*        bits = nullptr;
 
-    /* A resume trie's root edges hold continuation bits plus one; the carried bits are OR'ed in.
-     * `skip_first` leaves the root's first child out of the walk, for fill_resume to serve. */
+    /* A resume trie's root edges hold continuation bits plus one; the carried bits are OR'ed in. */
     bool             resume = false;
     uint32_t         root_base = 0;
-    bool             skip_first = false;
+    /* A resume walk's root children are stepped only where the carried sequence finishes as a
+     * well-formed character, code points [root_lo, root_hi] (utf8_range), and a token top at the
+     * root admits only the tokens below those children, lex [root_a, root_b). */
+    uint64_t         root_lo = 0, root_hi = UINT64_MAX;
+    uint32_t         root_a = 0, root_b = UINT32_MAX;
 
     bool                                        exits = false;
     std::vector<std::pair<uint32_t, uint32_t>>* frontier = nullptr;   /* (node, depth) */
@@ -741,8 +744,8 @@ static __attribute__((noinline)) void visit_token_tops(Walk& w, OpWork& work,
                                                        uint32_t n_end) {
     const TokenTrie& T = *w.trie;
     uint32_t a = T.lo[n] + n_end;                                /* strictly below n */
-    const uint32_t b = T.hi[n];
-    if (n == 0 && w.skip_first && T.node[0].n_child) a = std::max(a, T.hi[T.node[0].first]);
+    uint32_t b = T.hi[n];
+    if (n == 0 && w.resume) { a = std::max(a, w.root_a); b = std::min(b, w.root_b); }
     if (a >= b) return;
     for (const GbnfElement* top : vs.S->ttop) {
         const uint32_t v = top->value;
@@ -811,9 +814,13 @@ static void walk(SetDfa& dfa, int32_t start, Walk& w, OpWork& work, WalkScratch&
             if (!S.parted) dfa.parted(s);
             const uint32_t* lo = S.lo.data();
             const size_t    m  = S.lo.size();
-            uint32_t        c  = nd[n].first + (depth == 1 && w.skip_first ? 1u : 0u);
-            const uint32_t  c1 = nd[n].first + nd[n].n_child;
+            uint32_t        c  = nd[n].first;
+            uint32_t        c1 = nd[n].first + nd[n].n_child;
             size_t          i  = 0;
+            if (remap) {
+                while (c < c1 && cp_of(c) < w.root_lo) ++c;
+                while (c1 > c && cp_of(c1 - 1) > w.root_hi) --c1;
+            }
 
             /* One run of children per interval. Children are sorted, so the interval only moves
              * forward (linear among few intervals, binary search among many). A dead interval is
@@ -1772,40 +1779,34 @@ static void fill_resume(const MaskPlan& P, SetDfa& dfa, const GbnfStacks& stacks
     const SetDfa::St& S = dfa.st(s0);
     const TrieNode*   nd = RS.trie.node.data();
 
-    /* A character finished as U+0000 ends the piece. Carried bits are zero only after the head of
-     * an overlong sequence; finishing it with zero bits decodes to 0, the sequence terminator, so
-     * the piece has no characters whatever follows. Such a piece is admissible if it carries
-     * nothing out, or if some char-range top could finish what it carries. These pieces are all
-     * under the first root edge (zero bits) and are handled here, not stepped as a character. */
-    const bool nul = partial.value == 0 && nd[0].n_child > 0 && nd[nd[0].first].cp == 1;
-    if (nul) {
-        std::vector<uint32_t> todo{ nd[0].first };
-        while (!todo.empty()) {
-            const uint32_t n = todo.back();
-            todo.pop_back();
-            for (uint32_t k = nd[n].tbeg; k < nd[n + 1].tbeg; ++k) {
-                const PartialUtf8 tail = RS.trie.ttail[k];
-                bool ok = tail.n_remain == 0;
-                for (size_t j = 0; !ok && j < S.ctop.size(); ++j)
-                    ok = match_partial_char(S.ctop[j], tail);
-                if (ok) set_bit(bits, RS.trie.tid[k]);
-            }
-            for (uint32_t c = nd[n].first; c < nd[n].first + nd[n].n_child; ++c) todo.push_back(c);
-            work.add(4 + (nd[n + 1].tbeg - nd[n].tbeg) * (S.match_cost + 1));
-        }
-    }
+    /* Only the pieces that finish the carried sequence as a well-formed character are stepped
+     * (utf8_range), as the decoder refuses the rest. That includes every piece finishing it as
+     * U+0000: each carried head is a multi-byte one, so its zero-bit completion is overlong. */
+    uint32_t clo = 1, chi = 0;
+    const bool any = utf8_range(partial, &clo, &chi);
 
     Walk w;
     w.trie       = &RS.trie;
     w.bits       = bits;
     w.resume     = true;
     w.root_base  = partial.value << (6 * r);
-    w.skip_first = nul;
+    w.root_lo    = any ? clo : 1;
+    w.root_hi    = any ? chi : 0;
+    w.root_a = w.root_b = 0;
+    {
+        const uint32_t f = nd[0].first, e = nd[0].first + nd[0].n_child;
+        uint32_t ca = f, cb = e;
+        auto cp_at = [&](uint32_t c) { return (uint64_t)(w.root_base | (nd[c].cp - 1)); };
+        while (ca < cb && cp_at(ca) < w.root_lo) ++ca;
+        while (cb > ca && cp_at(cb - 1) > w.root_hi) --cb;
+        if (ca < cb) { w.root_a = RS.trie.lo[ca]; w.root_b = RS.trie.hi[cb - 1]; }
+    }
     walk(dfa, s0, w, work, P.ws);
 
     work.add(RS.shorts.size() * (S.match_cost + 1));
     for (const auto& sh : RS.shorts) {
         const PartialUtf8 tail{ (partial.value << (6 * sh.k)) | sh.bits, r - sh.k };
+        if (!utf8_may_go_on(partial, tail)) continue;
         for (const GbnfElement* top : S.ctop)
             if (match_partial_char(top, tail)) { set_bit(bits, sh.id); break; }
     }

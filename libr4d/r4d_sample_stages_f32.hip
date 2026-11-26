@@ -36,6 +36,7 @@
 #include "r4d_args.h"
 #include "r4d_common.h"
 #include "r4d_chain.h"
+#include "r4d_launch.h"   /* R4D_DYN_LDS: tests/r4d_emu runs this unit on the host */
 
 #include <cfloat>
 
@@ -63,6 +64,14 @@ constexpr uint32_t kWaves   = kThreads / kWave;
 constexpr uint32_t kArgmaxThreads = 1024;
 constexpr uint32_t kTopkThreads = 1024;
 constexpr uint32_t kTopkWaves   = kTopkThreads / kWave;
+
+// The radix select counts into one histogram per four waves, summed after the count. The keys of a
+// vocabulary row are concentrated, so with a single histogram every element's LDS atomic queues on
+// the same few bins across all 32 waves; eight histograms cut each bin's queue to four waves. The
+// counts are integers, so the summed histogram is the single one's, bit for bit. Eight is 8 KiB of
+// LDS, which leaves the widest candidate sort (kMaxCand, 32 KiB) its room in a workgroup's 64.
+constexpr uint32_t kHistGroups   = 8;
+constexpr uint32_t kWavesPerHist = kTopkWaves / kHistGroups;
 
 // The largest candidate width this unit sorts. The bitonic network runs in LDS over a power-of-two
 // padding, so the bound is 4096 x 8 bytes = 32 KiB, half a workgroup's 64 KiB. The engine declares
@@ -282,7 +291,7 @@ __global__ __launch_bounds__(kThreads) void dry_kernel(
     float* __restrict__ lg, const SP* __restrict__ sp, const int32_t* __restrict__ hist,
     const uint8_t* __restrict__ brk, uint32_t n_vocab, uint32_t lg_ld, uint32_t hmax,
     int32_t voff) {
-    extern __shared__ uint16_t len[];
+    R4D_DYN_LDS(uint16_t, len);
     const uint32_t m = blockIdx.x;
     const SP p = sp[m];
     // Every test below reads only the row's params, so the whole block leaves together.
@@ -409,23 +418,25 @@ __global__ __launch_bounds__(TH) void argmax_kernel(
 // whose running sum first reaches `remaining` (exactly one, as the sums are monotone), with `cum`
 // the sum before it. A walk that never stops ends on the last bin with every bin counted, and so
 // does this. Counts are integers, so the digit and `cum` match the walk. `scan` holds 256 words and
-// `wt` eight.
+// `wt` eight. `phist` is the kHistGroups counting histograms (see the constant), the caller's so
+// that the DESC and ASC instantiations share one allocation.
 template <bool DESC>
 __device__ uint32_t radix_select(const float* __restrict__ row, uint32_t n, uint32_t gate,
-                                 uint32_t rank, uint32_t* hist, uint32_t* scan, uint32_t* wt,
-                                 uint32_t* remaining_out, uint32_t* tie_out) {
+                                 uint32_t rank, uint32_t* hist, uint32_t* phist, uint32_t* scan,
+                                 uint32_t* wt, uint32_t* remaining_out, uint32_t* tie_out) {
     const uint32_t t = threadIdx.x;
     const int      lane = (int)(t & (kWave - 1)), wave = (int)(t / kWave);
     const bool     v4 = ((uintptr_t)row & 15u) == 0 && (n & 3u) == 0;
+    uint32_t* const mine = phist + ((uint32_t)wave / kWavesPerHist) * 256u;
     uint32_t prefix = 0, mask = 0, remaining = rank;
     for (int shift = 24; shift >= 0; shift -= 8) {
-        for (uint32_t b = t; b < 256; b += kTopkThreads) hist[b] = 0;
+        for (uint32_t b = t; b < kHistGroups * 256; b += kTopkThreads) phist[b] = 0;
         __syncthreads();
         auto count = [&](uint32_t key, uint32_t i) {
             if (!DESC && key != gate) return;
             const uint32_t v = DESC ? key : i;
             if ((v & mask) != prefix) return;
-            atomicAdd(&hist[(v >> shift) & 0xffu], 1u);
+            atomicAdd(&mine[(v >> shift) & 0xffu], 1u);
         };
         if (v4) {
             const float4* __restrict__ r4 = (const float4*)row;
@@ -440,9 +451,15 @@ __device__ uint32_t radix_select(const float* __restrict__ row, uint32_t n, uint
             for (uint32_t i = t; i < n; i += kTopkThreads) count(fkey(row[i]), i);
         }
         __syncthreads();
+        // Bin t's count is thread t's own sum over the groups, so the scan starts from it without
+        // another barrier; hist[t] keeps it for `tie_out`, read after the barriers below.
         uint32_t x = 0;
         if (t < 256) {
-            x = DESC ? r4d_wave_suffix_u32(hist[t], lane) : r4d_wave_prefix_u32(hist[t], lane);
+            uint32_t c = 0;
+#pragma unroll
+            for (uint32_t g = 0; g < kHistGroups; ++g) c += phist[g * 256u + t];
+            hist[t] = c;
+            x = DESC ? r4d_wave_suffix_u32(c, lane) : r4d_wave_prefix_u32(c, lane);
             if (lane == (DESC ? 0 : kWave - 1)) wt[wave] = x;
         }
         __syncthreads();
@@ -480,8 +497,8 @@ __device__ __forceinline__ void topk_body(
     int32_t* __restrict__ ci, float* __restrict__ cv, uint32_t* __restrict__ pr,
     uint32_t n_vocab, uint32_t n_cand, uint32_t lg_ld, uint32_t ci_ld, uint32_t cv_ld,
     uint32_t pr_ld, int32_t vocab_off, uint32_t pad) {
-    extern __shared__ unsigned long long shared_cand[];
-    __shared__ uint32_t hist[258];
+    R4D_DYN_LDS(unsigned long long, shared_cand);
+    __shared__ uint32_t hist[258], phist[kHistGroups * 256];
     __shared__ uint32_t scan[256], wt[256 / kWave];
     __shared__ uint32_t fill;
     __shared__ unsigned long long lds[kTopkWaves];
@@ -562,15 +579,16 @@ __device__ __forceinline__ void topk_body(
         // the number to take from the threshold's tie group, always at least one. `n_tie` is that
         // group's size.
         uint32_t n_eq = 0, dummy = 0, n_tie = 0;
-        const uint32_t T = radix_select<true>(row, n_vocab, 0, k, hist, scan, wt, &n_eq, &n_tie);
+        const uint32_t T = radix_select<true>(row, n_vocab, 0, k, hist, phist, scan, wt, &n_eq,
+                                              &n_tie);
 
         // The tie-break pass runs only when there is a tie to break. When `n_tie == n_eq` the whole
         // group is in, and the four ASC passes (over 124160 logits) would find nothing new. With
         // distinct logits, the ordinary case, `i <= 0xffffffff` holds for every member.
         const uint32_t idx_cut = (n_tie == n_eq)
                                      ? 0xffffffffu
-                                     : radix_select<false>(row, n_vocab, T, n_eq, hist, scan, wt,
-                                                           &dummy, &n_tie);
+                                     : radix_select<false>(row, n_vocab, T, n_eq, hist, phist, scan,
+                                                           wt, &dummy, &n_tie);
 
         if (threadIdx.x == 0) fill = 0;
         __syncthreads();
@@ -681,7 +699,7 @@ __global__ __launch_bounds__(kTopkThreads) void logprobs_kernel(
     const float* __restrict__ lg, const SP* __restrict__ sp, float* __restrict__ st,
     uint32_t n_vocab, uint32_t k, uint32_t lg_ld, uint32_t st_ld, int32_t vocab_off) {
     __shared__ unsigned long long cand[kMaxLogprobs];
-    __shared__ uint32_t hist[258];
+    __shared__ uint32_t hist[258], phist[kHistGroups * 256];
     __shared__ uint32_t scan[256], wt[256 / kWave];
     __shared__ uint32_t fill;
     __shared__ float red[kTopkWaves];
@@ -693,10 +711,11 @@ __global__ __launch_bounds__(kTopkThreads) void logprobs_kernel(
     const uint32_t kk = k < n_vocab ? k : n_vocab;
 
     uint32_t n_eq = 0, dummy = 0, n_tie = 0;
-    const uint32_t T = radix_select<true>(row, n_vocab, 0, kk, hist, scan, wt, &n_eq, &n_tie);
+    const uint32_t T = radix_select<true>(row, n_vocab, 0, kk, hist, phist, scan, wt, &n_eq,
+                                          &n_tie);
     const uint32_t idx_cut = (n_tie == n_eq)
                                  ? 0xffffffffu
-                                 : radix_select<false>(row, n_vocab, T, n_eq, hist, scan, wt,
+                                 : radix_select<false>(row, n_vocab, T, n_eq, hist, phist, scan, wt,
                                                        &dummy, &n_tie);
     if (threadIdx.x == 0) fill = 0;
     __syncthreads();
@@ -1005,7 +1024,7 @@ __device__ __forceinline__ void merge_topk_body(
     const uint32_t* __restrict__ gt, const SP* __restrict__ sp,
     int32_t* __restrict__ ci, float* __restrict__ cv,
     uint32_t n_in, uint32_t n_cand, uint32_t gt_ld, uint32_t ci_ld, uint32_t cv_ld, uint32_t pad) {
-    extern __shared__ unsigned long long shared_cand[];
+    R4D_DYN_LDS(unsigned long long, shared_cand);
     const uint32_t m = blockIdx.x;
     const uint32_t* __restrict__ g = gt + (size_t)m * gt_ld;
     int32_t* __restrict__ oi = ci + (size_t)m * ci_ld;

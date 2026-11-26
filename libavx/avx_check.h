@@ -61,7 +61,8 @@ bool row_gather_case(const Lib& lib, const std::string& dir, int64_t calls, uint
 /* embed_lookup_q over a prefill whose following chunks are passed ahead, as the engine passes
  * them: every row read about once, every row exact (avx_check_rows.cpp). */
 bool row_ahead_case(const Lib& lib, const std::string& dir, bool verbose);
-/* embed_lookup_q's init with io_uring refused, and in this process (avx_check_rows.cpp). */
-bool ngram_init_case(const Lib& lib);
+/* embed_lookup_q's init with io_uring refused, then a bf16 gather from a table in `dir` read
+ * through the pread fallback, and the init in this process (avx_check_rows.cpp). */
+bool ngram_init_case(const Lib& lib, const std::string& dir);
 
 #endif /* RAD_AVX_CHECK_H */

@@ -100,6 +100,13 @@ void NgramIndex::index(const TokenSeq& seq, int nmin, int nmax, int64_t upto) {
     index_to(seq, upto);
 }
 
+std::vector<uint64_t> NgramIndex::contents() const {
+    std::vector<uint64_t> v;
+    for (const uint32_t t : tab_) if (t) v.push_back(t);
+    std::sort(v.begin(), v.end());
+    return v;
+}
+
 int NgramIndex::propose(const TokenSeq& seq, int nmin, int nmax, int depth, int32_t* out,
                         int* match, int match_cap) {
     const int64_t len = seq.size();

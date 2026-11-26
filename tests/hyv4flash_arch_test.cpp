@@ -136,6 +136,14 @@ struct G3Env {
     }
     ~G3Env() { for (const char* k : set) unsetenv(k); }
 };
+/* Two Engram layers (in front of layers 0 and 2): the case P-06 is about, where the group is
+ * shared -- one window, one bound layer, and only the last of the two layers commits a step. */
+void two_engram_layers(MetaKV& k) {
+    k.set("engram_layer_ids", "1 3");
+    k.set("engram_layer_head_vocab_sizes.1", "11 13 17 19 23 29 31 37 41 43");
+    k.set("engram_layer_head_vocab_sizes.3", "11 13 17 19 23 29 31 37 41 43");
+}
+
 struct Declared {
     MetaKV mk;
     RadBuilder b;
@@ -143,8 +151,9 @@ struct Declared {
     int rc = 0;
     explicit Declared(void (*encs)(RadBuilder*) = bf16_encs, int world = 1, int rank = 0,
                       bool wide = false, int64_t ff_exp = 128, int64_t latent = 0,
-                      int64_t top_k = 0, int64_t n_exp = 0)
+                      int64_t top_k = 0, int64_t n_exp = 0, void (*kvset)(MetaKV&) = nullptr)
         : mk(mini_meta(wide, ff_exp, 128, latent, top_k, n_exp)) {
+        if (kvset) kvset(mk);
         encs(&b);
         ctx = build_ctx(rank, world);
         G3Env g3env;
@@ -442,6 +451,67 @@ TEST(the_ahead_ids_are_hashed_only_for_a_host_gather) {
     unsetenv("RADIANCE_HY4_ENGRAM_AHEAD");
 }
 
+TEST(the_engram_layers_share_one_window) {
+    Declared d(bf16_encs, 1, 0, false, 128, 0, 0, 0, two_engram_layers);
+    REQUIRE_EQ(d.rc, RAD_OK);
+    const RadBuilder& b = d.b;
+    const RecKV* eg = kv_named(b, "kv_engram_tokens");
+    REQUIRE(eg != nullptr);
+    /* One window for the two layers: ngram - 1 ids a sequence (plus the speculative entries),
+     * i32, and one bound layer, so a sequence holds one CONV state per checkpoint. */
+    REQUIRE(eg->d.kind == RAD_KV_CONV);
+    CHECK_EQ(eg->d.conv_width, 3);      /* the config's ngram */
+    CHECK_EQ(eg->d.n_head_kv, 1);
+    CHECK_EQ(eg->d.head_dim, 1);
+    const rad_kvgroup g = (rad_kvgroup)(eg - b.kv_groups.data() + 1);
+    /* Declared and bound once, to the first of the two layers: a sequence owns one CONV state per
+     * checkpoint and a rollback copies one, not one a layer. */
+    int nb = 0;
+    for (const auto& bd : b.binds)
+        if (bd.second == g) {
+            ++nb;
+            CHECK_EQ(bd.first, 0);
+        }
+    CHECK_EQ(nb, 1);
+    /* A step with both layouts (a decode sequence and a prefill chunk): every Engram layer issues
+     * its own `engram_ids` (the multipliers, sizes and offsets differ a layer), every issue reads
+     * the window through that one bound layer, and only the last Engram layer's issue of a layout
+     * advances it -- so all of them hash the window the step opened with. */
+    auto k = kit(b, { 1 }, { 12 }, 0);
+    RadCtx c{ .b = &d.b, .batch = &k->b };
+    hyv4flash::step(&c, &k->b);
+    CHECK(c.step_fail.empty());
+    CHECK_LINT(b, &c);
+    int n_ids = 0, n_adv = 0;
+    for (const RecIssue& is : c.issues) {
+        REQUIRE(is.op != 0);
+        const RecOp& o = b.ops[(size_t)is.op - 1];
+        if (o.op != "engram_ids") continue;
+        ++n_ids;
+        bool kv = false;
+        std::string mult;
+        for (const RadOperand& od : is.opd) {
+            if (od.kind == RAD_OPK_KV) {
+                kv = true;
+                CHECK_EQ((int64_t)od.handle, (int64_t)g);
+                CHECK_EQ((int64_t)od.offset, 0);   /* the bound layer, both layers of the pair */
+            }
+            if (od.kind == RAD_OPK_WEIGHT && od.handle > 0 &&
+                (size_t)od.handle <= b.weights.size()) {
+                const std::string& n = b.weights[(size_t)od.handle - 1].name;
+                if (n.size() > 4 && n.compare(n.size() - 4, 4, "mult") == 0) mult = n;
+            }
+        }
+        CHECK(kv);
+        REQUIRE(!mult.empty());
+        const int adv = (int)pint(&o, "advance");
+        CHECK_EQ(adv, mult == "blk.2.engram_mult" ? 1 : 0);   /* layer 2 is the last of the two */
+        n_adv += adv;
+    }
+    CHECK_EQ(n_ids, 4);         /* one a layer, in each of the two layouts */
+    CHECK_EQ(n_adv, 2);         /* the window moves on once a layout, not once a layer */
+}
+
 TEST(last_layer_keeps_cache_writers_at_chunk_height_and_queries_at_output_height) {
     RadBuilder b;
     bf16_encs(&b);
@@ -588,6 +658,17 @@ TEST(k24_a_declared_but_unserved_fused_key_side_still_declares) {
     CHECK(issue_of(b, c, "qsa_work") != nullptr);
     CHECK(issue_of(b, c, "idx_pool_gated") != nullptr);
     CHECK(issue_of(b, c, "qsa_tail_store") != nullptr);
+    /* and every unserved declaration of it is marked dropped (rad_op_dropped), so rad-convert's
+     * dead-op count and the engine's holes leave it out: the three ops run in its place */
+    int declared = 0;
+    for (const RecOp& o : b.ops)
+        if (o.op == "qsa_work_pool_tail") {
+            ++declared;
+            CHECK(o.dropped);
+        }
+    CHECK(declared > 0);
+    for (const RecOp& o : b.ops)
+        if (o.op != "qsa_work_pool_tail") CHECK(!o.dropped);
 }
 
 TEST(compact_dense_prefill_keeps_full_keys_and_restores_gather_indices) {
@@ -2875,11 +2956,15 @@ struct DeclDfly {
     RadBuildCtx ctx;
     int rc = 0;
     std::string err;
+    /* `refuse`: ops this build's kernels do not serve, so the declare must fall back (D-01). */
     explicit DeclDfly(int depth = 5, MetaKV m = dfly_meta(), int world = 1, int rank = 0,
-                      void (*encs)(RadBuilder*) = bf16_encs)
+                      void (*encs)(RadBuilder*) = bf16_encs,
+                      const std::vector<const char*>& refuse = {}, int max_seqs = 8)
         : mk(std::move(m)) {
         encs(&b);
+        for (const char* r : refuse) b.refuse.insert(r);
         ctx = spec_ctx(rank, world, depth);
+        ctx.max_seqs = max_seqs;
         err = stderr_of([&] { rc = hyv4flash::declare(&b, mk.meta(), &ctx); });
         if (rc != RAD_OK && std::getenv("HY4_TEST_STDERR")) fputs(err.c_str(), stderr);
     }
@@ -3005,7 +3090,9 @@ TEST(an_engine_step_with_dfly2_is_lint_clean_and_the_query_pass_touches_no_trunk
         const auto& df = d.df();
         size_t store = SIZE_MAX, attn = SIZE_MAX;
         for (size_t i = 0; i < ps[2]->issues.size(); ++i) {
-            if (ps[2]->issues[i].op == df.lay[0].op_store && store == SIZE_MAX) store = i;
+            /* D-01: the row's norm, key rotary and store are one launch where declared */
+            const rad_op h = ps[2]->issues[i].op;
+            if ((h == df.lay[0].op_store || h == df.lay[0].op_row_q) && store == SIZE_MAX) store = i;
             if (ps[2]->issues[i].op == df.lay[0].op_attn) attn = i;
         }
         REQUIRE(store != SIZE_MAX && attn != SIZE_MAX);
@@ -3345,6 +3432,174 @@ TEST(dfly2_reads_quantised_linears_as_the_trunk_does) {
         CHECK(find_w(d.b, "dfly.blk.0.attn_q_a.scale") != nullptr);
         CHECK(find_w(d.b, "dfly.blk.0.attn_gate.scale") != nullptr);
     }
+}
+
+/* D-01 (#87): a draft layer takes the trunk's fused producers wherever a loaded kernel library
+ * serves them and the draft's linears read rotated int8 codes of the 128 group -- the norm of the
+ * attention's input and the feed-forward's write their readers' codes, the q residual's norm writes
+ * q_b's, the MLP's activation writes down's, the expansion keeps its gate and o_proj's quantiser,
+ * the cache row's norm, key rotary and store are one launch, and the pass's last residual add folds
+ * into the final norm -- so the layer issues nine fewer launches for the same bytes and the same
+ * codes (docs/OPS.md states each byte-identical to the chain it replaces). A switch off, or a build
+ * without an op, keeps the plain chain and the pass is lint clean either way. */
+namespace {
+/* D-01's container: every draft linear a fused producer feeds reads rotated int8 codes of the 128
+ * group, q_lora and o_proj's input whole groups (the default 64 and 64 are not). */
+void dfly_fused_encs(RadBuilder* b) {
+    dfly_i8_encs(b);
+    std::vector<std::pair<std::string, RadEncoding>> q;
+    for (const char* n : { "attn_kv_a", "attn_q_b", "attn_output", "ffn_down" })
+        q.push_back({ std::string("dfly.blk.0.") + n + ".weight", enc_i8(true) });
+    b->encs.insert(b->encs.begin(), q.begin(), q.end());
+}
+MetaKV dfly_fused_meta() {
+    MetaKV k = dfly_meta(1, true, 256);
+    k.set("q_lora_rank", "128");       /* q_b's K is whole 128 groups */
+    k.set("kv_lora_rank", "40");       /* so kv_a's 40 + 8 columns are int8 rows of 16s */
+    return k;
+}
+/* The switches a case turns off, restored when it ends. */
+struct DflyOff {
+    std::vector<const char*> set;
+    explicit DflyOff(std::initializer_list<std::pair<const char*, const char*>> kv) {
+        for (const auto& p : kv) {
+            setenv(p.first, p.second, 1);
+            set.push_back(p.first);
+        }
+    }
+    ~DflyOff() { for (const char* k : set) unsetenv(k); }
+};
+/* One query pass over D-01's container: every draft op's issue count, and the layer's launch count
+ * (its first norm through its last add/norm, so the trunk's launches do not enter it). */
+struct DflyIssues {
+    std::map<std::string, int> n;
+    int64_t launches = 0;
+};
+}  // namespace
+TEST(dfly2_draft_layers_use_the_trunks_fused_producers) {
+    g3_fusions = true;
+    auto run = [](int off, std::vector<const char*> refuse, DflyIssues& got) {
+        std::unique_ptr<DflyOff> env;
+        if (off == 1)   /* the fused producers off: the plain chain, and sharing still on */
+            env = std::make_unique<DflyOff>(std::initializer_list<std::pair<const char*, const char*>>{
+                { "RADIANCE_HY4_FUSED_QUANT", "0" }, { "RADIANCE_HY4_FUSE_EXPAND_QUANT", "0" },
+                { "RADIANCE_HY4_CACHE_ROW", "0" } });
+        DeclDfly d(5, dfly_fused_meta(), 1, 0, dfly_fused_encs, refuse);
+        CHECK_EQ(d.rc, RAD_OK);
+        if (!d.df().served) fprintf(stderr, "%s\n", d.df().why.c_str());
+        CHECK(d.df().served);
+        const auto& df = d.df();
+        const auto& L = df.lay[0];
+        if (off == 0)
+            CHECK(L.op_attn_norm_q != 0 && L.op_qa_norm_q != 0 && L.op_ffn_norm_q != 0 &&
+                  L.op_row_q != 0 && L.op_expand_q != 0 && L.op_gated != 0 && df.op_final_add != 0);
+        if (off == 2)   /* a build whose kernels serve none of them */
+            CHECK(L.op_attn_norm_q == 0 && L.op_qa_norm_q == 0 && L.op_ffn_norm_q == 0 &&
+                  L.op_row_q == 0 && L.op_expand_q == 0 && L.op_gated == 0 && df.op_final_add == 0);
+        /* the trunk's own fusions stay as the build has them, so only the draft layer is compared */
+        auto trunk = kit(d.b, std::vector<int>(2, 6), {});
+        trunk->b.positions_h = trunk->pos.data();
+        auto ctxp = context_pass(d.b, *trunk);
+        Query qp(d.b, 2, 6, 5);
+        auto ps = run_passes(d.b, hyv4flash::step, { trunk.get(), ctxp.get(), qp.k.get() }, 0, 1);
+        CHECK_PASSES(d.b, ps);
+        CHECK_LINT(d.b, ps[2].get());
+        const auto& is = ps[2]->issues;
+        auto n_of = [&](rad_op h) {
+            int n = 0;
+            for (const auto& s : is) n += h != 0 && s.op == h;
+            return n;
+        };
+        const std::pair<const char*, rad_op> ops[] = {
+            { "attn_norm", L.op_attn_norm },     { "attn_norm_q", L.op_attn_norm_q },
+            { "qa_norm", L.op_qa_norm },         { "qa_norm_q", L.op_qa_norm_q },
+            { "ffn_norm", L.op_ffn_norm },       { "ffn_norm_q", L.op_ffn_norm_q },
+            { "kv_norm", L.op_kv_norm },         { "k_rope", L.op_k_rope },
+            { "store", L.op_store },            { "row_q", L.op_row_q },
+            { "expand", L.op_expand },           { "expand_q", L.op_expand_q },
+            { "gmul", L.op_gmul },               { "silu", L.op_silu },
+            { "gated", L.op_gated },             { "add2", L.op_add2 },
+            { "final", df.op_final },           { "final_add", df.op_final_add },
+        };
+        for (const auto& [nm, h] : ops) got.n[nm] = n_of(h);
+        size_t first = SIZE_MAX, last = SIZE_MAX;
+        for (size_t i = 0; i < is.size(); ++i) {
+            if ((is[i].op == L.op_attn_norm || is[i].op == L.op_attn_norm_q) && first == SIZE_MAX)
+                first = i;
+            if (is[i].op == df.op_final || is[i].op == df.op_final_add) last = i;
+        }
+        CHECK(first != SIZE_MAX && last != SIZE_MAX && first <= last);
+        got.launches = first == SIZE_MAX || last < first ? -1 : (int64_t)(last - first + 1);
+    };
+    const char* fused_ops[] = { "attn_norm_q", "qa_norm_q", "ffn_norm_q", "row_q", "expand_q",
+                               "gated", "final_add" };
+    const char* plain_ops[] = { "attn_norm", "qa_norm", "ffn_norm", "kv_norm", "k_rope", "store",
+                               "expand", "gmul", "silu", "add2", "final" };
+    DflyIssues on, off_by_switch, off_by_library;
+    run(0, {}, on);
+    run(1, {}, off_by_switch);
+    run(2, { "rmsnorm_had_quant_i8g", "mla_row_norm_rope_store", "mla_expand_gate_had_quant_i8g",
+             "gated_had_quant_i8g", "add_rmsnorm" }, off_by_library);
+    for (const char* nm : fused_ops) CHECK_EQ(on.n[nm], 1);
+    for (const char* nm : plain_ops) CHECK_EQ(on.n[nm], 0);
+    /* the switches off: the five switch-gated families fall back and the pass stays lint clean.
+     * The last add folds whatever the switches say: it has no switch, only a serving library. */
+    const char* switched[] = { "attn_norm", "qa_norm", "ffn_norm", "kv_norm", "k_rope", "store",
+                               "expand", "gmul", "silu" };
+    for (const char* nm : switched) CHECK_EQ(off_by_switch.n[nm], 1);
+    for (const char* nm : { "attn_norm_q", "qa_norm_q", "ffn_norm_q", "row_q", "expand_q", "gated" })
+        CHECK_EQ(off_by_switch.n[nm], 0);
+    CHECK_EQ(off_by_switch.n["final_add"], 1);
+    CHECK_EQ(off_by_switch.n["add2"], 0);
+    CHECK_EQ(off_by_switch.n["final"], 0);
+    /* a library that serves none of the seven: the plain chain from the first norm to the final
+     * norm, and no launch of a fused op */
+    for (const char* nm : plain_ops) CHECK_EQ(off_by_library.n[nm], 1);
+    for (const char* nm : fused_ops) CHECK_EQ(off_by_library.n[nm], 0);
+    /* nine launches a draft layer: three of the row and the expansion, one of each of the rest;
+     * eight against the switches alone, which leave the last add folded */
+    CHECK_EQ(off_by_library.launches - on.launches, 9);
+    CHECK_EQ(off_by_switch.launches - on.launches, 8);
+    g3_fusions = false;
+}
+
+/* The fused expansion takes at most kFuseRows rows (its range), which a server with many
+ * sequences a step can exceed: the declare keeps it, and the pass that drafts more rows than that
+ * issues the plain expansion, the gate's product and o_proj's own quantiser instead -- the same
+ * graph, fused for a block of drafts that fits and plain for one that does not. */
+TEST(dfly2_a_block_taller_than_the_fused_expansion_keeps_its_plain_chain) {
+    g3_fusions = true;
+    DeclDfly d(5, dfly_fused_meta(), 1, 0, dfly_fused_encs, {}, /*max_seqs=*/64);
+    CHECK_EQ(d.rc, RAD_OK);
+    const auto& df = d.df();
+    if (!df.served) fprintf(stderr, "%s\n", df.why.c_str());
+    REQUIRE(df.served);
+    CHECK(df.Md > 64);   /* Hy4Attn::kFuseRows, the expansion's row range */
+    const auto& L = df.lay[0];
+    CHECK(L.op_expand_q != 0 && L.op_expand != 0 && L.op_gmul != 0);
+    /* 8 sequences of 6 rows fit the expansion; 12 do not */
+    struct Case { int64_t n, block, exp, gmul, exp_q; };
+    for (const Case& k : { Case{ 8, 6, 0, 0, 1 }, Case{ 12, 6, 1, 1, 0 } }) {
+        auto trunk = kit(d.b, std::vector<int>(2, 6), {});
+        trunk->b.positions_h = trunk->pos.data();
+        auto ctxp = context_pass(d.b, *trunk);
+        Query qp(d.b, k.n, k.block, 5);
+        auto ps = run_passes(d.b, hyv4flash::step, { trunk.get(), ctxp.get(), qp.k.get() }, 0, 1);
+        CHECK_PASSES(d.b, ps);
+        CHECK_LINT(d.b, ps[2].get());
+        int exp = 0, gmul = 0, exp_q = 0, quant = 0;
+        for (const auto& s : ps[2]->issues) {
+            exp += s.op == L.op_expand;
+            gmul += s.op == L.op_gmul;
+            exp_q += s.op == L.op_expand_q;
+            quant += s.op == L.p_out.lin.op_q;
+        }
+        CHECK_EQ(exp, k.exp);
+        CHECK_EQ(gmul, k.gmul);
+        CHECK_EQ(exp_q, k.exp_q);
+        CHECK_EQ(quant, k.exp_q == 0 ? 1 : 0);   /* o_proj quantises where the expansion did not */
+    }
+    g3_fusions = false;
 }
 
 /* §3.2 / P-09: a dense trunk step clears the snapshot's counts with the one fill over the

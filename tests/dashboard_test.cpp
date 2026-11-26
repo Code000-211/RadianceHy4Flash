@@ -21,8 +21,14 @@
 
 namespace {
 
-/* A scheduler with a live request table, stored sessions and idle-tier counters. */
+/* A scheduler with a live request table, stored sessions and idle-tier counters. The request and
+ * the session run under the runtime LoRA "sql" (slot 0) unless `lora` is cleared: a populated
+ * engine emits every optional field, and `lora` is one (absent when no adapter is set). */
 struct StatsScheduler : FakeScheduler {
+    std::string lora = "sql";
+    std::vector<std::string> lora_names() const override {
+        return lora.empty() ? std::vector<std::string>{} : std::vector<std::string>{ lora };
+    }
     int requests(std::vector<RequestStat>* out) const override {
         RequestStat r;
         r.id = 41;
@@ -44,6 +50,7 @@ struct StatsScheduler : FakeScheduler {
         r.ttft_s = 0.25;
         r.prefill_s = 0.20;
         r.decode_tps = 61.0;
+        r.lora = lora;
         out->assign(1, r);
         return 1;
     }
@@ -62,6 +69,7 @@ struct StatsScheduler : FakeScheduler {
         s.snap_bytes = 4096;
         s.resume_tokens = 4096;
         s.moving = true;
+        s.lora = lora;
         out->assign(1, s);
         occ->host_bytes = 8 << 20;
         occ->host_cap_bytes = 64 << 20;
@@ -224,6 +232,63 @@ TEST(stats_carries_the_engine_the_requests_and_the_snapshot) {
     CHECK_EQ(d.srv->router().call("GET", "/graph").status, 501);
     Dash g(true);
     CHECK_EQ(g.get("/graph").value("order", json()).size(), (size_t)0);
+}
+
+/* `lora` names the runtime LoRA a request or a stored conversation ran under, and only then: the
+ * page reads it as optional (`lora?: string` in dashboard/src/lib/api.ts), so an engine with no
+ * adapter set leaves it out instead of sending an empty name or a null. /stats lists the slots by
+ * name with what each one served. */
+TEST(the_lora_fields_are_emitted_when_a_lora_is_set_and_left_out_otherwise) {
+    Dash d(false);
+    d.sched.m.loras[0].requests = 5;
+    d.sched.m.loras[0].output_tokens = 70;
+    const json s = d.get("/stats");
+    CHECK_EQ(s["requests"][0].value("lora", ""), std::string("sql"));
+    CHECK_EQ(d.get("/sessions")["sessions"][0].value("lora", ""), std::string("sql"));
+    REQUIRE(s["loras"].size() == 1);
+    CHECK_EQ(s["loras"][0].value("name", ""), std::string("sql"));
+    CHECK_EQ(s["loras"][0].value("requests", (int64_t)0), (int64_t)5);
+    CHECK_EQ(s["loras"][0].value("output_tokens", (int64_t)0), (int64_t)70);
+
+    Dash e(false);
+    e.sched.lora.clear();
+    const json t = e.get("/stats");
+    CHECK(!t["requests"][0].contains("lora"));
+    CHECK(!e.get("/sessions")["sessions"][0].contains("lora"));
+    CHECK(t["loras"].is_array() && t["loras"].empty());
+}
+
+/* /stats says why the loan stops: the pieces of its headroom for the group that lends least, so a
+ * reader can tell free room above the held top from free blocks left under it. Blocks of that
+ * group, since a block is the unit the loan's mark moves in. */
+TEST(stats_says_where_the_kv_loan_stops_and_what_keeps_it_there) {
+    Dash d(false);
+    d.sched.m.kv_loan.group         = "full";
+    d.sched.m.kv_loan.block_tokens  = 64;
+    d.sched.m.kv_loan.block_bytes   = 131072;
+    d.sched.m.kv_loan.held          = 1000;
+    d.sched.m.kv_loan.held_top      = 1040;
+    d.sched.m.kv_loan.buffer_blocks = 8;
+    d.sched.m.kv_loan.live          = 1048;
+    d.sched.m.kv_loan.spare_tokens  = 0;
+    d.sched.m.kv_loan.loan_tokens   = 512;
+    const json s = d.get("/stats");
+    REQUIRE(s.contains("kv_loan"));
+    const json& l = s["kv_loan"];
+    CHECK_EQ(l.value("group", ""), std::string("full"));
+    CHECK_EQ(l.value("block_tokens", (int64_t)0), (int64_t)64);
+    CHECK_EQ(l.value("block_bytes", (int64_t)0), (int64_t)131072);
+    CHECK_EQ(l.value("held", (int64_t)0), (int64_t)1000);
+    CHECK_EQ(l.value("held_top", (int64_t)0), (int64_t)1040);
+    CHECK_EQ(l.value("buffer_blocks", (int64_t)0), (int64_t)8);
+    CHECK_EQ(l.value("live", (int64_t)0), (int64_t)1048);
+    CHECK_EQ(l.value("spare_tokens", (int64_t)-1), (int64_t)0);
+    CHECK_EQ(l.value("loan_tokens", (int64_t)0), (int64_t)512);
+
+    /* An engine whose manager cannot answer says nothing: absent, not a row of zeros that would
+     * read as a pool with no room to lend. */
+    Dash e(false);
+    CHECK(!e.get("/stats").contains("kv_loan"));
 }
 
 /* /sessions lists each stored conversation with where its blocks are, the pool as the card holds
@@ -490,6 +555,43 @@ TEST(the_bridge_reads_the_binding_paged_group_and_sums_only_bytes) {
     CHECK_EQ(p.kv_tokens_total, (int64_t)(200 * 16));
     CHECK_EQ(p.kv_tokens_used, (int64_t)(190 * 16));
     CHECK_EQ(p.kv_tokens_max, (int64_t)(100 * 16));
+}
+
+/* The loan's pieces cross the bridge with the name of the group they are counted in, so a reader
+ * of /stats needs no index into the per-group array that only /metrics carries. A manager that
+ * cannot answer says group -1, and that must not name group 0. */
+TEST(the_bridge_names_the_group_the_kv_loan_stops_in) {
+    rad::SchedMetrics m;
+    m.n_kv_groups = 2;
+    m.kv[0].name = "full";
+    m.kv[1].name = "window";
+    m.kv_spare.group         = 1;
+    m.kv_spare.block_tokens  = 32;
+    m.kv_spare.block_bytes   = 4096;
+    m.kv_spare.held          = 10;
+    m.kv_spare.held_top      = 12;
+    m.kv_spare.buffer_blocks = 4;
+    m.kv_spare.live          = 16;
+    m.kv_spare.spare_tokens  = 99;
+    m.kv_spare.loan_tokens   = 77;
+    const server::SchedMetrics o = bridge_metrics(m);
+    CHECK_EQ(o.kv_loan.group, std::string("window"));
+    CHECK_EQ(o.kv_loan.block_tokens, (int64_t)32);
+    CHECK_EQ(o.kv_loan.block_bytes, (int64_t)4096);
+    CHECK_EQ(o.kv_loan.held, (int64_t)10);
+    CHECK_EQ(o.kv_loan.held_top, (int64_t)12);
+    CHECK_EQ(o.kv_loan.buffer_blocks, (int64_t)4);
+    CHECK_EQ(o.kv_loan.live, (int64_t)16);
+    CHECK_EQ(o.kv_loan.spare_tokens, (int64_t)99);
+    CHECK_EQ(o.kv_loan.loan_tokens, (int64_t)77);
+
+    rad::SchedMetrics none;   /* group -1: no paged FULL group, or a follower */
+    none.n_kv_groups = 2;
+    const server::SchedMetrics p = bridge_metrics(none);
+    CHECK(p.kv_loan.group.empty());
+    CHECK_EQ(p.kv_loan.held_top, (int64_t)0);
+    CHECK_EQ(p.kv_loan.buffer_blocks, (int64_t)0);
+    CHECK_EQ(p.kv_loan.spare_tokens, (int64_t)0);
 }
 
 /* SchedulerBridge copies S-07's seven reasons one for one: each keeps its own counter, so a
