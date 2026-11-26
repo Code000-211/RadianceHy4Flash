@@ -1909,7 +1909,10 @@ built-in table a knot, the estimate kept monotone in the confidence, the counts 
 so); the rate is a moving average of the pure decode steps' tokens and milliseconds; and the prices are
 those steps' milliseconds regressed on verify rows, rounds and tiles, with the built-in prices as the
 prior, so a price the steps do not tell apart (a round from the rows that come with it) stays near the
-table and one they do (a row, a tile) follows them. A lower temperature, which accepts more at the same
+table and one they do (a row, a tile) follows them. Each step is read against the steps just before it (a
+local level, half-life 8 steps), so what moves every step's time slowly -- the expert pool warming, a
+disk-placed Engram table, another job on the host -- is not taken for the price of a row, which the rule's
+own depth would otherwise follow. A lower temperature, which accepts more at the same
 confidence, another card or another model therefore needs no table of its own; `static` serves the tables
 as given. The output law is the target's either way: within a step the rule reads draft-side laws only (its
 own chain's up to the draft it admits, and the other sequences'), and the tables move between steps, from
