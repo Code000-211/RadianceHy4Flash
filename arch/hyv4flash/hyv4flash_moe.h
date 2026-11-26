@@ -44,7 +44,8 @@ struct GatedMlp {
     int declare(RadBuilder* b, Names& nm, const Geom& g, const Shape& s, int l, const char* gu_name,
                 const char* dn_name, const char* mp, int64_t ff_w, rad_buf x, rad_buf y,
                 rad_buf gu_buf, rad_buf ff_buf, const Lin* feed = nullptr,
-                const ActFP8* in_codes = nullptr, rad_buf* ff_slot = nullptr) {
+                const ActFP8* in_codes = nullptr, rad_buf* ff_slot = nullptr,
+                const char* ff_name = "dense_ff") {
         gu = gu_buf;
         ff = ActFP8{};
         ff.x = ff_buf;
@@ -85,9 +86,13 @@ struct GatedMlp {
         }
         /* The product plane (P-11b): only the unfused pair reads or writes it, so it is declared
          * here, where the form is settled, and once for the model -- `ff_slot` is the model's, and
-         * the first layer that needs the plane declares it for every later one. */
+         * the first layer that needs the plane declares it for every later one. Both gated MLPs of
+         * the model work this way: the dense one (`dense_ff`) and the shared expert of a MoE layer
+         * (`moe.shared_ff`), which is a second width and so a second slot. A model that folds every
+         * gate of a width charges the arena nothing for it, which is the point: charged for the
+         * whole program, the plane sat in the fixed region and cost its size at every step size. */
         if (!gfuse && ff_slot && !*ff_slot) {
-            *ff_slot = decl_b(b, nm.f("dense_ff"), RAD_BF16, { g.max_tok, ff_w });
+            *ff_slot = decl_b(b, nm.f("%s", ff_name), RAD_BF16, { g.max_tok, ff_w });
             if (!*ff_slot) return RAD_E_INVAL;
             ff.x = *ff_slot;
         }
@@ -209,7 +214,7 @@ struct MoeWire {
     ActFP8 sum{};
     rad_buf routed = 0;    /* [T, n] latent_out's output, then routed + shared */
     rad_buf sgu = 0;       /* [T, 2 * ff_shared] */
-    rad_buf sff = 0;       /* [T, ff_shared] */
+    rad_buf sff = 0;       /* [T, ff_shared]; 0 while every shared arm folds (GatedMlp::declare) */
     rad_buf sout = 0;      /* [T, n] */
     MoeFP8::Wire moe{};
     /* The routed arm's activation codes, by the experts' format (Ffn::arm): none for bf16
@@ -228,7 +233,10 @@ struct MoeWire {
         lat.x = bf("moe.latent", { T, L });
         routed = bf("moe.routed", { T, s.n_embd });
         sgu = bf("moe.shared_gate_up", { T, 2 * s.n_ff_shared_r });
-        sff = bf("moe.shared_ff", { T, s.n_ff_shared_r });
+        /* `sff` -- the shared expert's product plane -- is not declared here (P-11b): only an
+         * unfused shared arm reads or writes it, so GatedMlp::declare takes the slot and declares
+         * it at the first layer that needs it. Declared on the wire it was charged for the whole
+         * program, and the fixed region carried it at every step size. */
         sout = bf("moe.shared_out", { T, s.n_embd });
         auto& w = moe;
         w.logits = decl_b(b, nm.f("moe.router_logits"), RAD_F32, { T, s.n_expert });
@@ -272,7 +280,7 @@ struct MoeWire {
             RAD_ARCH_TRY(w.eff.declare_qs(b, nm, gq, nm.f("moe.expert_ff"), F, T * k, i8, true));
             w.eff.q8_fed = w.eff.q8_rot = i8;
         }
-        return lat.x && routed && sgu && sff && sout && w.logits && w.ids && w.ew && w.eoff &&
+        return lat.x && routed && sgu && sout && w.logits && w.ids && w.ew && w.eoff &&
                        w.ecnt && w.sorted && w.egu && w.eff.x && w.edn
                    ? RAD_OK
                    : RAD_E_INVAL;
@@ -490,7 +498,8 @@ struct Ffn {
             RAD_ARCH_TRY(shared.declare(b, nm, g, s, l, nm.f("blk.%d.ffn_gate_up_shexp", l),
                                         nm.f("blk.%d.ffn_down_shexp", l),
                                         nm.ckpt("%s.shared_experts", mp), s.n_ff_shared_r, xf,
-                                        w.sout, w.sgu, w.sff, &lat_in, in_codes));
+                                        w.sout, w.sgu, w.sff, &lat_in, in_codes, &w.sff,
+                                        "moe.shared_ff"));
             /* Issued inside MoeFP8's pass, ahead of their declared place behind latent_out, the
              * arm's buffers are excluded from sharing (SideOps' rule). It reads x's codes (or x),
              * which nothing in the routed span writes, and writes only its own buffers. */

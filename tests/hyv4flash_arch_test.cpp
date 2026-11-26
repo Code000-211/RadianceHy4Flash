@@ -4130,19 +4130,18 @@ TEST(g3_junctions_write_the_codes_their_readers_take) {
 
 /* P-11b. The buffer plan charges a transient the whole program when no op of the declared list
  * names it (core/build/rad_bufplan.cpp; `radiance --debug-graph` prints the ones it counts, with
- * the bytes), so each of them is arena the engine holds and never reads. The Hy4 plan declared
- * fourteen; six are gone with this change -- the dense MLP's bf16 product plane, declared now by
- * the first layer that takes the unfused pair, and the Engram round trip's three planes, declared
- * now by the first layer whose table is bf16 -- and the list below is what is left, a reason each,
- * so a new plane no op names fails this test by its name.
+ * the bytes), so each of them is arena the engine holds and never reads. The merge base's plan
+ * charged fifteen of them at TP2/2048; five are gone with this change -- the dense MLP's bf16
+ * product plane and the shared expert's, both declared now by the first layer that takes the
+ * unfused pair, and the Engram round trip's three, declared now by the first layer whose table is
+ * bf16 -- and the list below is what is left, a reason each, so a new plane no op names fails this
+ * test by its name.
  *   moe.expert_ff.q / .s -- the routed arm's E4M3 product codes. An int8 arm's fused SwiGLU writes
  *       the rotated int8 pair the down projection reads, so no op names them; MoeFP8's own rule
  *       does ask for them (down_codebook_fp8 / down_supported,
  *       arch/common/rad_block_moe_fp8.h), the mixed IQR-gate_up-behind-a-w6-down recipe with them.
  *   moe.latent.q / .s -- the same for the latent linear: the gather's output is read as the rotated
  *       int8 pair, and MoeFP8::declare refuses a wire whose latent carries no codes at all.
- *   moe.shared_ff -- the shared expert's bf16 product, for the same unfused pair as the dense MLP's
- *       was; the wire declares it because it cannot see the down projection's form there.
  *   ix.stage -- the indexer stages a closing group's raw keys through it, and the step issues that
  *       path only where the library does not serve the fused key side (qsa_work_pool_tail).
  * The sampler's four candidate planes are arena for the whole program for the same reason, but the
@@ -4171,6 +4170,28 @@ std::vector<std::string> unused_transients(const RadBuilder& b) {
     return dead;
 }
 
+/* How many buffers of the plan carry this name. The builder refuses a duplicate, so the answer is
+ * 0 or 1: the count is how the Engram test says two layers share one trio instead of each
+ * declaring its own, and how the P-11b test says a plane is not in the plan at all. */
+int count_buf(const RadBuilder& b, const char* name) {
+    int n = 0;
+    for (const auto& r : b.bufs) n += r.name == name;
+    return n;
+}
+
+/* Whether some declared op reads or writes the buffer of this name: charged and used is a plane the
+ * step runs through, charged and unnamed is the arena this card is about. */
+bool named_by_op(const RadBuilder& b, const char* name) {
+    for (size_t i = 0; i < b.bufs.size(); ++i) {
+        if (b.bufs[i].name != name) continue;
+        const rad_buf h = (rad_buf)(i + 1);
+        for (const auto& o : b.ops)
+            if (in(o.reads, h) || in(o.writes, h)) return true;
+        return false;
+    }
+    return false;
+}
+
 }  // namespace
 
 TEST(no_transient_is_declared_that_no_op_reads) {
@@ -4184,7 +4205,7 @@ TEST(no_transient_is_declared_that_no_op_reads) {
     };
     const Plan plans[] = {
         { "bf16", bf16_encs, 1, "ix.stage " },
-        { "int8 trunk", int8_trunk_encs, 1, "ix.stage moe.shared_ff " },
+        { "int8 trunk", int8_trunk_encs, 1, "ix.stage " },
         { "int8 experts",
           [](RadBuilder* b) { bf16_encs(b); b->encs[0].second = b->encs[1].second = enc_i8(true); },
           1, "ix.stage moe.expert_ff.q moe.expert_ff.s moe.latent.q moe.latent.s " },
@@ -4202,5 +4223,65 @@ TEST(no_transient_is_declared_that_no_op_reads) {
         REQUIRE_EQ(d.rc, RAD_OK);
         steps_clean_at(d.b, 0, 1);   /* every step kind, each lint clean */
         CHECK_EQ(dead_join(unused_transients(d.b)), std::string(p.kept));
+    }
+}
+
+/* P-11b. A product plane belongs to the gate that writes it, and the round trip belongs to the
+ * table it is taken from. Each of these planes was charged for the whole program from the wire,
+ * where the declare cannot see which form the layer takes; each is now declared where the form is
+ * settled, so a model that runs the other form reserves nothing for it. */
+TEST(the_product_planes_follow_the_gate_that_writes_them) {
+    /* The rotated int8 trunk with the fused gate: the gate writes the codes, so no layer of the
+     * model -- dense MLP or shared expert -- has a bf16 product plane at all. */
+    {
+        Declared d(int8_trunk_encs, 1);
+        REQUIRE_EQ(d.rc, RAD_OK);
+        steps_clean_at(d.b, 0, 1);
+        CHECK_EQ(count_op(d.b, "gated_had_quant_i8g") > 0, true);
+        CHECK_EQ(count_buf(d.b, "dense_ff"), 0);
+        CHECK_EQ(count_buf(d.b, "moe.shared_ff"), 0);
+    }
+    /* The switch off: the pair is back, the first layer of each kind declares its plane for every
+     * later one (one buffer, not one a layer), and `silu_mul` names it -- charged and used, which
+     * is not what the card is about. */
+    setenv("RADIANCE_HY4_FUSED_QUANT", "0", 1);
+    Declared unfused(int8_trunk_encs, 1);
+    unsetenv("RADIANCE_HY4_FUSED_QUANT");
+    REQUIRE_EQ(unfused.rc, RAD_OK);
+    steps_clean_at(unfused.b, 0, 1);
+    CHECK_EQ(count_buf(unfused.b, "dense_ff"), 1);
+    CHECK(named_by_op(unfused.b, "dense_ff"));
+    CHECK_EQ(count_buf(unfused.b, "moe.shared_ff"), 1);
+    CHECK(named_by_op(unfused.b, "moe.shared_ff"));
+    CHECK_EQ(count_op(unfused.b, "silu_mul") > 0, true);
+}
+
+/* P-11b. The Engram round trip's three planes follow the trip: the served recipe stores the table
+ * as E4M3 rows under a scale a row, which is what the model reads, so the trip is not taken and the
+ * plan carries none of them; a bf16 table with `engram_fp8_embedding` takes it, and the two Engram
+ * layers of this model share one trio -- the handles are carried to the later layer on the wire. */
+TEST(the_engram_round_trip_declares_its_planes_only_when_it_is_taken) {
+    /* The table as the u3 ships it: fp8_e4m3*f32[1x*] (data/recipes/hy4-flash-bf16-f32.recipe). */
+    Declared e4m3([](RadBuilder* b) {
+        bf16_encs(b);
+        b->encs.insert(b->encs.begin(),
+                       { { "engram_table", rad_enc_affine(RAD_F8E4M3, RAD_F32, 1, 0) },
+                         { "engram_mult", rad_enc_plain(RAD_I64) } });
+    }, 1, 0, false, 128, 0, 0, 0, two_engram_layers);
+    REQUIRE_EQ(e4m3.rc, RAD_OK);
+    steps_clean_at(e4m3.b, 0, 1);
+    REQUIRE(find_w(e4m3.b, "blk.1.engram_table.scale") != nullptr);   /* the trip really was off */
+    for (const char* n : { "eg.rows.q", "eg.rows.s", "eg.rows.rt" })
+        CHECK_EQ(count_buf(e4m3.b, n), 0);
+
+    /* The bf16 table as shipped: the round trip runs, so the trio is in the plan once, named by the
+     * quantiser and the dequant that write and read it. */
+    Declared bf16(bf16_encs, 1, 0, false, 128, 0, 0, 0, two_engram_layers);
+    REQUIRE_EQ(bf16.rc, RAD_OK);
+    steps_clean_at(bf16.b, 0, 1);
+    REQUIRE_EQ(count_op(bf16.b, "quant_act_fp8") > 0, true);
+    for (const char* n : { "eg.rows.q", "eg.rows.s", "eg.rows.rt" }) {
+        CHECK_EQ(count_buf(bf16.b, n), 1);
+        CHECK(named_by_op(bf16.b, n));
     }
 }

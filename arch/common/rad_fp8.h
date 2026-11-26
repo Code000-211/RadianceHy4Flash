@@ -709,10 +709,13 @@ inline int GateQuantFP8::declare(RadBuilder* b, const Geom& g, rad_buf gate_up, 
                { gate_up }, { a.x });
         return op ? RAD_OK : RAD_E_INVAL;
     }
-    /* The bf16 plane is asked for only where an op of this gate names it: a gate that writes the
-     * codes alone (the fused gate of a rotated int8 model, gated_had_quant_i8g) leaves it out of
-     * the write list below, and an architecture that declares no plane for that form passes 0
-     * (P-11b: the plane was arena nothing read, and refusing it here turned the fused gate off). */
+    /* What the plane is for, form by form: `relu2` (601), any clamp (634) and the bf16 line (699)
+     * read or write it and demand it; the chain below writes it and demands it through `want_x`
+     * (733, where a missing plane already returns the error). What is left -- this path -- is the
+     * gated quantiser, which writes the codes and nothing else: `bf16_out` false says exactly that,
+     * and `wr` names two writes at the bottom. So an architecture that declares no plane for that
+     * form passes 0 and gets the row it actually runs (P-11b: the plane was arena nothing read, and
+     * refusing it here turned the fused gate off). */
     if (!gate_up || !a.cq() || !a.cs() || n <= 0) return RAD_E_INVAL;
     /* Rotated codes feed a four-bit expert, which reads E4M3 only. */
     if (rot && a.q8_fed) return RAD_E_INVAL;
@@ -744,6 +747,10 @@ inline int GateQuantFP8::declare(RadBuilder* b, const Geom& g, rad_buf gate_up, 
         return op && op_q ? RAD_OK : RAD_E_INVAL;
     }
     if (!op) return RAD_E_INVAL;
+    /* A caller that asked for the product (`bf16_out` true, which is what sets `want_x`) must have
+     * declared one; only the codes-only form may arrive here without a plane, and it arrives with
+     * `want_x` false. Without this a gate could declare a row that writes buffer 0. */
+    if (want_x && !a.x) return RAD_E_INVAL;
     const rad_buf wr[3] = { a.cq(), a.cs(), a.x };
     rad_op_reads (b, op, &gate_up, 1);
     rad_op_writes(b, op, wr, want_x ? 3 : 2);
