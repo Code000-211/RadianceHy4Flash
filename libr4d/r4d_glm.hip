@@ -397,7 +397,7 @@ int gemm_f32_body(const RadArgs* a, RadStream stream) {
      * N 512 (the widest the entry takes) from 17 rows and N 256-511 from 32; the rest keeps 8x1.
      * With x staged 4 bytes at a time (x's rows contiguous, as the served router's are) it was
      * 11-12 % faster at N 512 up to 56 rows but no faster from 57, the eighth group of 8 rows
-     * (+0.5 % at 60 and 63 rows, its runs spread to 3 % slower than 8x1's); staged 2 bytes at a time
+     * (+0.5 / +0.3 % at 60 / 63 rows, its runs spread to 3 % slower than 8x1's); staged 2 bytes at a time
      * it stayed 8-10 % faster there. So above 56 rows the 4-byte staging keeps 8x1. */
     const long rows = x.shape[0];
     const bool ch = r4d_geti_or(a, "chain", 0) != 0 && rows <= 64;   /* decode heights */
