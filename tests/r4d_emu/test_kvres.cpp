@@ -68,6 +68,8 @@ constexpr int64_t kHy4TokenBytes = kHy4LayerBytes * kHy4Layers / kHy4BlockTok; /
 static_assert(kHy4LayerBytes % 16 == 0, "the miss copy is 16-byte vectors (r4d_kv_resolve.hip)");
 static_assert(kHy4LayerBytes * kHy4Layers == 55296, "a page of 4 tokens is 55,296 B (design X-05 §2)");
 static_assert(kHy4TokenBytes == 13824, "13,824 B a token (design X-05 §2)");
+static_assert(kHy4Pitch * kHy4BlockTok == 2048,
+              "one row's 512 claims reach back over 2,048 tokens (design X-05 §2)");
 static_assert(kHy4LayerBytes % kHy4Bf16Bytes == 0, "a bf16 row is 2,304 elements");
 
 RadTensor tens(void* p, uint32_t dt, std::vector<int64_t> shape) {

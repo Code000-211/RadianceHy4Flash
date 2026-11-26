@@ -9567,7 +9567,9 @@ TEST(without_a_span_the_scheduler_plans_and_stages_the_pinned_steps) {
  * tokens, 4,608 B a layer over twelve bound layers (design X-05 §2), and DFly2's depth in the
  * served container is 5. */
 TEST(a_hy4_shaped_decode_step_claims_n_times_one_plus_n_spec_rows_of_the_pitch) {
-    constexpr int64_t kSelPitch = 512, kBlockTok = 4, kLayerBytes = 4608;
+    constexpr int64_t kSelPitch = 512;    /* the row's selection pitch; the page it walks (4 tokens of
+                                           * 4,608 B a layer over 12 layers) is asserted in the emu
+                                           * fixture, where it can fail a build */
     const int n = 4, n_spec = 5;                    /* N4 at DFly2's depth: design §3.1's ledger */
 
     Fixture f;
@@ -9612,14 +9614,13 @@ TEST(a_hy4_shaped_decode_step_claims_n_times_one_plus_n_spec_rows_of_the_pitch) 
     const int64_t claims = (int64_t)b->n_tok_decode * kSelPitch;
     CHECK_EQ(claims, (int64_t)n * (1 + n_spec) * kSelPitch);           /* 12,288 */
     CHECK(claims > (int64_t)f.cfg.max_seqs * kSelPitch);      /* past the no-drafter bound */
-    /* The page that pitch walks: 4 tokens, 4,608 B a layer over the twelve bound layers, so 13,824 B
-     * a token and 55,296 B a page, and one row's claims reach back over 2,048 tokens (design §2). */
-    CHECK_EQ(kLayerBytes * 12, (int64_t)55296);
-    CHECK_EQ(kLayerBytes * 12 / kBlockTok, (int64_t)13824);
-    CHECK_EQ(kSelPitch * kBlockTok, (int64_t)2048);
-    /* That product is also the depth the ring has to reach. The engine side of it -- that
-     * kvstream_ceiling_blocks and kvstream_ring give exactly this number, and that a ring under it
-     * is what ctl[3] latches on -- is mem_test's
+    /* The page that pitch walks is 4 tokens of 4,608 B a layer over the twelve bound layers: 55,296 B
+     * a page, 13,824 B a token, so one row's claims reach back over 2,048 tokens (design §2). That
+     * arithmetic is pinned where it can fail a build rather than here -- `tests/r4d_emu/test_kvres.cpp`
+     * holds it as `static_assert` on the same constants -- because a CHECK of two local constants
+     * against a literal tests nothing the code can get wrong.
+     * The engine side -- that kvstream_ceiling_blocks and kvstream_ring give exactly this number, and
+     * that a ring under it is what ctl[3] latches on -- is mem_test's
      * a_hy4_shaped_ring_is_raised_to_exactly_one_verify_step_s_claims, not here: this binary's fakes
      * are weak definitions of the device C ABI, and core/kvstream/plan.cpp.o pulls in the real device
      * layer beside them, which is the collision sched_fakes.h warns of. */
