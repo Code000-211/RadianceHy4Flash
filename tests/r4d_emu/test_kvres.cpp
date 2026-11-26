@@ -21,6 +21,12 @@
  *   - 8200 claims at a launch whose bound (32 rows x 513) exceeds the workgroup's LDS room, so the
  *     claims are gathered into the row's scratch and sorted there; the slots must still be
  *     libref's.
+ *   - Hy4-flash's streamed sparse latent (X-05a, design X-05 §5.1's first gap): pitch 512, a page of
+ *     block 4 tokens = 4,608 bytes a layer over twelve bound layers, bf16 rows -- hits and
+ *     ascending misses over one sequence's verify rows, one row's full 512-claim copy, an eviction
+ *     whose copy lands on an evicted block's bytes, and twelve resolves over one ring the way a
+ *     step's layer loop runs them. Nothing above is at this shape: every one of them is 8-byte
+ *     blocks at pitch 513, which is Flash-Next's (§9: that fixture stays).
  *
  * A claim count is bounded by the launch's entries, `sum_q nsel[q] <= M * sel_pitch`, so every
  * fixture's claim count is a number the kernel derives rather than one it assumes. */
@@ -40,6 +46,29 @@ extern "C" int r4d_rad_kv_resolve(const RadArgs* a, RadStream stream);
 namespace {
 
 enum { kNOB = 0xEE };
+
+/* Hy4-flash's streamed sparse latent, the shape design X-05 §5.1 names as untested here and §2
+ * reads off the plugin's declarations:
+ *
+ *   - `sel_pitch` is `ix_group_topk`, the checkpoint's `compressed_indexer_group_topk`, which
+ *     arch/hyv4flash/hyv4flash.cpp:260 reads and hyv4flash_attn.h:484 hands to kv_resolve_declare:
+ *     512 for the served container (the mini model the arch test declares has 4);
+ *   - the group's page is block 4 tokens -- "the sparse layers' in a full group of block 4, so a page
+ *     is an indexer group" (docs/ARCHITECTURES.md, the caches bullet) -- and its row is
+ *     latent 512 + rope 64 = 576 values of bf16 = 1,152 B a token a layer, so a page is 55,296 B;
+ *   - twelve of the 42 layers bind it, and kv_resolve states the *per-layer* page, which is what
+ *     core/kvstream/plan.cpp:88-91 derives (`layer_bytes = bytes_per_block / n_bound`) and
+ *     arch/common/rad_arch.h:1250 states as `block_bytes`: 55,296 / 12 = 4,608 B.
+ */
+constexpr int64_t kHy4Pitch = 512, kHy4BlockTok = 4, kHy4LayerBytes = 4608, kHy4Layers = 12,
+                kHy4Bf16Bytes = 2 /* RAD_BF16, abi/rad_types.h */;
+constexpr int64_t kHy4TokenBytes = kHy4LayerBytes * kHy4Layers / kHy4BlockTok; /* 13,824 */
+/* Design §5.1's three untested things: a 4,608-byte copy the kernel moves as 16-byte vectors, the
+ * 12 x 512 claim list a launch's rows derive, and a row's scratch padded to next_pow2(slots). */
+static_assert(kHy4LayerBytes % 16 == 0, "the miss copy is 16-byte vectors (r4d_kv_resolve.hip)");
+static_assert(kHy4LayerBytes * kHy4Layers == 55296, "a page of 4 tokens is 55,296 B (design X-05 §2)");
+static_assert(kHy4TokenBytes == 13824, "13,824 B a token (design X-05 §2)");
+static_assert(kHy4LayerBytes % kHy4Bf16Bytes == 0, "a bf16 row is 2,304 elements");
 
 RadTensor tens(void* p, uint32_t dt, std::vector<int64_t> shape) {
     RadTensor t{};
@@ -61,12 +90,21 @@ uint8_t block_byte(int64_t b, int64_t i) { return (uint8_t)((29 * b + i) & 0xff)
 
 struct Fix {
     int64_t M = 1, blocks = 1, slots = 1, pitch = 1, bbytes = 8;
+    /* The cache operands' dtype and element size: the fixtures up to Hy4's hand the plane as bytes
+     * (RAD_U8, one element a byte), the Hy4 fixtures as bf16 rows, which is what that group's cache
+     * is (arch/hyv4flash/hyv4flash.cpp's latent_group declares RAD_BF16). Both are legal: libref and
+     * the kernel bind a row by its byte pitch, `block_bytes` (libref/ref_kvstream.cpp: "The mirror's
+     * row and the pool's slot are both `block_bytes`"). */
+    uint32_t dt = RAD_U8;
+    int64_t ebytes = 1;
     std::vector<int32_t> sel, nsel, res, sblk, sst, ctl;
     std::vector<uint8_t> host, pool;
 
     /* A fresh pool: the maps say what is resident, a free slot holds the marker. */
-    void shape(int64_t M_, int64_t blocks_, int64_t slots_, int64_t pitch_, int64_t bbytes_) {
+    void shape(int64_t M_, int64_t blocks_, int64_t slots_, int64_t pitch_, int64_t bbytes_,
+               uint32_t dt_ = RAD_U8, int64_t ebytes_ = 1) {
         M = M_; blocks = blocks_; slots = slots_; pitch = pitch_; bbytes = bbytes_;
+        dt = dt_; ebytes = ebytes_;
         sel.assign((size_t)(M * pitch), -1);
         nsel.assign((size_t)M, 0);
         res.assign((size_t)blocks, -1);
@@ -220,8 +258,8 @@ int dev_resolve(Fix& f) {
                        tens(f.sblk.data(), RAD_I32, { f.slots }),
                        tens(f.sst.data(), RAD_I32, { f.slots, 2 }),
                        tens(f.ctl.data(), RAD_I32, { 16 }),
-                       tens(f.host.data(), RAD_U8, { f.blocks, f.bbytes }),
-                       tens(f.pool.data(), RAD_U8, { f.slots, f.bbytes }) };
+                       tens(f.host.data(), f.dt, { f.blocks, f.bbytes / f.ebytes }),
+                       tens(f.pool.data(), f.dt, { f.slots, f.bbytes / f.ebytes }) };
     RadParam p[5]{};
     p[0] = { "M", RAD_P_INT, f.M };
     p[1] = { "blocks", RAD_P_INT, f.blocks };
@@ -262,8 +300,10 @@ size_t mismatch_bytes(const std::vector<uint8_t>& a, const std::vector<uint8_t>&
     return bad;
 }
 
-/* One fixture, both ways, every operand compared. */
-int check(const char* name, Fix f) {
+/* One fixture, both ways, every operand compared. `want_misses` / `want_placed`, when given, are
+ * also asserted on the device's own `ctl` (not only held to libref): they are how a case says out
+ * loud what it made the kernel do -- 512 claims copied, an eviction placed. */
+int check(const char* name, Fix& f, long long want_misses = -1, long long want_placed = -1) {
     std::printf("  ..   %s\n", name);
     std::fflush(stdout);
     Fix ref = f;
@@ -281,9 +321,62 @@ int check(const char* name, Fix f) {
     bad += mismatch(f.ctl, ref.ctl, "ctl", name);
     bad += mismatch_bytes(f.pool, ref.pool, "kv_cache", name);
     bad += mismatch_bytes(f.host, ref.host, "host", name);
+    if (want_misses >= 0 && (long long)f.ctl[12] != want_misses) {
+        std::printf("  FAIL %-42s ctl[12] claims: %d, wanted %lld\n", name, f.ctl[12], want_misses);
+        ++bad;
+    }
+    if (want_placed >= 0 && (long long)f.ctl[2] != want_placed) {
+        std::printf("  FAIL %-42s ctl[2] placed: %d, wanted %lld\n", name, f.ctl[2], want_placed);
+        ++bad;
+    }
     if (bad) return 1;
     std::printf("  ok   %-42s %lld claims, %lld placed\n", name, (long long)ref.ctl[12],
                 (long long)ref.ctl[2]);
+    return 0;
+}
+
+/* The same fixture run `calls` times back to back over one ring, which is what a step is for a
+ * streamed group: one resolve a bound layer, the maps, the epoch, the hand and the heat counters
+ * carried from the layer before. `qsa_select` writes block ids into `sel` before every one of them,
+ * so the selection is restored from what the case filled in rather than left as the last call's
+ * slots; both sides get the same restore, so the two still compare. */
+int check_layers(const char* name, Fix& f, int calls) {
+    std::printf("  ..   %s\n", name);
+    std::fflush(stdout);
+    const std::vector<int32_t> want_sel = f.sel, want_nsel = f.nsel;
+    for (int c = 0; c < calls; ++c) {
+        f.sel = want_sel;
+        f.nsel = want_nsel;
+        char label[160];
+        std::snprintf(label, sizeof label, "%s [%d]", name, c + 1);
+        /* A `const char*`, not the array: passed as an array the four-argument form above is a worse
+         * match than `std::mismatch`, which the vectors' own namespace drags into the lookup. */
+        const char* const lab = label;
+        Fix ref = f;
+        ref_resolve(ref);
+        const int rc = dev_resolve(f);
+        if (rc != RAD_OK) {
+            std::printf("  FAIL %-42s refused (%d)\n", label, rc);
+            return 1;
+        }
+        size_t bad = 0;
+        bad += mismatch(f.sel, ref.sel, "sel", lab);
+        bad += mismatch(f.res, ref.res, "res", lab);
+        bad += mismatch(f.sblk, ref.sblk, "slot_block", lab);
+        bad += mismatch(f.sst, ref.sst, "slot_state", lab);
+        bad += mismatch(f.ctl, ref.ctl, "ctl", lab);
+        bad += mismatch_bytes(f.pool, ref.pool, "kv_cache", lab);
+        bad += mismatch_bytes(f.host, ref.host, "host", lab);
+        if (bad) return 1;
+    }
+    const uint64_t* const ctr = (const uint64_t*)(f.ctl.data() + 4);
+    if ((long long)ctr[2] != calls) {
+        std::printf("  FAIL %-42s ctl calls: %llu, wanted %d\n", name,
+                    (unsigned long long)ctr[2], calls);
+        return 1;
+    }
+    std::printf("  ok   %-42s %d calls, %llu lookups, %llu misses\n", name, calls,
+                (unsigned long long)ctr[1], (unsigned long long)ctr[0]);
     return 0;
 }
 
@@ -494,6 +587,93 @@ int run_all() {
         f.sel = { 0, 2, 4, 6, 7 };
         f.nsel = { 5 };
         fails += check("identity for every miss, hand untouched", f);
+    }
+    ++cases;
+    {
+        /* X-05a, the Hy4 shape (design §5.1's first gap). One sequence's verify rows on the ring:
+         * 1 + 5 rows (the container's DFly2 depth), each a 512-entry selection, over a ring whose
+         * slots are 4,608-byte bf16 pages. Slot 5 holds block 900, which every row names: one hit
+         * stamped once for the call however many rows want it. The other twelve ids are distinct and
+         * ascending, all past the ring, so none is identity and the twelve take free slots from the
+         * hand. `slots` is not a power of two, so this is also the row's scratch padding
+         * (next_pow2(1000) + 1000 ints) at Hy4's ring depth. */
+        Fix f;
+        f.shape(6, 4096, 1000, kHy4Pitch, kHy4LayerBytes, RAD_BF16, kHy4Bf16Bytes);
+        f.resident(5, 900);
+        for (int64_t q = 0; q < f.M; ++q) {
+            f.nsel[(size_t)q] = 3;
+            f.sel[(size_t)(q * kHy4Pitch + 0)] = 900;
+            f.sel[(size_t)(q * kHy4Pitch + 1)] = (int32_t)(1200 + q);
+            f.sel[(size_t)(q * kHy4Pitch + 2)] = (int32_t)(2000 + q);
+        }
+        f.sst[5 * 2 + 1] = 1;              /* block 900's slot was wanted last call */
+        fails += check("Hy4 shape: 6 verify rows, one hit, twelve ascending misses", f, 12, 12);
+    }
+    ++cases;
+    {
+        /* One row's whole selection is a miss: 512 claims, 512 copies of a 4,608-byte layer page.
+         * This is the copy the design's whole link budget is priced on (X-05 §3.1: `n x 12 x 512 x c
+         * x 4,608 B`), and the launch's claim list is exactly `M x sel_pitch` = 512 -- the number
+         * `largest launch claims` reports. The ids are 0..511 and the ring is 1,024 slots deep, so
+         * every one takes its own slot and slot 512..1023 stay the marker. */
+        Fix f;
+        f.shape(1, 1024, 1024, kHy4Pitch, kHy4LayerBytes, RAD_BF16, kHy4Bf16Bytes);
+        f.nsel[0] = 512;
+        for (int64_t i = 0; i < 512; ++i) f.sel[(size_t)i] = (int32_t)i;
+        fails += check("Hy4 shape: one row's 512 claims, every one copied", f, 512, 512);
+        /* Not only libref's: the page that landed is the mirror's bytes, 4,608 of them, and a slot
+         * the call never named still holds the marker. */
+        size_t bad = 0;
+        for (int64_t i = 0; i < kHy4LayerBytes; ++i)
+            if (f.pool[(size_t)(511 * kHy4LayerBytes + i)] != block_byte(511, i)) ++bad;
+        for (int64_t i = 0; i < kHy4LayerBytes; ++i)
+            if (f.pool[(size_t)(512 * kHy4LayerBytes + i)] != (uint8_t)kNOB) ++bad;
+        if (bad) {
+            std::printf("  FAIL %-42s slot 511/512 bytes: %zu wrong\n", "Hy4 512-claim copy", bad);
+            ++fails;
+        }
+    }
+    ++cases;
+    {
+        /* Eviction at Hy4's shape: the ring is four slots deep and full, every one warm, and the two
+         * misses are ids past the ring, so identity has nowhere to go, CLOCK halves all four counters
+         * on its first lap and takes slots 0 and 1 -- copying a 4,608-byte page over the bytes of the
+         * blocks it evicted. ctl[3] must stay clear: two claims into four slots is not an overflow. */
+        Fix f;
+        f.shape(1, 64, 4, kHy4Pitch, kHy4LayerBytes, RAD_BF16, kHy4Bf16Bytes);
+        for (int64_t s = 0; s < 4; ++s) {
+            f.resident(s, 10 + s);
+            f.sst[(size_t)(s * 2 + 1)] = 1;
+        }
+        f.sel[0] = 40;
+        f.sel[1] = 41;
+        f.nsel = { 2 };
+        const std::vector<int32_t> held = f.sblk;
+        fails += check("Hy4 shape: a full ring, CLOCK evicts and copies over it", f, 2, 2);
+        int evicted = 0;
+        for (size_t s = 0; s < f.sblk.size(); ++s)
+            if (held[s] >= 0 && f.sblk[s] != held[s]) ++evicted;
+        if (evicted != 2 || f.ctl[3] != 0) {
+            std::printf("  FAIL %-42s evicted %d (want 2), overflow %d\n", "Hy4 eviction", evicted,
+                        f.ctl[3]);
+            ++fails;
+        }
+    }
+    ++cases;
+    {
+        /* Twelve bound layers over one ring, which is how a decode step issues this op: one resolve
+         * a layer, the epoch, the hand, the heat counters and the maps carried from the layer before,
+         * the selection re-written by `qsa_select` each time. 48 distinct ids over a ring of exactly
+         * 48 slots: the first resolve places every one (four by identity, the rest from the hand),
+         * the next eleven find them all resident and only warm the counters. */
+        Fix f;
+        f.shape(6, 1024, 48, kHy4Pitch, kHy4LayerBytes, RAD_BF16, kHy4Bf16Bytes);
+        for (int64_t q = 0; q < f.M; ++q) {
+            f.nsel[(size_t)q] = 8;
+            for (int64_t j = 0; j < 8; ++j)
+                f.sel[(size_t)(q * kHy4Pitch + j)] = (int32_t)(100 * q + 13 * j);
+        }
+        fails += check_layers("Hy4 shape: twelve layers resolve over one ring", f, (int)kHy4Layers);
     }
     std::printf("%d of %d fixtures match libref\n", cases - fails, cases);
     return fails ? 1 : 0;
