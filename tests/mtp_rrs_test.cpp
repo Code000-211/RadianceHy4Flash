@@ -1833,6 +1833,75 @@ TEST(online_calibration_prices_rows_and_tiles_from_step_times) {
     CHECK_NEAR(d.load_row_ms[2], 0.824, 1e-12); CHECK_NEAR(d.load_lam[2], 0.3558, 1e-12);
 }
 
+/* #295: one drafting row's step times, `ms = fixed(t) + 1.5 R + noise`, fed as the engine feeds them
+ * (a refresh every 64 steps). kind 0: no drift, R at random. kind 1: the fixed term falls 18 ms over
+ * 256 steps (the expert pool warming) while R climbs 2 -> 6, as when the load-aware rule drafts deeper
+ * as the price falls. kind 2: the same fall while R drops 6 -> 2. Returns the fitted row price and
+ * the verified prefixes draft_depth_block_load picks over a sweep of blocks with those tables, and
+ * with the same tables at the true price. */
+namespace {
+
+struct DriftFit { double row; int depth, truth; };
+int drift_depth_sum(const DraftDepthCfg& c) {
+    int sum = 0;
+    for (int b = 0; b < 100; ++b) {
+        DraftDepthRow r;
+        draft_depth_begin(c, &r, false);
+        const double q = 0.55 + 0.45 * b / 99.0;
+        for (int l = 1; l <= 5; ++l) draft_depth_observe(&r, l, q);
+        draft_depth_block_load(c, &r, 1, 5, 0);
+        sum += r.depth;
+    }
+    return sum;
+}
+DriftFit drift_fit(double level_half, int kind) {
+    DraftDepthCfg c = depth_cfg(5, 0, DRAFT_DEPTH_TOP, 0.3);
+    draft_depth_load_defaults(&c);
+    c.load = true; c.load_from = 1; c.load_min = 2;
+    DraftDepthOnline o;
+    draft_depth_online_begin(c, &o);
+    o.level_half = level_half;
+    uint64_t x = 0x2545f4914f6cdd1dull;
+    auto rnd = [&]() { x ^= x << 13; x ^= x >> 7; x ^= x << 17; return (double)(x >> 11) / 9007199254740992.0; };
+    for (int t = 0; t < 512; ++t) {
+        const double w = std::max(0.0, 1.0 - t / 256.0);
+        const int j = (int)(rnd() * 3.0) - 1;
+        int R = kind == 0 ? 2 + (int)(rnd() * 5.0)
+              : kind == 1 ? (int)std::lround(6.0 - 4.0 * w) + j : (int)std::lround(2.0 + 4.0 * w) + j;
+        R = std::min(6, std::max(2, R));
+        const double ms = 22.0 + 18.0 * (kind ? w : 0.5) + 1.5 * R + (rnd() - 0.5) * 2.0;
+        draft_depth_online_step(c, &o, 1, R, 1, ms, (R + 1) / 2);
+        if ((t & 63) == 63) draft_depth_online_refresh(&c, &o);
+    }
+    DraftDepthCfg truth = c;
+    truth.load_row_ms[1] = 1.5;
+    return { c.load_row_ms[1], drift_depth_sum(c), drift_depth_sum(truth) };
+}
+
+}  /* namespace */
+
+TEST(online_calibration_reads_a_drift_the_rows_follow_as_no_price) {
+    const DraftDepthOnline defaults;
+    CHECK(defaults.level_half > 0.0);                                    /* on by default */
+    const char* name[3] = { "no drift", "drift, rows climb", "drift, rows drop" };
+    for (int k = 0; k < 3; ++k) {
+        const DriftFit f = drift_fit(defaults.level_half, k), raw = drift_fit(0.0, k);
+        std::printf("  %-17s: row %.3f (raw regression %.3f; truth 1.5), prefixes %d (raw %d, truth %d)\n",
+                    name[k], f.row, raw.row, f.depth, raw.depth, f.truth);
+        CHECK(std::fabs(f.row - 1.5) < 0.35);
+        CHECK(f.depth >= f.truth - f.truth / 50);                         /* the prefix is not cut short */
+        CHECK(f.depth <= f.truth + f.truth / 10);                         /* nor verified through */
+        if (k == 0) {                                                    /* no drift: today's choice */
+            CHECK(std::fabs(f.row - raw.row) < 0.1);
+            CHECK(std::abs(f.depth - raw.depth) <= raw.depth / 100);
+        }
+    }
+    /* the raw regression on the same steps: the rows read as free, then as dear */
+    const DriftFit up = drift_fit(0.0, 1), down = drift_fit(0.0, 2);
+    CHECK(up.row < 0.5 && up.depth > up.truth + up.truth / 10);
+    CHECK(down.row > 3.0 && down.depth < down.truth - down.truth / 10);
+}
+
 TEST(online_calibration_keeps_the_target_law_and_tables_made_from_the_steps_own_verify_do_not) {
     const int trials = 120000;
     g_sharp = 2.0;

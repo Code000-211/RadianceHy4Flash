@@ -617,7 +617,9 @@ static const RadParamSpec pMoeGemmQ[]   = { P_INT("M"), P_INT("N"), P_INT("K"), 
 static const RadOperandSpec oMoeGemmQ[] = { OPD("a"), OPD_O("a_scale"), WTAB("w"), WTAB("w_scale"),
                                             OPD("sorted_tok"), OPD("expert_offset"),
                                             WTAB("w_odd"), WTAB("w_odd_scale"), OUT("y"),
-                                            OPD_O("split") };
+                                            OPD_O("split"),
+                                            { "w2", RAD_OPD_INOUT, 1 },
+                                            { "w2_tail", RAD_OPD_INOUT, 1 } };
 /* The same over four classes by expert number mod 4, `w_q` class q at [N_q, K_q], as in libref
  * and libr4d. */
 static const RadParamSpec pMoeGemmQMod4[]   = { P_INT("M"), P_INT("N"), P_INT("K"),
@@ -631,7 +633,9 @@ static const RadOperandSpec oMoeGemmQMod4[] = { OPD("a"), OPD_O("a_scale"), WTAB
                                                 OPD("expert_offset"), WTAB("w_1"),
                                                 WTAB("w_1_scale"), WTAB("w_2"), WTAB("w_2_scale"),
                                                 WTAB("w_3"), WTAB("w_3_scale"), OUT("y"),
-                                                OPD_O("split") };
+                                                OPD_O("split"),
+                                            { "w2", RAD_OPD_INOUT, 1 },
+                                            { "w2_tail", RAD_OPD_INOUT, 1 } };
 
 /* With `shared` and `shared_gate`, the shared expert is folded in: y = narrow(shared * act(gate))
  * + narrow(gathered), the unfused pair's roundings. `act` is sigmoid or none, as in scale_rows,

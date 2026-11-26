@@ -20,11 +20,13 @@
 #include <fcntl.h>
 #include <fstream>
 #include <functional>
+#include <initializer_list>
 #include <signal.h>
 #include <string>
 #include <sys/file.h>
 #include <sys/wait.h>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 #include <cstring>
 #include <sys/mman.h>
@@ -103,6 +105,26 @@ Planes planes_of(const RadWriter::Weight& w, uint8_t seed) {
                                (uint8_t)(seed + 16 * k)));
     for (const auto& b : p.bytes) p.ptr.push_back(b.data());
     return p;
+}
+
+/* Reserves a locked copy of each size, held all at once. A locked-memory limit below their sum is
+ * the machine's setting, not a defect (#235): then the copies already taken are freed and *limited
+ * says so, with the mlock2 refusal in *why. Any other failure returns as it is. */
+int reserve_all(std::initializer_list<std::pair<int64_t, TableCopy*>> copies, std::string* why,
+                bool* limited) {
+    *limited = false;
+    std::vector<TableCopy*> taken;
+    for (const auto& [n, c] : copies) {
+        const int rc = table_copy_reserve(n, c, why);
+        if (rc == RAD_OK) {
+            taken.push_back(c);
+            continue;
+        }
+        for (TableCopy* t : taken) table_copy_free(t);
+        *limited = rc == RAD_E_NOMEM && why->find("mlock2") != std::string::npos;
+        return rc;
+    }
+    return RAD_OK;
 }
 
 /* The expert shape: [36, 64] int4 is 1152 bytes of codes, so the 144-byte scale plane starts at
@@ -482,13 +504,12 @@ TEST(tables_filling_apart_land_their_own_bytes) {
     REQUIRE(na > 0);
     REQUIRE(nb > 0);
 
-    TableCopy ca, cb;
+    TableCopy ca, cb, dropped, bad;
     std::string why;
-    const int rc = table_copy_reserve(na, &ca, &why);
-    /* A locked-memory limit below the copy is the machine's setting, not a defect. */
-    if (rc == RAD_E_NOMEM && why.find("mlock2") != std::string::npos) SKIP("%s", why.c_str());
+    bool limited = false;
+    const int rc = reserve_all({{na, &ca}, {nb, &cb}, {na, &dropped}, {na, &bad}}, &why, &limited);
+    if (limited) SKIP("%s", why.c_str());
     REQUIRE_EQ(rc, (int)RAD_OK);
-    REQUIRE_EQ(table_copy_reserve(nb, &cb, &why), (int)RAD_OK);
 
     TableFill fa, fb;
     CHECK_EQ(fa.start(f, sa, na, (int64_t)pa.offset, (uint8_t*)ca.base), (int)RAD_OK);
@@ -502,8 +523,6 @@ TEST(tables_filling_apart_land_their_own_bytes) {
     CHECK(std::memcmp(ca.base, sa, (size_t)na) == 0);
 
     /* Dropped without a wait: the destructor joins, so the bytes are there before the free. */
-    TableCopy dropped;
-    REQUIRE_EQ(table_copy_reserve(na, &dropped, &why), (int)RAD_OK);
     {
         TableFill g;
         REQUIRE_EQ(g.start(f, sa, na, (int64_t)pa.offset, (uint8_t*)dropped.base), (int)RAD_OK);
@@ -512,8 +531,6 @@ TEST(tables_filling_apart_land_their_own_bytes) {
 
     /* Read from the wrong file offset (16 bytes on, still inside the container): real bytes,
      * wrong ones, caught by the wait's check. */
-    TableCopy bad;
-    REQUIRE_EQ(table_copy_reserve(na, &bad, &why), (int)RAD_OK);
     TableFill fbad;
     REQUIRE_EQ(fbad.start(f, sa, na, (int64_t)pa.offset + 16, (uint8_t*)bad.base), (int)RAD_OK);
     std::string fwhy;

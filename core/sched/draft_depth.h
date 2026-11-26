@@ -435,6 +435,14 @@ inline int draft_depth_parse_list(const char* s, double* out, int cap, double lo
  *                rows are past), by drafting rows, with the static prices as a prior: a
  *                coefficient the steps do not tell apart (a round from the rows that come with
  *                it) stays near the measured table, one they do (a row, a tile) follows them.
+ *                Each step is read against the steps just before it (its own local level, half
+ *                in `level_half` steps): what moves every step's time slowly -- the expert pool or
+ *                the page cache warming, a disk-placed table, another job on the host -- is a
+ *                fixed term of the step, not a price of its rows. Under the load-aware rule the
+ *                rows follow the prices, so a drift read as a price feeds itself: a step time that
+ *                falls while the rule drafts deeper reads as a row that costs less than nothing,
+ *                and the rule then verifies every draft; one that falls while it drafts shallower
+ *                reads as a dear row and cuts the verified prefix short (#295).
  *
  * Table 0 (the rule's, read one round behind) counts a chain the rule sent on to round j and the
  * late choice then cut as "not accepted": what the round yielded is what the rule weighs.
@@ -450,11 +458,15 @@ struct DraftDepthOnline {
     double  cal0[3][kR + 1][kK] = {};        /* the static tables */
     double  cn[3][kR + 1][kK]   = {}, ca[3][kR + 1][kK] = {};
     struct Lam { double tok = 0, ms = 0; int64_t n = 0; } lam[kN + 1];
-    struct Reg { double S[kF][kF] = {}; double b[kF] = {}; double ms_avg = 0; int64_t n = 0; } reg[kN + 1];
+    struct Reg {
+        double S[kF][kF] = {}; double b[kF] = {}; double ms_avg = 0; int64_t n = 0;
+        double xl[kF] = {}; double ml = 0;   /* the local level of the features and of the milliseconds */
+    } reg[kN + 1];
     double  theta0[kN + 1][kF] = {};         /* the static prices: (base, row, round, jumps) */
     double  theta[kN + 1][kF]  = {};         /* the last fit, for the log */
     double  prec[kF]   = { 1e-4, 200.0, 600.0, 20.0, 20.0, 20.0, 20.0 };   /* the prior's weight */
     double  reg_keep   = 1.0 - 1.0 / 2048.0; /* a step keeps this much of the sums */
+    double  level_half = 8.0;                /* the local level's half-life, in steps (0: none, the raw regression) */
     int64_t chains = 0, steps = 0, outliers = 0, refreshes = 0;
 };
 
@@ -523,8 +535,22 @@ inline void draft_depth_online_step(const DraftDepthCfg& c, DraftDepthOnline* o,
     double x[DraftDepthOnline::kF];
     x[0] = 1.0; x[1] = (double)R; x[2] = (double)D;
     for (int k = 0; k < DraftDepthCfg::kJumps; ++k) x[3 + k] = R > c.load_jump_at[k] ? 1.0 : 0.0;
+    /* the step against its local level (DraftDepthOnline, prices): the constant drops out and the
+     * base is left to its prior; the first step of a row count sets the level and adds nothing */
+    double y = ms;
+    if (o->level_half > 0.0) {
+        const double a = 1.0 - std::exp2(-1.0 / o->level_half);
+        const bool first = G.n == 1;
+        y = first ? 0.0 : ms - G.ml;
+        G.ml = first ? ms : G.ml + a * (ms - G.ml);
+        for (int f = 0; f < DraftDepthOnline::kF; ++f) {
+            const double d = first ? 0.0 : x[f] - G.xl[f];
+            G.xl[f] = first ? x[f] : G.xl[f] + a * (x[f] - G.xl[f]);
+            x[f] = d;
+        }
+    }
     for (int a = 0; a < DraftDepthOnline::kF; ++a) {
-        G.b[a] = G.b[a] * o->reg_keep + x[a] * ms;
+        G.b[a] = G.b[a] * o->reg_keep + x[a] * y;
         for (int b = 0; b < DraftDepthOnline::kF; ++b) G.S[a][b] = G.S[a][b] * o->reg_keep + x[a] * x[b];
     }
 }

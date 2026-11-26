@@ -2,6 +2,7 @@
  * `mini` geometry (ref/minicfg.py, the convert test's fixture) at one and two ranks, and its
  * `mini4` twin (twice the heads and experts) at one, two and four ranks, bf16. */
 #define RAD_ARCH_NO_EXPORTS 1
+#include "rad_w2.h"
 #include "arch_fakes.h"
 #include "rad_plugin.h"
 #include "../arch/hyv4flash/hyv4flash.cpp"
@@ -1795,6 +1796,152 @@ void undeclaring_encs(RadBuilder* b) {
     bf16_encs(b);
     for (const std::string& op : g_undecl) b->undeclared.insert(op);
 }
+/* W2 (abi/rad_w2.h, issue #309): the routed layer of a decode-phase step issued as one pass.
+ *
+ * With the core's switch off (rad_expert_w2 returns null) the step issues what it always did: no
+ * routed GEMM and no router carries a W2 operand. With it on, each routed layer's router carries
+ * the control block as its last operand (it plans there), its two routed GEMMs carry it as `w2`
+ * (the resident experts), and behind the first down GEMM comes the tail: gate_up, the gated
+ * quantiser's issues again, down, each GEMM with the block as `w2_tail` and at the pass height of the first
+ * launch (the same tile geometry and sums). Nothing else of the step changes: with the tail's
+ * three issues and the W2 operands taken out, the issues are the switch-off step's. A pass below
+ * the core's row threshold, and a prefill step, issue the switch-off step. */
+TEST(w2_splits_a_decode_passes_routed_layer_into_the_resident_launches_and_a_tail) {
+    /* Hy4-flash's served forms: an IQR gate_up and a six-bit codebook down. */
+    Declared d(+[](RadBuilder* b) {
+        bf16_encs(b);
+        b->encs[0].second = enc_trellis(RAD_U4, true);
+        b->encs[1].second = enc_nl64(6);
+    });
+    REQUIRE_EQ(d.rc, RAD_OK);
+    static char block[sizeof(RadW2Layer)];
+    auto opname = [&](const RecIssue& i) {
+        const RecOp* o = d.b.op_of(i.op);
+        return o ? o->op : std::string("<null>");
+    };
+    auto same = [](const RadOperand& a, const RadOperand& b) {
+        return a.kind == b.kind && a.dtype == b.dtype && a.handle == b.handle && a.raw == b.raw &&
+               a.offset == b.offset && a.rows == b.rows && a.cols == b.cols;
+    };
+    auto is_w2 = [&](const RadOperand& o) {
+        return o.kind == RAD_OPK_RAW && o.raw == (void*)block && o.dtype == RAD_U8 &&
+               o.rows == (int64_t)sizeof(RadW2Layer);
+    };
+    auto k = kit(d.b, { 1, 1, 1 }, {}, 0);
+    REQUIRE_EQ(k->b.phase, (int)RAD_PHASE_DECODE);
+
+    RadCtx off{ .b = &d.b, .batch = &k->b };
+    hyv4flash::step(&off, &k->b);
+    CHECK(off.step_fail.empty());
+    CHECK(off.w2_asked >= 2);          /* every routed layer asked, and was told no */
+    CHECK(off.w2_tails.empty());
+    int gemms_off = 0;
+    for (const RecIssue& i : off.issues) {
+        for (const RadOperand& o : i.opd) CHECK(!is_w2(o));
+        if (opname(i) == "moe_gemm_q") { ++gemms_off; CHECK_EQ(i.opd.size(), (size_t)9); }
+        if (opname(i) == "router_sigmoid_topk_scatter") CHECK(i.opd.size() <= (size_t)9);
+    }
+    CHECK_EQ(gemms_off, 4);            /* two MoE layers, gate_up and down */
+
+    RadCtx on{ .b = &d.b, .batch = &k->b };
+    on.w2 = block;
+    hyv4flash::step(&on, &k->b);
+    CHECK(on.step_fail.empty());
+    /* The routers plan, the first GEMMs carry `w2`, the tail's `w2_tail`. */
+    std::vector<size_t> gemm, tail_issue;
+    for (size_t x = 0; x < on.issues.size(); ++x) {
+        const RecIssue& i = on.issues[x];
+        if (opname(i) == "router_sigmoid_topk_scatter") {
+            REQUIRE_EQ(i.opd.size(), (size_t)10);
+            CHECK(is_w2(i.opd[9]));
+        }
+        if (opname(i) == "moe_gemm_q") gemm.push_back(x);
+    }
+    REQUIRE_EQ(gemm.size(), (size_t)8);
+    for (size_t l = 0; l < 2; ++l) {
+        const RecIssue &gu = on.issues[gemm[4 * l]], &dn = on.issues[gemm[4 * l + 1]];
+        const RecIssue &tgu = on.issues[gemm[4 * l + 2]], &tdn = on.issues[gemm[4 * l + 3]];
+        for (const RecIssue* f : { &gu, &dn }) {
+            REQUIRE_EQ(f->opd.size(), (size_t)11);
+            CHECK_EQ((int)f->opd[9].kind, (int)RAD_OPK_NONE);      /* split */
+            CHECK(is_w2(f->opd[10]));
+        }
+        for (const RecIssue* t : { &tgu, &tdn }) {
+            REQUIRE_EQ(t->opd.size(), (size_t)12);
+            CHECK_EQ((int)t->opd[9].kind, (int)RAD_OPK_NONE);
+            CHECK_EQ((int)t->opd[10].kind, (int)RAD_OPK_NONE);     /* w2: the tail's is the next */
+            CHECK(is_w2(t->opd[11]));
+        }
+        /* The tail is the first launches' ops over the same operands at the same height. */
+        CHECK_EQ(tgu.op, gu.op);
+        CHECK_EQ(tdn.op, dn.op);
+        CHECK_EQ(tgu.n, gu.n);
+        CHECK_EQ(tdn.n, dn.n);
+        for (size_t o = 0; o < 9; ++o) {
+            CHECK(same(tgu.opd[o], gu.opd[o]));
+            CHECK(same(tdn.opd[o], dn.opd[o]));
+        }
+        /* It sits right behind the first down GEMM: gate_up, the expert quantiser's issues again
+         * (in their order, the ones between the first GEMMs that read gate_up's output), down. */
+        REQUIRE_EQ(gemm[4 * l + 2], gemm[4 * l + 1] + 1);
+        REQUIRE(gemm[4 * l + 3] > gemm[4 * l + 2] + 1);
+        size_t at = gemm[4 * l] + 1;
+        for (size_t x = gemm[4 * l + 2] + 1; x < gemm[4 * l + 3]; ++x) {
+            const RecIssue& tq = on.issues[x];
+            bool found = false;
+            for (; at < gemm[4 * l + 1] && !found; ++at) {
+                const RecIssue& q = on.issues[at];
+                if (q.op != tq.op || q.n != tq.n || q.opd.size() != tq.opd.size()) continue;
+                found = true;
+                for (size_t o = 0; o < q.opd.size(); ++o) found = found && same(q.opd[o], tq.opd[o]);
+            }
+            CHECK(found);
+        }
+        /* the core is told right in front of the tail's first launch (where its ring is cached
+         * memory, that launch acquires) */
+        REQUIRE_EQ(on.w2_tails.size(), (size_t)2);
+        CHECK_EQ(on.w2_tails[l], gemm[4 * l + 2]);
+        for (size_t x = gemm[4 * l + 2]; x <= gemm[4 * l + 3]; ++x) tail_issue.push_back(x);
+    }
+    /* Without the tail and the W2 operands the step is the switch-off step. */
+    std::vector<RecIssue> rest;
+    for (size_t x = 0; x < on.issues.size(); ++x) {
+        if (std::find(tail_issue.begin(), tail_issue.end(), x) != tail_issue.end()) continue;
+        RecIssue i = on.issues[x];
+        while (!i.opd.empty() && (is_w2(i.opd.back()) || (i.opd.back().kind == RAD_OPK_NONE &&
+                                                           opname(i) == "moe_gemm_q")))
+            i.opd.pop_back();
+        rest.push_back(i);
+    }
+    REQUIRE_EQ(rest.size(), off.issues.size());
+    for (size_t x = 0; x < rest.size(); ++x) {
+        CHECK_EQ(rest[x].op, off.issues[x].op);
+        CHECK_EQ(rest[x].n, off.issues[x].n);
+        CHECK_EQ(rest[x].lane, off.issues[x].lane);
+        REQUIRE_EQ(rest[x].opd.size(), off.issues[x].opd.size());
+        for (size_t o = 0; o < rest[x].opd.size(); ++o) CHECK(same(rest[x].opd[o], off.issues[x].opd[o]));
+    }
+
+    /* A pass under the core's threshold is told no and issues the switch-off step. */
+    RadCtx narrow{ .b = &d.b, .batch = &k->b };
+    narrow.w2 = block;
+    narrow.w2_min_rows = 4;
+    hyv4flash::step(&narrow, &k->b);
+    REQUIRE_EQ(narrow.issues.size(), off.issues.size());
+    for (size_t x = 0; x < narrow.issues.size(); ++x) {
+        CHECK_EQ(narrow.issues[x].op, off.issues[x].op);
+        CHECK_EQ(narrow.issues[x].opd.size(), off.issues[x].opd.size());
+    }
+    /* A prefill step does not ask at all. */
+    auto pk = kit(d.b, {}, { 12 }, 0);
+    RadCtx pre{ .b = &d.b, .batch = &pk->b };
+    pre.w2 = block;
+    hyv4flash::step(&pre, &pk->b);
+    CHECK_EQ(pre.w2_asked, 0);
+    for (const RecIssue& i : pre.issues)
+        for (const RadOperand& o : i.opd) CHECK(!is_w2(o));
+}
+
 TEST(the_moe_gather_reads_the_sorts_inverse_table) {
     struct Case {
         const char* what;
@@ -2815,6 +2962,117 @@ TEST(a_sizing_declare_at_four_ranks_matches_with_the_pipeline_on_and_off) {
         }
         unsetenv("RADIANCE_HY4_PIPE");
     }
+}
+
+/* #282: the pipelined prefill, run card-less. With the floor and the cut moved to the GEMMs' 64-row
+ * grain (RADIANCE_HY4_PIPE_MIN / _ROWS), a 128-row fresh prefill cuts 64 + 64, the shape a served
+ * 4096-row chunk takes at 2048 + 2048. The int8 recipe makes the junctions write the G-3b codes the
+ * feed-forward's and the attention's input linears read. Checked against the same graph declared
+ * with the pipeline off (the same ops, the sizing test above):
+ *  - every junction piece carries every buffer the whole step's issue of that op carries: a piece
+ *    without the codes left the linears behind it reading stale ones (on-card: long prompts off
+ *    topic, and different from run to run);
+ *  - every buffer an issue on the second lane touches is named concurrent (lane1_unnamed): the last
+ *    junction's pieces wrote `final_hidden` there unnamed, into bytes lane 0's arms could hold;
+ *  - the piped step is lint clean;
+ *  - a cut whose second piece is under the floor does not pipe (96 rows: 64 + 32), the gate's
+ *    both-pieces rule (it used to check the first piece only, so 1984 rows piped as 1024 + 960). */
+void pipe_i8_encs(RadBuilder* b) {
+    bf16_encs(b);   /* only the replicated linears int8: a rank's shard of the others is too narrow */
+    b->encs.insert(b->encs.begin(), { { "ffn_latent_in", enc_i8(true) }, { "attn_q_a.", enc_i8(true) } });
+}
+TEST(the_pipelined_prefill_pieces_are_the_whole_steps_junctions) {
+    const bool g3 = g3_fusions;
+    g3_fusions = true;
+    setenv("RADIANCE_HY4_PIPE_MIN", "64", 1);
+    setenv("RADIANCE_HY4_PIPE_ROWS", "64", 1);
+    auto declare = [](RadBuilder& b, MetaKV& mk, int world, bool pipe) {
+        if (pipe) setenv("RADIANCE_HY4_PIPE", "1", 1);
+        else unsetenv("RADIANCE_HY4_PIPE");
+        pipe_i8_encs(&b);
+        RadBuildCtx ctx = build_ctx(0, world);
+        G3Env g3env;
+        const int rc = hyv4flash::declare(&b, mk.meta(), &ctx);
+        unsetenv("RADIANCE_HY4_PIPE");
+        return rc;
+    };
+    /* The buffers each issue of `op` names, unioned over its issues. */
+    auto bufs_of = [](const RadCtx& c, rad_op op) {
+        std::set<rad_buf> v;
+        for (const RecIssue& is : c.issues)
+            if (is.op == op)
+                for (const RadOperand& od : is.opd)
+                    if (od.kind == RAD_OPK_BUF && od.handle) v.insert(od.handle);
+        return v;
+    };
+    for (int world : { 2, 4 }) {
+        MetaKV mk = mini_meta(true, 128, 256);
+        RadBuilder whole, piped;
+        REQUIRE_EQ(declare(whole, mk, world, false), RAD_OK);
+        REQUIRE_EQ(declare(piped, mk, world, true), RAD_OK);
+        REQUIRE_EQ(whole.ops.size(), piped.ops.size());
+        REQUIRE(buf_handle(piped, "trunk_codes.junc_ffn_in.256.128.q8") != 0);
+        auto kw = kit(whole, {}, { 128 });
+        auto kp = kit(piped, {}, { 128 });
+        kw->b.positions_h = kw->pos.data();
+        kp->b.positions_h = kp->pos.data();
+        auto vw = run_passes(whole, hyv4flash::step, { kw.get() }, 0, world);
+        auto vp = run_passes(piped, hyv4flash::step, { kp.get() }, 0, world);
+        CHECK(steps_ok(vw));
+        CHECK_PASSES(piped, vp);
+        const RadCtx& cw = *vw[0];
+        const RadCtx& cp = *vp[0];
+        /* It piped: the junctions ran as 64-row pieces, their reductions on the second lane. */
+        int lane1 = 0, pieces = 0, junctions = 0;
+        for (const RecIssue& is : cp.issues) {
+            lane1 += is.lane == 1;
+            const RecOp* o = piped.op_of(is.op);
+            if (o && o->op == "rmsnorm_ihc_junction") pieces += is.n == 64;
+        }
+        CHECK(lane1 > 0);
+        CHECK(pieces > 0);
+        /* Every buffer a junction declares it writes is an operand of every piece's issue (the
+         * whole step's issue passes them all; the reads may differ, the chain's add having taken
+         * `b`). At four ranks the whole step runs the same op, so its operands are compared too
+         * (at two the whole step takes the fused twin, another op). */
+        for (const RecIssue& is : cp.issues) {
+            const RecOp* o = piped.op_of(is.op);
+            if (!o || o->op != "rmsnorm_ihc_junction") continue;
+            ++junctions;
+            std::set<rad_buf> got;
+            for (const RadOperand& od : is.opd)
+                if (od.kind == RAD_OPK_BUF) got.insert(od.handle);
+            for (rad_buf h : o->writes)
+                if (!got.count(h)) {
+                    fprintf(stderr, "    world %d: a %lld-row junction issue leaves out '%s'\n",
+                            world, (long long)is.n, piped.bufs[h - 1].name.c_str());
+                    CHECK(got.count(h) != 0);
+                }
+        }
+        for (size_t k = 0; k < whole.ops.size(); ++k) {
+            if (whole.ops[k].op != "rmsnorm_ihc_junction") continue;
+            const std::set<rad_buf> w = bufs_of(cw, (rad_op)(k + 1)), p = bufs_of(cp, (rad_op)(k + 1));
+            if (!w.empty()) CHECK(w == p);
+        }
+        CHECK(junctions > 0);
+        CHECK_EQ(report_lint(lane1_unnamed(piped, view(vp))), (size_t)0);
+        /* 96 rows cut 64 + 32: the second piece is under the floor, so the step runs whole. */
+        auto k96 = kit(piped, {}, { 96 });
+        k96->b.positions_h = k96->pos.data();
+        auto v96 = run_passes(piped, hyv4flash::step, { k96.get() }, 0, world);
+        CHECK_PASSES(piped, v96);
+        int l96 = 0, short96 = 0;
+        for (const RecIssue& is : v96[0]->issues) {
+            l96 += is.lane == 1;
+            const RecOp* o = piped.op_of(is.op);
+            if (o && o->op == "rmsnorm_ihc_junction") short96 += is.n != 96;
+        }
+        CHECK_EQ(l96, 0);
+        CHECK_EQ(short96, 0);
+    }
+    unsetenv("RADIANCE_HY4_PIPE_MIN");
+    unsetenv("RADIANCE_HY4_PIPE_ROWS");
+    g3_fusions = g3;
 }
 
 /* The Engram table as E4M3 rows under a bf16 or an f32 scale a row (hy4-flash-bf16.recipe,
