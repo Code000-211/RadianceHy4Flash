@@ -1106,6 +1106,63 @@ TEST(a_streamed_group_is_refused_at_carve_without_its_host_copy) {
     }
 }
 
+/* ================================= a Hy4-shaped ring against one verify step's claims (X-05a)
+ * Design X-05 §5.2's second gap, on the engine's side. `Engine::stream_report` prints `largest
+ * launch claims` over a comment that says a value above `max_seqs x sel_pitch` means the derivation
+ * is wrong (core/engine.cpp). That bound holds only with no drafter: a verify pass is 1 + n_spec rows
+ * a sequence and every row brings its own selection, so one launch claims `max_seqs x (1 + n_spec) x
+ * sel_pitch` -- the product kvstream_ceiling_blocks prices the ring with (core/kvstream/plan.cpp) and
+ * the product the plugin states as `kv_resolve`'s `slots` (arch/common/rad_arch.h:1254, held by
+ * arch_test's the_declared_slot_ceiling_covers_a_ring_raised_to_one_decode_step). A ring under it is
+ * not merely slow: a selection the ring cannot hold latches ctl[3] and fails the request
+ * (docs/KV-STREAMING.md §3.4), so the two products have to be tied by a test rather than by two files
+ * agreeing. That a Hy4-shaped verify step really plans n x (1 + n_spec) rows is sched_test's
+ * a_hy4_shaped_decode_step_claims_n_times_one_plus_n_spec_rows_of_the_pitch. The geometry is
+ * Hy4-flash's as declared: `sel_pitch` is `ix_group_topk` = 512
+ * (arch/hyv4flash/hyv4flash.cpp:260 -> hyv4flash_attn.h:484), the streamed latent's page is 4 tokens
+ * = 4,608 B a layer over the twelve bound layers (design X-05 §2), and DFly2's depth served is 5. */
+TEST(a_hy4_shaped_ring_is_raised_to_exactly_one_verify_step_s_claims) {
+    constexpr int64_t kSelPitch = 512, kBlockTok = 4, kLayerBytes = 4608;
+    constexpr int64_t kTokenBytes = kLayerBytes * 12 / kBlockTok;   /* 13,824 B a token */
+    const int n = 4, n_spec = 5;                    /* N4 at DFly2's depth: design §3.1's ledger */
+
+    Config c = small_config();
+    c.max_seqs = n;
+    c.n_spec = n_spec;
+    c.max_ctx = 60000;                              /* the D60K the design's ledger is priced at */
+    c.kv_resident = kStreamFloorTokens;             /* under one step's selection: the floor */
+
+    /* The ceiling is exactly that product, and with no drafter exactly the bound the report's
+     * comment states. */
+    CHECK_EQ(kvstream_ceiling_blocks(c, kSelPitch), (int64_t)n * (1 + n_spec) * kSelPitch);
+    Config plain = c;
+    plain.n_spec = 0;
+    CHECK_EQ(kvstream_ceiling_blocks(plain, kSelPitch), (int64_t)n * kSelPitch);
+
+    /* `--kv-resident` at the floor asks for 8,192 blocks of 4 tokens -- under the 12,288 one verify
+     * step can name -- so the ring is raised, by the step bound and not by the floor, to exactly the
+     * launch's claims. Nothing above it is added: the ring is the ceiling and nothing else. */
+    KVStreamRing ring;
+    kvstream_ring(c, c.max_ctx, kBlockTok, kSelPitch, &ring);
+    CHECK_EQ(ring.floor_blocks, kStreamFloorTokens / kBlockTok);
+    CHECK(ring.by_union);
+    CHECK_EQ(ring.raised_blocks, kvstream_ceiling_blocks(c, kSelPitch));
+    CHECK_EQ(ring.ring_blocks, (int64_t)n * (1 + n_spec) * kSelPitch);
+    CHECK(ring.streams());                          /* the context names four times as many */
+    CHECK_EQ(ring.ctx_blocks, (int64_t)n * (c.max_ctx / kBlockTok));
+    /* Design §3.1's ledger for N4 at DFly2's depth: 49,152 tokens of latent, 648 MiB of pages. */
+    CHECK_EQ(ring.ring_blocks * kBlockTok, (int64_t)49152);
+    CHECK_EQ(ring.ring_blocks * kBlockTok * kTokenBytes, (int64_t)648 << 20);
+
+    /* With the drafter off the step bound (2,048 blocks) falls under the floor, so the floor is what
+     * leaves the ring at 8,192 and `by_union` says the raise was not the step's. */
+    KVStreamRing ring0;
+    kvstream_ring(plain, plain.max_ctx, kBlockTok, kSelPitch, &ring0);
+    CHECK(!ring0.by_union);
+    CHECK_EQ(ring0.ring_blocks, ring0.floor_blocks);
+    CHECK(ring0.ring_blocks > kvstream_ceiling_blocks(plain, kSelPitch));
+}
+
 TEST(a_streamed_group_addresses_its_context_but_backs_only_the_resident_window) {
     /* A streamed group allocates block ids over its whole context while the pool backs only
      * --kv-resident of them. This pins the places that multiply by one of the two numbers: the
