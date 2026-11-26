@@ -3725,7 +3725,8 @@ TEST(dfly2_chain_rounds_compute_the_headers_chain_at_every_served_shape) {
                 }
             }
             rp.issue(is);
-            if (is.op == df.op_final) Z = rp.rows_of(df.z, n * blk);
+            /* D-01 (#87) folds the last add into the final norm where a library serves add_rmsnorm */
+            if (is.op == (df.op_final_add ? df.op_final_add : df.op_final)) Z = rp.rows_of(df.z, n * blk);
             for (int64_t i = 0; i < rounds; ++i) {
                 const auto& st = df.steps[(size_t)i];
                 if (is.op == st.op_head) dg = Replay::mix(dg, Replay::fold(rp.rows_of(df.logits, n)));
