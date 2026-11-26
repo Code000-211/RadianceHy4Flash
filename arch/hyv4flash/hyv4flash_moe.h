@@ -257,11 +257,10 @@ struct MoeWire {
             Geom gq = g;
             gq.w_bf16 = false;
             const bool i8 = arm == kArmI8;
-            /* The latent's E4M3 pair (P-11b): the routed GEMMs read the rotated int8 pair `hr`, so
-             * for an int8 arm nothing is left to read it -- the comment above called it a
-             * prepared-input check, and no op of the plan names it. A codebook arm still reads it,
-             * so only the int8 arm declares none (declare_qs takes no both-empty form). */
-            if (!i8) RAD_ARCH_TRY(lat.declare_qs(b, nm, gq, nm.f("moe.latent"), L));
+            /* The latent's E4M3 pair stays for every quantised arm: MoeFP8::declare refuses a wire
+             * whose latent carries no codes (P-11b checked whether it is arena nothing reads -- it
+             * is, and the block still asks for it). */
+            RAD_ARCH_TRY(lat.declare_qs(b, nm, gq, nm.f("moe.latent"), L));
             RAD_ARCH_TRY(w.hr.declare_qs(b, nm, gq, nm.f("moe.latent_rot"), L, 0, i8, !i8));
             w.hr.q8_fed = w.hr.q8_rot = i8;
             /* `!i8` as for `hr` a line above: the fused SwiGLU writes the rotated int8 pair the

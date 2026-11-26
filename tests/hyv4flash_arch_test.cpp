@@ -4166,32 +4166,33 @@ std::vector<std::string> unused_transients(const RadBuilder& b) {
 }  // namespace
 
 TEST(no_transient_is_declared_that_no_op_reads) {
-    static const char* kKept[] = { "ix.stage", "moe.expert_ff", "moe.shared_ff" };
-    const std::string kept = dead_join({ kKept, kKept + 3 });
     struct Plan {
         const char* what;
         void (*encs)(RadBuilder*);
         int world;
+        /* The planes this plan leaves without a use, sorted, with the reason from the comment
+         * above: `moe.expert_ff` only where the experts are bf16 does an op read the product. */
+        const char* kept;
     };
     const Plan plans[] = {
-        { "bf16", bf16_encs, 1 },
-        { "int8 trunk", int8_trunk_encs, 1 },
+        { "bf16", bf16_encs, 1, "ix.stage " },
+        { "int8 trunk", int8_trunk_encs, 1, "ix.stage moe.shared_ff " },
         { "int8 experts",
           [](RadBuilder* b) { bf16_encs(b); b->encs[0].second = b->encs[1].second = enc_i8(true); },
-          1 },
+          1, "ix.stage moe.expert_ff moe.shared_ff " },
         { "iqr experts",
           [](RadBuilder* b) {
               bf16_encs(b);
               b->encs[0].second = b->encs[1].second = enc_trellis(RAD_U4, true);
           },
-          1 },
-        { "bf16, two ranks", bf16_encs, 2 },
+          1, "ix.stage moe.expert_ff moe.shared_ff " },
+        { "bf16, two ranks", bf16_encs, 2, "ix.stage " },
     };
     for (const Plan& p : plans) {
         fprintf(stderr, "plan %s\n", p.what);
         Declared d(p.encs, p.world);
         REQUIRE_EQ(d.rc, RAD_OK);
         steps_clean_at(d.b, 0, 1);   /* every step kind, each lint clean */
-        CHECK_EQ(dead_join(unused_transients(d.b)), kept);
+        CHECK_EQ(dead_join(unused_transients(d.b)), std::string(p.kept));
     }
 }
