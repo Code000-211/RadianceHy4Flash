@@ -88,7 +88,7 @@ else
         exec flock "$RAD_LANE_LOCK_DIR/iks.lock" bash -c '
           set -o pipefail
           git -C "$1" ls-files -z --cached --others --exclude-standard |
-            tar --null -T - --ignore-failed-read -czf - |
+            tar -C "$1" --null -T - --ignore-failed-read -czf - |
             ssh iks moebius-gpu/run.sh "$2" "$3"' _ "$RAD_REPO" "$name" "$(printf %s "$inner" | base64 -w0)"
       fi
       ;;

@@ -946,8 +946,9 @@ TEST(libr4d_resolves_the_all_reduce_by_message_size) {
              "41943040:ar_twoshot_3rank_exact ");
 
     /* At `overlap` 1 (an all-reduce beside compute) the four-rank two-shot band takes the lane
-     * rows, exact and lossy; the one-shot band has no lane row past two ranks. Three and eight ranks
-     * have no lane row and keep the plain two-shot. */
+     * rows, exact and lossy, and so does the four-rank exact one-shot band
+     * (`ar_oneshot_4rank_exact_lane`, the same kernel at fewer blocks). Three and eight ranks have
+     * no lane row and keep the plain rows. */
     auto lane = [&](int world, int exact) {
         Geometry g;
         g.set_i("world_size", world);
@@ -957,8 +958,8 @@ TEST(libr4d_resolves_the_all_reduce_by_message_size) {
         g.set_i("overlap", 1);
         return r.build_bands("all_reduce", "numel", width, chunk * width, g);
     };
-    CHECK_EQ(band_names(lane(4, 1)), "8192:ar_oneshot_4rank_exact 524288:ar_oneshot_4rank_exact "
-             "5242880:ar_twoshot_4rank_exact_lane ");
+    CHECK_EQ(band_names(lane(4, 1)), "8192:ar_oneshot_4rank_exact_lane "
+             "524288:ar_oneshot_4rank_exact_lane 5242880:ar_twoshot_4rank_exact_lane ");
     CHECK_EQ(band_names(lane(4, 0)), "8192:ar_twoshot_4rank_ti8_lane 524288:ar_twoshot_4rank_ti8_lane "
              "5242880:ar_twoshot_4rank_ti8_lane ");
     CHECK_EQ(band_names(lane(3, 1)), "8192:ar_oneshot_3rank_exact 524288:ar_oneshot_3rank_exact "

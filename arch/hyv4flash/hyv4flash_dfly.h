@@ -328,6 +328,15 @@ struct Dfly {
                op_store_stream = 0, op_resolve = 0, op_absorb = 0, op_attn = 0,
                op_expand = 0, op_gmul = 0, op_post = 0, op_add1 = 0, op_ffn_norm = 0,
                op_silu = 0, op_add2 = 0;
+        /* D-01: the trunk's fused producers, each byte-identical to the chain of separate
+         * launches it replaces (docs/OPS.md), hence 0 where the pair is kept: the norm that
+         * writes its readers' codes (rmsnorm_had_quant_i8g), the expansion with the gate and the
+         * o_proj quantiser (mla_expand_gate_had_quant_i8g), the MLP's activation with the down
+         * quantiser (gated_had_quant_i8g), the cache row's norm, key rotary and store
+         * (mla_row_norm_rope_store), and the residual add with the norm after it (add_rmsnorm). */
+        rad_op op_attn_norm_q = 0, op_qa_norm_q = 0, op_ffn_norm_q = 0, op_row_q = 0,
+               op_expand_q = 0, op_gated = 0, op_final_add = 0;
+        bool ra = false;   /* whether q_a writes `qa_raw` (the fused q residual norm reads it) */
         rad_op op_tap_tab = 0;
         Tap t_in{}, t_qres{}, t_row{}, t_gate{}, t_oproj{}, t_out{}, t_mid{}, t_ffn_in{}, t_mlp{},
             t_resid{}, t_len{};
@@ -354,6 +363,7 @@ struct Dfly {
     rad_buf final_hidden = 0;
     rad_buf emb = 0, x = 0, xn = 0, y = 0, ffgu = 0, ffo = 0, qa = 0, q = 0, q_nope = 0, q_rope = 0,
             row = 0, q_lat = 0, lat = 0, ao = 0, gt = 0, ag = 0, o = 0, z = 0;
+    rad_buf qa_raw = 0;   /* D-01: q_a's output, which a fused q residual norm reads */
     rad_buf row0 = 0, ea = 0, th = 0, cat = 0, fu = 0;
     rad_buf zk = 0, pe = 0, ccat = 0, cg = 0, cup = 0, cgu = 0, cff = 0, cd = 0, zc = 0, logits = 0, lbf = 0,
             cidx = 0, cval = 0, prev = 0, tokens = 0;
@@ -369,6 +379,7 @@ struct Dfly {
     Proj p_fuse, c_g, c_u, c_d;   /* the fusion and the correction's three linears */
     rad_op op_embed = 0, op_xcopy = 0, op_row0 = 0, op_ea = 0, op_th = 0, op_fen = 0, op_fhn = 0,
            op_fgate = 0, op_fadd = 0, op_scatter = 0, op_final = 0, op_sabotage = 0;
+    rad_op op_final_add = 0;   /* D-01: the last add with the final norm in one launch */
     rad_op op_row0_lo = 0;   /* row0 at the short block's stride */
     rad_op op_ident = 0;
     std::vector<Layer> lay;
@@ -687,10 +698,51 @@ struct Dfly {
             RAD_ARCH_TRY(d.t_in.declare(b, nm, Md, "dfly.attn_in_norm", li, RAD_BF16, E, xn));
             const std::string ln = nm.f("dfly.blk.%lld", (long long)i);
             const int gi = (int)(s.n_layer + i);
-            RAD_ARCH_TRY(linear(d.p_qa, ln + ".attn_q_a", gi, Md, s.q_lora, E, d.q_a, xn, qa, RAD_SHARD_NONE, {}));
-            d.op_qa_norm = decl_rmsnorm(b, Md, s.q_lora, s.eps, d.qa_norm, qa, qa);
+            /* D-01: the trunk's fused producers (docs/OPS.md), each byte-identical to the chain of
+             * separate launches it replaces, so a draft layer issues fewer launches for the same
+             * bytes. A producer writes the codes its reader's own quantiser would have written and
+             * the reader then issues none: the norm of the attention's input (read by q_a, kv_a
+             * and gate), the norm of the q residual (q_b), the feed-forward's norm (gate_up), the
+             * MLP's activation (down) and the expansion with the gate (o_proj). Each needs the
+             * rotated int8 codes at its reader's group; where it does not run the chain stays, and
+             * q_a, kv_a and gate still share the one quantiser of xn that q_a issues. */
+            const CodeForm f_qa = code_form(b, (ln + ".attn_q_a.weight").c_str());
+            const CodeForm f_kva = code_form(b, (ln + ".attn_kv_a.weight").c_str());
+            const CodeForm f_gate = code_form(b, (ln + ".attn_gate.weight").c_str());
+            const CodeForm f_qb = code_form(b, (ln + ".attn_q_b.weight").c_str());
+            const bool share_in = f_qa.i8 && f_qa.rot && f_qa.same(f_kva) && f_qa.same(f_gate) &&
+                                  E % f_qa.g8 == 0;
+            if (share_in) {
+                d.p_qa.lin.lead = "dfly_attn_in";
+                d.p_kva.lin.feed = d.p_gate.lin.feed = &d.p_qa.lin;
+            }
+            /* the q residual's norm writes q_b's codes and reads q_a's output, so q_a writes the
+             * norm's input and the norm writes `qa` */
+            if (fused_quant_on() && f_qb.i8 && f_qb.rot && f_qb.g8 == RAD_FP8_BLOCK &&
+                s.q_lora % f_qb.g8 == 0) {
+                if (!qa_raw) {
+                    qa_raw = bf("attn_q_a_raw", { Md, s.q_lora });
+                    if (!qa_raw) return RAD_E_INVAL;
+                }
+                d.ra = true;
+            }
+            RAD_ARCH_TRY(linear(d.p_qa, ln + ".attn_q_a", gi, Md, s.q_lora, E, d.q_a, xn,
+                                d.ra ? qa_raw : qa, RAD_SHARD_NONE, {}));
+            /* the norm of the attention's input writes q_a's codes -- and the fed ones' of kv_a and
+             * gate, which take q_a's pair -- so the three issue no quantiser */
+            if (fused_quant_on() && qplans(d.p_qa) && d.p_qa.lin.form.rot &&
+                d.p_qa.lin.g8 == RAD_FP8_BLOCK && E % d.p_qa.lin.g8 == 0)
+                d.op_attn_norm_q = decl_norm_codes(b, g, Md, E, s.eps, d.attn_norm, x, xn,
+                                                   d.p_qa.lin.q8, d.p_qa.lin.s8, d.p_qa.lin.g8);
+            d.op_qa_norm =
+                decl_rmsnorm(b, Md, s.q_lora, s.eps, d.qa_norm, d.ra ? qa_raw : qa, qa);
             RAD_ARCH_TRY(d.t_qres.declare(b, nm, Md, "dfly.attn_q_resid", li, RAD_BF16, s.q_lora, qa));
             RAD_ARCH_TRY(linear(d.p_qb, ln + ".attn_q_b", gi, Md, H * Q, s.q_lora, d.q_b, qa, q, RAD_SHARD_ROW, {}));
+            /* the q residual's norm writes q_b's codes: its quantiser then issues none */
+            if (d.ra && fused_quant_on() && qplans(d.p_qb) && d.p_qb.lin.form.rot &&
+                s.q_lora % d.p_qb.lin.g8 == 0)
+                d.op_qa_norm_q = decl_norm_codes(b, g, Md, s.q_lora, s.eps, d.qa_norm, qa_raw, qa,
+                                                 d.p_qb.lin.q8, d.p_qb.lin.s8, d.p_qb.lin.g8);
             /* q_b stays one tensor (the manifest is the checkpoint's): its output is split a head
              * at a time into the nope and rope parts. */
             d.op_qn = decl_copy(b, Md, H * N, RAD_BF16, q, q_nope);
@@ -709,6 +761,28 @@ struct Dfly {
                               RAD_INT("n_head_kv", 1), RAD_INT("block_size", s.ix_pool),
                               RAD_STR("kv_dtype", "bf16") },
                             {}, { row }, {});
+            /* The row's front in one launch (mla_row_norm_rope_store): the latent norm, the key's
+             * rotary and the store, byte-identical to the three. It is not the streamed store's,
+             * nor the debug taps' (t_row reads the row between the norm and the store), nor the
+             * late store's. */
+            if (cache_row_on() && !taps_on() && !break_store_late &&
+                rad_op_declared(b, "mla_row_norm_rope_store")) {
+                rad_op h = (sec && *sec)
+                    ? mk(b, "mla_row_norm_rope_store",
+                         { RAD_RANGE("M", 1, Md), RAD_INT("latent", L), RAD_INT("rope_dim", RO),
+                           RAD_F64("eps", s.eps), RAD_F64("theta", s.theta_sparse),
+                           RAD_F64("scale", 1.0), RAD_STR("mode", "imrope_gptj"),
+                           RAD_STR("sections", sec), RAD_INT("block_size", s.ix_pool),
+                           RAD_STR("dtype", "bf16") },
+                         { d.kv_norm }, { row }, { row })
+                    : mk(b, "mla_row_norm_rope_store",
+                         { RAD_RANGE("M", 1, Md), RAD_INT("latent", L), RAD_INT("rope_dim", RO),
+                           RAD_F64("eps", s.eps), RAD_F64("theta", s.theta_sparse),
+                           RAD_F64("scale", 1.0), RAD_STR("mode", "gptj"),
+                           RAD_INT("block_size", s.ix_pool), RAD_STR("dtype", "bf16") },
+                         { d.kv_norm }, { row }, { row });
+                if (const rad_op hr = optional_op(b, h)) d.op_row_q = hr;
+            }
             if (rad_op_declared(b, "kv_store_streamed"))
                 d.op_store_stream = mk(b, "kv_store_streamed",
                                        { RAD_RANGE("M", 1, Md), RAD_INT("head_dim", half),
@@ -736,7 +810,26 @@ struct Dfly {
             d.op_gmul = mk(b, "gate_mul",
                            { RAD_RANGE("M", 1, Md), RAD_INT("n", H * VD), RAD_STR("dtype", "bf16") },
                            {}, { ao, gt }, { ag });
-            RAD_ARCH_TRY(linear(d.p_out, ln + ".attn_output", gi, Md, E, H * VD, d.out, ag, o, RAD_SHARD_COL, {}));
+            RAD_ARCH_TRY(linear(d.p_out, ln + ".attn_output", gi, Md, E, H * VD, d.out, ag, o,
+                                RAD_SHARD_COL, {}));
+            /* The expansion with its gate and o_proj's quantiser in one launch
+             * (mla_expand_gate_had_quant_i8g, byte-identical to the three): o_proj then reads the
+             * codes and issues none. It takes at most kFuseRows rows (its range), so a taller block
+             * of drafts keeps o_proj's quantiser at issue; a calibrated run keeps the expansion's
+             * own plane. */
+            if (fused_quant_on() && calib_dir() == nullptr && qplans(d.p_out) &&
+                d.p_out.lin.form.rot && d.p_out.lin.g8 == RAD_FP8_BLOCK &&
+                (H * VD) % d.p_out.lin.g8 == 0 &&
+                fuse_on("RADIANCE_HY4_FUSE_EXPAND_QUANT") &&
+                rad_op_declared(b, "mla_expand_gate_had_quant_i8g")) {
+                d.op_expand_q = mk(b, "mla_expand_gate_had_quant_i8g",
+                                   { RAD_RANGE("M", 1, std::min(Md, kFuseRows)),
+                                     RAD_INT("heads", H), RAD_INT("k_dim", N),
+                                     RAD_INT("v_dim", VD), RAD_INT("latent_dim", L),
+                                     RAD_INT("group", d.p_out.lin.g8), RAD_STR("dtype", "bf16") },
+                                   { d.kv_b }, { lat, gt }, { d.p_out.lin.q8, d.p_out.lin.s8 });
+                d.op_expand_q = optional_op(b, d.op_expand_q);
+            }
             RAD_ARCH_TRY(d.t_oproj.declare(b, nm, Md, "dfly.attn_o_proj", li, RAD_BF16, E, o));
             if (d.post) d.op_post = decl_rmsnorm(b, Md, E, s.eps, d.post_norm, o, y);
             RAD_ARCH_TRY(d.t_out.declare(b, nm, Md, "dfly.attn_out", li, RAD_BF16, E, d.post ? y : o));
@@ -745,9 +838,26 @@ struct Dfly {
             d.op_ffn_norm = decl_rmsnorm(b, Md, E, s.eps, d.ffn_norm, x, xn);
             RAD_ARCH_TRY(d.t_ffn_in.declare(b, nm, Md, "dfly.ffn_in_norm", li, RAD_BF16, E, xn));
             RAD_ARCH_TRY(linear(d.p_gu, ln + ".ffn_gate_up", gi, Md, 2 * F, E, d.gu, xn, ffgu, RAD_SHARD_ROW, { F, F }));
+            /* the feed-forward's norm writes gate_up's codes: its quantiser then issues none */
+            if (fused_quant_on() && qplans(d.p_gu) && d.p_gu.lin.form.rot &&
+                d.p_gu.lin.g8 == RAD_FP8_BLOCK && E % d.p_gu.lin.g8 == 0)
+                d.op_ffn_norm_q = decl_norm_codes(b, g, Md, E, s.eps, d.ffn_norm, x, xn,
+                                                  d.p_gu.lin.q8, d.p_gu.lin.s8, d.p_gu.lin.g8);
             d.op_silu = mk(b, "silu_mul", { RAD_RANGE("M", 1, Md), RAD_INT("n", F), RAD_STR("dtype", "bf16") },
                            {}, { ffgu }, { ffo });
             RAD_ARCH_TRY(linear(d.p_down, ln + ".ffn_down", gi, Md, E, F, d.down, ffo, y, RAD_SHARD_COL, {}));
+            /* the activation with down's quantiser in one launch (gated_had_quant_i8g, byte-identical
+             * to the two): down then reads the codes and issues none */
+            if (fused_quant_on() && calib_dir() == nullptr && qplans(d.p_down) &&
+                d.p_down.lin.form.rot && d.p_down.lin.g8 == RAD_FP8_BLOCK &&
+                F % d.p_down.lin.g8 == 0 && rad_op_declared(b, "gated_had_quant_i8g")) {
+                d.op_gated = mk(b, "gated_had_quant_i8g",
+                                { RAD_RANGE("M", 1, Md), RAD_INT("n", F),
+                                  RAD_INT("group", d.p_down.lin.g8), RAD_STR("dtype", "bf16"),
+                                  RAD_STR("act", "silu") },
+                                {}, { ffgu }, { d.p_down.lin.q8, d.p_down.lin.s8 });
+                d.op_gated = optional_op(b, d.op_gated);
+            }
             RAD_ARCH_TRY(d.t_mlp.declare(b, nm, Md, "dfly.mlp_out", li, RAD_BF16, E, y));
             d.op_add2 = add(Md, x, y, x);
             RAD_ARCH_TRY(d.t_resid.declare(b, nm, Md, "dfly.resid", li, RAD_BF16, E, x));
@@ -788,9 +898,22 @@ struct Dfly {
                 HY4_NEED(d.op_tap_tab, "dfly_sel");
             }
         }
-        /* E: the final norm. */
-        op_final = decl_rmsnorm(b, Md, E, s.eps, out_norm, x, z);
-        HY4_NEED(op_final, "rmsnorm");
+        /* E: the final norm. The last layer's residual add is folded into it where a library
+         * serves add_rmsnorm (byte-identical to the add and the norm on both outputs, docs/OPS.md):
+         * this norm feeds no quantiser, so nothing else can take it in. */
+        if (!taps_on() && rad_op_declared(b, "add_rmsnorm")) {
+            op_final_add = mk(b, "add_rmsnorm",
+                              { RAD_RANGE("M", 1, Md), RAD_INT("n", E), RAD_F64("eps", s.eps),
+                                RAD_STR("dtype", "bf16") },
+                              { out_norm }, { x, y }, { x, z });
+            op_final_add = optional_op(b, op_final_add);
+            if (op_final_add) {
+                op_final = 0;
+                if (!lay.empty()) lay.back().op_add2 = 0;   /* the add moved into the norm */
+            }
+        }
+        if (!op_final_add) op_final = decl_rmsnorm(b, Md, E, s.eps, out_norm, x, z);
+        HY4_NEED(op_final || op_final_add, "rmsnorm");
         RAD_ARCH_TRY(t_final.declare(b, nm, Md, "dfly.final", -1, RAD_BF16, E, z));
 
         /* F: the chain, one step a proposal. */
@@ -848,7 +971,7 @@ struct Dfly {
                                      { RAD_RANGE("M", 1, S), RAD_INT("N", Vr), RAD_INT("R", R),
                                        RAD_STR("dtype", "f32") },
                                      {}, { logits }, { cidx, cval });
-                if (st.op_ctopk && !rad_op_resolved(b, st.op_ctopk)) st.op_ctopk = 0;
+                st.op_ctopk = optional_op(b, st.op_ctopk);
             }
             if (!st.op_ctopk) {
                 st.op_lcast = mk(b, "cast",
@@ -960,15 +1083,44 @@ struct Dfly {
         return RAD_OK;
     }
 
-    /* A draft linear's step over `n` rows of `in` into `out`. */
-    static void run(RadCtx* c, const Proj& p, rad_buf in, rad_buf out, int64_t n) {
+    /* D-01: the rows mla_expand_gate_had_quant_i8g takes at most (the trunk's kFuseRows). */
+    static constexpr int64_t kFuseRows = 64;
+
+    /* rmsnorm_had_quant_i8g: the norm of `in` into `out` that writes `q8`/`s8` -- the pair of the
+     * linear that reads them -- as well, byte-identical to the norm and the quantiser of that
+     * linear's input it replaces. With the rank's chained quantisers (Geom::chain_q8) it carries the
+     * chain, as the trunk's does. Only libr4d declares it: elsewhere (libref, libavx) the plain
+     * norm and the linear's own quantiser run, as where it does not resolve. */
+    static rad_op decl_norm_codes(RadBuilder* b, const Geom& g, int64_t rows, int64_t n, double eps,
+                                  rad_weight gain, rad_buf in, rad_buf out, rad_buf q8,
+                                  rad_buf s8, int64_t grp) {
+        if (!rad_op_declared(b, "rmsnorm_had_quant_i8g")) return 0;
+        rad_op h = g.chain_q8
+            ? mk(b, "rmsnorm_had_quant_i8g",
+                 { RAD_RANGE("M", 1, rows), RAD_INT("n", n), RAD_F64("eps", eps),
+                   RAD_INT("group", grp), RAD_STR("dtype", "bf16"), RAD_INT("chained", 1) },
+                 { gain }, { in }, { q8, s8, out })
+            : mk(b, "rmsnorm_had_quant_i8g",
+                 { RAD_RANGE("M", 1, rows), RAD_INT("n", n), RAD_F64("eps", eps),
+                   RAD_INT("group", grp), RAD_STR("dtype", "bf16") },
+                 { gain }, { in }, { q8, s8, out });
+        return optional_op(b, h);
+    }
+    /* Whether `p` quantises its input itself (an int8 plan of its own, not a fed one), into the
+     * pair a fused producer can write instead. */
+    static bool qplans(const Proj& p) { return p.q && p.lin.q8 && p.lin.s8 && !p.lin.fed; }
+
+    /* A draft linear's step over `n` rows of `in` into `out`; `codes_ready` says a fused producer
+     * wrote this step's codes, so the step issues its own quantiser not. */
+    static void run(RadCtx* c, const Proj& p, rad_buf in, rad_buf out, int64_t n,
+                    bool codes_ready = false) {
         if (p.q) {
             ActFP8 a{};
             a.x = in;
-            a.q8 = p.q8;
+            a.q8 = p.q8;   /* the persist chain's pair; a layer linear takes its own */
             a.s8 = p.s8;
             if (p.q8) a.g8 = p.g8;
-            p.lin.step(c, a, out, n);
+            p.lin.step(c, a, out, n, 0, 0, -1, codes_ready);
         } else {
             RAD_ISSUE_N(c, p.op, n, brows(in, n), RAD_W(p.w), brows(out, n));
         }
@@ -1030,12 +1182,22 @@ struct Dfly {
                             bcol_at(ident, 0, ident_w, 0, ident_w, n), pos, cu,
                             brows(d.tap_tab, M), brows(d.t_len.buf, M), RAD_NONE);
             }
-            RAD_ISSUE_N(c, d.op_attn_norm, M, brows(x, M), RAD_W(d.attn_norm), brows(xn, M));
+            if (d.op_attn_norm_q)
+                RAD_ISSUE_N(c, d.op_attn_norm_q, M, brows(x, M), RAD_NONE, RAD_W(d.attn_norm),
+                            brows(d.p_qa.lin.q8, M), brows(d.p_qa.lin.s8, M), brows(xn, M));
+            else
+                RAD_ISSUE_N(c, d.op_attn_norm, M, brows(x, M), RAD_W(d.attn_norm), brows(xn, M));
             d.t_in.step(c, brows(xn, M), M);
-            run(c, d.p_qa, xn, qa, M);
-            RAD_ISSUE_N(c, d.op_qa_norm, M, brows(qa, M), RAD_W(d.qa_norm), brows(qa, M));
+            const rad_buf qa_in = d.ra ? qa_raw : qa;
+            const bool ac = d.op_attn_norm_q != 0;
+            run(c, d.p_qa, xn, qa_in, M, ac);
+            if (d.op_qa_norm_q)
+                RAD_ISSUE_N(c, d.op_qa_norm_q, M, brows(qa_in, M), RAD_NONE, RAD_W(d.qa_norm),
+                            brows(d.p_qb.lin.q8, M), brows(d.p_qb.lin.s8, M), brows(qa, M));
+            else
+                RAD_ISSUE_N(c, d.op_qa_norm, M, brows(qa_in, M), RAD_W(d.qa_norm), brows(qa, M));
             d.t_qres.step(c, brows(qa, M), M);
-            run(c, d.p_qb, qa, q, M);
+            run(c, d.p_qb, qa, q, M, d.op_qa_norm_q != 0);
             RadOperand qn = brows(q, M), qr = qn;
             qn.cols = N;
             qr.offset = N;
@@ -1043,33 +1205,44 @@ struct Dfly {
             RAD_ISSUE_N(c, d.op_qn, M, qn, brows(q_nope, M));
             RAD_ISSUE_N(c, d.op_qr, M, qr, brows(q_rope, M));
             RAD_ISSUE_N(c, d.op_q_rope, M, brows(q_rope, M), rpos);
-            run(c, d.p_kva, xn, row, M);
-            RAD_ISSUE_N(c, d.op_kv_norm, M, bcol(row, 0, L, M), RAD_W(d.kv_norm), bcol(row, 0, L, M));
-            RAD_ISSUE_N(c, d.op_k_rope, M, bcol(row, L, RO, M), rpos);
-            d.t_row.step(c, brows(row, M), M);
-            /* Every row of the block into trunk layer Lkv's cache before any row attends. */
+            run(c, d.p_kva, xn, row, M, ac && d.p_kva.lin.q8 == d.p_qa.lin.q8);
+            /* Every row of the block into trunk layer Lkv's cache before any row attends. The
+             * row's norm, rotary and store are one launch where it is declared (and the cache
+             * streams nothing: that store is kv_store_streamed). */
             const RadOperand slots = praw(kb->slot_mapping, RAD_I32, M);
-            if (break_store_late && !kb->stream) {
-                /* (test only) the attention first, over the previous pass's rows */
-            } else if (!kb->stream) {
-                RAD_ISSUE_N(c, d.op_store, M, bcol(row, 0, half, M), bcol(row, half, half, M), slots,
+            const bool row_q = d.op_row_q && !kb->stream;
+            if (row_q) {
+                RAD_ISSUE_N(c, d.op_row_q, M, brows(row, M), RAD_W(d.kv_norm), rpos, slots,
                             kv_cache(kvg, d.kvl));
             } else {
-                const bool staged = kv_stage_wait(c, kvg, kb, d.kvl);
-                const KVStreamLayer S = kv_stream_layer(c, kvg, d.kvl, kb);
-                if (!d.op_store_stream || !S.host || S.blocks <= 0) {
-                    rad_step_fail(c, "hyv4flash: the sparse latent cache streams but the build has "
-                                     "no kv_store_streamed row for the DFly2 draft rows");
-                    return;
-                }
-                RAD_ISSUE_N(c, d.op_store_stream, M, bcol(row, 0, half, M), bcol(row, half, half, M),
-                            slots, kv_cache(kvg, d.kvl), praw(S.res, RAD_I32, S.blocks),
-                            praw2(S.host, RAD_U8, S.blocks, S.bbytes));
-                if (staged)
+                RAD_ISSUE_N(c, d.op_kv_norm, M, bcol(row, 0, L, M), RAD_W(d.kv_norm), bcol(row, 0, L, M));
+                RAD_ISSUE_N(c, d.op_k_rope, M, bcol(row, L, RO, M), rpos);
+            }
+            d.t_row.step(c, brows(row, M), M);
+            if (!row_q) {
+                if (break_store_late && !kb->stream) {
+                    /* (test only) the attention first, over the previous pass's rows */
+                } else if (!kb->stream) {
                     RAD_ISSUE_N(c, d.op_store, M, bcol(row, 0, half, M), bcol(row, half, half, M),
                                 slots, kv_cache(kvg, d.kvl));
+                } else {
+                    const bool staged = kv_stage_wait(c, kvg, kb, d.kvl);
+                    const KVStreamLayer S = kv_stream_layer(c, kvg, d.kvl, kb);
+                    if (!d.op_store_stream || !S.host || S.blocks <= 0) {
+                        rad_step_fail(c, "hyv4flash: the sparse latent cache streams but the build has "
+                                         "no kv_store_streamed row for the DFly2 draft rows");
+                        return;
+                    }
+                    RAD_ISSUE_N(c, d.op_store_stream, M, bcol(row, 0, half, M),
+                                bcol(row, half, half, M), slots, kv_cache(kvg, d.kvl),
+                                praw(S.res, RAD_I32, S.blocks),
+                                praw2(S.host, RAD_U8, S.blocks, S.bbytes));
+                    if (staged)
+                        RAD_ISSUE_N(c, d.op_store, M, bcol(row, 0, half, M), bcol(row, half, half, M),
+                                    slots, kv_cache(kvg, d.kvl));
+                }
             }
-            run(c, d.p_gate, xn, gt, M);
+            run(c, d.p_gate, xn, gt, M, ac && d.p_gate.lin.q8 == d.p_qa.lin.q8);
             d.t_gate.step(c, brows(gt, M), M);
             RAD_ISSUE_N(c, d.op_absorb, M, brows(q_nope, M), RAD_W(d.kv_b), brows(q_lat, M));
             if (kb->stream && !kv_stage_layer(c, kvg, kb, d.kvl)) {
@@ -1087,9 +1260,17 @@ struct Dfly {
             if (break_store_late && !kb->stream)
                 RAD_ISSUE_N(c, d.op_store, M, bcol(row, 0, half, M), bcol(row, half, half, M), slots,
                             kv_cache(kvg, d.kvl));
-            RAD_ISSUE_N(c, d.op_expand, M, brows(lat, M), RAD_W(d.kv_b), brows(ao, M));
-            RAD_ISSUE_N(c, d.op_gmul, M, brows(ao, M), brows(gt, M), brows(ag, M));
-            run(c, d.p_out, ag, o, M);
+            /* the fused expansion takes at most kFuseRows rows: a taller block of drafts keeps
+             * the plain expansion and o_proj's own quantiser */
+            const bool xq = d.op_expand_q && M <= kFuseRows;
+            if (xq) {
+                RAD_ISSUE_N(c, d.op_expand_q, M, brows(lat, M), RAD_W(d.kv_b), brows(gt, M),
+                            brows(d.p_out.lin.q8, M), brows(d.p_out.lin.s8, M));
+            } else {
+                RAD_ISSUE_N(c, d.op_expand, M, brows(lat, M), RAD_W(d.kv_b), brows(ao, M));
+                RAD_ISSUE_N(c, d.op_gmul, M, brows(ao, M), brows(gt, M), brows(ag, M));
+            }
+            run(c, d.p_out, ag, o, M, xq);
             issue_all_reduce(c, op_ar_o, o, M, E);
             d.t_oproj.step(c, brows(o, M), M);
             const rad_buf ab = d.post ? y : o;
@@ -1098,18 +1279,30 @@ struct Dfly {
             RAD_ISSUE_N(c, d.op_add1, M, brows(x, M), brows(ab, M), brows(x, M));
             d.t_mid.step(c, brows(x, M), M);
             if (kb->stream) kv_stage_next(c, kvg, d.kvl);
-            RAD_ISSUE_N(c, d.op_ffn_norm, M, brows(x, M), RAD_W(d.ffn_norm), brows(xn, M));
+            if (d.op_ffn_norm_q)
+                RAD_ISSUE_N(c, d.op_ffn_norm_q, M, brows(x, M), RAD_NONE, RAD_W(d.ffn_norm),
+                            brows(d.p_gu.lin.q8, M), brows(d.p_gu.lin.s8, M), brows(xn, M));
+            else
+                RAD_ISSUE_N(c, d.op_ffn_norm, M, brows(x, M), RAD_W(d.ffn_norm), brows(xn, M));
             d.t_ffn_in.step(c, brows(xn, M), M);
-            run(c, d.p_gu, xn, ffgu, M);
-            RAD_ISSUE_N(c, d.op_silu, M, brows(ffgu, M), brows(ffo, M));
-            run(c, d.p_down, ffo, y, M);
+            run(c, d.p_gu, xn, ffgu, M, d.op_ffn_norm_q != 0);
+            if (d.op_gated)
+                RAD_ISSUE_N(c, d.op_gated, M, brows(ffgu, M), brows(d.p_down.lin.q8, M),
+                            brows(d.p_down.lin.s8, M));
+            else
+                RAD_ISSUE_N(c, d.op_silu, M, brows(ffgu, M), brows(ffo, M));
+            run(c, d.p_down, ffo, y, M, d.op_gated != 0);
             issue_all_reduce(c, op_ar_y, y, M, E);
             d.t_mlp.step(c, brows(y, M), M);
-            RAD_ISSUE_N(c, d.op_add2, M, brows(x, M), brows(y, M), brows(x, M));
+            if (d.op_add2)   /* 0 where the last layer's add moved into the final norm (D-01) */
+                RAD_ISSUE_N(c, d.op_add2, M, brows(x, M), brows(y, M), brows(x, M));
             d.t_resid.step(c, brows(x, M), M);
         }
         /* E */
-        RAD_ISSUE_N(c, op_final, M, brows(x, M), RAD_W(out_norm), brows(z, M));
+        if (op_final_add)
+            RAD_ISSUE_N(c, op_final_add, M, brows(x, M), brows(y, M), RAD_W(out_norm), brows(z, M));
+        else
+            RAD_ISSUE_N(c, op_final, M, brows(x, M), RAD_W(out_norm), brows(z, M));
         t_final.step(c, brows(z, M), M);
         /* F */
         for (int64_t k = 0; k < rounds; ++k) {

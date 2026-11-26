@@ -3384,7 +3384,8 @@ One step, as `arch/hyv4flash` issues it (PLAN §1.2; the blocks are `hyv4flash_a
 ```
 embed_lookup -> copied into every stream (cast a stream)
 per layer
-  [Engram] engram_ids (the layer's own CONV history), embed_lookup_q over the ids, for a bf16 table
+  [Engram] engram_ids over the four layers' one shared CONV history (the last of them advances
+           it), embed_lookup_q over the ids, for a bf16 table
            the E4M3 round trip (quant_act_fp8 one group a row, dequant), engram_norm,
            gemm_nt_bias key and value, engram_gate into the streams
   ihc_pre (hc_attn), rmsnorm (attn_norm)

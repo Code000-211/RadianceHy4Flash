@@ -1136,8 +1136,10 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     RAD_ARCH_TRY(m.t_embed.declare(b, nm, T, "embed", -1, RAD_BF16, E, m.x0));
 
     if (!s.engram_layers.empty()) {
-        /* One CONV state a layer (each Engram layer advances its own window once a step): the last
-         * ngram - 1 token ids, i32. */
+        /* P-06: one CONV state for all four Engram layers -- the last ngram - 1 token ids, i32, the
+         * same for each of them, since they hash the same tokens. The first Engram layer binds it
+         * and the last one's engram_ids advances it once a step; the group has one bound layer, so
+         * a checkpoint or a rollback copies one window per sequence, not four. */
         RadKVGroupDecl d{};
         d.kind = RAD_KV_CONV;
         d.dtype = RAD_I32;

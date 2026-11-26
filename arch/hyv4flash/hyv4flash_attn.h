@@ -338,7 +338,7 @@ struct Attn {
                            RAD_STR("mode", "gptj"), RAD_INT("block_size", bs),
                            RAD_STR("dtype", "bf16") },
                          { kv_gain }, { w.row }, { w.row });
-            if (op_row_front && !rad_op_resolved(b, op_row_front)) op_row_front = 0;
+            op_row_front = optional_op(b, op_row_front);   /* else the three ops */
         }
         /* The streamed store: kv_store's operands plus the residency map and the layer's mirror
          * row, added at issue. Declared only when the architecture can stream and --kv-resident
@@ -477,7 +477,7 @@ struct Attn {
                                   RAD_INT("v_dim", a.v), RAD_INT("latent_dim", L),
                                   RAD_STR("dtype", "bf16") },
                                 { kv_b }, { w.lat, w.gate }, { w.ag });
-            if (op_expand_gate && !rad_op_resolved(b, op_expand_gate)) op_expand_gate = 0;
+            op_expand_gate = optional_op(b, op_expand_gate);   /* else the pair */
         }
         HY4_NEED(op_paged && op_paged_pf, "mla_attn_paged_sink");
         if (!sliding) {
@@ -537,7 +537,7 @@ struct Attn {
                      RAD_INT("k_dim", N), RAD_INT("v_dim", a.v), RAD_INT("latent_dim", L),
                      RAD_INT("group", RAD_FP8_BLOCK), RAD_STR("dtype", "bf16") },
                    { kv_b }, { w.lat, w.gate }, { out.q8, out.s8 });
-            if (op_expand_quant && !rad_op_resolved(b, op_expand_quant)) op_expand_quant = 0;
+            op_expand_quant = optional_op(b, op_expand_quant);
         }
         int rc = RAD_OK;
         op_ar = decl_all_reduce(b, g, s.n_embd, w.o, &rc);

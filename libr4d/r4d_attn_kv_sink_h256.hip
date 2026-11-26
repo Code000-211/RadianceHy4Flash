@@ -11,9 +11,10 @@
  * The kernel is r4d_attn_paged_window.hip's WMMA prefill kernel at gqa 1 with the paged cache
  * replaced by two flat [N, heads, 256] planes (see that kernel's header for the fragment layouts):
  *
- *   - Workgroup: one head, 128 consecutive query rows of one sequence, 16 waves (512 threads).
+ *   - Workgroup: one head, BQ consecutive query rows of one sequence, RG = BQ / 16 row groups of NS
+ *     = 2 waves each: 128 rows (the default) are 16 waves and 512 threads, 64 rows 8 waves and 256.
  *     Wave (row group rg, slice sl) owns 16 rows by the head's dims [128 sl, 128 sl + 128).
- *   - Grid: x = 128-row tiles numbered sequence by sequence (found from cu_q by a block scan), y =
+ *   - Grid: x = BQ-row tiles numbered sequence by sequence (found from cu_q by a block scan), y =
  *     heads. Tiles past the batch's last return at once.
  *   - Keys in tiles of 16 starting at the workgroup's lowest visible key, max(0, p_first - window +
  *     1), up to its last row's own key; nothing outside that range is read. The next tile is
@@ -28,6 +29,16 @@
  *     the sink, as the paged kernel does, would leave every P tiny when the sink dominates and push
  *     it into f16's subnormals; here the largest key weight is always 1. A sink past 2^128 times the
  *     largest key weight makes the denominator infinite and the row zero, which is its limit.
+ *
+ * The `bq` axis ({128, 64}, r4d_rows.cpp's tAttnKvSink; decode rows never take this kernel) trades a
+ * narrower workgroup for less masked work: a workgroup reads window + BQ - 1 keys and each of its
+ * rows sees `window` of them, so 128 rows mask 20 % of the key tiles at window 512 and 64 rows 11 %.
+ * A narrower workgroup also moves a row's key tile grid, since the tiles start at the workgroup's
+ * lowest visible key: the two points are the same arithmetic over different tiles, not byte-equal,
+ * and both stay inside the op's prefill bound against libref (tests/r4d_emu/test_attn_kv_sink.cpp
+ * runs both and the two against each other). A thread of a 64-row workgroup stages two K chunks a
+ * tile instead of one, so it carries 176 VGPRs against 168 and its workgroup 28 KiB of LDS against
+ * 37 (libr4d/isa/res.sh: no spill, no scratch, 8 waves a SIMD against 9 by its VGPR model).
  *
  * Rows of a sequence whose cu ranges are malformed (n_s < m_s, or past k's rows) cannot be refused
  * from the device; they are written as zeros. A query always sees its own key, so no valid row is
@@ -50,19 +61,27 @@
 namespace r4d_akvs {
 
 constexpr int HD = 256;
-constexpr int kThreads = 512;
-constexpr int kWaves = kThreads / 32;
 constexpr int kDQ = 128;                 /* dims of a wave's slice of the head */
 constexpr int NS = HD / kDQ;             /* slices sharing one 16-row group */
-constexpr int RG = kWaves / NS;          /* row groups a workgroup */
-constexpr int BQ = RG * 16;              /* query rows a workgroup: 128 */
 constexpr int KS = HD * 2 + 16;          /* bytes a key row of the K tile, 16 of pad */
 constexpr int VS = 48;                   /* bytes a dim row of the V^T tile: 16 keys + pad */
 constexpr int CW = 8;                    /* bf16 a 16-byte load carries */
 constexpr int NCH = HD / CW;             /* such chunks a row */
 constexpr int NKI = 16 * NCH;            /* K items a tile: (key, chunk) */
 constexpr int NVI = 8 * NCH;             /* V items a tile: (key pair, chunk) */
-static_assert(NKI == kThreads && NVI <= kThreads, "one K load and at most one V pair a thread");
+
+/* The `bq` axis: query rows a workgroup. A wave owns 16 rows, NS waves share a row group, and 32
+ * threads a wave, so BQ rows are BQ / 8 waves and BQ * 4 threads, and each thread loads NKI / (BQ *
+ * 4) K chunks a tile. 128 (512 threads) and 64 (256) are the points r4d_rows.cpp offers. */
+template <int BQ> struct Tile {
+    static constexpr int threads = BQ * 4;
+    static constexpr int waves   = BQ / 8;
+    static constexpr int rg      = BQ / 16;
+    static constexpr int kit     = NKI / threads;   /* K chunks a thread */
+    static_assert(BQ % 16 == 0, "a wave owns 16 query rows");
+    static_assert(rg * NS == waves, "a row group is NS waves");
+    static_assert(NKI % threads == 0 && NVI <= threads, "the whole K tile and at most one V pair a thread");
+};
 
 typedef short v8s __attribute__((ext_vector_type(8)));
 typedef float v8f __attribute__((ext_vector_type(8)));
@@ -128,8 +147,10 @@ __device__ __forceinline__ v8f wmma_f16(v8h a, v8h b, v8f c) {
 /* Tile `tile`'s sequence and its BQ-row slice: tiles are numbered sequence by sequence,
  * ceil(m_s / BQ) each, found by a block-wide prefix sum over cu_q (r4d_attn_paged_window.hip's
  * find_tile). All threads get the same answer from LDS. */
+template <int BQ>
 __device__ void find_tile(const int* cu, int n_seq, int tile, int* s_scan, int* s_res, int& s_out,
                           int& lt_out) {
+    constexpr int kThreads = Tile<BQ>::threads, kWaves = Tile<BQ>::waves;
     const int tid = (int)threadIdx.x, lane = tid & 31, wave = tid >> 5;
     if (tid == 0) { s_res[0] = -1; s_res[1] = 0; }
     __syncthreads();
@@ -164,7 +185,9 @@ __device__ void find_tile(const int* cu, int n_seq, int tile, int* s_scan, int* 
     lt_out = s_res[1];
 }
 
-__global__ __launch_bounds__(kThreads) void attn_kv_sink_kernel(Args A) {
+template <int BQ>
+__global__ __launch_bounds__(Tile<BQ>::threads) void attn_kv_sink_kernel(Args A) {
+    constexpr int kThreads = Tile<BQ>::threads, kWaves = Tile<BQ>::waves, KIT = Tile<BQ>::kit;
     __shared__ uint4 s_k[16 * KS / 16];
     __shared__ uint4 s_vt[HD * VS / 16];
     __shared__ float4 s_x[kWaves * 32 * 2];
@@ -176,7 +199,7 @@ __global__ __launch_bounds__(kThreads) void attn_kv_sink_kernel(Args A) {
     const int tile = (int)blockIdx.x, head = (int)blockIdx.y;
 
     int s = -1, lt = 0;
-    find_tile(A.cuq, A.n_seq, tile, s_scan, s_res, s, lt);
+    find_tile<BQ>(A.cuq, A.n_seq, tile, s_scan, s_res, s, lt);
     if (s < 0) return;                               /* uniform across the block */
     const int qb = A.cuq[s], m = A.cuq[s + 1] - qb;
     const int kb = A.cuk[s], n = A.cuk[s + 1] - kb;
@@ -217,15 +240,17 @@ __global__ __launch_bounds__(kThreads) void attn_kv_sink_kernel(Args A) {
     float mrun = -__builtin_inff(), l = 0.0f;
 
     /* ---- the key tiles, prefetched one ahead through registers. A key past hi is a zero row. */
-    uint4 pk, pv0, pv1;
+    uint4 pk[KIT], pv0, pv1;
     const uint16_t* kbase = A.k + (long long)kb * A.k_rs + (long long)head * A.k_hs;
     const uint16_t* vbase = A.v + (long long)kb * A.v_rs + (long long)head * A.v_hs;
     auto fetch = [&](int kt) __attribute__((always_inline)) {
         const int k0 = lo + kt * 16;
-        {
-            const int key = tid / NCH, ch = tid - key * NCH;
-            pk = make_uint4(0u, 0u, 0u, 0u);
-            if (k0 + key < hi) pk = *(const uint4*)(kbase + (long long)(k0 + key) * A.k_rs + ch * CW);
+#pragma unroll
+        for (int i = 0; i < KIT; ++i) {
+            const int it = tid + i * kThreads;      /* this thread's i-th (key, chunk) of the tile */
+            const int key = it / NCH, ch = it - key * NCH;
+            pk[i] = make_uint4(0u, 0u, 0u, 0u);
+            if (k0 + key < hi) pk[i] = *(const uint4*)(kbase + (long long)(k0 + key) * A.k_rs + ch * CW);
         }
         pv0 = pv1 = make_uint4(0u, 0u, 0u, 0u);
         if (tid < NVI) {
@@ -242,9 +267,11 @@ __global__ __launch_bounds__(kThreads) void attn_kv_sink_kernel(Args A) {
     for (int kt = 0; kt < nkt; ++kt) {
         const int k0 = lo + kt * 16;
         __syncthreads();                             /* the previous tile's LDS is consumed */
-        {
-            const int key = tid / NCH, ch = tid - key * NCH;
-            *(uint4*)(kl + key * KS + ch * 16) = pk;
+#pragma unroll
+        for (int i = 0; i < KIT; ++i) {
+            const int it = tid + i * kThreads;
+            const int key = it / NCH, ch = it - key * NCH;
+            *(uint4*)(kl + key * KS + ch * 16) = pk[i];
         }
         /* V: [dim][key] as f16, two keys a dword; the row order rotated by 2 per 8-lane group, so
          * the four groups of a wave write four different rows mod 8 -- 32 banks */
@@ -414,8 +441,10 @@ static int launch(const RadArgs* a, RadStream stream) {
         !rad_ptr_aligned(o->data, 16) || (q_rs | q_hs | k_rs | k_hs | v_rs | v_hs | o_rs | o_hs) % 8)
         return RAD_E_ALIGN;
 
+    const int64_t bq = rad_args_geti_or(a, "bq", 128);
+    if (bq != 128 && bq != 64) return RAD_E_SHAPE;
     /* an upper bound on the tiles of a ragged batch; the ones past the last exit at once */
-    const int64_t nt = (rows + n_seq * (BQ - 1)) / BQ;
+    const int64_t nt = (rows + n_seq * (bq - 1)) / bq;
     if (nt <= 0) return RAD_OK;
     if (nt > 0x7fffffff) return RAD_E_SHAPE;
     Args A{};
@@ -430,8 +459,11 @@ static int launch(const RadArgs* a, RadStream stream) {
     A.n_seq = (int)n_seq;
     A.n_keys = (int)nk;
     A.window = (int)window;
-    R4D_KLAUNCH(attn_kv_sink_kernel, dim3((unsigned)nt, (unsigned)H, 1u), dim3(kThreads),
-                (hipStream_t)stream, A);
+    const dim3 grid((unsigned)nt, (unsigned)H, 1u);
+    if (bq == 64)
+        R4D_KLAUNCH(attn_kv_sink_kernel<64>, grid, dim3(Tile<64>::threads), (hipStream_t)stream, A);
+    else
+        R4D_KLAUNCH(attn_kv_sink_kernel<128>, grid, dim3(Tile<128>::threads), (hipStream_t)stream, A);
     return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
 }
 

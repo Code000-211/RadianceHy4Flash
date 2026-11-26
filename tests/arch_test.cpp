@@ -10729,12 +10729,27 @@ const char* const kW8a8Fused[] = { "rmsnorm_had_quant_i8g", "ar_rmsnorm_had_quan
                                    "gated_had_quant_i8g", "gate_had_quant_i8g",
                                    "gdn_conv_recurrent_update_had" };
 
+/* The plain bf16 `gemm_nt` ops over an attn_output or ssm_out weight: the runtime-LoRA view sites
+ * a rotated int8 trunk declares for those module kinds (LinearFP8::plain_bf16_view). */
+int lora_view_sites(const RadBuilder& b) {
+    int n = 0;
+    for (const RecOp& o : b.ops) {
+        if (o.op != "gemm_nt" || o.w.empty() || o.w[0] == 0 || o.w[0] > b.weights.size()) continue;
+        const std::string& wn = b.weights[o.w[0] - 1].name;
+        n += wn.find(".attn_output.") != std::string::npos ||
+             wn.find(".ssm_out.") != std::string::npos;
+    }
+    return n;
+}
+
 /* Where the `_had_quant_i8g` producers are not served, every trunk linear of a rotated int8
  * container is an i8a8h GEMM right behind its own had_quant_act_i8g, at one rank and two: 2
- * attention layers of four linears, 6 delta-net layers of two and 8 feed-forwards of two. None is
- * left at fp8, which is what a linear that missed the encoding falls back to, and the MLP declares
- * no gated fold (an fp8a8 tile over E4M3 codes). The four trunk activations carry an int8 pair;
- * the delta net's `gdn_in` feeds no int8 linear. */
+ * attention layers of three linears (q, k, v), 6 delta-net layers of one (qkv|z) and 8
+ * feed-forwards of two. The LoRA target modules attn_output and ssm_out are the plain bf16 view
+ * sites (LinearFP8::plain_bf16_view): a `gemm_nt` each, 2 + 6. None is left at fp8, which is what
+ * a linear that missed the encoding falls back to, and the MLP declares no gated fold (an fp8a8
+ * tile over E4M3 codes). The four trunk activations carry an int8 pair; the delta net's `gdn_in`
+ * feeds no int8 linear. */
 TEST(qwen35_w8a8_serves_every_trunk_linear_rotated_int8) {
     MetaKV mk = q35w8a8_meta();
     for (int world : { 1, 2 }) {
@@ -10752,8 +10767,9 @@ TEST(qwen35_w8a8_serves_every_trunk_linear_rotated_int8) {
             ++rot;
             paired += i > 0 && b.ops[i - 1].op == "had_quant_act_i8g";
         }
-        CHECK_EQ(rot, 2 * 4 + 6 * 2 + 8 * 2);
+        CHECK_EQ(rot, 2 * 3 + 6 * 1 + 8 * 2);
         CHECK_EQ(paired, rot);
+        CHECK_EQ(lora_view_sites(b), 2 + 6);
         CHECK_EQ(count_op(b, "quant_act_i8g"), 0);
         CHECK_EQ(count_op(b, "gemm_nt_q_gated"), 0);
         for (const char* a : { "h.q8", "attn_out.q8", "gdn_o.q8", "ffn.q8" })
@@ -10767,8 +10783,8 @@ TEST(qwen35_w8a8_serves_every_trunk_linear_rotated_int8) {
  * them declare no quantiser: had_quant_act_i8g is left only as the delta net's quantiser of the
  * rows its decode fold does not serve (6), every norm is the rotated twin (at two ranks with its
  * fused all-reduce form beside it), every feed-forward's product is gated_had_quant_i8g and every
- * attention gate gate_had_quant_i8g. No E4M3 norm or gated quantiser is left, and the 36 GEMMs are
- * unchanged. */
+ * attention gate gate_had_quant_i8g. No E4M3 norm or gated quantiser is left, and the 28 i8a8h
+ * GEMMs and the 8 plain bf16 view sites are unchanged. */
 TEST(qwen35_w8a8_feeds_its_rotated_codes_from_the_producers_where_libr4d_serves_them) {
     MetaKV mk = q35w8a8_meta();
     for (int world : { 1, 2 }) {
@@ -10778,7 +10794,8 @@ TEST(qwen35_w8a8_feeds_its_rotated_codes_from_the_producers_where_libr4d_serves_
         REQUIRE_EQ(qwen35_w8a8::declare(&b, mk.meta(), &ctx), RAD_OK);
         int rot = 0;
         for (const RecOp& o : b.ops) rot += o.op == "gemm_nt_q" && pstr(&o, "dtype") == "i8a8h";
-        CHECK_EQ(rot, 2 * 4 + 6 * 2 + 8 * 2);
+        CHECK_EQ(rot, 2 * 3 + 6 * 1 + 8 * 2);
+        CHECK_EQ(lora_view_sites(b), 2 + 6);
         CHECK_EQ(count_op(b, "had_quant_act_i8g"), 6);
         CHECK_EQ(count_op(b, "rmsnorm_had_quant_i8g"), 8 + 8);
         CHECK_EQ(count_op(b, "gated_had_quant_i8g"), 8);
@@ -13210,10 +13227,10 @@ struct ArchCases {
             qwen35_fp8::step, 7, {}, 0x60d33ded99aa451eull);
         add("qwen35_w8a8 + DFlash2", [this, sc](RadBuilder* b) {
                 auto c = sc(1, 7); return w8a8_declare(b, q35w8df.meta(), &c); },
-            qwen35_w8a8::step, 7, {}, 0x570d3bc8fc15f701ull);
+            qwen35_w8a8::step, 7, {}, 0x0f91201dfd524ba9ull);
         add("qwen35_w8a8 + DFlash2, two ranks", [this, sc](RadBuilder* b) {
                 auto c = sc(2, 7); return w8a8_declare(b, q35w8df.meta(), &c); },
-            nullptr, 7, { "ar_rmsnorm_quant_fp8" }, 0x6c5267846652829full);
+            nullptr, 7, { "ar_rmsnorm_quant_fp8" }, 0xe90b985881c7616bull);
         add("qwen35moe_fp8 + MTP", [this, sc](RadBuilder* b) {
                 auto c = sc(1, 3); return qwen35moe_fp8::declare(b, q35moe.meta(), &c); },
             qwen35moe_fp8::step, 3, {}, 0x325d0299495a0dd8ull);

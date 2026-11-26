@@ -214,6 +214,7 @@ vendor/cpp-httplib/LICENSE                   <- llama.cpp vendor/cpp-httplib/cpp
     budget narrowed that window; they never closed it.
 
     LOCAL CHANGES: patches/0022-httplib-the-drain-keeps-a-five-second-budget.patch
+                   patches/0024-httplib-the-write-trusts-the-wait-before-it.patch
 
     On 0022: a response whose body the handler left unread drains on the keep-alive socket, and
     upstream bounds that drain only by the connection's read timeout -- the same knob that bounds a
@@ -723,3 +724,22 @@ headings name the removed patch files, whose diffs are in git history.
       format specs are refused by name. runtime.cpp: `none in <list>` / `not in` is a membership test
       with the equality the engine already uses. Tests: chat_test and hyv4flash_chat_test (the golden
       renders); drop with the next refresh if upstream carries both.
+
+  patches/0024-httplib-the-write-trusts-the-wait-before-it.patch
+
+      vendor/cpp-httplib/, not vendor/llama/: applies from vendor/cpp-httplib/ with `patch -p1`.
+
+      Upstream's three response loops wait for the socket to be writable before they produce a
+      chunk, and SocketStream::write() then waits for it again before the send -- one poll() of the
+      socket per chunk that asks a question the loop's own poll answered microseconds earlier. The
+      patch mirrors the readable hint this fork already carries: Stream gains set_writable_hint(),
+      which the three loops (write_content_with_progress, write_content_without_length,
+      write_content_chunked) set after their wait, and SocketStream::write() and
+      SSLSocketStream::write() consume instead of waiting a second time. The hint is consumed by
+      the very next write either way -- a send may fill the socket, so the write after it has to
+      look again -- and only the loop sets it, so it can never be a stale "writable" left over from
+      an older chunk. A full socket still blocks in send() under SO_SNDTIMEO (the connection's
+      write timeout, 600 s by default), so nothing that waited before waits forever now. Tests:
+      transport_test (a_streamed_chunk_waits_for_writability_once, which counts the polls and the
+      sends of a sixteen-chunk stream: 29 to 35 polls against 15 to 19 writes with the hint, 50 to
+      53 against the same writes without it).

@@ -3421,6 +3421,12 @@ static int sweep_container(RadFile* file, std::vector<LoadRun>& runs,
     *read_out = 0;
     if (runs.empty()) return RAD_OK;
 
+    /* --keep-container-cache wants the container's pages to stay, and an O_DIRECT read never puts
+     * them in the page cache. Read buffered then: the first load pays the copy and the lower rate,
+     * later starts read the whole container from memory (load_weights has checked the room). */
+    const int dio_flags = RAD_DIO_READ |
+        (file->keep_pages() ? RAD_DIO_BUFFERED : RAD_DIO_ALLOW_BUFFERED);
+
     /* Sort by file offset into a reading order; the span tie-break makes the order total, so the
      * same load always issues copies in the same sequence. */
     std::sort(runs.begin(), runs.end(), [](const LoadRun& a, const LoadRun& b) {
@@ -3493,7 +3499,7 @@ static int sweep_container(RadFile* file, std::vector<LoadRun>& runs,
          * blocks wider). A filesystem that refuses O_DIRECT is read buffered. Opened here once so
          * a file that cannot be read fails before any window is pinned; the readers open their
          * own. */
-        RAD_TRY(dio.open(file->path(), RAD_DIO_READ | RAD_DIO_ALLOW_BUFFERED));
+        RAD_TRY(dio.open(file->path(), dio_flags));
         /* The first window is pinned here and the others by a helper while the first reads run
          * (below, `pinner`): a window takes ~7 ms to pin (its pages faulted and zeroed, then
          * locked for every card), and all eight ahead of the first read cost every sweep ~60 ms
@@ -3695,7 +3701,7 @@ static int sweep_container(RadFile* file, std::vector<LoadRun>& runs,
         auto busy0 = std::chrono::steady_clock::now();
         auto reader = [&] {
             DirectFile f;
-            const int orc = f.open(file->path(), RAD_DIO_READ | RAD_DIO_ALLOW_BUFFERED);
+            const int orc = f.open(file->path(), dio_flags);
             for (;;) {
                 size_t k;
                 {
@@ -3843,7 +3849,8 @@ static int sweep_container(RadFile* file, std::vector<LoadRun>& runs,
      * stay (RadFile::keep_cached, named where load_weights publishes a mapped weight): an n-gram
      * table is gathered from its mapping on every step, and with its pages dropped the first long
      * prefill after each load or restore faults them back from the drive (a 103 GiB table: 1460
-     * against 1998 tok/s on a 24k prompt). */
+     * against 1998 tok/s on a 24k prompt). With --keep-container-cache the whole container stays
+     * instead (drop_blob_cache asks rad_drop_ranges for no range). */
     file->drop_blob_cache();
     /* Drain before freeing: a sweep that failed part-way may have copies outstanding. */
     if (rc < 0) {
@@ -4300,6 +4307,26 @@ int Engine::load_weights() {
         RAD_ERR("%lld declared weights are absent from the container; the model cannot run",
                 (long long)n_missing);
         return RAD_E_NOTFOUND;
+    }
+
+    /* B-04: the walk has pinned the tables it will pin, so this is the "after pinning" check the
+     * backlog asks for: keep the container's pages only if the RAM is still there beside them. The
+     * table copies above dropped their pages behind the read; the sweep below reads the container
+     * buffered when it is kept, so those are the pages that stay and the next start reads.
+     * Dropping them here still frees everything the walk read, and drop_blob_cache takes the blob
+     * as usual when the check refuses. */
+    if (file_ && cfg_.keep_container_cache) {
+        std::string why;
+        if (lockable_room(file_->size(), 0, host_margin_bytes(), false, &why)) {
+            file_->keep_pages(true);
+            RAD_INFO("load: the container stays in the page cache (%s): the sweep reads it "
+                     "buffered for that, and the next start reads it at memory speed",
+                     humanb(file_->size()).c_str());
+        } else {
+            file_->keep_pages(false);
+            RAD_INFO("load: the container's pages are dropped behind the read: --keep-container-"
+                     "cache is on but %s", why.c_str());
+        }
     }
 
     /* ============================================================== the sweep */
@@ -5315,13 +5342,19 @@ int Engine::start() {
      * Here because it needs the cache's carve (the addresses) and the mover's compute stream
      * (which a recall drains). Every rank lends its own pool, same geometry on every card; only a
      * plan that moves units borrows. A strip is one layer's stripe of one lendable group, lent
-     * from the top, since a group's top blocks are the top of every layer's stripe. */
+     * from the top, since a group's top blocks are the top of every layer's stripe.
+     *
+     * A sliding-window group lends the slots no sequence occupies through its own loan (M-11,
+     * kv.h "the loan"), so it is its own set of strips. It is carved second, with the unit budget
+     * the KV cache's slots left: the two loans hold the same experts, and a slot no unit can fill
+     * would mark blocks lent that nothing then uses. */
     for (auto& r : ranks_) {
         if (!r->heat.enabled()) continue;
         RAD_TRY(rad_dev_set(r->device));
-        std::vector<LoanStrip> strips;
+        std::vector<LoanStrip> strips, win_strips;
         for (const KVGroupPlan& p : r->kv.plans()) {
-            if (!r->kv.lendable(p.index) || !p.base) continue;
+            const bool win = r->kv.win_lendable(p.index);
+            if ((!win && !r->kv.lendable(p.index)) || !p.base) continue;
             const int64_t lbpb = p.layer_bytes_per_block(), stripe = p.layer_stride();
             for (int64_t L = 0; L < p.n_layers; ++L) {
                 LoanStrip st;
@@ -5329,10 +5362,11 @@ int Engine::start() {
                 st.bytes = p.pool_blocks() * lbpb;
                 st.unit_bytes = lbpb;
                 st.unit_tokens = p.block_size;
-                strips.push_back(st);
+                (win ? win_strips : strips).push_back(st);
             }
         }
         RAD_TRY(r->mover.lend_from(Mover::kLendKV, strips));
+        RAD_TRY(r->mover.lend_from(Mover::kLendKvWindow, win_strips, /*share_unit_budget=*/true));
         if (r->mover.flex_capacity() > 0) lending_ = true;
     }
     /* The next-layer expert prefetch, where one rank's experts sit in a pinned pool for routed GEMMs
@@ -5514,17 +5548,25 @@ int Engine::start() {
      * drained to the affordable loan before the blocks are handed out, and the followers' marks
      * move at once (a tier restore on a follower uses the id rank 0 just chose). */
     if (lending_)
-        ranks_[0]->kv.set_reclaim([this](int64_t tokens) -> int {
+        ranks_[0]->kv.set_reclaim([this](int32_t group, int64_t tokens) -> int {
+            /* A window group has a loan of its own (kv.h "the loan"); every other paged group
+             * answers on the KV loan. */
+            const int lender = ranks_[0]->kv.win_lendable(group) ? Mover::kLendKvWindow
+                                                                 : Mover::kLendKV;
             int st = RAD_OK;
             for (auto& r : ranks_) {
                 if (rad_dev_set(r->device) < 0) { st = RAD_E_DEVICE; break; }
-                st = r->mover.reclaim(Mover::kLendKV, tokens, &r->heat);
+                st = r->mover.reclaim(lender, tokens, &r->heat);
                 if (st < 0) break;
             }
             if (st >= 0)
                 for (size_t i = 1; i < ranks_.size(); ++i) {
                     KVManager& f = ranks_[i]->kv;
-                    if (tokens < f.loan_tokens()) (void)f.set_loan(tokens);
+                    if (lender == Mover::kLendKvWindow) {
+                        if (tokens < f.window_loan_tokens()) (void)f.set_window_loan(tokens);
+                    } else if (tokens < f.loan_tokens()) {
+                        (void)f.set_loan(tokens);
+                    }
                 }
             (void)rad_dev_set(ranks_[0]->device);
             return st;
@@ -5534,7 +5576,8 @@ int Engine::start() {
      * model holds, backs the stripes on every rank, and the followers take the new mark. A
      * refusal is RAD_E_FULL, and the request waits as on a full cache. */
     if (!lending_ && broker_ && ranks_[0]->kv.flex())
-        ranks_[0]->kv.set_fleet_reclaim([this](int64_t tokens, bool* waiting_for_fleet) -> int {
+        ranks_[0]->kv.set_fleet_reclaim([this](int32_t, int64_t tokens,
+                                               bool* waiting_for_fleet) -> int {
             KVManager& k0 = ranks_[0]->kv;
             const int64_t cur = k0.loan_tokens();
             if (tokens >= cur) return RAD_OK;

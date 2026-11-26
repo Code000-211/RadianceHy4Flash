@@ -301,7 +301,12 @@ if (!h) {
 
 `rad_op_resolved` is the shipped form of that test: an unresolved handle is `RAD_NULL_HANDLE`,
 an error only if issued. `rad_op_declared` asks whether any loaded library declares an op, for a
-fused op only an optional library defines. There is no pattern matcher; the plugin author decides.
+fused op only an optional library defines. `rad_op_dropped`, right after the unresolved
+declaration, says the plugin declares the chain in its place (arch/common/rad_arch.h
+`optional_op`): the op stays in the list by name but is never issued, so neither the engine's
+device holes nor rad-convert's dead-op count (which also picks the KV cache width) counts it. An
+unresolved op that is not dropped is still a hole. There is no pattern matcher; the plugin author
+decides.
 
 A kernel may also declare the chain it replaces (`RadFuseFn`, §2.1). That lets a fused kernel be
 checked against the same plugin's unfused rows, byte for byte, and feeds `debug-graph`'s fusion
