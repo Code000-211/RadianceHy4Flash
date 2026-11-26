@@ -6,6 +6,9 @@ Prints, per run: c1 tok/s and ms a step, c8 aggregate tok/s, its decode steps an
 the greedy texts' sha256 heads, and for the widest recorded pass kind of the c8 phase (the DFly2
 verify pass) the per-pass sums the stall is read from: moe_iqr + moe_down_dec over every launch,
 the routed span (router end to the last routed down's end), the pass wall and the rest of the pass.
+
+w2ab.py --seq <records> <a1.csv,a2.csv,..> <b1.csv,..> compares the kernel sequences of two arms'
+passes of one kind.
 """
 import csv, json, os, sys, statistics as st
 from collections import defaultdict
@@ -57,6 +60,51 @@ def stamps(path, t0, t1):
     res["med_wall"] = st.median(out["wall"]); res["med_span"] = st.median(out["span"]); res["med_moe"] = st.median(out["moe"])
     return res
 
+_names = {}
+def base_name(mangled):
+    """The kernel's name without its template arguments (an instantiation's symbol changes when a
+    template gains a defaulted parameter, as moe_iqr_kernel did; the code launched does not)."""
+    if mangled not in _names:
+        import subprocess
+        try: d = subprocess.run(["c++filt", mangled], capture_output=True, text=True).stdout.strip()
+        except Exception: d = mangled
+        d = d.split("(")[0]
+        out, depth = [], 0
+        for ch in d:
+            if ch == "<": depth += 1
+            elif ch == ">": depth -= 1
+            elif depth == 0: out.append(ch)
+        _names[mangled] = "".join(out).split("::")[-1].split(" ")[-1]
+    return _names[mangled]
+
+def first_pass(path, records):
+    seq = defaultdict(list)
+    with open(path) as f:
+        for r in csv.DictReader(f):
+            if int(r["records"]) == records:
+                seq[int(r["pass"])].append((int(r["seq"]), base_name(r["kernel"]), int(r["ordered"]), int(r["chained"])))
+    out = []
+    for p in sorted(seq):
+        out.append([(k, o, c) for _, k, o, c in sorted(seq[p])])
+    return out
+
+# --seq <records> <a1.csv,a2.csv,..> <b1.csv,..>: the kernel sequences of every pass of that kind in
+# two arms' runs, by kernel name without template arguments (the switch-off check: the same
+# launches in the same order with the same chained bits).
+if len(sys.argv) > 1 and sys.argv[1] == "--seq":
+    rec = int(sys.argv[2])
+    def arm(files):
+        ks, n = set(), 0
+        for f in files.split(","):
+            ps = first_pass(f, rec)
+            n += len(ps)
+            ks |= {tuple((k, c) for k, o, c in p) for p in ps}
+        return ks, n
+    (ka, na), (kb, nb) = arm(sys.argv[3]), arm(sys.argv[4])
+    print(f"{na} and {nb} passes of {rec} records; distinct (kernel, chained) sequences: {len(ka)} and {len(kb)}, "
+          f"{len(ka & kb)} in both; the same set: {ka == kb}")
+    sys.exit(0 if ka == kb else 1)
+
 for d in sys.argv[1:]:
     tag = os.path.basename(d.rstrip("/"))
     try: J = json.load(open(os.path.join(d, tag + ".json")))
@@ -81,3 +129,4 @@ for d in sys.argv[1:]:
             print(f"{'':22s}  c8 verify pass kind {r['records']}: {r['n']} passes, {r['disp']:.0f} dispatches, {r['ordered']:.0f} ordered; "
                   f"ms a pass (mean): moe_iqr {r['gu']:.2f} + moe_down_dec {r['dn']:.2f} = {r['moe']:.2f}, routed span {r['span']:.2f} "
                   f"(sem {r['sem_span']:.2f}), wall {r['wall']:.2f}, rest {r['rest']:.2f}; medians: moe {r['med_moe']:.2f} span {r['med_span']:.2f} wall {r['med_wall']:.2f}")
+
