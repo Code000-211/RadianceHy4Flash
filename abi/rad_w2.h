@@ -130,7 +130,11 @@ typedef struct RadW2Layer {
     /* w2-explore. `form` 0: the prototype's (resident launches, then the tail's). 1, "inline": one
      * gate_up and one down launch whose blocks are renumbered so that every tile of a posted
      * (copied) expert runs behind every other tile, reading the ring where the unit has landed
-     * and the pool in place otherwise; no tail launch. `spin`: how often a block of a posted
+     * and the pool in place otherwise; no tail launch. The blocks that find no tile then all sit
+     * at the launch's end. 2, "inline2": the launch's rows (column groups) keep their order and
+     * their empty blocks; the posted experts' tiles of every column group take the last empty
+     * blocks of the last rows. 3, "inline3": the one launch's own numbering, a posted expert's
+     * block reading the ring where the unit has landed by then. `spin`: how often a block of a posted
      * expert re-reads the done word before it gives up and reads in place. `gu_first` 1: the
      * list copies every unit's first `split` bytes (the gate_up tables) before any unit's rest,
      * so the done word counts 2 n ranges. */

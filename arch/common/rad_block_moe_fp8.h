@@ -2053,7 +2053,7 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
      * takes the tail's system-scope acquire (a ring of ordinary device memory). */
     static const bool w2_inline = [] {
         const char* v = std::getenv("RADIANCE_W2_FORM");
-        return v && !std::strcmp(v, "inline");
+        return v && !std::strncmp(v, "inline", 6);
     }();
     if (w2p && w2_inline) rad_expert_w2_tail(c_);
     {

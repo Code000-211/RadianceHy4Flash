@@ -33,7 +33,8 @@ W2Config w2_config(const char* (*get)(const char*)) {
     const char* ring = get("RADIANCE_W2_RING");
     c.ring_cached = !(ring && !std::strcmp(ring, "uncached"));
     const char* form = get("RADIANCE_W2_FORM");
-    c.form = form && !std::strcmp(form, "inline") ? 1 : 0;
+    c.form = !form ? 0 : !std::strcmp(form, "inline") ? 1 : !std::strcmp(form, "inline2") ? 2 :
+             !std::strcmp(form, "inline3") ? 3 : 0;
     c.spin = (int)std::clamp(num("RADIANCE_W2_SPIN", 0), 0.0, 1e6);
     c.gu_first = (int64_t)std::clamp(num("RADIANCE_W2_GU_FIRST", 0), 0.0, 64e6);
     return c;

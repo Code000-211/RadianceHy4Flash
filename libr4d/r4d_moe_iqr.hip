@@ -253,7 +253,7 @@ __device__ __forceinline__ void moe_iqr_body(R4D_MOEIQR_PARAMS) {
     /* w2-explore, the inline form: the block's column group `by` and its tile are renumbered
      * behind the search (every posted expert's tile behind every other tile of the launch). */
     uint32_t by = blockIdx.y, ycol0 = blockIdx.y * kCols;
-    bool inl = false;
+    bool inl = false, ring3 = false;
     /* Rows [ra, rb) of the block's columns, zeroed: dropped slots, which no run owns. */
     auto zero_rows = [&](uint32_t ra, uint32_t rb) {
         for (uint32_t x = tid; x < (rb - ra) * kCols; x += NTHR)
@@ -291,7 +291,12 @@ __device__ __forceinline__ void moe_iqr_body(R4D_MOEIQR_PARAMS) {
         static_assert(NPT * NTHR == kMaxExpert && NPT <= 16, "a thread's experts in one round");
         __shared__ uint32_t s_rc[NW];
         __shared__ uint32_t s_rcb[NW];
-        if constexpr (W2) inl = ((const RadW2Layer*)map)->form == 1u && !(mode & kModeW2Tail);
+        uint32_t w2form = 0u;
+        if constexpr (W2) {
+            if (!(mode & kModeW2Tail)) w2form = ((const RadW2Layer*)map)->form;
+            inl = w2form == 1u || w2form == 2u;
+            ring3 = w2form == 3u;
+        }
         uint32_t bx = blockIdx.x;
         if (!inl && blockIdx.x == gridDim.x - 1u) {
             /* W2: the first pass zeroed them */
@@ -356,7 +361,25 @@ __device__ __forceinline__ void moe_iqr_body(R4D_MOEIQR_PARAMS) {
                  * column group at a time, then the posted experts' the same way, then a block a
                  * column group that zeroes the dropped slots' rows. */
                 const uint32_t gy = gridDim.y, lin = blockIdx.y * gridDim.x + blockIdx.x;
-                if (lin < ntile * gy) {
+                if (w2form == 2u) {
+                    /* The rows as they were; the posted experts' tiles in the last empty blocks
+                     * of the last rows (an empty block is one past the row's other tiles and
+                     * before its last block, which zeroes). */
+                    if (blockIdx.x == gridDim.x - 1u) {
+                        const uint32_t live = (uint32_t)off[n_expert];
+                        if (live < T) zero_rows(live, T);
+                        return;
+                    }
+                    if (blockIdx.x >= ntile) {
+                        const uint32_t E = gridDim.x - 1u - ntile, nb = ntb * gy;
+                        const uint32_t r = (gy - 1u - blockIdx.y) * E + (E - 1u - (blockIdx.x - ntile));
+                        if (r >= nb) return;
+                        const uint32_t q = nb - 1u - r;
+                        by = q / ntb;
+                        bx = q - by * ntb;
+                        useb = true;
+                    }
+                } else if (lin < ntile * gy) {
                     by = lin / ntile;
                     bx = lin - by * ntile;
                 } else if (lin < (ntile + ntb) * gy) {
@@ -423,8 +446,8 @@ __device__ __forceinline__ void moe_iqr_body(R4D_MOEIQR_PARAMS) {
         /* the table entries beside the mask byte, not behind it */
         const void* pw = C.w[e >> cshift];
         const void* ps = C.s[e >> cshift];
-        if (!inl && !r4d_w2::mine(L, e, tail)) return;
-        if (tail || inl) {
+        if (!inl && !ring3 && !r4d_w2::mine(L, e, tail)) return;
+        if (tail || inl || ring3) {
             bool ring = false;
             pw = r4d_w2::where(L, e, pw, &ring, inl ? L->spin : 0u);
             ps = r4d_w2::where(L, e, ps);

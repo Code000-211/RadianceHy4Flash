@@ -1590,8 +1590,13 @@ __device__ __forceinline__ void moe_down_dec_body(R4D_MOEDD_PARAMS, const RadW2L
     const uint32_t tid = threadIdx.x, lane = tid % kWave, wave = tid / kWave;
     /* w2-explore, the inline form (r4d_moe_iqr.hip's): the block's column group and tile are
      * renumbered behind the search. */
-    bool inl = false;
-    if constexpr (W2) inl = w2->form == 1u && !(mode & kModeW2Tail);
+    bool inl = false, ring3 = false;
+    uint32_t w2form = 0u;
+    if constexpr (W2) {
+        if (!(mode & kModeW2Tail)) w2form = w2->form;
+        inl = w2form == 1u || w2form == 2u;
+        ring3 = w2form == 3u;
+    }
     /* The block's columns: G 64-wide tiles from cg0, the last group cut at N. */
     uint32_t cg0 = blockIdx.y * G * FN;
     if (!inl && cg0 >= N) return;       /* the launcher's grid has none; block-uniform */
@@ -1672,7 +1677,21 @@ __device__ __forceinline__ void moe_down_dec_body(R4D_MOEDD_PARAMS, const RadW2L
             const uint32_t gy = gridDim.y, lin = blockIdx.y * gridDim.x + blockIdx.x;
             uint32_t by;
             bool useb = false, zero = false;
-            if (lin < ntile * gy) {
+            if (w2form == 2u) {
+                /* r4d_moe_iqr.hip's inline2 */
+                by = blockIdx.y;
+                if (blockIdx.x == gridDim.x - 1u) {
+                    zero = true;
+                } else if (blockIdx.x >= ntile) {
+                    const uint32_t E = gridDim.x - 1u - ntile, nb = ntb * gy;
+                    const uint32_t r = (gy - 1u - blockIdx.y) * E + (E - 1u - (blockIdx.x - ntile));
+                    if (r >= nb) return;
+                    const uint32_t q = nb - 1u - r;
+                    by = q / ntb;
+                    j = q - by * ntb;
+                    useb = true;
+                }
+            } else if (lin < ntile * gy) {
                 by = lin / ntile;
                 j = lin - by * ntile;
             } else if (lin < (ntile + ntb) * gy) {
@@ -1737,8 +1756,8 @@ __device__ __forceinline__ void moe_down_dec_body(R4D_MOEDD_PARAMS, const RadW2L
     const uint16_t* Wsp0 = (const uint16_t*)wtab_at(C.s, C.s_s0, e >> cshift);
     if constexpr (W2) {
         const bool tail = (mode & kModeW2Tail) != 0u;
-        if (!inl && !r4d_w2::mine(w2, e, tail)) return;   /* the table entries are loaded beside it */
-        if (tail || inl) {
+        if (!inl && !ring3 && !r4d_w2::mine(w2, e, tail)) return;   /* the table entries are loaded beside it */
+        if (tail || inl || ring3) {
             Wp0  = (const uint8_t*)r4d_w2::where(w2, e, Wp0, nullptr, inl ? w2->spin : 0u);
             Wsp0 = (const uint16_t*)r4d_w2::where(w2, e, Wsp0);
         }
