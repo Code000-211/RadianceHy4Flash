@@ -3456,7 +3456,7 @@ ihc_pre (hc_head), rmsnorm (output_norm), gather_rows, logits_gemm
   |---|---|---|---|---|---|
   | `kv_latent_sparse` (bf16, 12 layers) | latent 512 + rope 64, one head | **13,824 B** | 4 tokens = **55,296 B** (4,608 B a layer) | 829 MB | **13.8 GB** |
   | `kv_latent_sliding` (bf16, 30 layers) | same row, window 512 | 34,560 B | 16 tokens | 17.7 MB (window-bounded) | 17.7 MB |
-  | `kv_index_keys` (bf16 or fp8, 12 layers) | one pooled key, head 16 (17 at fp8) | 768 B (456 B at fp8) | 4 tokens = 3,072 B | 46 MB | 768 MB |
+  | `kv_index_keys` (bf16 or fp8, 12 layers) | one pooled key: `head_dim = index_head_dim / 8` = 16, K **and** V halves, so a row is `2 * head_dim` = 32 bf16 = 64 B a layer; at fp8/int8 the packed page is `2 * 17 + 4` = 38 B a layer (the `+ 4` is its f32 scale) — both from `hyv4flash.cpp:833-845` read against `core/runtime/ctx.h:143-144` | 768 B (456 B at fp8) | 4 tokens = 3,072 B (2,736 B at fp8) | 46 MB (27 MB at fp8) | 768 MB (456 MB at fp8) |
 
   Only the first row streams. `kv_resolve`'s `block_bytes` is that row's per-layer page (4,608 B,
   `bytes_per_block / n_bound`, which is what core/kvstream/plan.cpp derives), its `sel_pitch` is

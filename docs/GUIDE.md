@@ -1234,7 +1234,7 @@ RAM, and the VRAM it gave up went to the expert slab.
 |---|---|---|---|
 | Qwen3.8-Flash-Next (`qwen4exp_fp8`) | **yes** | bf16, i8 | sparse QSA; the measured path |
 | GLM-5.3-Flash (`glm5next`) | **yes** | bf16, fp8 | sparse MLA + DSA; declare and issue are tested, not served here |
-| Hy4-flash (`hyv4flash`) | **yes** | bf16 | sparse MLA + indexer; declared, linked, served on the mini model, its numbers below |
+| Hy4-flash (`hyv4flash`) | **yes** | bf16 | sparse MLA + indexer; `out->kv_stream_ok = 1` at `arch/hyv4flash/hyv4flash.cpp:1603`, declared, linked, served on the mini model, its numbers below |
 | Qwen3.5/3.6/3.8 dense (`qwen35_*`, `qwen35moe_fp8`) | no | | dense attention reads the whole history every step |
 | all other architectures | no | | no streamed store and no `kv_resolve` |
 
