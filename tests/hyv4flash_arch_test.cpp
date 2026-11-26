@@ -4350,35 +4350,35 @@ TEST(the_engram_round_trip_declares_its_planes_only_when_it_is_taken) {
  * launch can write buffer 0. */
 TEST(a_gate_that_asks_for_the_product_without_a_plane_is_refused) {
     RadBuilder b;
-    Geom g;
+    hyv4flash::Geom g;
     g.max_tok = 64;
-    const rad_buf gate_up = decl_b(&b, "t.gate_up", RAD_BF16, { 64, 256 });
-    const rad_buf q       = decl_b(&b, "t.q", RAD_F8E4M3, { 64, 128 });
-    const rad_buf s       = decl_b(&b, "t.s", RAD_F32,    { 64, 1 });
-    const rad_buf x       = decl_b(&b, "t.x", RAD_BF16,   { 64, 128 });
+    const rad_buf gate_up = hyv4flash::decl_b(&b, "t.gate_up", RAD_BF16, { 64, 256 });
+    const rad_buf q       = hyv4flash::decl_b(&b, "t.q", RAD_F8E4M3, { 64, 128 });
+    const rad_buf s       = hyv4flash::decl_b(&b, "t.s", RAD_F32,    { 64, 1 });
+    const rad_buf x       = hyv4flash::decl_b(&b, "t.x", RAD_BF16,   { 64, 128 });
     REQUIRE(gate_up && q && s && x);
 
-    ActFP8 codes_only;   /* the codes pair, no bf16 plane: what an arch that declares none hands */
+    hyv4flash::ActFP8 codes_only;   /* the codes pair, no bf16 plane: what an arch that declares none hands */
     codes_only.q = q;
     codes_only.s = s;
 
-    GateQuantFP8 asked;
+    hyv4flash::GateQuantFP8 asked;
     CHECK_EQ(asked.declare(&b, g, gate_up, codes_only, 128, "silu", 0, /*bf16_out=*/true),
              RAD_E_INVAL);
     CHECK_EQ(asked.want_x, true);
     REQUIRE(!b.ops.empty());
     CHECK_EQ((int)b.ops.back().writes.size(), 0);   /* refused before it named an operand */
 
-    ActFP8 with_plane = codes_only;
+    hyv4flash::ActFP8 with_plane = codes_only;
     with_plane.x = x;
-    GateQuantFP8 full;
+    hyv4flash::GateQuantFP8 full;
     CHECK_OK(full.declare(&b, g, gate_up, with_plane, 128, "silu", 0, /*bf16_out=*/true));
     REQUIRE(!b.ops.empty());
     CHECK_EQ((int)b.ops.back().writes.size(), 3);
     CHECK(in(b.ops.back().writes, x));
     CHECK(in(b.ops.back().writes, q));
 
-    GateQuantFP8 folded;
+    hyv4flash::GateQuantFP8 folded;
     CHECK_OK(folded.declare(&b, g, gate_up, codes_only, 128, "silu", 0, /*bf16_out=*/false));
     CHECK_EQ(folded.want_x, false);
     REQUIRE(!b.ops.empty());
