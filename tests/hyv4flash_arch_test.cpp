@@ -4140,11 +4140,12 @@ TEST(g3_junctions_write_the_codes_their_readers_take) {
  *       the rotated int8 pair the down projection reads, so no op names them; MoeFP8's own rule
  *       does ask for them (down_codebook_fp8 / down_supported,
  *       arch/common/rad_block_moe_fp8.h), the mixed IQR-gate_up-behind-a-w6-down recipe with them.
- *   moe.expert_ff -- only in the last plan, where the experts' down projection is i8a8h as the served
- *       model reads it: the fused gated quantiser writes the int8 pair, so the bf16 product itself is
- *       arena. MoeFP8::declare refuses a wire without it (the two tests of
- *       quantised_experts_are_served_clamped), which is why this PR drops the planes the arch can
- *       hand over and not this one; the measurement file counts what each side is worth.
+ *   moe.expert_ff -- only in the last plan, where the routed arm is read as i8a8h (rotated int8
+ *       latent and experts' down projection) as the served model runs it: the fused gated quantiser
+ *       writes the int8 pair, so the bf16 product itself is arena. MoeFP8::declare refuses a wire
+ *       without it (the two tests of quantised_experts_are_served_clamped), which is why this PR
+ *       drops the planes the arch can hand over and not this one; the measurement file counts what
+ *       each side is worth.
  *   moe.latent.q / .s -- the same for the latent linear: the gather's output is read as the rotated
  *       int8 pair, and MoeFP8::declare refuses a wire whose latent carries no codes at all.
  *   ix.stage -- the indexer stages a closing group's raw keys through it, and the step issues that
@@ -4232,17 +4233,19 @@ void served_u3_encs(RadBuilder* b) {
                                       { "engram_mult", rad_enc_plain(RAD_I64) } });
 }
 
-/* The same recipe with the routed arm's down projection stored as i8a8h, the form the served model
- * is read at: the gather hands the expert gate rotated int8 codes, the fused `gated_had_quant_i8g`
- * writes the int8 pair itself, and no op of the declared list reads the bf16 product -- which is
- * `moe.expert_ff`, the largest plane of the dump at the rig's shapes (48 MiB at TP2/2048, 96 MiB at
- * TP4/8192). At the trellis down above the gate falls back to the chain, so the product is written
- * and read there; both rows are pinned because the dump's list depends on which of the two the
- * library serves. */
+/* The same recipe with the routed arm read as i8a8h, the form the served model runs at: the latent
+ * linear and the experts' down projection are rotated int8, so the gather hands the expert gate
+ * rotated int8 codes (ActFP8::q8_fed and q8_rot), `gated_had_quant_i8g` writes the int8 pair itself
+ * and no op of the declared list reads the bf16 product. That product is `moe.expert_ff`, the largest
+ * plane of the dump at the rig's shapes (48 MiB at TP2/2048, 96 MiB at TP4/8192). At the trellis arm
+ * above the gate falls back to the chain, so the plane is written and read there; both rows are
+ * pinned because which of the two the library serves decides whether the dump names it. */
 void served_u3_i8a8h_encs(RadBuilder* b) {
     served_u3_encs(b);
-    for (auto& e : b->encs)
+    for (auto& e : b->encs) {
         if (e.first == "ffn_down_exps") e.second = enc_i8(true);
+        if (e.first == "ffn_latent_in" || e.first == "ffn_latent_out") e.second = enc_i8(true);
+    }
 }
 
 }  // namespace
@@ -4275,10 +4278,10 @@ TEST(no_transient_is_declared_that_no_op_reads) {
          * the round trip is off, and the trunk on rotated int8 activations). */
         { "the served u3", served_u3_encs, 1,
           "ix.stage moe.expert_ff.q moe.expert_ff.s moe.latent.q moe.latent.s ", 110592 },
-        /* The same with the experts' down projection at i8a8h: the gated quantiser serves the arm
-         * alone, so the bf16 product itself joins the list -- the plane the card counts and this
-         * change leaves where MoeFP8's own rule asks for it. */
-        { "served u3, i8a8h down", served_u3_i8a8h_encs, 1,
+        /* The same with the routed arm read as i8a8h: the gated quantiser serves the arm alone, so
+         * the bf16 product itself joins the list -- the plane the card counts and this change leaves
+         * where MoeFP8's own rule asks for it. */
+        { "served u3, i8a8h arm", served_u3_i8a8h_encs, 1,
           "ix.stage moe.expert_ff moe.expert_ff.q moe.expert_ff.s moe.latent.q moe.latent.s ", 0 },
     };
     for (const Plan& p : plans) {
