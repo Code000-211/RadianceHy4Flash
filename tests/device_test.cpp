@@ -2640,6 +2640,9 @@ TEST(the_resident_device_code_query_answers_for_whichever_backend_is_running) {
     int64_t bytes = -1;
     int     modules = -1;
     const int s = rad::dev_code_resident(0, &bytes, &modules);
+    /* The host backend loads no device code, also where it runs beside HIP with no card visible
+     * and the query goes on to the AQL backend that never started: never a bad-index answer. */
+    if (std::strcmp(rad::device_backend_name(), "host") == 0) CHECK_EQ(s, RAD_E_UNSUPPORTED);
     if (s == RAD_OK) {
         CHECK(bytes >= 0);
         CHECK(modules >= 0);

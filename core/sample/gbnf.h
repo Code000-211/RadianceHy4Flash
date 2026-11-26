@@ -46,6 +46,11 @@
  *     shared by every request and rank that uses the grammar.
  *   - The vocabulary index is computed once per vocabulary and shared. Nothing is per request and
  *     nothing is on the device.
+ *   - The UTF-8 decoder takes well-formed UTF-8 only (Unicode Table 3-7). Upstream's reads any
+ *     lead's bits, so an overlong form (C0 AF, E0 9F BF, F0 85 AA 8D), a surrogate or a code point
+ *     past U+10FFFF was a character a negated class such as a JSON string's admits; such a piece is
+ *     now an invalid sequence, and match_partial_char counts only well-formed completions
+ *     (gbnf_internal.h: utf8_range).
  *
  * So the state machine stays on host: the walk is precomputed (XGrammar's adaptive token-mask
  * cache, adapted to this machine's stacks) rather than moved to the device (spec §13).

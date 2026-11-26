@@ -21,8 +21,14 @@
 
 namespace {
 
-/* A scheduler with a live request table, stored sessions and idle-tier counters. */
+/* A scheduler with a live request table, stored sessions and idle-tier counters. The request and
+ * the session run under the runtime LoRA "sql" (slot 0) unless `lora` is cleared: a populated
+ * engine emits every optional field, and `lora` is one (absent when no adapter is set). */
 struct StatsScheduler : FakeScheduler {
+    std::string lora = "sql";
+    std::vector<std::string> lora_names() const override {
+        return lora.empty() ? std::vector<std::string>{} : std::vector<std::string>{ lora };
+    }
     int requests(std::vector<RequestStat>* out) const override {
         RequestStat r;
         r.id = 41;
@@ -44,6 +50,7 @@ struct StatsScheduler : FakeScheduler {
         r.ttft_s = 0.25;
         r.prefill_s = 0.20;
         r.decode_tps = 61.0;
+        r.lora = lora;
         out->assign(1, r);
         return 1;
     }
@@ -62,6 +69,7 @@ struct StatsScheduler : FakeScheduler {
         s.snap_bytes = 4096;
         s.resume_tokens = 4096;
         s.moving = true;
+        s.lora = lora;
         out->assign(1, s);
         occ->host_bytes = 8 << 20;
         occ->host_cap_bytes = 64 << 20;
@@ -224,6 +232,30 @@ TEST(stats_carries_the_engine_the_requests_and_the_snapshot) {
     CHECK_EQ(d.srv->router().call("GET", "/graph").status, 501);
     Dash g(true);
     CHECK_EQ(g.get("/graph").value("order", json()).size(), (size_t)0);
+}
+
+/* `lora` names the runtime LoRA a request or a stored conversation ran under, and only then: the
+ * page reads it as optional (`lora?: string` in dashboard/src/lib/api.ts), so an engine with no
+ * adapter set leaves it out instead of sending an empty name or a null. /stats lists the slots by
+ * name with what each one served. */
+TEST(the_lora_fields_are_emitted_when_a_lora_is_set_and_left_out_otherwise) {
+    Dash d(false);
+    d.sched.m.loras[0].requests = 5;
+    d.sched.m.loras[0].output_tokens = 70;
+    const json s = d.get("/stats");
+    CHECK_EQ(s["requests"][0].value("lora", ""), std::string("sql"));
+    CHECK_EQ(d.get("/sessions")["sessions"][0].value("lora", ""), std::string("sql"));
+    REQUIRE(s["loras"].size() == 1);
+    CHECK_EQ(s["loras"][0].value("name", ""), std::string("sql"));
+    CHECK_EQ(s["loras"][0].value("requests", (int64_t)0), (int64_t)5);
+    CHECK_EQ(s["loras"][0].value("output_tokens", (int64_t)0), (int64_t)70);
+
+    Dash e(false);
+    e.sched.lora.clear();
+    const json t = e.get("/stats");
+    CHECK(!t["requests"][0].contains("lora"));
+    CHECK(!e.get("/sessions")["sessions"][0].contains("lora"));
+    CHECK(t["loras"].is_array() && t["loras"].empty());
 }
 
 /* /stats says why the loan stops: the pieces of its headroom for the group that lends least, so a
