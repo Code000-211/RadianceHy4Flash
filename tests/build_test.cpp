@@ -228,6 +228,76 @@ TEST(graph_dump_matches_the_spec) {
     CHECK(!has(s, "---- unresolved"));
 }
 
+/* A transient that no declared op reads or writes is charged for the whole program, and the graph
+ * dump has to say which one it was (P-11b): the number alone gave a reader nothing to take away.
+ * Both halves are under test -- the flag the report reads, which a whole-program PERSIST plane must
+ * not trip, and the text an operator reads. */
+TEST(a_transient_no_op_names_is_charged_and_named) {
+    NEED_PLUGIN(reg)
+    Builder b(reg, make_meta(), make_ctx());
+
+    rad_weight w = decl_w(b, "blk.0.ffn_gate.weight");
+    const rad_op gemm = decl_gemm(b, w);
+    CHECK(gemm == 1);
+
+    RadBufDecl d{};
+    d.dtype = RAD_BF16;
+    d.rank  = 2;
+    d.shape[0] = 8192;
+    d.shape[1] = 4096;
+    d.kind   = RAD_BUF_TRANSIENT;
+    d.domain = RAD_DOMAIN_DEVICE;
+
+    /* One the declared op names as its output; one no op of the list mentions at all -- what an
+     * architecture leaves charged when it declares a plane for a form it then does not run. */
+    const rad_buf named  = b.decl_buffer("named_plane", &d);
+    const rad_buf orphan = b.decl_buffer("orphan_plane", &d);
+    CHECK(named != 0 && orphan != 0);
+    const rad_buf out[1] = { named };
+    CHECK_OK(rad_op_writes(&b, gemm, out, 1));
+
+    /* A PERSIST plane nothing names is not waste: it lives for the whole program by definition, and
+     * it sits outside the packed arena. Read off the range alone the two are the same buffer. */
+    RadBufDecl pd = d;
+    pd.kind = RAD_BUF_PERSIST;
+    const rad_buf keep = b.decl_buffer("persist_plane", &pd);
+    CHECK(keep != 0);
+
+    CHECK_OK(b.finish());
+
+    const BufferInfo* n = nullptr;
+    const BufferInfo* o = nullptr;
+    const BufferInfo* k = nullptr;
+    for (const BufferInfo& bi : b.program().buffers) {
+        if (bi.name == "named_plane") n = &bi;
+        else if (bi.name == "orphan_plane") o = &bi;
+        else if (bi.name == "persist_plane") k = &bi;
+    }
+    REQUIRE(n && o && k);
+    CHECK(!n->no_op_use);
+    CHECK(o->no_op_use);
+    CHECK(!k->no_op_use);
+    /* The charge itself: whole-program liveness, which is what makes it arena. */
+    CHECK_EQ(o->first_def, 0);
+    CHECK(o->last_use > n->last_use);
+
+    const std::string s = dump_graph_str(b.program(), &b.errors());
+    CHECK(has(s, "---- buffer plan: arena"));
+    CHECK(has(s, "1 transient buffer(s), 64.00 MiB, had no declared use"));
+    /* Named, once, and the plane that was named by an op is not in that list. */
+    int hit_orphan = 0, hit_named = 0;
+    const std::string mark = "no op of the declared list names it";
+    for (size_t pos = s.find(mark); pos != std::string::npos; pos = s.find(mark, pos + mark.size())) {
+        const size_t bol = s.rfind('\n', pos);
+        const size_t from = bol == std::string::npos ? 0 : bol + 1;
+        const std::string line = s.substr(from, pos - from);
+        if (line.find("orphan_plane") != std::string::npos) ++hit_orphan;
+        if (line.find("named_plane") != std::string::npos) ++hit_named;
+    }
+    CHECK_EQ(hit_orphan, 1);
+    CHECK_EQ(hit_named, 0);
+}
+
 /* ================================================================== the buffer plan */
 TEST(liveness_packing) {
     Program p;
