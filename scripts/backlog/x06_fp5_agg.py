@@ -11,7 +11,15 @@ runs = {}
 for p in sys.argv[1:]:
     m = re.search(r"-(on|off)-r(\d+)\.json$", p)
     runs[(m.group(1), int(m.group(2)))] = json.load(open(p))
-phases = list(next(iter(runs.values())).keys())
+# Runs need not carry the same phases (session 2 ran only some of them): each phase is aggregated over the runs
+# that have it, in first-seen order.
+phases = []
+for d in runs.values():
+    phases += [ph for ph in d if ph not in phases]
+
+
+def having(arm, ph):
+    return sorted(k for k in runs if k[0] == arm and ph in runs[k])
 
 
 def row(d, ph):
@@ -27,7 +35,9 @@ print("| phase | arm | decode tok/s (median of requests) r.. | median | tokens a
 print("|---|---|---|---|---|---|---|")
 for ph in phases:
     for arm in ("on", "off"):
-        ks = sorted(k for k in runs if k[0] == arm)
+        ks = having(arm, ph)
+        if not ks:
+            continue
         rs = [row(runs[k], ph) for k in ks]
         decs = [r[0] for r in rs]
         m = rs[0][3]
@@ -38,29 +48,30 @@ for ph in phases:
 
 # greedy retries by retry index, and the 64K turn 2 TTFT
 for arm in ("on", "off"):
-    ks = sorted(k for k in runs if k[0] == arm)
-    if "rg" in phases:
-        by = [[r for k in ks for g in runs[k]["rg"]["reqs"] for j, r in enumerate(g) if j == i] for i in range(3)]
+    if having(arm, "rg"):
+        by = [[r for k in having(arm, "rg") for g in runs[k]["rg"]["reqs"] for j, r in enumerate(g) if j == i] for i in range(3)]
         print(f"rg {arm}: decode tok/s by retry (median over prompts and runs): "
               + ", ".join(f"ask {i + 1} {st.median(x['dec'] for x in b):.1f}" for i, b in enumerate(by)))
-    if "t64" in phases:
-        t = [runs[k]["t64"]["reqs"][0] for k in ks]
+    if having(arm, "t64"):
+        t = [runs[k]["t64"]["reqs"][0] for k in having(arm, "t64")]
         print(f"t64 {arm}: turn 1 prompt {t[0][0]['prompt']} TTFT " + " / ".join(f"{x[0]['ttft']:.3f}" for x in t)
               + f"; turn 2 prompt {t[0][1]['prompt']} TTFT " + " / ".join(f"{x[1]['ttft']:.3f}" for x in t))
 
-# parity: every T 0 request in order
-shas = {}
-for k, d in runs.items():
-    shas[k] = [r["sha"] for ph in phases for g in d[ph]["reqs"] for r in g if r["temp"] == 0.0]
-ref = shas[sorted(shas)[0]]
-same = all(v == ref for v in shas.values())
-print(f"greedy parity: {len(ref)} T 0 texts per run, {len(shas)} runs, all equal: {same}")
-if not same:
-    for k, v in sorted(shas.items()):
-        print(k, " ".join(v))
+# parity: every T 0 request in order, per phase, over the runs that have the phase
+for ph in phases:
+    ks = sorted(k for k in runs if ph in runs[k])
+    shas = {k: [r["sha"] for g in runs[k][ph]["reqs"] for r in g if r["temp"] == 0.0] for k in ks}
+    ref = shas[ks[0]]
+    if not ref:
+        continue
+    same = all(v == ref for v in shas.values())
+    print(f"greedy parity {ph}: {len(ref)} T 0 texts per run, {len(shas)} runs, all equal: {same}")
+    if not same:
+        for k, v in sorted(shas.items()):
+            print(k, " ".join(v))
 # sampled: equal texts between arms, request by request, per phase
 for ph in phases:
-    a = [[r["sha"] for g in runs[k][ph]["reqs"] for r in g] for k in sorted(runs)]
+    a = [[r["sha"] for g in runs[k][ph]["reqs"] for r in g] for k in sorted(runs) if ph in runs[k]]
     n = len(a[0])
     eq = sum(1 for i in range(n) if len({x[i] for x in a}) == 1)
     print(f"{ph}: {eq} of {n} requests give the same text in all {len(a)} runs")
