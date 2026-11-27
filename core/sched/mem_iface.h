@@ -242,6 +242,12 @@ struct IPrefixCache {
     virtual void set_drafter_floor(int64_t) {}
     /* --prefix-resume exact: the cold chunk grid every key carries (ExactKeys, exact_keys). */
     virtual void set_exact_keys(const ExactKeys&) {}
+    /* Every key a request's chain carries, for a reader outside the binding (the engine's
+     * disk-store page-in, pcache_page_in_request): what lookup and publish hash with, so a page-in
+     * finds what a lookup looks for. `salt` is the control vector's (media_keys). The default is
+     * media_keys alone; PCBinding adds the exact grid's chunks. */
+    virtual void request_keys(const Request& r, uint64_t salt,
+                              std::vector<MMContentKey>* out) const;
 
     /* Publish what this sequence computed so a later request sharing the prefix can adopt it.
      * `blocks[i]` is the block table of cached_groups()[i]; `n_tokens` is how many tokens are
@@ -619,6 +625,11 @@ inline void exact_keys(const Request& r, const ExactKeys& x, std::vector<MMConte
     }
 }
 
+inline void IPrefixCache::request_keys(const Request& r, uint64_t salt,
+                                       std::vector<MMContentKey>* out) const {
+    media_keys(r, out, salt);
+}
+
 template <class PC>
 struct PCBinding final : IPrefixCache {
     PC* m;
@@ -637,7 +648,8 @@ struct PCBinding final : IPrefixCache {
     /* Every key a request's chain carries: its media, adapter and control vector (media_keys),
      * then the exact grid's chunks (exact_keys). Lookup, publish, snapshot keys, restore and the
      * engine's page-in all take them here, so they cannot drift apart. */
-    void request_keys(const Request& r, uint64_t salt, std::vector<MMContentKey>* out) const {
+    void request_keys(const Request& r, uint64_t salt,
+                      std::vector<MMContentKey>* out) const override {
         media_keys(r, out, salt);
         exact_keys(r, exact, out);
     }

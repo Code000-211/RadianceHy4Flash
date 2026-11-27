@@ -19,6 +19,7 @@
 #include "plugin/registry.h"
 #include "runtime/tierexec.h"
 #include "sched/mem_iface.h"
+#include "engine_priv.h"           /* pcache_page_in_request */
 #include "rad_internal.h"
 
 /* Only FakeKV: this binary runs on the real device layer. */
@@ -8927,6 +8928,56 @@ TEST(a_restarted_cache_pages_a_conversation_back_byte_for_byte) {
     CHECK_OK(pc_flush_cache(y.f.pc, y.t, &y.f.ck, st, all_admit(), &f));
     CHECK_EQ(f.written_items, 0ll);
     CHECK_EQ(f.kept_items, 21ll);
+}
+
+/* --prefix-resume exact with --prefix-cache-dir (#236): a conversation published under the exact
+ * grid's chunk keys goes to disk, and a restarted server's page-in (Engine::pcache_page_in, through
+ * pcache_page_in_request) reads its chain back keyed by the binding (IPrefixCache::request_keys),
+ * so the restore and lookup that follow find it. Keyed by media_keys alone, as before the binding
+ * carried the chunk keys, the page-in reads nothing and the next turn resumes from zero. */
+TEST(exact_keys_a_restarted_cache_pages_in_what_the_binding_looks_up) {
+    const std::string dir = radtest::tmp_path("pcache_exact_page_in");
+    (void)std::system(("rm -rf '" + dir + "'").c_str());
+    const Request first = turn(7, tok_run(100, 300), tok_run(9000, 8));
+    const Request next = turn(8, cat(cat(first.prompt, first.output), tok_run(3000, 100)), {});
+    PrefixStore::Config sc;
+    {
+        TierFixture x;
+        CHECK_OK(x.build(/*with_linear=*/true, /*ckpt_slots=*/4));
+        PCBinding<PrefixCache> b(&x.f.pc);
+        b.exact = exact_grid();
+        REQUIRE(serve_turn(x.f, b, first, 192) >= 0);
+        REQUIRE(!copy_now(x.t).empty());
+        sc = store_cfg(dir, x);
+        PrefixStore st;
+        CHECK_OK(st.open(sc));
+        PcFlush fl;
+        CHECK_OK(pc_flush_cache(x.f.pc, x.t, &x.f.ck, st, all_admit(), &fl));
+        CHECK(fl.written_items > 0);
+    }
+    TierFixture y;
+    CHECK_OK(y.build(true, 4));
+    PrefixStore st;
+    CHECK_OK(st.open(sc));
+    int64_t ns = 0;
+    REQUIRE(pc_import(y.f.pc, st, &ns) > 0);
+    PCBinding<PrefixCache> b(&y.f.pc);
+    b.exact = exact_grid();
+    /* The engine's own path, through the interface: no binding means media keys alone. */
+    PcPageIn plain;
+    CHECK_OK(pcache_page_in_request(nullptr, y.f.pc, y.t, &y.f.ck, st, next, 0, &plain));
+    CHECK_EQ(plain.entries, 0ll);
+    CHECK(!plain.snap);
+    const IPrefixCache& keys = b;
+    PcPageIn r;
+    CHECK_OK(pcache_page_in_request(&keys, y.f.pc, y.t, &y.f.ck, st, next, 0, &r));
+    /* The first turn's chunks [0, 64) and [64, 192) are whole in the next turn too: 12 blocks of
+     * 16. Its [192, 300) was the prompt's last, partial chunk, keyed apart from the next turn's
+     * whole [192, 320), so the chain stops at 192, where the snapshot is. */
+    CHECK_EQ(r.entries, 12ll);
+    CHECK_EQ(r.failed, 0ll);
+    CHECK(r.snap);
+    CHECK_EQ((int64_t)b.restore_plan(next, 0).size(), 12ll);
 }
 
 /* A snapshot the store holds gives up its slot to a newer one without being lost, and a host
