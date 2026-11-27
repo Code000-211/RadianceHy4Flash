@@ -382,7 +382,8 @@ private:
                                 const std::vector<int64_t>& emb_bytes,
                                 const std::vector<WeightFootprint>& wfs, int64_t kv_floor,
                                 int64_t ngram_bytes, bool ngram_device, bool ngram_host,
-                                int64_t host_late);
+                                int64_t host_late,
+                                const std::map<int, int64_t>& ngram_layer_bytes);
     /* --ngram-placement ram: one copy of the container's [src, src + n) at file offset `foff`,
      * shared by every rank. Locked for the host gather, or pinned for a device kernel to read
      * over the link (`card`); with ram=DIR the pinned copy is a file other engines map too.
@@ -390,7 +391,7 @@ private:
      * join_table_fills joins after the container pass, so the four Engram tables fill beside it
      * (B-01) instead of one after the other before it. */
     int copy_table(const uint8_t* src, int64_t n, int64_t foff, bool card, void** out,
-                   std::string* why);
+                   std::string* why, const std::string& share_dir = std::string());
     /* An Engram table whose bytes are still being read: copy_table has reserved and published its
      * memory, and the load may not use it until join_table_fills has joined it. */
     struct PendingTable {
@@ -423,7 +424,12 @@ private:
      * container's range (table_file_map); unmapped in ~Engine. */
     std::vector<TableCopy> table_files_;
     std::vector<const void*> table_file_src_;   /* the container address each of table_files_ replaces */
-    int table_file_map(const uint8_t* src, int64_t n, int64_t foff, void** out, std::string* why);
+    int table_file_map(const uint8_t* src, int64_t n, int64_t foff, void** out, std::string* why,
+                       const std::string& dir);
+    /* The Engram bytes the resolved placements put on the cards -- the global placement's whole
+     * table, or only the layers --ngram-placement-layers put on vram. Engine::plan adds it back
+     * to every rank's statics after the resolution. */
+    int64_t ngram_on_card_bytes_ = 0;
     /* --expert-profile: the decode ranking loaded once, before any rank plans, and handed to every
      * rank's planner in place of the container's activation profile. */
     std::vector<RadFileProfile> expert_profile_;

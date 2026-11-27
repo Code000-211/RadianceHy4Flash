@@ -121,6 +121,8 @@ diag::RunFacts Engine::run_facts(bool failed) const {
     }
     for (const TableCopy& t : table_copies_) r.locked_bytes += (int64_t)t.bytes;
     r.ngram_placement   = has_ngram_ ? table_placement_name(cfg_.ngram_resolved) : "";
+    for (const auto& [l, p] : cfg_.ngram_layer_resolved)   /* --ngram-placement-layers */
+        r.ngram_placement += "," + std::to_string(l) + "=" + table_placement_name(p);
     r.reference_kernels = cfg_.accept_reference_kernels;
     r.profile_ops       = cfg_.profile_ops;
     r.deterministic     = cfg_.deterministic;

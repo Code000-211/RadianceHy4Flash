@@ -728,6 +728,7 @@ const std::map<std::string, std::vector<std::string>>& legal_values() {
         { "--diagnose-prefill", { "1024,4096", "--diagnose", "/d" } },
         { "--diagnose-corpus", { "/c.jsonl", "--diagnose", "/d" } },
         { "--diagnose-baseline", { "/b.json", "--diagnose", "/d" } },
+        { "--ngram-placement-layers", { "1=ram,11=disk,21=disk,31=disk" } },
     };
     return v;
 }
@@ -1061,6 +1062,44 @@ TEST(the_embedding_is_ram_or_vram_and_the_ngram_table_takes_four) {
         CHECK_EQ(parse({ "--ngram-placement", bad }, &c), RAD_E_INVAL);
     }
     CHECK_EQ(parse({ "--ngram-placement" }, &c), RAD_E_INVAL);
+}
+
+/* --ngram-placement-layers: a comma list of L=WHERE (WHERE without auto), the per-layer dirs
+ * ram=DIR/disk=DIR, and RADIANCE_NGRAM_PLACEMENT_LAYERS where the flag is absent. Unset names no
+ * layer, which is today's one-global behavior. */
+TEST(the_ngram_layers_spec_parses_per_layer) {
+    Config c;
+    CHECK_EQ(parse({ "--ngram-placement-layers", "1=ram,11=disk,21=disk,31=disk" }, &c), RAD_OK);
+    CHECK_EQ(c.ngram_layer_asked.size(), (size_t)4);
+    CHECK(c.ngram_layer_asked[1] == TablePlacement::Ram);
+    CHECK(c.ngram_layer_asked[11] == TablePlacement::Disk);
+    CHECK(c.ngram_layer_asked[21] == TablePlacement::Disk);
+    CHECK(c.ngram_layer_asked[31] == TablePlacement::Disk);
+    Config d;
+    CHECK_EQ(parse({ "--ngram-placement-layers", "1=ram=/dev/shm,11=disk=/mnt/fast/ng" }, &d),
+             RAD_OK);
+    CHECK(d.ngram_layer_share_dir[1] == "/dev/shm");
+    CHECK(d.ngram_layer_disk_dir[11] == "/mnt/fast/ng");
+    for (const char* bad : { "", "1", "1=", "=ram", "x=ram", "1=auto", "1=ram,",
+                             "1=ram,,11=disk", "1=ram,1=disk", "-1=ram", "1=ram=",
+                             "1=disk=", "1=RAM" }) {
+        Config b;
+        CHECK_EQ(parse({ "--ngram-placement-layers", bad }, &b), RAD_E_INVAL);
+    }
+    Config e;
+    CHECK_EQ(parse({}, &e), RAD_OK);
+    CHECK(e.ngram_layer_asked.empty());
+    ::setenv("RADIANCE_NGRAM_PLACEMENT_LAYERS", "1=ram,11=disk", 1);
+    Config f;
+    CHECK_EQ(parse({}, &f), RAD_OK);
+    CHECK_EQ(f.ngram_layer_asked.size(), (size_t)2);
+    CHECK(f.ngram_layer_asked[11] == TablePlacement::Disk);
+    /* The flag on the line wins whole over the environment. */
+    Config g;
+    CHECK_EQ(parse({ "--ngram-placement-layers", "3=disk" }, &g), RAD_OK);
+    CHECK_EQ(g.ngram_layer_asked.size(), (size_t)1);
+    CHECK(g.ngram_layer_asked.count(3));
+    ::unsetenv("RADIANCE_NGRAM_PLACEMENT_LAYERS");
 }
 
 /* ram=DIR is ram whose pinned copy is a shared file in DIR; a later plain placement drops the

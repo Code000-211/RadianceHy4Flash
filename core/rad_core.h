@@ -971,6 +971,19 @@ struct Config {
      * from the container at the first start, instead of from the container (a faster drive than
      * the model's). Empty: from the container. */
     std::string    ngram_disk_dir;
+    /* --ngram-placement-layers SPEC (or RADIANCE_NGRAM_PLACEMENT_LAYERS when the flag is
+     * absent): a comma list of L=WHERE that overrides --ngram-placement for the named Engram
+     * layers -- e.g. 1=ram,11=disk,21=disk,31=disk keeps layer 1's table pinned and reads the
+     * rest from the drive. WHERE is the global flag's form (vram, ram, ram=DIR, disk, disk=DIR)
+     * but never auto: the layers a spec does not name take --ngram-placement, which is today's
+     * one-global behavior when neither is given. `asked` is what the value named; `resolved` is
+     * what Engine::resolve_table_placement confirmed, and ngram_effective is the view the
+     * planner and the load read. A per-layer ram=DIR/disk=DIR names that layer's directory;
+     * without one the layer uses the global ram=DIR/disk=DIR. */
+    std::map<int, TablePlacement> ngram_layer_asked;
+    std::map<int, TablePlacement> ngram_layer_resolved;
+    std::map<int, std::string>    ngram_layer_share_dir;   /* ram=DIR for that layer */
+    std::map<int, std::string>    ngram_layer_disk_dir;    /* disk=DIR for that layer */
     TablePlacement embedding_resolved  = TablePlacement::Vram;
     TablePlacement ngram_resolved      = TablePlacement::Disk;
     /* Set by the resolver: pinned host MiB per rank for the token embedding when it resolves to
@@ -987,6 +1000,22 @@ struct Config {
     int64_t        tower_host_mib  = 0;
     /* The pinned host pool one rank allocates: --host-pool-mib and the tables placed beside it. */
     int64_t host_pool_total_mib() const { return host_pool_mib + embedding_host_mib + tower_host_mib; }
+    /* Where the Engram table of `layer` goes: the resolved per-layer override, or the global
+     * resolved placement -- ngram_resolved itself when --ngram-placement-layers named nothing. */
+    TablePlacement ngram_effective(int layer) const {
+        const auto it = ngram_layer_resolved.find(layer);
+        return it != ngram_layer_resolved.end() ? it->second : ngram_resolved;
+    }
+    /* The directory holding `layer`'s ram=DIR copy / disk=DIR file: its own when the spec named
+     * one, the global ram=DIR/disk=DIR otherwise. */
+    const std::string& ngram_share_dir_for(int layer) const {
+        const auto it = ngram_layer_share_dir.find(layer);
+        return it != ngram_layer_share_dir.end() ? it->second : ngram_share_dir;
+    }
+    const std::string& ngram_disk_dir_for(int layer) const {
+        const auto it = ngram_layer_disk_dir.find(layer);
+        return it != ngram_layer_disk_dir.end() ? it->second : ngram_disk_dir;
+    }
     bool    deterministic = false;
     /* --control-vector off|on. Without the flag (`disabled`) no vector is loaded: the program
      * declares no projection op, an off request costs the stock model's launches, and a request
