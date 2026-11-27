@@ -374,25 +374,42 @@ int Ctx::resolve_weight_table(rad_op h, int operand, rad_weight first, int64_t n
     return weight_table_tensor(h, operand, t, w_tmpl_[first], out);
 }
 
+/* Resolves entry `e` of `t` through the residency table into `*out`, or names the entry and fails
+ * the step when the load phase bound it no pointer. Both walks resolve through here -- the whole
+ * table at its first issue (table_refresh) and the entries that moved (wtab_entry) -- so an
+ * unbound entry is reported by one resolve, in one text. `defer_in_flight` leaves an entry whose
+ * copy has not landed at `*out` = null, for the caller's op to wait on (Ctx::resolve_weight). */
+int Ctx::wtab_resolve(const WeightTable& t, int64_t e, rad_op h, int operand, bool defer_in_flight,
+                      void** out) {
+    const rad_weight w = (rad_weight)(t.first + e);
+    bool in_flight = false;
+    void* const p = resolve_weight(w, defer_in_flight, &in_flight);
+    if (in_flight) {
+        *out = nullptr;
+    } else if (!p) {
+        return abort_step_msg(h, RAD_E_STATE,
+                              fmt("weight '%s' (entry %lld of operand %d's table) has no "
+                                  "pointer at issue: the load phase never bound it and no "
+                                  "residency table claims it",
+                                  program_->weights[w].name.c_str(), (long long)e, operand));
+    } else {
+        *out = p;
+    }
+    return RAD_OK;
+}
+
 /* Resolves one queued entry of `t` and, when the pointer the residency table gives differs from
  * the one the device array holds, appends the write to `pt` (runtime/wtab.h), dispatching it when
  * the block fills. Both callers patch only what moved: table_refresh for the entries the op that
  * reads the table needs, wtab_patch_pass for every table ahead of a pass that has no stager. */
 int Ctx::wtab_entry(WeightTable& t, int64_t e, rad_op h, int operand, WtabPatch& pt,
                     int64_t* walked, bool defer_in_flight, bool* in_flight) {
-    const rad_weight w = (rad_weight)(t.first + e);
-    bool in_flight_here = false;
-    void* p = resolve_weight(w, defer_in_flight, &in_flight_here);
-    if (in_flight_here) {
-        if (in_flight) *in_flight = true;
+    void* p = nullptr;
+    RAD_TRY(wtab_resolve(t, e, h, operand, defer_in_flight, &p));
+    if (!p) {                             /* the copy has not landed: the op that reads the table */
+        if (in_flight) *in_flight = true;  /* patches this entry (ctx.h, wtab_patch_pass) */
         return RAD_OK;
     }
-    if (!p)
-        return abort_step_msg(h, RAD_E_STATE,
-                              fmt("weight '%s' (entry %lld of operand %d's table) has no "
-                                  "pointer at issue: the load phase never bound it and no "
-                                  "residency table claims it",
-                                  program_->weights[w].name.c_str(), (long long)e, operand));
     ++*walked;
     if (t.cur[(size_t)e] == p) return RAD_OK;
     t.cur[(size_t)e] = p;
@@ -411,19 +428,6 @@ int Ctx::table_refresh(rad_op h, int operand, WeightTable& t) {
     const bool wt_time = g_dbg_issue && rank() == 0;   /* one thread accumulates */
     const auto t_wt0 = wt_time ? std::chrono::steady_clock::now()
                                : std::chrono::steady_clock::time_point{};
-    auto resolve = [&](int64_t e, void** out) -> int {
-        const rad_weight w = (rad_weight)(t.first + e);
-        void* p = resolve_weight(w);
-        if (!p)
-            return abort_step_msg(h, RAD_E_STATE,
-                                  fmt("weight '%s' (entry %lld of operand %d's table) has no "
-                                      "pointer at issue: the load phase never bound it and no "
-                                      "residency table claims it",
-                                      program_->weights[w].name.c_str(), (long long)e, operand));
-        *out = p;
-        return RAD_OK;
-    };
-
     int64_t walked = 0;
     if (!t.checked) {
         /* First issue: check agreement, resolve every entry, upload the whole array. `host` is
@@ -448,7 +452,8 @@ int Ctx::table_refresh(rad_op h, int operand, WeightTable& t) {
                                               "('%s') disagrees with entry 0 about axis %u",
                                               operand, (long long)e,
                                               program_->weights[w].name.c_str(), d));
-            RAD_TRY(resolve(e, &t.cur[(size_t)e]));
+            RAD_TRY(wtab_resolve(t, e, h, operand, /*defer_in_flight=*/false,
+                                 &t.cur[(size_t)e]));
             t.host[e] = t.cur[(size_t)e];
         }
         walked = t.n;

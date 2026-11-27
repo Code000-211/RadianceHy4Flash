@@ -571,6 +571,11 @@ private:
      * its stager publishes mid-pass (stager.h, before_op). An entry whose transfer has not landed
      * yet also keeps it, so its stream wait stays where the op that reads it can carry it. */
     int  wtab_patch_pass();
+    /* Resolves entry `e` of `t` into `*out`, or fails the step naming the entry when the load phase
+     * bound it no pointer. The first issue of a table (table_refresh) and the patch of its moved
+     * entries (wtab_entry) both resolve through here, so that diagnostic is one text. */
+    int  wtab_resolve(const WeightTable& t, int64_t e, rad_op h, int operand, bool defer_in_flight,
+                      void** out);
     /* Resolves one queued entry of `t` and, when its pointer differs from the one the device array
      * holds, appends the write to `pt`, dispatching it when the block fills (table_refresh,
      * wtab_patch_pass). `h` and `operand` name the table in a diagnostic. `defer_in_flight` leaves an
