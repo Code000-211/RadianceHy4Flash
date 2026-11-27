@@ -585,6 +585,15 @@ inline bool cvec_taps_on() {
     return e && *e && std::strcmp(e, "0") != 0;
 }
 
+/* RADIANCE_HY4_LOGITS_TAPS=1: only the draft round's f32 logits plane tap (dbg.dfly.logits.<l>),
+ * on its own as well as with the rest of the set. The fused head (logits_topk, K-21) writes the
+ * candidate pair and never that plane, so a run that wants to read the plane declares the head and
+ * the cast / row_topk pair instead; the other taps read what the fused op writes either way. */
+inline bool logits_taps_on() {
+    const char* e = std::getenv("RADIANCE_HY4_LOGITS_TAPS");
+    return e && *e && std::strcmp(e, "0") != 0;
+}
+
 struct Tap {
     rad_buf buf = 0;
     rad_op op = 0;

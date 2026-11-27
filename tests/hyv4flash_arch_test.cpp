@@ -3341,9 +3341,11 @@ TEST(an_engine_step_with_dfly2_is_lint_clean_and_the_query_pass_touches_no_trunk
         for (const char* op : kTrunkOnly) CHECK_EQ(std::count(q.begin(), q.end(), std::string(op)), 0);
         CHECK_EQ(std::count(q.begin(), q.end(), std::string("dfly_sel")), 1);
         CHECK_EQ(std::count(q.begin(), q.end(), std::string("mla_attn_sel_sink")), 1);
-        CHECK_EQ(std::count(q.begin(), q.end(), std::string("logits_gemm")), depth);
-        /* the f32 logits' top-k in one op where a library serves it (D-04) */
-        CHECK_EQ(std::count(q.begin(), q.end(), std::string("cast_row_topk")), depth);
+        /* a round's head, then its shortlist: the fused head where the round is in its band (K-21) */
+        const int64_t k21 = (int64_t)std::count(q.begin(), q.end(), std::string("logits_topk"));
+        CHECK_EQ(std::count(q.begin(), q.end(), std::string("logits_gemm")) + k21, depth);
+        /* the f32 logits' top-k in one op where a library serves it (D-04), or the head's own (K-21) */
+        CHECK_EQ(std::count(q.begin(), q.end(), std::string("cast_row_topk")) + k21, depth);
         CHECK_EQ(std::count(q.begin(), q.end(), std::string("row_topk")), 0);
         const auto& df = d.df();
         size_t store = SIZE_MAX, attn = SIZE_MAX;
@@ -3375,6 +3377,7 @@ TEST(an_engine_step_with_dfly2_is_lint_clean_and_the_query_pass_touches_no_trunk
 void no_cast_topk(RadBuilder* b) { bf16_encs(b); b->undeclared.insert("cast_row_topk"); }
 void refused_cast_topk(RadBuilder* b) { bf16_encs(b); b->refuse.insert("cast_row_topk"); }
 TEST(dfly2_takes_cast_row_topk_where_served_and_the_cast_pair_otherwise) {
+    /* eight rows a round, above the fused head's band (K-21), which has its own test below */
     const int depth = 5;
     for (int world : { 1, 2 }) for (int form = 0; form < 3; ++form) {
         DeclDfly d(depth, dfly_meta(), world, 0,
@@ -3398,10 +3401,10 @@ TEST(dfly2_takes_cast_row_topk_where_served_and_the_cast_pair_otherwise) {
             if (world > 1) CHECK_EQ(pint(o, "vocab_off"), 0);
         }
         if (world > 1) continue;   /* the passes below are the whole-vocabulary engine's */
-        auto trunk = kit(b, std::vector<int>(2, depth + 1), {});
+        auto trunk = kit(b, std::vector<int>(8, depth + 1), {});
         trunk->b.positions_h = trunk->pos.data();
         auto ctxp = context_pass(b, *trunk);
-        Query qp(b, 2, depth + 1, depth);
+        Query qp(b, 8, depth + 1, depth);
         auto ps = run_passes(b, hyv4flash::step, { trunk.get(), ctxp.get(), qp.k.get() });
         for (const auto& c : ps) {
             if (!c->step_fail.empty()) fprintf(stderr, "%s\n", c->step_fail.c_str());
@@ -3429,28 +3432,31 @@ TEST(dfly2_takes_cast_row_topk_where_served_and_the_cast_pair_otherwise) {
     }
 }
 
-/* K-21: at the head's matvec band (a round of at most two sequences, the width logits_gemm picks
- * its matvec for) one op does the head, the f32 -> bf16 rounding cast_row_topk makes and row_topk's
- * stage 1: logits_topk, fed the head's plane and writing cast_row_topk's idx/val (and, sharded,
- * the pairs the gather needs). A wider round keeps the head, a tap of the f32 plane still has to
- * see that plane, and a library without the row falls back to the same pair as before. */
-TEST(dfly2_takes_the_fused_head_at_the_matvec_band) {
+/* K-21: one op does the head, the f32 -> bf16 rounding cast_row_topk makes and row_topk's stage 1
+ * (logits_topk) for a chain round of at most two sequences -- the width logits_gemm itself picks
+ * its matvec for, so the fused head reads the weight with the kernel the head would have run. The
+ * choice is made per round on the round's own row count, not on the plan's max_seqs: a one-sequence
+ * step at max_seqs 8 takes the fused op and its eight-row sibling keeps the head and the pair that
+ * are declared beside it. A tap of the f32 plane still has to see that plane, and a library without
+ * the row falls back to the same pair as before. */
+TEST(dfly2_takes_the_fused_head_on_rounds_of_at_most_two_sequences) {
     const int depth = 5;
+    /* max_seqs 2: every round fits the band, so the head, the plane and the pair are not declared */
     for (int world : { 1, 2 }) {
         DeclDfly d(depth, dfly_meta(), world, 0, bf16_encs, {}, 2);   /* max_seqs 2: M <= 2 */
         REQUIRE_EQ(d.rc, RAD_OK);
         RadBuilder& b = d.b;
         const auto& df = d.df();
         for (const auto& S : df.steps) {
-            CHECK(S.op_topk_f != 0);
-            CHECK_EQ(S.op_head, 0);
-            CHECK_EQ(S.op_ctopk, 0);
-            CHECK_EQ(S.op_lcast, 0);
-            CHECK_EQ(S.op_topk, 0);
-            const RecOp* o = b.op_of(S.op_topk_f);
+            CHECK(S.op_head_topk != 0);
+            CHECK_EQ(S.op_head, 0u);
+            CHECK_EQ(S.op_ctopk, 0u);
+            CHECK_EQ(S.op_lcast, 0u);
+            CHECK_EQ(S.op_topk, 0u);
+            const RecOp* o = b.op_of(S.op_head_topk);
             REQUIRE(o);
             CHECK_EQ(pstr(o, "dtype"), std::string("bf16"));
-            CHECK_EQ(pint(o, "M"), 1);                 /* the range's low bound: [1, max_seqs] */
+            CHECK_EQ(pint(o, "M"), 1);                 /* the range's low bound: [1, 2] */
             CHECK_EQ(pint(o, "n_vocab"), 320 / world);
             /* the activation's own row width */
             CHECK_EQ(pint(o, "n_embd"), b.bufs[o->reads[0] - 1].d.shape[1]);
@@ -3480,23 +3486,96 @@ TEST(dfly2_takes_the_fused_head_at_the_matvec_band) {
         CHECK_EQ(count("cast_row_topk"), 0);
         CHECK_EQ(count("row_topk"), 0);
     }
-    /* The refusals: a library without the row keeps the pair; so does a tap of the f32 plane. */
+    /* max_seqs 8, a one-sequence step: both declared, the fused op takes the round. The band, not
+     * max_seqs, is the fused row's M range. */
+    {
+        DeclDfly d(depth, dfly_meta(), 1, 0, bf16_encs, {}, 8);
+        REQUIRE_EQ(d.rc, RAD_OK);
+        RadBuilder& b = d.b;
+        const auto& df = d.df();
+        for (const auto& S : df.steps) {
+            CHECK(S.op_head_topk != 0);
+            CHECK(S.op_head != 0 && S.op_ctopk != 0);     /* what a wider round runs */
+            const RecOp* o = b.op_of(S.op_head_topk);
+            REQUIRE(o);
+            CHECK_EQ(pint(o, "M"), 1);
+            for (const RecParam& p : o->p)
+                if (p.key == "M") CHECK_EQ(p.ihi, 2LL);     /* [1, 2], not [1, 8] */
+        }
+        auto trunk = kit(b, std::vector<int>(1, depth + 1), {});
+        trunk->b.positions_h = trunk->pos.data();
+        auto ctxp = context_pass(b, *trunk);
+        Query qp(b, 1, depth + 1, depth);
+        auto ps = run_passes(b, hyv4flash::step, { trunk.get(), ctxp.get(), qp.k.get() });
+        for (const auto& c : ps) {
+            if (!c->step_fail.empty()) fprintf(stderr, "%s\n", c->step_fail.c_str());
+            CHECK(c->step_fail.empty());
+        }
+        CHECK_LINT(b, ps[0].get(), ps[1].get(), ps[2].get());
+        const auto q = issued_ops(b, *ps[2]);
+        auto count = [&](const char* op) {
+            return (int64_t)std::count(q.begin(), q.end(), std::string(op));
+        };
+        CHECK_EQ(count("logits_topk"), (int64_t)depth);
+        CHECK_EQ(count("logits_gemm"), 0);
+        CHECK_EQ(count("cast_row_topk"), 0);
+    }
+    /* max_seqs 8, an eight-sequence step: past the band, so the head and the pair run as before. */
+    {
+        DeclDfly d(depth, dfly_meta(), 1, 0, bf16_encs, {}, 8);
+        REQUIRE_EQ(d.rc, RAD_OK);
+        RadBuilder& b = d.b;
+        auto trunk = kit(b, std::vector<int>(8, depth + 1), {});
+        trunk->b.positions_h = trunk->pos.data();
+        auto ctxp = context_pass(b, *trunk);
+        Query qp(b, 8, depth + 1, depth);
+        auto ps = run_passes(b, hyv4flash::step, { trunk.get(), ctxp.get(), qp.k.get() });
+        for (const auto& c : ps) {
+            if (!c->step_fail.empty()) fprintf(stderr, "%s\n", c->step_fail.c_str());
+            CHECK(c->step_fail.empty());
+        }
+        CHECK_LINT(b, ps[0].get(), ps[1].get(), ps[2].get());
+        const auto q = issued_ops(b, *ps[2]);
+        auto count = [&](const char* op) {
+            return (int64_t)std::count(q.begin(), q.end(), std::string(op));
+        };
+        CHECK_EQ(count("logits_topk"), 0);
+        CHECK_EQ(count("logits_gemm"), (int64_t)depth);
+        CHECK_EQ(count("cast_row_topk"), (int64_t)depth);
+        CHECK_EQ(count("row_topk"), 0);
+    }
+    /* The refusals: a library without the row keeps the pair, and so does a tap of the f32 plane. */
     {
         DeclDfly d(depth, dfly_meta(), 1, 0, bf16_encs, { "logits_topk" }, 2);
         REQUIRE_EQ(d.rc, RAD_OK);
         for (const auto& S : d.df().steps) {
-            CHECK_EQ(S.op_topk_f, 0);
+            CHECK_EQ(S.op_head_topk, 0u);
             CHECK(S.op_head != 0 && S.op_ctopk != 0);
         }
     }
+    {
+        setenv("RADIANCE_HY4_LOGITS_TAPS", "1", 1);
+        DeclDfly d(depth, dfly_meta(), 1, 0, bf16_encs, {}, 2);
+        unsetenv("RADIANCE_HY4_LOGITS_TAPS");
+        REQUIRE_EQ(d.rc, RAD_OK);
+        for (const auto& S : d.df().steps) {
+            CHECK_EQ(S.op_head_topk, 0u);         /* the tap reads the f32 plane behind the head */
+            CHECK(S.op_head != 0 && S.op_ctopk != 0);
+            CHECK(S.t_logits.op != 0);
+        }
+    }
+    /* The rest of the tap set does not need that plane: the candidate pair's taps run over the
+     * fused op, which is what makes the item's verify step -- dfly.cand_* identical -- test it. */
     {
         setenv("RADIANCE_HY4_TAPS", "1", 1);
         DeclDfly d(depth, dfly_meta(), 1, 0, bf16_encs, {}, 2);
         unsetenv("RADIANCE_HY4_TAPS");
         REQUIRE_EQ(d.rc, RAD_OK);
         for (const auto& S : d.df().steps) {
-            CHECK_EQ(S.op_topk_f, 0);           /* the tap reads the f32 plane behind the head */
-            CHECK(S.op_head != 0 && S.op_ctopk != 0);
+            CHECK(S.op_head_topk != 0);
+            CHECK_EQ(S.op_head, 0u);
+            CHECK_EQ(S.t_logits.op, 0u);          /* no plane, no plane tap */
+            CHECK(S.t_idx.op != 0 && S.t_val.op != 0);
         }
     }
 }
@@ -3547,8 +3626,8 @@ TEST(dfly2_serves_a_short_block_of_four_rows) {
                 auto count = [&](const char* op) {
                     return (int64_t)std::count(q.begin(), q.end(), std::string(op));
                 };
-                CHECK_EQ(count("logits_gemm"), rounds);
-                CHECK_EQ(count("cast_row_topk"), rounds);
+                CHECK_EQ(count("logits_gemm") + count("logits_topk"), rounds);
+                CHECK_EQ(count("cast_row_topk") + count("logits_topk"), rounds);
                 CHECK_EQ(count("mtp_couple_propose"), coupled ? rounds : 0);
                 /* each anchor and each round's row found at this block's stride */
                 int row0 = 0, row0_lo = 0, rowk = 0, rowk_lo = 0;
@@ -3637,7 +3716,8 @@ TEST(dfly2_coupled_draws_each_chain_step_from_its_shortlist_law) {
                 const auto& S = df.steps[(size_t)k];
                 size_t at_top = SIZE_MAX, at_c = SIZE_MAX, at_tok = SIZE_MAX, at_merge = SIZE_MAX;
                 for (size_t i = 0; i < is.size(); ++i) {
-                    if (is[i].op == (S.op_ctopk ? S.op_ctopk : S.op_topk)) at_top = i;
+                    if (is[i].op == (S.op_ctopk ? S.op_ctopk : S.op_topk) ||
+                        (S.op_head_topk && is[i].op == S.op_head_topk)) at_top = i;
                     if (is[i].op == S.op_merge && S.op_merge) at_merge = i;
                     if (is[i].op == S.op_couple) at_c = i;
                     if (is[i].op == S.op_tok) at_tok = i;
@@ -4027,10 +4107,13 @@ TEST(dfly2_chain_rounds_compute_the_headers_chain_at_every_served_shape) {
         int64_t heads = 0;
         wrong = 0;
         for (const RecIssue& is : c->issues) {
-            /* a round's head: its input against the header, before the head runs */
+            /* a round's head: its input against the header, before the head runs -- the fused head
+             * of a round of at most two sequences reads the same rows (K-21) */
             int64_t k = -1;
-            for (int64_t i = 0; i < rounds; ++i)
-                if (is.op == df.steps[(size_t)i].op_head) k = i;
+            for (int64_t i = 0; i < rounds; ++i) {
+                const auto& st = df.steps[(size_t)i];
+                if (is.op == st.op_head || (st.op_head_topk && is.op == st.op_head_topk)) k = i;
+            }
             if (k >= 0 && world == 1 && !i8) {
                 ++heads;
                 REQUIRE(!Z.empty());
@@ -4060,6 +4143,11 @@ TEST(dfly2_chain_rounds_compute_the_headers_chain_at_every_served_shape) {
             for (int64_t i = 0; i < rounds; ++i) {
                 const auto& st = df.steps[(size_t)i];
                 if (is.op == st.op_head) dg = Replay::mix(dg, Replay::fold(rp.rows_of(df.logits, n)));
+                /* K-21's fused head writes no f32 plane: what it hands the engine is its shortlist */
+                if (st.op_head_topk && is.op == st.op_head_topk) {
+                    dg = Replay::mix(dg, Replay::fold(rp.rows_of(df.cidx, n)));
+                    dg = Replay::mix(dg, Replay::fold(rp.rows_of(df.cval, n)));
+                }
                 if (is.op == st.op_tok) {   /* the round's proposal, as it left the shortlist */
                     const Replay::View t = rp.view(*b.op_of(is.op), is.opd[0]);
                     dg = Replay::mix(dg, Replay::fold(rp.rows_of(df.cidx, n)));
@@ -4231,8 +4319,13 @@ TEST(dfly2_chain_launches_each_shared_step_once_a_pass) {
                         const int64_t tp = world > 1 ? 1 : 0;
                         /* D-04: no cast of the logits where the fused shortlist is served */
                         const int64_t lcast = df.steps[0].op_ctopk ? 0 : 1;
-                        const int64_t a_round = 14 + lcast + (i8 ? 2 : 0) + 3 * tp + coupled;
+                        /* K-21: in the band the round's head, cast and stage 1 are one launch */
+                        const int64_t fused_head = (df.steps[0].op_head_topk && n <= 2) ? 1 : 0;
+                        const int64_t a_round = 14 + lcast - fused_head + (i8 ? 2 : 0) + 3 * tp + coupled;
                         const int64_t fixed = (int64_t)c->issues.size() - rounds * a_round;
+                        CHECK_EQ(named("logits_topk"), fused_head ? rounds : 0);
+                        CHECK_EQ(named("logits_gemm"), fused_head ? 0 : rounds);
+                        CHECK_EQ(named("cast_row_topk"), fused_head ? 0 : rounds);
                         if (blk == 6) {
                             Query* q4 = nullptr;
                             auto c4 = d.query(n, 4, world, &q4);
@@ -4745,7 +4838,7 @@ TEST(dfly2_at_tp_splits_heads_and_width_and_merges_the_vocabulary_shards) {
                         add = add || op == st.op_add;
                     }
                     if (op == df.c_d.op || op == df.op_ar_c || add) chain.push_back(i);
-                    if (op == df.steps[0].op_ctopk) ++tk;
+                    if (op == df.steps[0].op_ctopk || (df.steps[0].op_head_topk && op == df.steps[0].op_head_topk)) ++tk;
                     if (op == L.p_out.op) i_out = i;
                     if (op == df.op_ar_o) i_ar = i;
                     if (op == L.op_post || (op == L.op_add1 && i_post == SIZE_MAX)) i_post = std::min(i_post, i);
@@ -4794,8 +4887,11 @@ TEST(the_draft_passes_carry_their_own_pass_keys) {
 /* The debug taps of a query pass: the reference's dump keys (ref/dfly_ref.py), PERSIST, and the
  * trunk's rotated key part (dbg.attn_kv_rope.<l>, every layer). */
 TEST(the_dfly2_taps_are_the_references_keys) {
+    /* The f32 logits plane tap has its own knob: the fused head (K-21) never writes that plane. */
     setenv("RADIANCE_HY4_TAPS", "1", 1);
+    setenv("RADIANCE_HY4_LOGITS_TAPS", "1", 1);
     DeclDfly d;
+    unsetenv("RADIANCE_HY4_LOGITS_TAPS");
     unsetenv("RADIANCE_HY4_TAPS");
     REQUIRE_EQ(d.rc, RAD_OK);
     const char* names[] = { "dbg.dfly.embed", "dbg.dfly.fused", "dbg.dfly.final", "dbg.dfly.tokens",

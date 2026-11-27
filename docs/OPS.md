@@ -2231,7 +2231,10 @@ more than its eight candidates of the row's top eight, and stage 2 ranks their u
 key, so the outputs are the pair's bytes; a slot a block could not fill carries the same -inf key
 `row_topk` pads with. It serves the matvec band (`M <= 2`, where `logits_gemm` runs its matvec), `R
 <= 8` and the int8 head -- an E4M3 head would be a second row on a layout family this build does not
-have; a drafter keeps the head and the pair above that, or with a tap of the f32 plane. `x`
+have. The drafter picks it per chain round, on the round's own row count: a round of at most two
+sequences takes it and a wider one (a c8 step's eight rows) keeps the head and the pair that are
+declared beside it; a tap of the f32 plane (`RADIANCE_HY4_LOGITS_TAPS=1`) needs the two-op path,
+since this op never writes that plane. `x`
 alone is the head's input, so a rank's slice is `n_vocab` columns from `vocab_off`.
 
 **`pair_argmax`** is the merge at R = 1, for a vocab-sharded draft head that wants each position's

@@ -724,7 +724,9 @@ __device__ __forceinline__ lm_s8v e4m3x8_to_bf16(uint32_t lo, uint32_t hi) {
 // Waves per SIMD (R4D_WAVES): FKB = 2 holds 33 KB of LDS, capping a SIMD at six waves; at one
 // block per round, MT = 3 targets seven and MT = 4 six. Without the target the scheduler trades
 // the activation loads' overlap for occupancy, which cost 40% at MT = 4.
-constexpr uint32_t lm_waves(uint32_t mt, uint32_t fkb) {
+// [[maybe_unused]]: only lm_wmma_kernel's instantiations call it, and the host build of this unit
+// (tests/r4d_emu's logits_topk oracle) instantiates none of them.
+[[maybe_unused]] constexpr uint32_t lm_waves(uint32_t mt, uint32_t fkb) {
     return fkb == 2u ? 6u : mt >= 4u ? 6u : mt == 3u ? 7u : mt == 2u ? 9u : 12u;
 }
 
@@ -1123,7 +1125,7 @@ static int rad_logits_gemm_8(const RadArgs* a, RadStream s, bool i8) {
     const RadTensor* y = r4d_opt(a, LG_Y);
     if (!x || !w || !y) return R4D_NO(RAD_E_INVAL);
     if (x->dtype != RAD_BF16) return R4D_NO(RAD_E_DTYPE);
-    if (w->dtype != RAD_I8) return R4D_NO(RAD_E_DTYPE);
+    if (w->dtype != (i8 ? RAD_I8 : RAD_F8E4M3)) return R4D_NO(RAD_E_DTYPE);
     if (y->dtype != RAD_F32) return R4D_NO(RAD_E_DTYPE);
     if (!r4d_contig(w)) return R4D_NO(RAD_E_STRIDE);
 
