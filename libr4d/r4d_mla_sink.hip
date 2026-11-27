@@ -555,7 +555,10 @@ __device__ __forceinline__ void mla_sink_rows_body(
  * maximum and denominator; its values are not read. A batch is the default law's slot count
  * (kMaxSplitsFull), so a launch of that law is one pass -- the load-then-fold it has always done,
  * and the one call the default law makes -- and the widest law's 40 slots are two: the folds' order
- * and their arithmetic are the same either way. */
+ * and their arithmetic are the same either way. A slot the batch does not hold gets a defined value
+ * (den 0, so the fold skips it) instead of a register LLVM would read before writing it: the second
+ * batch of a launch that needs fewer slots than a batch holds has dead slots, and their address
+ * would point past the row's partials. */
 __device__ __forceinline__ void merge_sink_slots(float4& value, float& acc_m, float& den,
                                                  const float* src, int base, int n, int t) {
     float part_max[kMaxSplitsFull], part_den[kMaxSplitsFull];
@@ -567,6 +570,10 @@ __device__ __forceinline__ void merge_sink_slots(float4& value, float& acc_m, fl
             part_max[s] = p[D];
             part_den[s] = p[D + 1];
             part[s] = part_den[s] > 0 ? *(const float4*)(p + 4 * t) : make_float4(0, 0, 0, 0);
+        } else {
+            part_max[s] = -INFINITY;
+            part_den[s] = 0;
+            part[s] = make_float4(0, 0, 0, 0);
         }
 #pragma unroll
     for (int s = 0; s < kMaxSplitsFull; ++s) {
