@@ -93,19 +93,17 @@ __device__ __forceinline__ void embed_lookup_body(
     if (mult == 1.0f) {
         if constexpr (V == 8) {
             /* Two groups a pass, both loaded before either is stored: a 3072-entry row is 384
-             * groups, so a 256-thread block covers it in two. */
+             * groups, so a 256-thread block covers it in two. A thread with no second group reads
+             * its own again, which stays inside the row whatever the width. */
             const uint4* __restrict__ s4 = (const uint4*)src;
             uint4* __restrict__ d4 = (uint4*)dst;
             for (uint32_t j = threadIdx.x; j < nv; j += 2 * kThreads) {
-                const uint4 a = s4[j];
                 const uint32_t j1 = j + kThreads;
-                if (j1 < nv) {
-                    const uint4 b = s4[j1];
-                    d4[j] = a;
-                    d4[j1] = b;
-                } else {
-                    d4[j] = a;
-                }
+                const bool two = j1 < nv;
+                const uint4 a = s4[j];
+                const uint4 b = s4[two ? j1 : j];
+                d4[j] = a;
+                if (two) d4[j1] = b;
             }
         } else {
             for (uint32_t i = threadIdx.x; i < n_embd; i += kThreads) dst[i] = src[i];
