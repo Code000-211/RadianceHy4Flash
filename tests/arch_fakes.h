@@ -569,6 +569,20 @@ extern "C" int rad_op_domain(RadCtx* c, rad_op op) {
         if (h == op) return RAD_DOMAIN_HOST;
     return RAD_DOMAIN_DEVICE;
 }
+/* The layers --ngram-placement-layers named, as the test sets them (rad_ngram_layer_named,
+ * abi/rad_runtime.h): the real one records the parse; the fake records what a case asks for. */
+inline std::vector<int>& fake_ngram_layers() {
+    static std::vector<int> v;
+    return v;
+}
+extern "C" void radtest_set_ngram_layers(const int* layers, int n) {
+    fake_ngram_layers().assign(layers, layers + (n > 0 ? n : 0));
+}
+extern "C" int rad_ngram_layer_named(int layer) {
+    for (int l : fake_ngram_layers())
+        if (l == layer) return 1;
+    return 0;
+}
 /* The second lane, recorded: each issue's lane, and each join's position among the issues. */
 extern "C" int rad_lane(RadCtx* c, int lane) {
     if (lane != 0 && lane != 1) return RAD_E_INVAL;

@@ -13,6 +13,8 @@
 #include "format/radfile.h"
 #include "format/table_copy.h"
 #include "format/table_share.h"
+#include "mem/vram_budget.h"
+#include "place/planner.h"
 
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -21,23 +23,49 @@
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
 
 namespace rad {
-/* The walk, copy_table and join_table_fills are private, as the other bringup tests reach them. */
+/* The walk, copy_table and join_table_fills are private, as the other bringup tests reach them.
+ * copy_table takes the share directory as the load passes it -- Config::ngram_share_dir_for the
+ * layer, its own ram=DIR or the global one -- so a test says which layer it copies for. */
 struct TableFillTestAccess {
     static void hold(Engine& e, std::unique_ptr<RadFile> f) { e.file_ = std::move(f); }
     static int  copy(Engine& e, const uint8_t* src, int64_t n, int64_t foff, bool card, void** out,
-                     std::string* why) {
-        return e.copy_table(src, n, foff, card, out, why);
+                     std::string* why, const std::string& share_dir = std::string()) {
+        return e.copy_table(src, n, foff, card, out, why, share_dir);
     }
     static int    join(Engine& e) { return e.join_table_fills(); }
     static size_t pending(Engine& e) { return e.pending_tables_.size(); }
     static size_t locked(Engine& e) { return e.table_copies_.size(); }
     static size_t pinned(Engine& e) { return e.card_copies_.size(); }
     static size_t shared(Engine& e) { return e.table_shares_.size(); }
+    /* The per-layer disk=DIR path of load_weights: the table's own file, filled from the
+     * container and mapped, replacing the container's bytes for the host gather. */
+    static int    file_map(Engine& e, const uint8_t* src, int64_t n, int64_t foff, void** out,
+                           std::string* why, const std::string& dir) {
+        return e.table_file_map(src, n, foff, out, why, dir);
+    }
+    static size_t files(Engine& e) { return e.table_files_.size(); }
+};
+
+/* resolve_table_placement, driven the way Engine::bringup drives it: the facts, the table's
+ * bytes, and the per-layer bytes the load measured (--ngram-placement-layers tests each asked
+ * layer on its own). */
+struct TableResolveTestAccess {
+    static int resolve(Engine& e, const std::vector<VramFacts>& facts,
+                       const std::vector<int64_t>& emb_bytes,
+                       const std::vector<WeightFootprint>& wfs, int64_t kv_floor,
+                       int64_t ngram_bytes, bool ngram_device, bool ngram_host, int64_t host_late,
+                       const std::map<int, int64_t>& ngram_layer_bytes) {
+        return e.resolve_table_placement(facts, emb_bytes, wfs, kv_floor, ngram_bytes,
+                                         ngram_device, ngram_host, host_late, ngram_layer_bytes);
+    }
+    static const Config& cfg(Engine& e) { return e.cfg_; }
+    static int64_t on_card(Engine& e) { return e.ngram_on_card_bytes_; }
 };
 }  // namespace rad
 

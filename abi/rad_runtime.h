@@ -952,6 +952,14 @@ int rad_lane_join(RadCtx* c, int from, int to);
  * ask at run time. A negative status for a handle that was never declared. Additive export. */
 int rad_op_domain(RadCtx* c, rad_op op);
 
+/* Whether --ngram-placement-layers named this Engram layer -- its table takes a placement of its
+ * own instead of the global --ngram-placement (1 named, 0 not). The parse records it once
+ * (core/config.cpp); it does not depend on the deployment, so no ctx is needed. The step-start
+ * Engram prefetch (hyv4flash_engram.h) reads it: the overlap serves the layers the knob put on a
+ * drive, while the global placement -- all-disk included -- keeps the synchronous path. Additive
+ * export. */
+int rad_ngram_layer_named(int layer);
+
 /* Same, with the ranged value taken from the batch. */
 #define RAD_ISSUE(c, op, ...) rad_issue((c), (op), RAD_OPD(__VA_ARGS__), RAD_N_BATCH)
 #define RAD_ISSUE_N(c, op, n, ...) rad_issue((c), (op), RAD_OPD(__VA_ARGS__), (n))

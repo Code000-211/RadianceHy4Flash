@@ -578,6 +578,15 @@ static bool parse_table_placement(const char* v, TablePlacement* out) {
     return true;
 }
 
+/* The Engram layers --ngram-placement-layers has named in this process (every parse of the flag
+ * or its env adds to it). rad_ngram_layer_named answers from it; the step-start Engram prefetch
+ * gates on it (abi/rad_runtime.h, hyv4flash_engram.h). */
+static std::set<int> g_ngram_layers_named;
+
+extern "C" int rad_ngram_layer_named(int layer) {
+    return g_ngram_layers_named.count(layer) ? 1 : 0;
+}
+
 /* --ngram-placement-layers / RADIANCE_NGRAM_PLACEMENT_LAYERS: the comma list of L=WHERE parsed
  * into Config's per-layer maps. WHERE splits at the item's first '=', so ram=DIR/disk=DIR keep
  * their directory. auto is refused: a layer left to fit tests takes the global placement.
@@ -631,6 +640,7 @@ static bool parse_ngram_layers(const char* spec, Config* c) {
             RAD_ERR("--ngram-placement-layers: layer %d is named twice", l);
             return false;
         }
+        g_ngram_layers_named.insert(l);   /* what rad_ngram_layer_named answers (abi/rad_runtime.h) */
         if (!share_dir.empty()) c->ngram_layer_share_dir[l] = share_dir;
         if (!disk_dir.empty()) c->ngram_layer_disk_dir[l] = disk_dir;
         if (comma == std::string::npos) break;
@@ -1949,14 +1959,16 @@ const ShowRow kShow[] = {
           for (const auto& [l, p] : c.ngram_layer_asked) {
               if (!v.empty()) v += ",";
               v += std::to_string(l) + "=" + table_placement_name(p);
-              const std::string& d = c.ngram_layer_share_dir.count(l)
-                                         ? c.ngram_layer_share_dir.at(l)
-                                         : c.ngram_layer_disk_dir.count(l) ? c.ngram_layer_disk_dir.at(l)
-                                                                           : c.ngram_disk_dir;
-              if (p == TablePlacement::Ram && !c.ngram_layer_share_dir.count(l) && !c.ngram_share_dir.empty())
-                  v += "=" + c.ngram_share_dir;
-              else if (p == TablePlacement::Disk && !d.empty())
-                  v += "=" + d;
+              /* The directory that layer's copy is made in: its own ram=DIR/disk=DIR when the
+                 spec named one, the global ram=DIR/disk=DIR otherwise (Config's own
+                 ngram_share_dir_for/ngram_disk_dir_for, which the load reads). */
+              if (p == TablePlacement::Ram) {
+                  const std::string& rd = c.ngram_share_dir_for(l);
+                  if (!rd.empty()) v += "=" + rd;
+              } else if (p == TablePlacement::Disk) {
+                  const std::string& dd = c.ngram_disk_dir_for(l);
+                  if (!dd.empty()) v += "=" + dd;
+              }
           }
           return v; } },
     { "--vision-tower-placement", [](const Config& c) { return std::string(table_placement_name(c.tower_placement)); } },

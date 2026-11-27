@@ -551,6 +551,11 @@ TEST(the_later_engram_layers_prefetch_at_the_step_start) {
     const rad_buf pf_h = (rad_buf)(pf_ids - b.bufs.data() + 1);
     const rad_buf pm_h = (rad_buf)(pf_mask - b.bufs.data() + 1);
     const rad_buf pr_h = (rad_buf)(pf_rows - b.bufs.data() + 1);
+    /* The prefetch is off by default and gated on the per-layer knob: every case below says
+     * which way RADIANCE_HY4_ENGRAM_PREFETCH and rad_ngram_layer_named stand. */
+    const int named2 = 2;
+    setenv("RADIANCE_HY4_ENGRAM_PREFETCH", "1", 1);
+    radtest_set_ngram_layers(&named2, 1);
     /* A device-placed table: the step is the parent's, nothing hashed or read early. */
     {
         RadCtx c{ .b = &d.b, .batch = &k->b };
@@ -618,9 +623,10 @@ TEST(the_later_engram_layers_prefetch_at_the_step_start) {
         CHECK(first_pf >= 0 && first_pf < pfg_at);                     /* hash before the read */
         CHECK(pfg_at < own2);   /* the step's start, ahead of the layer this read belongs to */
     }
-    /* The A/B arm: RADIANCE_HY4_ENGRAM_PREFETCH=0 leaves the sync-hybrid step of the parent. */
+    /* The gate on the knob: PREFETCH=1 but the layer NOT named by --ngram-placement-layers --
+     * today's global all-disk step, the parent's byte for byte, no second gather into pf_rows. */
     {
-        setenv("RADIANCE_HY4_ENGRAM_PREFETCH", "0", 1);
+        radtest_set_ngram_layers(nullptr, 0);
         RadCtx c{ .b = &d.b, .batch = &k->b };
         for (rad_op h : gathers) c.host_ops.push_back(h);
         hyv4flash::step(&c, &k->b);
@@ -628,8 +634,33 @@ TEST(the_later_engram_layers_prefetch_at_the_step_start) {
         CHECK_LINT(b, &c);
         CHECK_EQ(count_issued(b, c, "engram_ids"), 4);
         CHECK_EQ(count_issued(b, c, "embed_lookup_q"), 2);
-        unsetenv("RADIANCE_HY4_ENGRAM_PREFETCH");
+        radtest_set_ngram_layers(&named2, 1);
     }
+    /* Off by default: PREFETCH unset leaves the parent's step whatever the knob says. */
+    {
+        unsetenv("RADIANCE_HY4_ENGRAM_PREFETCH");
+        RadCtx c{ .b = &d.b, .batch = &k->b };
+        for (rad_op h : gathers) c.host_ops.push_back(h);
+        hyv4flash::step(&c, &k->b);
+        CHECK(c.step_fail.empty());
+        CHECK_LINT(b, &c);
+        CHECK_EQ(count_issued(b, c, "engram_ids"), 4);
+        CHECK_EQ(count_issued(b, c, "embed_lookup_q"), 2);
+    }
+    /* Only =1 turns it on: =0 (the sync-hybrid A/B arm) and any other value leave the parent's
+     * step. */
+    for (const char* v : {"0", "2"}) {
+        setenv("RADIANCE_HY4_ENGRAM_PREFETCH", v, 1);
+        RadCtx c{ .b = &d.b, .batch = &k->b };
+        for (rad_op h : gathers) c.host_ops.push_back(h);
+        hyv4flash::step(&c, &k->b);
+        CHECK(c.step_fail.empty());
+        CHECK_LINT(b, &c);
+        CHECK_EQ(count_issued(b, c, "engram_ids"), 4);
+        CHECK_EQ(count_issued(b, c, "embed_lookup_q"), 2);
+    }
+    unsetenv("RADIANCE_HY4_ENGRAM_PREFETCH");
+    radtest_set_ngram_layers(nullptr, 0);
 }
 
 TEST(last_layer_keeps_cache_writers_at_chunk_height_and_queries_at_output_height) {

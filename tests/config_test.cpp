@@ -1102,6 +1102,29 @@ TEST(the_ngram_layers_spec_parses_per_layer) {
     ::unsetenv("RADIANCE_NGRAM_PLACEMENT_LAYERS");
 }
 
+
+/* The shown row prints the directory each named layer's copy is made in (the review: a layer with
+ * its own ram=DIR printed without the directory). Its own ram=DIR/disk=DIR first, else the global
+ * ram=DIR/disk=DIR, else nothing. */
+TEST(the_shown_ngram_layers_row_prints_the_directory) {
+    LogGuard lg;
+    auto row = [](const Config& c) {
+        for (const diag::ConfigRow& r : diag::config_rows(c))
+            if (r.flag == "--ngram-placement-layers") return r;
+        return diag::ConfigRow{};
+    };
+    Config c;
+    CHECK_EQ(parse({ "--ngram-placement", "disk=/mnt/g",
+                     "--ngram-placement-layers",
+                     "1=ram=/dev/shm,11=disk=/mnt/fast/ng,21=disk,31=ram" },
+                   &c), RAD_OK);
+    CHECK_EQ(row(c).value,
+             std::string("1=ram=/dev/shm,11=disk=/mnt/fast/ng,21=disk=/mnt/g,31=ram"));
+    Config g;
+    CHECK_EQ(parse({ "--ngram-placement-layers", "1=ram" }, &g), RAD_OK);
+    CHECK_EQ(row(g).value, std::string("1=ram"));
+}
+
 /* ram=DIR is ram whose pinned copy is a shared file in DIR; a later plain placement drops the
  * directory, and no other tier takes one. */
 TEST(the_ngram_table_takes_a_directory_for_a_shared_ram_copy) {
