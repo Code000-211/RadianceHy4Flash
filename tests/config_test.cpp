@@ -638,6 +638,7 @@ const std::map<std::string, std::vector<std::string>>& legal_values() {
         { "--state-cache-dtype", { "f16" } },
         { "--kv-resident", { "65536" } },
         { "--host-pool-mib", { "1024" } }, { "--host-headroom-mib", { "2048" } },
+        { "--host-memory-wait-s", { "30" } },
         { "--embedding-placement", { "vram" } },
         { "--vision-tower-placement", { "ram" } }, { "--ngram-placement", { "disk" } },
         { "--debug-draft-oracle", { "/o.txt", "--spec-ngram", "4" } },
@@ -1841,6 +1842,20 @@ TEST(the_download_dir_is_taken_and_left_empty_until_given) {
     Config d;
     CHECK_EQ(parse({ "--download-dir", "/big/models" }, &d), 0);
     CHECK_EQ(d.download_dir, std::string("/big/models"));
+}
+
+/* #273: --host-memory-wait-s is how long a startup a little short of host memory waits for it.
+ * 90 s by default (the stuck-device exit's memory took about a minute to come back), 0 never
+ * waits, and an hour is the most: a restart policy should see a stop, not a server that hangs. */
+TEST(host_memory_wait_is_ninety_seconds_zero_off_at_most_an_hour) {
+    Config c;
+    CHECK_EQ(c.host_memory_wait_s, (int64_t)90);
+    CHECK_EQ(parse({ "--host-memory-wait-s", "0" }, &c), RAD_OK);
+    CHECK_EQ(c.host_memory_wait_s, (int64_t)0);
+    CHECK_EQ(parse({ "--host-memory-wait-s", "3600" }, &c), RAD_OK);
+    CHECK_EQ(c.host_memory_wait_s, (int64_t)3600);
+    CHECK_EQ(parse({ "--host-memory-wait-s", "3601" }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--host-memory-wait-s", "-1" }, &c), RAD_E_INVAL);
 }
 
 /* The last occurrence wins for every flag with a value: scripts append overrides. */

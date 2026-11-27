@@ -307,7 +307,10 @@ int64_t Engine::host_margin_bytes() const {
 
 /* See engine_hostmem.h. */
 bool lockable_room(int64_t need, int64_t still, int64_t margin, bool mlocks,
-                   std::string* why) {
+                   std::string* why, int64_t* short_by) {
+    int64_t no_short = 0;
+    if (!short_by) short_by = &no_short;
+    *short_by = -1;
     long long locked_kb = 0;
     unsigned long long caps = 0;
     {
@@ -328,6 +331,7 @@ bool lockable_room(int64_t need, int64_t still, int64_t margin, bool mlocks,
     }
     if (const int64_t avail = meminfo_bytes("MemAvailable");
         avail >= 0 && avail - still - margin < need) {
+        *short_by = need - (avail - still - margin);
         *why = fmt("%s of memory is available, %s more is still to be allocated (the pinned host "
                    "pools, the prefix cache's host tier, the checkpoint slots and the host "
                    "activation arenas), and this wants %s with %s to spare "
@@ -339,6 +343,7 @@ bool lockable_room(int64_t need, int64_t still, int64_t margin, bool mlocks,
     bool fits = true;
     memory_cgroups([&](const std::string& dir, int64_t room) {
         if (room - still - margin >= need) return true;
+        *short_by = need - (room - still - margin);
         *why = fmt("the memory cgroup at %s leaves %s, %s more is still to be allocated, "
                    "and this wants %s with %s to spare (--host-headroom-mib)", dir.c_str(),
                    humanb(room).c_str(), humanb(still).c_str(), humanb(need).c_str(),
@@ -347,6 +352,15 @@ bool lockable_room(int64_t need, int64_t still, int64_t margin, bool mlocks,
         return false;
     });
     return fits;
+}
+
+/* #273: a fatal lockable_room that waits up to --host-memory-wait-s for a small shortfall, which
+ * after the stuck-device exit is the old process's memory not yet given back (wait_for_room). */
+bool Engine::host_room(int64_t need, int64_t still, int64_t margin, bool mlocks,
+                       std::string* why) const {
+    return wait_for_room(
+        [&](std::string* w, int64_t* s) { return lockable_room(need, still, margin, mlocks, w, s); },
+        need + still + margin, cfg_.host_memory_wait_s * 1000, 5000, why);
 }
 
 /* The most lockable_room(need, still, margin, false) admits, and in `limit` the bound that
@@ -622,10 +636,14 @@ int Engine::resolve_table_placement(const std::vector<VramFacts>& facts,
         emb_why = "no table only embed_lookup reads (an output head tied to it reads it too, "
                   "whole, every step)";
     } else if (emb == TablePlacement::Ram) {
-        if (!emb_room()) {
+        /* Asked for, or in a fleet, a refusal stops startup, so a small shortfall is waited out
+         * (host_room); by default the card takes it instead. */
+        const bool must = emb_asked || broker_;
+        if (must ? !host_room(emb_pin, pools_still, host_margin_bytes(), false, &emb_room_why)
+                 : !emb_room()) {
             /* In a fleet the claim left it out already (Engine::plan): on the card it would come
              * out of the cache's floor. */
-            if (emb_asked || broker_) {
+            if (must) {
                 RAD_ERR("--embedding-placement ram: the token embedding (%s a rank, pinned on "
                         "every rank) cannot be held in host memory: %s. Use vram.",
                         humanb(emb_max).c_str(), emb_room_why.c_str());
@@ -666,8 +684,8 @@ int Engine::resolve_table_placement(const std::vector<VramFacts>& facts,
         }
         std::string why;
         const int64_t pin = (int64_t)cfg_.tp * align_up(tower_max, (int64_t)MiB);
-        if (!lockable_room(pin, pools_still + (int64_t)cfg_.tp * cfg_.embedding_host_mib * MiB,
-                           host_margin_bytes(), false, &why)) {
+        if (!host_room(pin, pools_still + (int64_t)cfg_.tp * cfg_.embedding_host_mib * MiB,
+                       host_margin_bytes(), false, &why)) {
             RAD_ERR("--vision-tower-placement ram: the encoder towers (%s a rank, pinned on every "
                     "rank) cannot be held in host memory: %s. Use vram.", humanb(tower_max).c_str(),
                     why.c_str());
@@ -786,8 +804,12 @@ int Engine::resolve_table_placement(const std::vector<VramFacts>& facts,
     } else {
         std::string card_why, ram_why;
         const bool card = ng == TablePlacement::Auto && ngram_device && card_holds(&card_why);
+        /* Asked for, a refusal stops startup, so a small shortfall is waited out (host_room);
+         * auto falls to the container instead. */
         const bool room =
-            !card && lockable_room(need, still, host_margin_bytes(), !ngram_device, &ram_why);
+            !card && (ng == TablePlacement::Ram
+                          ? host_room(need, still, host_margin_bytes(), !ngram_device, &ram_why)
+                          : lockable_room(need, still, host_margin_bytes(), !ngram_device, &ram_why));
         if (ng == TablePlacement::Ram) {
             if (!room) {
                 RAD_ERR("--ngram-placement ram: the n-gram table (%s) cannot be held in memory as "
@@ -4747,7 +4769,8 @@ int Engine::configure_kv() {
             for (auto& r : ranks_) slot += r->kv.checkpoint_bytes();
             still += slot * cfg_.checkpoint_slots;
         }
-        RAD_TRY(kvstream_host_gate(stream_host, (int)ranks_.size(), still, host_headroom_bytes()));
+        RAD_TRY(kvstream_host_gate(stream_host, (int)ranks_.size(), still, host_headroom_bytes(),
+                                   cfg_.host_memory_wait_s * 1000));
     }
     for (auto& r : ranks_) {
         LogRank lr(r->index);
@@ -4828,7 +4851,7 @@ int Engine::configure_kv() {
             const int64_t marg = host_reserve_for_floor(
                 want_bytes, lockable_bytes(0, host_headroom_bytes(), &guard_why),
                 host_headroom_bytes());
-            if (!lockable_room(want_bytes, 0, marg, false, &why))
+            if (!host_room(want_bytes, 0, marg, false, &why))
                 return refuse("does not fit: " + why);
             if (ck_store_.open(slot, slot * n) != RAD_OK)
                 return refuse(std::string("the host did not pin: ") + rad_dev_last_error());

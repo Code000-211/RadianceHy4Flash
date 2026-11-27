@@ -367,6 +367,10 @@ private:
     /* What a table's or a stream's pin leaves free: the headroom, and in a fleet what the fleet
      * keeps (VramBroker::host_margin). */
     int64_t host_margin_bytes() const;
+    /* lockable_room for a refusal that stops startup: a small shortfall is re-checked for up to
+     * --host-memory-wait-s first (#273, wait_for_room in engine_hostmem.h). */
+    bool host_room(int64_t need, int64_t still, int64_t margin, bool mlocks,
+                   std::string* why) const;
     /* Why a fleet's load put an embedding left to its default on the card; empty if it did not. */
     std::string emb_on_card_why_;
     /* Resolves --embedding-placement, --vision-tower-placement and --ngram-placement into Config
