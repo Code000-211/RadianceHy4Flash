@@ -36641,6 +36641,45 @@ static void hy4_engram_gate_case(const Plugin& pl) {
     }
 }
 
+/* embed_lookup_bf16 with the 16-byte group the emit picks when width, pitch and both bases allow
+ * it (K-28: eight entries a thread from one uint4) and with one entry a thread where they do not: the
+ * real width, a pitched row, a width that is not a multiple of eight, a pitch that is not, a
+ * vocabulary slice whose outside ids are zero rows, and the scaled form. Byte for byte against
+ * libref, row padding untouched. */
+static void hy4_embed_lookup_case(const Plugin& pl) {
+    if (!sel("embed_lookup_bf16")) return;
+    struct G { int64_t M, ne, nv, voff, pad; float mult; };
+    const G gs[] = { { 5, 3072, 11, 0, 0, 1.0f }, { 9, 512, 7, 0, 8, 1.0f },
+                     { 4, 131, 5, 0, 0, 1.0f }, { 3, 256, 3, 0, 2, 1.0f },
+                     { 6, 2560, 9, 64, 0, 1.0f }, { 4, 3072, 11, 0, 0, 55.4256248f } };
+    for (const G& g : gs) {
+        Hy4Rng rng((uint32_t)(g.M * 13 + g.ne + g.nv + (int64_t)g.voff));
+        std::vector<Hy4Opd> ops;
+        ops.push_back(hy_opd(RAD_I32, { g.M }));
+        /* libref refuses an id past the table unless the table is a slice (vocab_offset), where it
+         * is another rank's token and a zero row, as it is here; a negative id is one either way. */
+        hy_fill(ops[0], [&](int64_t i) {
+            if (i == 1) return -1.0;
+            if (g.voff) return (double)(g.voff + (int64_t)rng.r((uint32_t)g.nv + 4) - 2);
+            return (double)rng.r((uint32_t)g.nv);
+        });
+        ops.push_back(hy_opd(RAD_BF16, { g.nv, g.ne }));
+        hy_fill(ops[1], [&](int64_t) { return (double)rng.n(); });
+        ops.push_back(hy_opd(RAD_BF16, { g.M, g.ne }, g.pad ? g.ne + g.pad : 0));
+        ops[2].out = true;   /* a copy, or one f32 product rounded once: exact either way */
+        std::vector<RadParam> ps = { PI("M", g.M), PI("n_embd", g.ne), PI("n_vocab", g.nv),
+                                     PS("dtype", "bf16") };
+        if (g.voff) ps.push_back(PI("vocab_offset", g.voff));
+        if (g.mult != 1.0f) ps.push_back(PF("mult", g.mult));
+        hy_check(pl, "embed_lookup_bf16",
+                 fmt("embed_lookup vs libref, to the bit: M %lld width %lld%s%s%s%s", (long long)g.M,
+                     (long long)g.ne, g.ne % 8 ? ", one entry a thread (width)" : "",
+                     g.pad ? (g.pad % 8 ? ", one entry a thread (pitch)" : ", pitched rows") : "",
+                     g.voff ? ", a vocabulary slice" : "", g.mult != 1.0f ? ", scaled" : ""),
+                 ps, ops);
+    }
+}
+
 /* embed_lookup_q with a scale a table row: an E4M3 table and a plain bf16 one, bf16 and f32 scale
  * planes, ids below, at and past the table, against libref to the bit. */
 static void hy4_embed_row_scale_case(const Plugin& pl) {
@@ -36707,6 +36746,7 @@ static void device_phase(const Plugin& pl) {
     ngram_ahead_case(pl);
     ngram_hint_case(pl);
     embed_lookup_q_case(pl);
+    hy4_embed_lookup_case(pl);
     hy4_embed_row_scale_case(pl);
     hy4_ihc_pre_case(pl);
     hy4_ihc_post_case(pl);
