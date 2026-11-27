@@ -4019,7 +4019,9 @@ TEST(a_pass_head_outside_hc_enters_range_copies_each_stream) {
             bool reads = false, writes = false;
             for (rad_buf r : o.reads) reads = reads || r == embed;
             for (rad_buf w : o.writes) writes = writes || w == streams;
-            decl_copies += reads && writes;
+            if (!reads || !writes) continue;
+            ++decl_copies;
+            CHECK_EQ(pint(&o, "n"), E);   /* the row, not a stream: the copies slice it off */
         }
         CHECK_EQ(enters, 0);
         CHECK_EQ(decl_copies, 1);

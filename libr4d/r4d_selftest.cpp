@@ -35420,6 +35420,7 @@ struct Hy4Opd {
     std::vector<int64_t> shape;
     int64_t pitch = 0;               /* rank 2: elements between rows, 0 for tight */
     std::vector<uint8_t> bytes;      /* the initial bytes, padding included */
+    int64_t skew = 0;                /* bytes before the tensor: a base off its 16-byte alignment */
     bool absent = false, out = false;
     double rtol = 0, atol = 0;       /* an output's bound; 0 and 0 is exact */
     RadTensor tensor(void* data) const {
@@ -35501,15 +35502,17 @@ static bool hy_check(const Plugin& pl, const char* row_name, const std::string& 
     std::vector<RadTensor> ht(n), dt(n);
     std::vector<void*> dev(n, nullptr);
     for (size_t i = 0; i < n; ++i) {
-        host[i] = ops[i].bytes;
-        ht[i] = ops[i].tensor(ops[i].absent ? nullptr : host[i].data());
+        const size_t sk = (size_t)ops[i].skew;
+        host[i].assign(sk, 0);
+        host[i].insert(host[i].end(), ops[i].bytes.begin(), ops[i].bytes.end());
+        ht[i] = ops[i].tensor(ops[i].absent ? nullptr : host[i].data() + sk);
         if (ops[i].absent) { dt[i] = ht[i]; continue; }
         const size_t b = ops[i].bytes.size();
-        dev[i] = dalloc(b + 256);
+        dev[i] = dalloc(b + 256 + sk);
         if (!dev[i]) { ok(what.c_str(), false, "allocation failed"); return false; }
-        st_memset(dev[i], 0xa5, b + 256);
-        st_memcpy((char*)dev[i] + 128, ops[i].bytes.data(), b, hipMemcpyHostToDevice);
-        dt[i] = ops[i].tensor((char*)dev[i] + 128);
+        st_memset(dev[i], 0xa5, b + 256 + sk);
+        st_memcpy((char*)dev[i] + 128 + sk, ops[i].bytes.data(), b, hipMemcpyHostToDevice);
+        dt[i] = ops[i].tensor((char*)dev[i] + 128 + sk);
     }
     RadArgs ao{};
     ao.t = ht.data(); ao.n_t = (int)n; ao.p = ps.data(); ao.n_p = (int)ps.size(); ao.world_size = 1;
@@ -35531,18 +35534,21 @@ static bool hy_check(const Plugin& pl, const char* row_name, const std::string& 
     for (size_t i = 0; i < n; ++i) {
         if (ops[i].absent) continue;
         const size_t b = ops[i].bytes.size();
-        std::vector<uint8_t> got(b + 256);
-        st_memcpy(got.data(), dev[i], b + 256, hipMemcpyDeviceToHost);
-        for (size_t j = 0; j < 128; ++j) zones = zones && got[j] == 0xa5 && got[b + 128 + j] == 0xa5;
+        const size_t sk = (size_t)ops[i].skew;
+        std::vector<uint8_t> got(b + 256 + sk);
+        st_memcpy(got.data(), dev[i], b + 256 + sk, hipMemcpyDeviceToHost);
+        for (size_t j = 0; j < 128; ++j) zones = zones && got[j] == 0xa5 && got[b + 128 + sk + j] == 0xa5;
+        for (size_t j = 0; j < sk; ++j) zones = zones && got[128 + j] == 0xa5;
+        const uint8_t* g0 = got.data() + 128 + sk;
         if (!ops[i].out) {      /* an input must come back as it went */
-            zones = zones && std::memcmp(got.data() + 128, ops[i].bytes.data(), b) == 0;
+            zones = zones && std::memcmp(g0, ops[i].bytes.data(), b) == 0;
             continue;
         }
         std::vector<char> live(b / esz(ops[i].dt), 0);
         for (int64_t off : hy_offsets(ht[i])) {
             live[(size_t)off] = 1;
-            const double e = hy_get(ops[i].dt, host[i].data(), off);
-            const double g = hy_get(ops[i].dt, got.data() + 128, off);
+            const double e = hy_get(ops[i].dt, host[i].data() + sk, off);
+            const double g = hy_get(ops[i].dt, g0, off);
             const double tol = ops[i].atol + ops[i].rtol * std::fabs(e);
             ++total;
             const bool same = std::isfinite(g) && std::fabs(g - e) <= tol;
@@ -35554,7 +35560,7 @@ static bool hy_check(const Plugin& pl, const char* row_name, const std::string& 
         }
         const size_t es = esz(ops[i].dt);
         for (size_t off = 0; off < live.size(); ++off)
-            if (!live[off] && std::memcmp(got.data() + 128 + off * es, ops[i].bytes.data() + off * es, es))
+            if (!live[off] && std::memcmp(g0 + off * es, ops[i].bytes.data() + off * es, es))
                 padding = false;
     }
     char msg[300];
@@ -36643,15 +36649,18 @@ static void hy4_engram_gate_case(const Plugin& pl) {
 
 /* embed_lookup_bf16 with the 16-byte group the emit picks when width, pitch and both bases allow
  * it (K-28: eight entries a thread from one uint4) and with one entry a thread where they do not: the
- * real width, a pitched row, a width that is not a multiple of eight, a pitch that is not, a
- * vocabulary slice whose outside ids are zero rows, and the scaled form. Byte for byte against
- * libref, row padding untouched. */
+ * real width, a pitched row, a width that is not a multiple of eight, a pitch that is not, a base
+ * that is only two-byte aligned, a vocabulary slice whose outside ids are zero rows, and the scaled
+ * form. Byte for byte against libref, row padding untouched. */
 static void hy4_embed_lookup_case(const Plugin& pl) {
     if (!sel("embed_lookup_bf16")) return;
-    struct G { int64_t M, ne, nv, voff, pad; float mult; };
-    const G gs[] = { { 5, 3072, 11, 0, 0, 1.0f }, { 9, 512, 7, 0, 8, 1.0f },
-                     { 4, 131, 5, 0, 0, 1.0f }, { 3, 256, 3, 0, 2, 1.0f },
-                     { 6, 2560, 9, 64, 0, 1.0f }, { 4, 3072, 11, 0, 0, 55.4256248f } };
+    struct G { int64_t M, ne, nv, voff, pad; float mult; int64_t xskew, wskew; };
+    const G gs[] = { { 5, 3072, 11, 0, 0, 1.0f, 0, 0 }, { 9, 512, 7, 0, 8, 1.0f, 0, 0 },
+                     { 4, 131, 5, 0, 0, 1.0f, 0, 0 }, { 3, 256, 3, 0, 2, 1.0f, 0, 0 },
+                     { 6, 2560, 9, 64, 0, 1.0f, 0, 0 }, { 4, 3072, 11, 0, 0, 55.4256248f, 0, 0 },
+                     /* width and pitch multiples of eight, one base off its 16-byte alignment: the
+                      * emit's alignment test alone takes the one-entry path here */
+                     { 5, 512, 7, 0, 0, 1.0f, 2, 0 }, { 5, 512, 7, 0, 0, 1.0f, 0, 2 } };
     for (const G& g : gs) {
         Hy4Rng rng((uint32_t)(g.M * 13 + g.ne + g.nv + (int64_t)g.voff));
         std::vector<Hy4Opd> ops;
@@ -36665,16 +36674,20 @@ static void hy4_embed_lookup_case(const Plugin& pl) {
         });
         ops.push_back(hy_opd(RAD_BF16, { g.nv, g.ne }));
         hy_fill(ops[1], [&](int64_t) { return (double)rng.n(); });
+        ops[1].skew = g.wskew;
         ops.push_back(hy_opd(RAD_BF16, { g.M, g.ne }, g.pad ? g.ne + g.pad : 0));
+        ops[2].skew = g.xskew;
         ops[2].out = true;   /* a copy, or one f32 product rounded once: exact either way */
         std::vector<RadParam> ps = { PI("M", g.M), PI("n_embd", g.ne), PI("n_vocab", g.nv),
                                      PS("dtype", "bf16") };
         if (g.voff) ps.push_back(PI("vocab_offset", g.voff));
         if (g.mult != 1.0f) ps.push_back(PF("mult", g.mult));
         hy_check(pl, "embed_lookup_bf16",
-                 fmt("embed_lookup vs libref, to the bit: M %lld width %lld%s%s%s%s", (long long)g.M,
-                     (long long)g.ne, g.ne % 8 ? ", one entry a thread (width)" : "",
+                 fmt("embed_lookup vs libref, to the bit: M %lld width %lld%s%s%s%s%s%s",
+                     (long long)g.M, (long long)g.ne, g.ne % 8 ? ", one entry a thread (width)" : "",
                      g.pad ? (g.pad % 8 ? ", one entry a thread (pitch)" : ", pitched rows") : "",
+                     g.xskew ? ", one entry a thread (x off 16-byte alignment)" : "",
+                     g.wskew ? ", one entry a thread (wte off 16-byte alignment)" : "",
                      g.voff ? ", a vocabulary slice" : "", g.mult != 1.0f ? ", scaled" : ""),
                  ps, ops);
     }
