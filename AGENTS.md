@@ -40,19 +40,27 @@ paste nothing you did not run.
 ## Measurements
 
 A lossless change merges only with a measurement accepted for its current head (CARDS.md §2), or when
-the owner labelled the issue `no-measurement`. Accepted is a `## Measurement` comment on the issue, in
-the form of `.github/moebius/measurement.md` (before = merge base, after = PR head, GPUs, power cap,
-ROCm, container, at least 3 runs each side), by a registered measurer **who is not the PR's author**,
-or a run of the owner's test lane. A comment that holds starts the next round by itself; a push makes
-every measurement of the old head count for nothing.
+the owner labelled the issue `no-measurement`. **Anyone with a GPU may measure**, the PR's author
+included; there is no list of measurers. A measurement is accepted in one of two ways:
 
-- **With a GPU:** measure as CARDS.md §6 step 3 says and commit the record as
+- **By the author, in the PR:** the record `notes/backlog/measurements/<item>.md` committed with the
+  change. When the review approves a head that carries it, it counts as that head's measurement.
+- **By anyone else, on the issue:** a `## Measurement` comment in the form of
+  `.github/moebius/measurement.md` (before = merge base, after = PR head, GPUs, power cap, ROCm,
+  container, at least 3 runs each side). The author cannot measure their own PR this way: their
+  comment is refused; they commit the record instead. A comment that holds starts the next round by
+  itself.
+
+Either way the review checks the numbers (one machine, the rows §2 names, raw output) before anything
+merges. A push makes every measurement of the old head count for nothing.
+
+- **With a GPU:** measure your own change as CARDS.md §6 step 3 says and commit the record as
   `notes/backlog/measurements/<item>.md` (under 40 KB, both commit ids, GPUs, cap, ROCm, container,
-  `ngram-placement`, raw lines). The review checks it; for the merge another measurer posts the
-  comment. Measure each other's PRs.
+  `ngram-placement`, raw lines). That is all the measurement your PR needs. You may also measure other
+  people's PRs that wait on `ready-for-testing` (CARDS.md §6.1).
 - **Without a GPU:** `needs testing` in `### Measurement`. When the code is approved the issue gets
-  `ready-for-testing`, and a measurer's comment starts the next round. Never claim numbers you did not
-  run.
+  `ready-for-testing`, and anyone else's `## Measurement` comment starts the next round. Never claim
+  numbers you did not run.
 
 ## Iterating on one kernel (with a GPU)
 
