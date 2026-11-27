@@ -3459,9 +3459,11 @@ ihc_pre (hc_head), rmsnorm (output_norm), gather_rows, logits_gemm
   equals the selection form, a row's bytes are its own, the fused and split forms agree, the launch
   stays inside the f64 reference's bound -- and what it moves is the fold's order: the output's last
   bits (32 of 24 576 values in the emulator, 1.2e-4 at most). A window's own super-chunk is 64
-  either way and does not move. Off by default; the KL it costs is
-  `notes/backlog/lossy/F-16.md`'s. Any value but 64 is refused by the sink (`RAD_E_UNSUPPORTED`)
-  rather than run as one of the two laws.
+  either way and does not move. Off by default: unset, or any value but `64`, leaves every sink op --
+  the model's and the drafter's -- without the parameter, so the declaration is the one it was and
+  nothing keyed on an op's parameters (a recorded pass, a tuned plan) sees a different sink. An op
+  whose `sink_sc` is anything but 0 or 64 is refused by the sink (`RAD_E_UNSUPPORTED`) rather than run
+  as one of the two laws. The KL it costs is `notes/backlog/lossy/F-16.md`'s.
 - **Arena levels and the prefill stager.** The probe sets `shape_probe_ok`, and a sizing declare
   (`RadBuildCtx::shape_probe`) fills a thread-local model of its own, so the core declares again at
   256 and 1024 rows (4x steps below the chunk), lends the arena above a level to the expert slab

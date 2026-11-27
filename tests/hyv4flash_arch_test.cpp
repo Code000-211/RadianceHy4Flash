@@ -182,6 +182,37 @@ int count_issued(const RadBuilder& b, const RadCtx& c, const char* op) {
     return n;
 }
 
+/* Every op of a declaration as one line: the op's name, then each parameter as `key=ival/dval/sval`.
+ * The whole declaration, so a test can say "this and only this moved". */
+std::vector<std::string> ops_snapshot(const RadBuilder& b) {
+    std::vector<std::string> s;
+    for (const auto& o : b.ops) {
+        std::string line = o.op;
+        for (const auto& p : o.p)
+            line += " " + p.key + "=" + std::to_string(p.ival) + "/" + std::to_string(p.dval) +
+                    "/" + p.sval;
+        s.push_back(line);
+    }
+    return s;
+}
+
+/* The sinks of a declaration, in order: the paged instance (the sliding layers, the verify) and the
+ * selection form (the sparse layers, the drafter). */
+std::vector<const RecOp*> sink_ops(const RadBuilder& b, int* paged = nullptr, int* sel = nullptr) {
+    std::vector<const RecOp*> v;
+    for (const auto& o : b.ops) {
+        if (o.op == "mla_attn_paged_sink") {
+            if (paged) ++*paged;
+        } else if (o.op == "mla_attn_sel_sink") {
+            if (sel) ++*sel;
+        } else {
+            continue;
+        }
+        v.push_back(&o);
+    }
+    return v;
+}
+
 }  // namespace
 
 /* WP16.0c / WP16.1a: the whole-on-every-rank paged groups are declared replicated at every world
@@ -892,46 +923,24 @@ TEST(a_decode_only_step_folds_the_query_rotary_into_the_sinks) {
  * it every sink op carries `sink_sc` 64 (one parameter, once), and no other op gains, loses or
  * changes a parameter; unset, or any other value, leaves every op as it was. */
 TEST(the_sink_super_chunk_switch_is_the_sinks_alone) {
-    /* op name, then every parameter as `key=value` (the integer form, which is what sink_sc is). */
-    auto snapshot = [](const RadBuilder& b) {
-        std::vector<std::string> s;
-        for (const auto& o : b.ops) {
-            std::string line = o.op;
-            for (const auto& p : o.p)
-                line += " " + p.key + "=" + std::to_string(p.ival) + "/" +
-                        std::to_string(p.dval) + "/" + p.sval;
-            s.push_back(line);
-        }
-        return s;
-    };
-    auto sinks = [](const RadBuilder& b, int& paged, int& sel) {
-        std::vector<const RecOp*> v;
-        for (const auto& o : b.ops) {
-            if (o.op == "mla_attn_paged_sink") ++paged;
-            else if (o.op == "mla_attn_sel_sink") ++sel;
-            else continue;
-            v.push_back(&o);
-        }
-        return v;
-    };
     unsetenv("RADIANCE_HY4_SINK_SC");
     Declared off;
     REQUIRE_EQ(off.rc, RAD_OK);
     int paged_off = 0, sel_off = 0;
-    const auto sinks_off = sinks(off.b, paged_off, sel_off);
+    const auto sinks_off = sink_ops(off.b, &paged_off, &sel_off);
     /* The model's sinks: the sparse layers through the selection form, the sliding ones through the
      * paged instance, plus the verify's instances. */
     CHECK(paged_off > 0);
     CHECK(sel_off > 0);
     for (const RecOp* o : sinks_off) CHECK(param(o, "sink_sc") == nullptr);
-    const std::vector<std::string> before = snapshot(off.b);
+    const std::vector<std::string> before = ops_snapshot(off.b);
 
     setenv("RADIANCE_HY4_SINK_SC", "64", 1);
     Declared on;
     unsetenv("RADIANCE_HY4_SINK_SC");
     REQUIRE_EQ(on.rc, RAD_OK);
     int paged_on = 0, sel_on = 0;
-    const auto sinks_on = sinks(on.b, paged_on, sel_on);
+    const auto sinks_on = sink_ops(on.b, &paged_on, &sel_on);
     CHECK_EQ(paged_on, paged_off);
     CHECK_EQ(sel_on, sel_off);
     for (const RecOp* o : sinks_on) {
@@ -944,7 +953,7 @@ TEST(the_sink_super_chunk_switch_is_the_sinks_alone) {
     }
     /* Every op, in the declaration's order, and every parameter of it, save the one parameter this
      * switch adds to the sinks: the switch moves nothing else. */
-    const std::vector<std::string> after = snapshot(on.b);
+    const std::vector<std::string> after = ops_snapshot(on.b);
     REQUIRE_EQ(after.size(), before.size());
     for (size_t i = 0; i < after.size(); ++i) {
         std::string want = before[i];
@@ -964,8 +973,8 @@ TEST(the_sink_super_chunk_switch_is_the_sinks_alone) {
         unsetenv("RADIANCE_HY4_SINK_SC");
         REQUIRE_EQ(d.rc, RAD_OK);
         int paged = 0, sel = 0;
-        for (const RecOp* o : sinks(d.b, paged, sel)) CHECK(param(o, "sink_sc") == nullptr);
-        CHECK(snapshot(d.b) == before);
+        for (const RecOp* o : sink_ops(d.b, &paged, &sel)) CHECK(param(o, "sink_sc") == nullptr);
+        CHECK(ops_snapshot(d.b) == before);
     }
 }
 
@@ -3327,6 +3336,56 @@ const char* kTrunkOnly[] = { "qsa_work", "qsa_work_pool_tail", "qsa_tail_store",
                              "idx_pool_gated_fp8", "dsa_score", "attn_kv_sink",
                              "mla_attn_paged_sink" };
 }  // namespace
+
+/* F-16, opt-in (issue #143 review, the blocking finding): the drafter's sink carries the super-chunk
+ * exactly as the model's sinks do -- the parameter at 64 with the switch, and none at all without it,
+ * so a default build's drafter is the op it was (nothing keyed on an op's parameters -- a recorded
+ * pass, a tuned plan -- sees a different drafter). The model's own sinks are the same test's other
+ * half, `the_sink_super_chunk_switch_is_the_sinks_alone`. */
+TEST(the_drafters_sink_takes_the_super_chunk_only_when_the_switch_names_it) {
+    unsetenv("RADIANCE_HY4_SINK_SC");
+    DeclDfly off;
+    REQUIRE_EQ(off.rc, RAD_OK);
+    REQUIRE(off.b.drafter.kind != RAD_DRAFT_NONE);
+    const RecOp* sink_off = off.b.op_of(off.df().lay[0].op_attn);
+    REQUIRE(sink_off != nullptr);
+    CHECK_EQ(sink_off->op, std::string("mla_attn_sel_sink"));
+    CHECK(param(sink_off, "sink_sc") == nullptr);
+    const std::vector<std::string> before = ops_snapshot(off.b);
+
+    setenv("RADIANCE_HY4_SINK_SC", "64", 1);
+    DeclDfly on;
+    unsetenv("RADIANCE_HY4_SINK_SC");
+    REQUIRE_EQ(on.rc, RAD_OK);
+    const RecOp* sink_on = on.b.op_of(on.df().lay[0].op_attn);
+    REQUIRE(sink_on != nullptr);
+    CHECK_EQ(sink_on->op, std::string("mla_attn_sel_sink"));
+    int n = 0;
+    for (const auto& p : sink_on->p) n += p.key == "sink_sc";
+    CHECK_EQ(n, 1);
+    CHECK_EQ(pint(sink_on, "sink_sc"), 64);
+
+    /* Every op and every parameter of the drafter's step, in order, save the one parameter this
+     * switch adds to the sinks: the drafter's declaration moves nothing else. */
+    const std::vector<const RecOp*> sinks_off = sink_ops(off.b);
+    const std::vector<std::string> after = ops_snapshot(on.b);
+    REQUIRE_EQ(after.size(), before.size());
+    for (size_t i = 0; i < after.size(); ++i) {
+        bool is_sink = false;
+        for (const RecOp* o : sinks_off) is_sink = is_sink || o == &off.b.ops[i];
+        if (!is_sink) CHECK(after[i] == before[i]);
+        else CHECK_EQ(after[i], before[i] + " sink_sc=64/0.000000/");
+    }
+    /* Another value, and an empty one: the law, and the drafter's sink with no parameter at all. */
+    for (const char* v : { "0", "128", "" }) {
+        setenv("RADIANCE_HY4_SINK_SC", v, 1);
+        DeclDfly d;
+        unsetenv("RADIANCE_HY4_SINK_SC");
+        REQUIRE_EQ(d.rc, RAD_OK);
+        CHECK(param(d.b.op_of(d.df().lay[0].op_attn), "sink_sc") == nullptr);
+        CHECK(ops_snapshot(d.b) == before);
+    }
+}
 
 /* kernels/dfly2.md §3.1: a block drafter of block depth + 1 (the anchor predicts nothing), no cache
  * of its own and window 1 (§3.5 point 1), its proposals at the depth's pitch, the trunk's mask id. */

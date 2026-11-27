@@ -813,15 +813,18 @@ struct Dfly {
             };
             d.op_absorb = proj("absorb", q_nope, q_lat);
             d.op_resolve = kv_resolve_declare(b, g, kvg, d.tab, d.cnt, W);
-            d.op_attn = mk(b, "mla_attn_sel_sink",
-                           { RAD_RANGE("M", 1, Md), RAD_INT("heads", H), RAD_INT("latent_dim", L),
-                             RAD_INT("rope_dim", RO), RAD_INT("blocks", W),
-                             RAD_INT("block_size", s.ix_pool), RAD_F64("scale", scale),
-                             RAD_STR("dtype", "bf16"),
-                             /* F-16, opt-in: the drafter's sink takes the same super-chunk at
-                              * window 0 and in the selection form as the model's. */
-                             RAD_INT("sink_sc", sink_sc()) },
-                           { d.sinks }, { q_lat, q_rope, d.tab, d.len }, { lat });
+            /* F-16, opt-in: the drafter's sink takes the same super-chunk at window 0 and in the
+             * selection form as the model's own, and, like the model's, only when the switch names
+             * it: unset leaves the op the one it was (no `sink_sc` at all), so nothing keyed on the
+             * op's parameters -- a recorded pass, a tuned plan -- sees a different drafter. */
+            std::vector<RadParam> attn_ps = {
+                RAD_RANGE("M", 1, Md), RAD_INT("heads", H), RAD_INT("latent_dim", L),
+                RAD_INT("rope_dim", RO), RAD_INT("blocks", W),
+                RAD_INT("block_size", s.ix_pool), RAD_F64("scale", scale),
+                RAD_STR("dtype", "bf16") };
+            if (const int64_t sc = sink_sc()) attn_ps.push_back(RAD_INT("sink_sc", sc));
+            d.op_attn = mk_list(b, "mla_attn_sel_sink", attn_ps, { d.sinks },
+                                { q_lat, q_rope, d.tab, d.len }, { lat });
             d.op_expand = proj("expand", lat, ao);
             d.op_gmul = mk(b, "gate_mul",
                            { RAD_RANGE("M", 1, Md), RAD_INT("n", H * VD), RAD_STR("dtype", "bf16") },
