@@ -437,7 +437,12 @@ static const RadConstraint cPagedBlock[] = { RAD_CGE("block_size", 1) };
 
 static const RadParamSpec pAttnDense[]   = { P_INT("M"), P_INT("head_dim"), P_INT("gqa"),
                                              P_INT("causal"), P_STR("dtype"), P_F64O("scale"),
-                                             P_INTO("max_seqlen"), P_INTO("window"),
+                                             /* A capacity: the sizing declare runs at a smaller
+                                              * max_tok and may declare a smaller bound than the
+                                              * real one the kernel was chosen with. */
+                                             { "max_seqlen", RAD_P_INT, RAD_OPTIONAL,
+                                               RAD_PROLE_CAPACITY },
+                                             P_INTO("window"),
                                              P_INTO("cu_div"), P_INTO("block"),
                                              P_INTO("window_right") };
 static const RadOperandSpec oAttnDense[] = { OPD("q"), OPD("k"), OPD("v"), OPD("cu_seqlens"),
