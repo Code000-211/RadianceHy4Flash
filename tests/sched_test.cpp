@@ -1287,6 +1287,43 @@ static void exact_fixture(Fixture& f, int kind) {
     f.cfg.prefix_exact = true;
 }
 
+/* #236: the prefix cache keys a block by its cold chunk (exact_keys), so it must be told the grid
+ * and the span rule this scheduler cuts by -- the span_min a lone prefill spans from, -1 where
+ * nothing spans -- at start and whenever the engine resolves --prefill-span-min. Nearest tells it
+ * nothing, so its keys stay those of a build without exact. */
+TEST(exact_resume_hands_the_prefix_cache_its_grid_and_span_rule) {
+    {
+        Fixture f;
+        exact_fixture(f, 2);                       /* span 2: grid 512 from 256 */
+        REQUIRE_EQ(f.start(), RAD_OK);
+        CHECK_EQ(f.pc.exact.grid, 512);
+        CHECK_EQ(f.pc.exact.origin, 256);
+        CHECK_EQ(f.pc.exact.span_min, 0);         /* every lone prefill spans until told */
+        f.sch.set_span_min(3000);
+        CHECK_EQ(f.pc.exact.span_min, 3000);
+        f.sch.set_span_min(0);
+        CHECK_EQ(f.pc.exact.span_min, 0);
+    }
+    {
+        Fixture f;
+        exact_fixture(f, 0);                       /* no span: nothing a prompt's length cuts */
+        REQUIRE_EQ(f.start(), RAD_OK);
+        CHECK_EQ(f.pc.exact.grid, 256);
+        CHECK_EQ(f.pc.exact.origin, 0);
+        CHECK_EQ(f.pc.exact.span_min, -1);
+        f.sch.set_span_min(3000);
+        CHECK_EQ(f.pc.exact.span_min, -1);
+    }
+    {
+        Fixture f;
+        exact_fixture(f, 2);
+        f.cfg.prefix_exact = false;
+        REQUIRE_EQ(f.start(), RAD_OK);
+        f.sch.set_span_min(3000);
+        CHECK_EQ(f.pc.exact.grid, 0);
+    }
+}
+
 TEST(exact_resume_grid_is_the_chunk_an_idle_prefill_cuts) {
     struct Want { int kind; int64_t interval, grid, origin; };
     for (const Want w : { Want{ 0, 256, 256, 0 }, Want{ 1, 1024, 512, 0 }, Want{ 2, 256, 512, 256 },

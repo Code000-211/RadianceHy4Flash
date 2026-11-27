@@ -248,7 +248,10 @@ void Engine::pcache_page_in(const Request& req) {
     if (!pstore_) return;
     Rank& lead = *ranks_[0];
     std::vector<MMContentKey> mm;
-    media_keys(req, &mm, cvec_salt_for(req.sp.use_control_vector));
+    /* The binding's keys, the exact grid's chunks included, so a page-in finds what lookups do. */
+    if (!pc_iface_) return;
+    static_cast<const PCBinding<PrefixCache>*>(pc_iface_.get())
+        ->request_keys(req, cvec_salt_for(req.sp.use_control_vector), &mm);
     PcPageIn r;
     (void)pc_page_in(lead.prefix, lead.tiers, ck_store_.enabled() ? &ck_store_ : nullptr, *pstore_,
                      req.prompt, mm, &r);
