@@ -4519,12 +4519,12 @@ TEST(the_trunk_writes_its_selection_into_the_snapshot_and_clears_it_on_a_dense_s
         hyv4flash::step(&c, &k->b);
         CHECK(c.step_fail.empty());
         CHECK_LINT(d.b, &c);
-        size_t sel = SIZE_MAX, cp = SIZE_MAX, zero = SIZE_MAX, attn = SIZE_MAX;
+        size_t sel = SIZE_MAX, zero = SIZE_MAX, attn = SIZE_MAX;
         int cps = 0, zeros = 0;
         for (size_t i = 0; i < c.issues.size(); ++i) {
             const rad_op op = c.issues[i].op;
             if (op == m.layers[2].ix.op_select && sel == SIZE_MAX) sel = i;
-            if (op == m.df.op_sel) { cp = i; ++cps; }
+            if (op == m.df.op_sel) ++cps;
             if (op == m.df.op_zero) { zero = i; ++zeros; }
             if ((op == m.layers[2].attn.op_sel || op == m.layers[2].attn.op_paged) &&
                 attn == SIZE_MAX)
