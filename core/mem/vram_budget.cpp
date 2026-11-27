@@ -495,4 +495,15 @@ void vram_budget_need(const std::vector<VramFacts>& per_rank, int64_t* need, int
     *want = fixed + experts + std::max(kv_ceiling, kv_one) + 2 * kMiB;
 }
 
+QueueProbe vram_queue_cost(const std::vector<int64_t>& free_readings) {
+    QueueProbe q;
+    for (size_t i = 1; i < free_readings.size(); ++i) {
+        const int64_t drop = free_readings[i - 1] - free_readings[i];
+        if (drop <= kKeptQueueSlack) continue;
+        q.bytes = q.fresh ? std::min(q.bytes, drop) : drop;
+        ++q.fresh;
+    }
+    return q;
+}
+
 }  /* namespace rad */

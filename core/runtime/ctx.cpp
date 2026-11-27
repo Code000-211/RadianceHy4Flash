@@ -6,6 +6,7 @@
 #include "kvstream/bind.h"
 #include "kvstream/stage.h"
 #include "xp_state.h"
+#include "w2_state.h"
 #include "../device/device.h"
 #include "../plugin/registry.h"
 
@@ -63,6 +64,7 @@ int Ctx::init(const CtxDesc& d) {
 void Ctx::shutdown() {
     oracle_close();
     xp_close();
+    w2_close();
     /* Teardown sync, before freeing memory the streams may still use: the routing staging is the
      * destination of unwaited copies (spec §5.5) and the arena holds every kernel's operands. */
     if (stream_) rad_stream_sync(stream_);
@@ -1133,6 +1135,8 @@ uint64_t Ctx::pass_key(const RadBatch* b) const {
         mix(geometry);
     }
     mix((uint64_t)level_);
+    /* W2 (w2.h): a layer takes the form from the pass that binds it. Off, nothing is mixed. */
+    if (w2_) mix(w2_->epoch);
     mix(dense_epoch_);
     mix(domain_epoch_.load(std::memory_order_relaxed));
     ptr(arena_.base());
@@ -1359,6 +1363,7 @@ bool Ctx::tapes_agree(const PassTape& a, const PassTape& b, std::string* why) {
 
 int Ctx::play_pass(PassTape& t) {
     const int l0 = lane_;
+    if (t.w2) w2_kick();
     for (const TapeStep& st : t.steps) {
         int rc = RAD_OK;
         switch (st.kind) {

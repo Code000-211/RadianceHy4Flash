@@ -1,0 +1,51 @@
+diff --git a/tools/kbench_timer.cpp b/tools/kbench_timer.cpp
+index ebb085ce2..97a127f35 100644
+--- a/tools/kbench_timer.cpp
++++ b/tools/kbench_timer.cpp
+@@ -15,6 +15,9 @@
+ #include <set>
+ #include <unistd.h>
+ 
++extern "C" void* rad_dev_alloc_uncached(int64_t bytes);
++extern "C" void  rad_dev_free_uncached(void* p);
++
+ namespace rad {
+ namespace kb {
+ 
+@@ -152,7 +155,7 @@ struct DeviceTimer::Prepared {
+     std::vector<Rot>   rot;
+     std::vector<Tab>   tab;
+     std::vector<Store> restores;
+-    std::vector<void*> frees;
++    std::vector<void*> frees, frees_unc;
+     int64_t R = 1;
+     int64_t next = 0;               /* the launch index, continued across batches */
+     /* Measured behind the gate: submissions a unit (restores plus launch) and a restore set take,
+@@ -526,13 +529,16 @@ bool DeviceTimer::prepare(Held& h, Prepared* p, std::string* why) {
+         uint8_t* base = (uint8_t*)d.t.data;
+         uint8_t* arena = nullptr;
+         if (p->R > 1) {
+-            arena = (uint8_t*)rad_dev_alloc(p->R * stride, RAD_MEM_DEVICE);
++            /* W2 microbench: the rotated weights in uncached device memory (the prefetch ring's kind). */
++            static const bool unc = std::getenv("RAD_KBENCH_ROT_UNCACHED") != nullptr;
++            arena = unc ? (uint8_t*)rad_dev_alloc_uncached(p->R * stride)
++                        : (uint8_t*)rad_dev_alloc(p->R * stride, RAD_MEM_DEVICE);
+             if (!arena) {
+                 *why = "no device memory for " + std::to_string(p->R) + " rotated copies of " +
+                        humanb(d.bytes);
+                 return false;
+             }
+-            p->frees.push_back(arena);
++            (unc ? p->frees_unc : p->frees).push_back(arena);
+             /* The original into the first copy, then the filled prefix doubled. */
+             int rc = rad_memcpy_async(arena, base, d.bytes, s_);
+             for (int64_t have = 1; have < p->R && rc >= 0; have *= 2)
+@@ -571,6 +577,8 @@ void DeviceTimer::release(Prepared* p) {
+     (void)rad_stream_sync(s_);
+     for (void* f : p->frees) rad_dev_free(f, RAD_MEM_DEVICE);
+     p->frees.clear();
++    for (void* f : p->frees_unc) rad_dev_free_uncached(f);
++    p->frees_unc.clear();
+ }
+ 
+ void DeviceTimer::unit(Prepared& p, bool restore, int* rc) {

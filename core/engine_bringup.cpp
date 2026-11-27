@@ -30,6 +30,7 @@
 #include "runtime/arena.h"
 #include "runtime/kvbind.h"
 #include "runtime/xprefetch.h"
+#include "runtime/w2.h"
 #include "sample/gbnf.h"
 #include "sched/scheduler.h"
 #include "text/token_view.h"
@@ -1947,17 +1948,39 @@ int Engine::plan() {
         for (auto& r : ranks_) {
             RAD_TRY(rad_dev_set(r->device));
             VramFacts f{};
-            /* One hardware queue's VRAM, measured as the difference between creating the first and
-             * the second queue (the runtime's one-time setup lands on the first, and is charged to
-             * `already held`). The compute stream, the mover's and a second lane are created after
-             * this reading, and the driver backs each with VRAM beyond its ring. */
+            /* One hardware queue's VRAM, measured as the drop in free VRAM over opening streams
+             * (vram_queue_cost). A stream handed one of the card's kept queues (the kernel inits'
+             * streams', on the AQL backend) allocates nothing, so the probe opens streams until two
+             * of them opened a fresh queue and takes the smaller drop. One fresh queue is not
+             * enough: the runtime makes a one-time allocation of 140 MiB with the first queue that
+             * finds room for it on the card, and a start that opened its first queues while the
+             * previous process's VRAM was still being released (a lane handing the cards on) found
+             * none, so the allocation landed here: one start in eight measured 175 MiB a queue,
+             * and the card lost ~300 expert slots (notes/backlog/measurements/vram-queue-probe.md).
+             * The compute stream, the mover's and a second lane are created after this reading
+             * and take these kept queues first. */
+            int probe_extra = 0;   /* kept queues past the two the probe used to leave (below) */
             {
-                RadStream q[2] = { nullptr, nullptr };
-                RadDeviceProps a{}, b{};
-                if (rad_stream_create(&q[0], 0) >= 0 && rad_dev_props(r->device, &a) >= 0 &&
-                    rad_stream_create(&q[1], 0) >= 0 && rad_dev_props(r->device, &b) >= 0)
-                    f.queue_bytes = std::max<int64_t>(a.vram_free - b.vram_free, 0);
-                for (RadStream s : q) if (s) rad_stream_destroy(s);
+                int open = 0, kept = 0;
+                dev_stream_counts(r->device, &open, &kept);
+                std::vector<RadStream> q;
+                std::vector<int64_t> rd;
+                RadDeviceProps p{};
+                if (rad_dev_props(r->device, &p) >= 0) rd.push_back(p.vram_free);
+                QueueProbe qp;
+                while (!rd.empty() && qp.fresh < 2 && (int)q.size() < kept + 2) {
+                    RadStream st = nullptr;
+                    if (rad_stream_create(&st, 0) < 0) break;
+                    q.push_back(st);
+                    if (rad_dev_props(r->device, &p) < 0) break;
+                    rd.push_back(p.vram_free);
+                    qp = vram_queue_cost(rd);
+                }
+                f.queue_bytes = qp.bytes;
+                for (RadStream st : q) rad_stream_destroy(st);
+                int kept_after = 0;
+                dev_stream_counts(r->device, &open, &kept_after);
+                probe_extra = std::max(kept_after - std::max(kept, 2), 0);
             }
             f.n_queues = 2 + (r->program.scratch_regions > 1 ? 1 : 0);
             f.queue_scratch = 0;   /* set below, once props are read */
@@ -1978,12 +2001,25 @@ int Engine::plan() {
                     if (w.decl.group.expert >= 0) nl = std::max(nl, (int64_t)w.decl.group.layer + 1);
                 f.n_queues += 1;
                 f.prefetch = xp_device_bytes(wf.expert_unit_max, nl);
+            } else if (wf.routed && wf.expert_unit_max > 0 && !cfg_.deterministic && w2_config().on &&
+                       (cfg_.placement == "auto" || cfg_.placement == "expert_tiered") &&
+                       rad_xp_supported(r->device)) {
+                /* W2's ring and control blocks (core/runtime/w2.h), where its switch is on. */
+                int64_t nl = r->program.meta.n_layers;
+                for (const WeightInfo& w : r->program.weights)
+                    if (w.decl.group.expert >= 0) nl = std::max(nl, (int64_t)w.decl.group.layer + 1);
+                f.prefetch = w2_device_bytes(wf.expert_unit_max, nl);
             }
             RadDeviceProps props{};
             rad_dev_props(r->device, &props);
             f.queue_scratch = rad_dev_resident_scratch_bytes(&props);
             f.capacity = props.vram_bytes;
             f.free     = props.vram_free;
+            /* The two-queue probe left max(kept, 2) kept queues on the card, inside this reading,
+             * and the budget has been split with them there. The queues this probe opens past
+             * that, for its second clean reading, are the engine's own streams' queues already
+             * (they take the kept ones first, and `n_queues` charges them): not counted twice. */
+            f.free += (int64_t)std::min(probe_extra, f.n_queues) * f.queue_bytes;
             /* And what of the memory `free` excludes is device code: the code objects this card has
              * loaded, each one whole from its module at its kernel's first launch (module_load in
              * core/device/aql.cpp). The receipt prints it beside `already held`, so a lane can say
@@ -5370,6 +5406,18 @@ int Engine::start() {
             uint64_t lo[kXpMaxPools], hi[kXpMaxPools], st[kXpMaxPools];
             const int n = r->mover.pool_ranges(lo, hi, st, kXpMaxPools);
             if (n > 0) r->ctx.xp_open(lo, hi, st, n);
+        }
+    /* "Weg 2" (core/runtime/w2.h), on by default, RADIANCE_W2=0 turns it off: resident experts first on
+     * wide passes, the misses' whole units copied meanwhile on the prefetch's DMA queue (which the
+     * TP1 prefetch above does not share: one of the two is on). Every rank plans and copies its
+     * own half. */
+    if (const W2Config w2c = w2_config(); w2c.on && !cfg_.deterministic)
+        for (auto& r : ranks_) {
+            if (r->ctx.xp_on()) continue;
+            RAD_TRY(rad_dev_set(r->device));
+            uint64_t lo[RAD_W2_MAX_POOLS], hi[RAD_W2_MAX_POOLS], st[RAD_W2_MAX_POOLS];
+            const int n = r->mover.pool_ranges(lo, hi, st, RAD_W2_MAX_POOLS);
+            if (n > 0) r->ctx.w2_open(w2c, lo, hi, st, n);
         }
     /* Expert streaming X1 (b): the mover's paced copies go out from the routed layers' marks
      * (Ctx::xp_mark), which recorded passes then carry. Not beside the TP1 prefetch, which rides

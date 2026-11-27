@@ -154,10 +154,18 @@ extern "C" void    rad_ride_release(void* token, RadStream after, int64_t packet
 /* `flags` RAD_XP_NO_YIELD: the list does not yield the link to a hold by a stream of this card. A
  * copy the compute stream waits on must set it, since the hold's release is behind that wait. */
 #define RAD_XP_NO_YIELD 1u
+/* `flags` RAD_XP_DONE_EACH: `done` is written behind every range instead of once behind the list,
+ * with `done_val + i + 1` behind range i, so a reader sees how far a list still copying has come. */
+#define RAD_XP_DONE_EACH 2u
 extern "C" int     rad_xp_list(int device, void* mark, int n, const uint64_t* src, const uint64_t* dst,
                                const uint64_t* bytes, uint32_t* done, uint32_t done_val,
                                unsigned flags);
 extern "C" int64_t rad_xp_behind(int device);
+/* The next dispatch this thread issues acquires at system scope: what the card's caches hold of
+ * any memory is dropped before the kernel runs (and before the kernels behind it), so memory a DMA
+ * list has rewritten since it was last read is read afresh. A recorded pass keeps it with the
+ * dispatch. A backend without caches of its own ignores it. */
+extern "C" void    rad_dev_acquire_next(void);
 extern "C" void*   rad_dev_alloc_uncached(int64_t bytes);
 extern "C" void    rad_dev_free_uncached(void* p);
 
@@ -426,6 +434,9 @@ struct DeviceBackend {
      * RADIANCE_AQL_STAMP can time its dispatches as it times a played one. Null on a backend
      * without stamps; a no-op while the switch is off. */
     void    (*pass_stamp)(int on);
+    /* rad_dev_acquire_next; null where the backend has no caches of its own. Last: the host
+     * backend's table is positional. */
+    void    (*acquire_next)(void);
 };
 
 

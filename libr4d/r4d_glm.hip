@@ -4,6 +4,7 @@
 #include "r4d_common.h"
 #include "r4d_emit.h"
 #include "r4d_moe_sort.h"
+#include "r4d_w2.h"
 #include <climits>
 #include <cmath>
 
@@ -186,6 +187,126 @@ __global__ void __launch_bounds__(128)
     gemm_nt_f32_lds_body<R, C, KC, VX>(x, w, y, xp, wp, yp, m, n, k);
 }
 
+/* The staged form for verify heights (17-63 rows at N >= 512, 32-63 at N 256-511). Its grid is the
+ * 8x1 form's: a wave a column, four columns and 8 rows a workgroup. The 8 rows' x is staged once a
+ * workgroup, 256 values of k at a time and transposed: the 8 rows' bf16 at one k are 16 bytes, so a
+ * step of k costs a wave one weight load from memory and one LDS read for 8 FMA, where the 8x1 form
+ * loads a weight and 8 values of x from memory. Thread t stages k = 2t, 2t+1 of a stage: VX 2 with
+ * one 4-byte load a row (x 4-byte aligned, its pitch and K even), VX 1 with two 2-byte loads a row.
+ * Two buffers, so a stage costs one barrier, and the next stage's x and weights load while this
+ * stage's FMAs run. Lane l still folds k = l, l+32, ... ascending with fmaf, then the same
+ * butterfly: byte-identical to every tile form. Tail lanes (j >= K) skip the FMA; loads past K read
+ * a clamped address whose value is never used. Rows past M read a clamped row and are not stored;
+ * waves past N stage and wait, and store nothing. Like the tile form (K-10), the k loop and the
+ * butterfly are a function of their own, gemm_nt_f32_xt_sums, with no early return and no store;
+ * the store is the caller's. */
+template <int VX, class W>
+__device__ __forceinline__ void
+    gemm_nt_f32_xt_sums(const uint16_t* x, const W* w, float (&sum)[8], long xp, long wp, int m,
+                        int n, int k, int c0, int r0) {
+    constexpr int R = 8, KC = 256, S = KC / 32;
+    __shared__ r4d_u32x4 xs[2][KC];   /* [buffer][k of the stage]: rows 0-7, two to a word */
+    const int lane = threadIdx.x & 31, t = threadIdx.x;
+    const bool live = c0 < n;
+    const W* wc = w + (long)(live ? c0 : n - 1) * wp;
+    const uint16_t* xr[R];
+#pragma unroll
+    for (int q = 0; q < R; ++q) xr[q] = x + (long)(r0 + q < m ? r0 + q : m - 1) * xp;
+    const int nst = (k + KC - 1) / KC;
+    W wn[S];          /* the stage's weights, loaded a stage ahead */
+    uint32_t g[R];    /* the next stage's x: row q's k = 2t, 2t+1 */
+    auto load = [&](int kc) {
+#pragma unroll
+        for (int s = 0; s < S; ++s) {
+            const int j = kc + 32 * s + lane;
+            wn[s] = *(const W*)((const char*)wc + (uint32_t)(j < k ? j : k - 1) * sizeof(W));
+        }
+        if (VX == 2) {
+            const int j2 = kc + 2 * t < k ? kc + 2 * t : k - 2;
+#pragma unroll
+            for (int q = 0; q < R; ++q)
+                g[q] = *(const uint32_t*)((const char*)xr[q] + (uint32_t)j2 * 2u);
+        } else {
+            const int ja = kc + 2 * t < k ? kc + 2 * t : k - 1, jb = ja + 1 < k ? ja + 1 : k - 1;
+#pragma unroll
+            for (int q = 0; q < R; ++q)
+                g[q] = (uint32_t)*(const uint16_t*)((const char*)xr[q] + (uint32_t)ja * 2u) |
+                       (uint32_t)*(const uint16_t*)((const char*)xr[q] + (uint32_t)jb * 2u) << 16;
+        }
+    };
+    auto stage = [&](int b) {
+        r4d_u32x4 lo, hi;
+#pragma unroll
+        for (int e = 0; e < 4; ++e) {
+            lo[e] = (g[2 * e] & 0xffffu) | (g[2 * e + 1] << 16);
+            hi[e] = (g[2 * e] >> 16) | (g[2 * e + 1] & 0xffff0000u);
+        }
+        xs[b][2 * t] = lo;
+        xs[b][2 * t + 1] = hi;
+    };
+#pragma unroll
+    for (int q = 0; q < R; ++q) sum[q] = 0;
+    auto step = [&](int b, int s, float wf) {
+        const r4d_u32x4 p = xs[b][32 * s + lane];
+#pragma unroll
+        for (int e = 0; e < 4; ++e) {
+            sum[2 * e] = fmaf(__builtin_bit_cast(float, p[e] << 16), wf, sum[2 * e]);
+            sum[2 * e + 1] = fmaf(__builtin_bit_cast(float, p[e] & 0xffff0000u), wf, sum[2 * e + 1]);
+        }
+    };
+    load(0);
+    stage(0);
+    __syncthreads();
+#pragma unroll 1
+    for (int st = 0; st < nst; ++st) {
+        const int kc = st * KC, b = st & 1;
+        float wf[S];
+#pragma unroll
+        for (int s = 0; s < S; ++s) wf[s] = weight_f32(wn[s]);
+        if (st + 1 < nst) load(kc + KC);
+        if (live) {
+            if (k - kc >= KC) {
+#pragma unroll
+                for (int s = 0; s < S; ++s) step(b, s, wf[s]);
+            } else {
+#pragma unroll
+                for (int s = 0; s < S; ++s)
+                    if (kc + 32 * s + lane < k) step(b, s, wf[s]);
+            }
+        }
+        if (st + 1 < nst) {
+            stage(b ^ 1);
+            __syncthreads();
+        }
+    }
+#pragma unroll
+    for (int q = 0; q < R; ++q)
+#pragma unroll
+        for (int mask = 16; mask; mask >>= 1) sum[q] += __shfl_xor(sum[q], mask, 32);
+}
+template <int VX, class W>
+__device__ __forceinline__ void
+    gemm_nt_f32_xt_body(const uint16_t* x, const W* w, float* y, long xp, long wp, long yp,
+                        int m, int n, int k) {
+    const int lane = threadIdx.x & 31,
+              c0 = __builtin_amdgcn_readfirstlane(blockIdx.x * 4 + (threadIdx.x >> 5)),
+              r0 = blockIdx.y * 8;
+    float sum[8];
+    gemm_nt_f32_xt_sums<VX, W>(x, w, sum, xp, wp, m, n, k, c0, r0);
+    if (c0 >= n || lane) return;
+#pragma unroll
+    for (int q = 0; q < 8; ++q)
+        if (r0 + q < m) y[(long)(r0 + q) * yp + c0] = sum[q];
+}
+template <int VX, class CH, class W>
+__global__ void __launch_bounds__(128)
+    gemm_nt_f32_xt_kernel(const uint16_t* x, const W* w, float* y, long xp, long wp, long yp,
+                          int m, int n, int k) {
+    if (CH::on) r4d_chain_wait();
+    gemm_nt_f32_xt_body<VX>(x, w, y, xp, wp, yp, m, n, k);
+    if (CH::on) r4d_chain_done();
+}
+
 /* CH `r4dchain`: the chained forms of this file's kernels (r4d_chain.h). Each body keeps its early
  * returns; the wrapper brackets it so every block counts once. */
 template <int R, int C, int U, class CH, class W>
@@ -223,6 +344,26 @@ int gemm_f32_lds(RadStream stream, const RadTensor& x, const RadTensor& w, const
     return v8 ? R4D_GF32L(8, float) : R4D_GF32L(1, float);
 #undef R4D_GF32L
 }
+/* The verify form stages x 4 bytes at a time when x, its pitch and K allow it, else 2 bytes. */
+bool gemm_f32_xt_v2(const RadTensor& x, long k) {
+    return ((uintptr_t)x.data & 3) == 0 && x.stride[0] % 2 == 0 && k % 2 == 0;
+}
+int gemm_f32_xt(RadStream stream, const RadTensor& x, const RadTensor& w, const RadTensor& y,
+                long n, long k, bool chain) {
+    const long m = x.shape[0];
+    const bool v2 = gemm_f32_xt_v2(x, k);
+#define R4D_GF32X(VX_, CH_, W_)                                                                        \
+    R4D_EMIT(stream, (gemm_nt_f32_xt_kernel<VX_, CH_, W_>),                                            \
+             dim3((unsigned)((n + 3) / 4), (unsigned)((m + 7) / 8)), dim3(128), 0,                     \
+             (const uint16_t*)x.data, (const W_*)w.data, (float*)y.data, x.stride[0], w.stride[0], \
+             y.stride[0], (int)m, (int)n, (int)k)
+#define R4D_GF32XV(CH_, W_) (v2 ? R4D_GF32X(2, CH_, W_) : R4D_GF32X(1, CH_, W_))
+    if (w.dtype == RAD_BF16)
+        return chain ? R4D_GF32XV(r4dchain, uint16_t) : R4D_GF32XV(R4dUnchained, uint16_t);
+    return chain ? R4D_GF32XV(r4dchain, float) : R4D_GF32XV(R4dUnchained, float);
+#undef R4D_GF32XV
+#undef R4D_GF32X
+}
 int gemm_f32_body(const RadArgs* a, RadStream stream) {
     if (!a || a->n_t < 3) return RAD_E_INVAL;
     const auto &x = a->t[0], &w = a->t[1], &y = a->t[2];
@@ -240,18 +381,33 @@ int gemm_f32_body(const RadArgs* a, RadStream stream) {
      * cold) at N 4/32/36/288, K 4096: 16x4 gains 3-5 % at N 288/32 above 64 rows but loses 16 % at
      * N 36; 8x4 holds at every width. Below 64 rows the steps of k in flight decide: 2x2 with 16
      * steps is 2 to 2.5 times as fast as one step at N 288 up to 16 rows, and about 3 times at N 32
-     * at every count below 64; at N 288 from 17 rows 8x1 with 8 steps is faster.
+     * at every count below 64; at N 288 from 17 rows 8x1 with 8 steps was faster, and its grid is
+     * the verify form's (below).
      * A projection of a few columns has too few waves for wide tiles at any M.
      * At prefill heights (the router: N 128 a rank at TP4, 256 at TP2, 512 at TP1) the staged 8x8
      * form: x read from LDS as f32, a step of k 8 weight loads for 64 FMA where 8x4 has 12 loads
      * for 32. Staging x costs a fixed share a workgroup, so the narrower N needs more rows before it
      * pays: from 256 rows at N 512, 384 at N 256 and 768 at N 128 (below those 8x4 was as fast or
      * faster on gfx1201). It holds 16 waves a SIMD like 8x4 (8 KiB of LDS a workgroup); 16x8 and
-     * 16x4 drop to 8. Decode and verify heights keep the forms above. */
+     * 16x4 drop to 8. Decode heights keep the forms above.
+     * At verify heights (17-63 rows) from N 256 the 8x1 form's grid with x staged transposed in
+     * LDS: a step of k is one weight load and one LDS read a wave for 8 FMA, where 8x1 loads 8
+     * values of x and a weight from memory. It holds 16 waves a SIMD (8 KiB of LDS). At N 128 it
+     * was 2-21 % slower than 8x1 at every verify height (gfx1201, K 3072), and at N 256 about 3 %
+     * slower at 17 and 24 rows, faster from 32; at N 512 it was faster at every height. So it takes
+     * N 512 (the widest the entry takes) from 17 rows and N 256-511 from 32; the rest keeps 8x1.
+     * With x staged 4 bytes at a time (x's rows contiguous, as the served router's are) it was
+     * 11-12 % faster at N 512 up to 56 rows but no faster from 57, the eighth group of 8 rows
+     * (+0.5 / +0.3 % at 60 / 63 rows, its runs spread to 3 % slower than 8x1's); staged 2 bytes at a time
+     * it stayed 8-10 % faster there. So above 56 rows the 4-byte staging keeps 8x1. */
     const long rows = x.shape[0];
     const bool ch = r4d_geti_or(a, "chain", 0) != 0 && rows <= 64;   /* decode heights */
     if (n <= 8) return gemm_f32_tile<4, 1>(stream, x, w, y, n, k, ch);
     if (rows <= 16 || (rows < 64 && n < 128)) return gemm_f32_tile<2, 2, 16>(stream, x, w, y, n, k, ch);
+    constexpr long xt_wide_n = 512, xt_n = 256, xt_rows = 32, xt_v2_rows = 56;   /* the verify form's bounds */
+    if (rows < 64 && (n >= xt_wide_n || (n >= xt_n && rows >= xt_rows)) &&
+        (rows <= xt_v2_rows || !gemm_f32_xt_v2(x, k)))
+        return gemm_f32_xt(stream, x, w, y, n, k, ch);
     if (rows < 64) return gemm_f32_tile<8, 1, 8>(stream, x, w, y, n, k, ch);
     const long lds_rows = n >= 512 ? 256 : n >= 256 ? 384 : 768;   /* where staging x pays */
     if (n >= 128 && rows >= lds_rows) return gemm_f32_lds<8, 8, 256>(stream, x, w, y, n, k);
@@ -490,6 +646,38 @@ __global__ void __launch_bounds__(NW * 32)
                                               (uint32_t)n_local, sl, inv);
     if (CH::on) r4d_chain_done();
 }
+/* The same launch with the W2 plan behind the sort (r4d_w2.h, abi/rad_w2.h): the body above, then
+ * each routed expert marked resident or missing and the layer's copy list posted. A kernel of its
+ * own, so the launch without a `w2` operand is the instantiation it was. */
+template <int OWN, uint32_t NW, bool INV, class CH>
+__global__ void __launch_bounds__(NW * 32)
+    router_sigmoid_scatter_w2_kernel(const float* logits, const float* bias, int* ids,
+                                     float* weights, int32_t* sorted, int32_t* off, int32_t* cnt,
+                                     uint16_t* gate, int32_t* inv, long lp, long bp, long ip,
+                                     long wp, long gp, int m, int ne, int n_local, int k, int norm,
+                                     float factor, int base, r4d_moesort::Protect prot,
+                                     RadW2Layer* w2) {
+    if (CH::on) r4d_chain_wait();
+    __shared__ r4d_moesort::ScatterLds<NW> sl;
+    __shared__ r4d_w2::PlanLds pl;
+    const int lane = threadIdx.x & 31, wave = threadIdx.x >> 5;
+    for (int e = threadIdx.x; e < n_local; e += (int)(NW * 32)) sl.cnt[e] = 0;
+    for (int r = wave; r < m; r += (int)NW) {
+        const int e = router_sigmoid_row<OWN>(logits, bias, ids, weights, lp, bp, ip, wp, r, ne, k,
+                                              norm, factor, lane) -
+                      base;
+        if (lane < k)
+            sl.e[r * k + lane] =
+                e >= 0 && e < n_local ? r4d_moesort::sort_place(e, (uint32_t)n_local, prot) : -1;
+        if (gate && !lane) gate[(long)r * gp] = f32_to_bf16(1.0f);
+    }
+    lds_barrier();
+    r4d_moesort::scatter_small_place<NW, INV>(sorted, off, cnt, (uint32_t)(m * k),
+                                              (uint32_t)n_local, sl, inv);
+    lds_barrier();
+    r4d_w2::plan(w2, sl.cnt, pl, NW * 32u, (uint32_t)n_local);
+    if (CH::on) r4d_chain_done();
+}
 int router_body(const RadArgs* a, RadStream stream) {
     if (!a || a->n_t < 4) return RAD_E_INVAL;
     const auto &lg = a->t[0], &bias = a->t[1], &ids = a->t[2], &w = a->t[3];
@@ -555,6 +743,9 @@ int router_scatter_body(const RadArgs* a, RadStream stream) {
     const RadTensor *sorted = &a->t[4], *off = &a->t[5], *cnt = &a->t[6];
     const RadTensor* gate = a->n_t > 7 ? r4d_opt(a, 7) : nullptr;
     const RadTensor* inv = a->n_t > 8 ? r4d_opt(a, 8) : nullptr;
+    /* `w2` (optional, last): the layer's W2 control block (abi/rad_w2.h); the plan runs behind
+     * the sort. */
+    const RadTensor* w2 = a->n_t > 9 ? r4d_opt(a, 9) : nullptr;
     const long ne = r4d_geti_or(a, "n_expert", 0), k = r4d_geti_or(a, "top_k", 0);
     const long nl = r4d_geti_or(a, "n_local", ne), base = r4d_geti_or(a, "expert_base", 0);
     const float factor = (float)r4d_getf(a, "route_scale", 0);
@@ -595,8 +786,20 @@ int router_scatter_body(const RadArgs* a, RadStream stream) {
                     inv ? (int32_t*)inv->data : (int32_t*)nullptr, lg.stride[0], bias.stride[0],   \
                     ids.stride[0], w.stride[0], (long)gp, (int)m, (int)ne, (int)nl, (int)k, norm,  \
                     factor, (int)base, prot)
+#define R4D_RSS_W(OWN, NW, INV, CH)                                                                \
+    R4D_EMIT(stream, (router_sigmoid_scatter_w2_kernel<OWN, NW, INV, CH>), dim3(1),                \
+                    dim3((NW) * 32), 0, (const float*)lg.data, (const float*)bias.data,            \
+                    (int*)ids.data, (float*)w.data, (int32_t*)sorted->data, (int32_t*)off->data,   \
+                    (int32_t*)cnt->data, gate ? (uint16_t*)gate->data : (uint16_t*)nullptr,        \
+                    inv ? (int32_t*)inv->data : (int32_t*)nullptr, lg.stride[0], bias.stride[0],   \
+                    ids.stride[0], w.stride[0], (long)gp, (int)m, (int)ne, (int)nl, (int)k, norm,  \
+                    factor, (int)base, prot, (RadW2Layer*)w2->data)
 #define R4D_RSS_I(OWN, NW, INV)                                                                    \
-    return ch ? R4D_RSS_C(OWN, NW, INV, r4dchain) : R4D_RSS_C(OWN, NW, INV, R4dUnchained)
+    do {                                                                                           \
+        if (w2 && w2->data)                                                                        \
+            return ch ? R4D_RSS_W(OWN, NW, INV, r4dchain) : R4D_RSS_W(OWN, NW, INV, R4dUnchained); \
+        return ch ? R4D_RSS_C(OWN, NW, INV, r4dchain) : R4D_RSS_C(OWN, NW, INV, R4dUnchained);     \
+    } while (0)
 #define R4D_RSS(OWN, NW)                                                                           \
     do {                                                                                           \
         if (inv) R4D_RSS_I(OWN, NW, true);                                                         \
@@ -612,6 +815,7 @@ int router_scatter_body(const RadArgs* a, RadStream stream) {
     R4D_RSS(16, 32u);
 #undef R4D_RSS
 #undef R4D_RSS_I
+#undef R4D_RSS_W
 #undef R4D_RSS_C
 }
 template <class CH>

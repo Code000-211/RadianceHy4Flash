@@ -1066,6 +1066,9 @@ int64_t rad_xp_behind(int device) {
     if (const auto f = dev()->xp_behind) return f(device);
     return 0;
 }
+void rad_dev_acquire_next(void) {
+    if (const auto f = dev()->acquire_next) f();
+}
 void* rad_dev_alloc_uncached(int64_t bytes) {
     if (const auto f = dev()->alloc_uncached) return f(bytes);
     return nullptr;
