@@ -617,7 +617,8 @@ int Engine::resolve_table_placement(const std::vector<VramFacts>& facts,
     const bool emb_asked = cfg_.embedding_placement_given;
     std::string emb_why;
     /* Host memory the table would pin (each rank its shard) after the pools and the prefix cache's
-     * host tier still to be allocated; no memlock check, since card-read pins are not charged. */
+     * host tier still to be allocated; no memlock check, since a card-read pin the limit refuses
+     * stays unlocked rather than failing (#272). */
     const int64_t emb_pin = (int64_t)cfg_.tp * align_up(emb_max, (int64_t)MiB);
     const int64_t pools_still = (int64_t)cfg_.tp * cfg_.host_pool_mib * MiB +
                                 cfg_.prefix_cache_mib * MiB + host_late;

@@ -6,6 +6,7 @@
  */
 #include "engine_priv.h"
 #include "device/device.h"
+#include "device/kfd_evict.h"
 #include "mm/media.h"
 
 #include <algorithm>
@@ -108,6 +109,8 @@ diag::RunFacts Engine::run_facts(bool failed) const {
         rad_dev_alloc_totals(RAD_MEM_HOST_PINNED, &pinned, &n);
         rad_dev_alloc_totals(RAD_MEM_HOST_MAPPED, &mapped, &n);
         r.pinned_bytes = pinned + mapped;
+        r.pinned_unlocked_bytes = std::max<int64_t>(
+            pin_lock_tally().unlocked.load(std::memory_order_relaxed), 0);
     }
     /* The most any rank streams from the host, since each step waits for the slowest rank.
      * Excludes host-placed tables (the embedding, read a few rows per step; the towers, once per

@@ -170,6 +170,7 @@ struct RunFacts {
     std::string prefix_cache_off_why;
     int64_t     host_pool_mib = 0;       /* a rank, as configured */
     int64_t     pinned_bytes = -1;       /* every pinned host allocation the process made */
+    int64_t     pinned_unlocked_bytes = 0;   /* of those, what mlock refused (#272): swappable */
     int64_t     host_weight_bytes = 0;   /* weights a rank reads from the pinned host pool */
     int64_t     file_weight_bytes = 0;   /* and from the container on disk */
     int64_t     locked_bytes = 0;        /* memory locked for a host gather (an n-gram copy) */

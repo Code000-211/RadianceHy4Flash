@@ -70,6 +70,7 @@
 
 #include "aql.h"
 #include "directio.h"
+#include "kfd_evict.h"
 #include "rad_format.h"
 #include "../rad_internal.h"
 
@@ -840,6 +841,13 @@ void dump_queues(const char* where) {
                 (void*)s->q, wr, rd, what.c_str());
         RAD_ERR("    %s", chain_line(s, rd).c_str());
     }
+    /* #272: whether the driver holds the queues. An evicted process's queues all stop together
+     * on every card; the counts growing between dumps say so, where a hung kernel leaves them. */
+    static std::map<uint32_t, int64_t> last_evicted;
+    std::vector<std::pair<int, uint32_t>> cards;
+    for (size_t i = 0; i < G().dev.size(); ++i) cards.emplace_back((int)i, G().dev[i].kfd_id);
+    RAD_ERR("  %s", evict_line("/sys/class/kfd/kfd/proc", "/proc/self/status", (long)::getpid(),
+                               cards, &last_evicted).c_str());
     if (g_dump_lanes) g_dump_lanes();
 }
 
@@ -1887,6 +1895,7 @@ void loc_keep(const void* host_base, size_t bytes, intptr_t shift, uint64_t owne
 struct Pinned {
     int64_t len = 0;
     void* pool = nullptr;
+    bool locked = false;          /* held against swap (lock_pinned) */
 };
 std::mutex g_pinned_mu;
 std::map<uintptr_t, Pinned> g_pinned;
@@ -4554,7 +4563,8 @@ int a_props(int device, RadDeviceProps* out) {
  * transparent_hugepage/shmem_enabled (`never` on stock Ubuntu), while private memory follows
  * transparent_hugepage/enabled (`madvise` there). Under IOMMU translation each page is its own
  * translation, and streaming from a 4 KiB-page pool made prefill 10-21% slower. MADV_DONTFORK
- * keeps a forked child from copying the pinned range whole.
+ * keeps a forked child from copying the pinned range whole, and mlock keeps reclaim from swapping
+ * it out, which the lock itself does not (lock_pinned).
  *
  * kPinPiece is a power of two well under the failing size; the cost is one buffer object per
  * piece per card, a few dozen for the largest pools. */
@@ -4718,6 +4728,22 @@ bool lock_pieces(char* p, int64_t len, int64_t bytes, std::vector<hsa_agent_t>& 
     return true;
 }
 
+/* Holds a pinned range's pages against swap (#272, kfd_evict.h). The cards' lock does not: on a
+ * driver with the SVM API it mirrors the range without pinning a page (VmPin stays 0), so reclaim
+ * could swap the pages out, and each swap-out evicts every queue of the process on every card
+ * until they are read back in. MLOCK_ONFAULT takes what is resident and what faults in later. A
+ * refusal (RLIMIT_MEMLOCK, which the soft limit is first raised to the hard one for) leaves the
+ * range as it was and is said once with the fix; it never fails the allocation. */
+bool lock_pinned(char* p, int64_t len) {
+    static const int64_t soft = memlock_soft_to_hard();
+    std::string say;
+    const bool ok = lock_against_swap(
+        p, len, [](void* a, size_t n) { return ::mlock2(a, n, MLOCK_ONFAULT); }, soft,
+        &pin_lock_tally(), &say);
+    if (!say.empty()) RAD_WARN("%s", say.c_str());
+    return ok;
+}
+
 void* pin_pieces(int64_t bytes) {
     std::vector<hsa_agent_t> cards;
     for (const Dev& d : G().dev) cards.push_back(d.agent);
@@ -4746,22 +4772,23 @@ void* pin_pieces(int64_t bytes) {
     }
     (void)::madvise(p, (size_t)len, MADV_DONTFORK);
     prefault(p, len);
+    const bool locked = lock_pinned(p, len);
 
     if (!lock_pieces(p, len, bytes, cards, "rad_dev_alloc")) {
+        pin_lock_forget(len, locked, &pin_lock_tally());
         ::munmap(p, (size_t)len);
         return nullptr;
     }
     std::lock_guard<std::mutex> lk(g_pinned_mu);
-    g_pinned.emplace((uintptr_t)p, Pinned{len, nullptr});
+    g_pinned.emplace((uintptr_t)p, Pinned{len, nullptr, locked});
     return p;
 }
 
 /* pin_pieces over a shared file mapping instead of private anonymous memory: the pages are the
  * file's (a tmpfs file other processes map too) and the lock takes them in place. The file maps
  * onto a 2 MiB boundary inside a reservation made with one alignment extra, then the ends are
- * trimmed. MADV_HUGEPAGE is advised but shmem follows shmem_enabled, not it. A tmpfs page is
- * swappable until the lock pins it, so MLOCK_ONFAULT keeps the pages in memory meanwhile; a
- * refusal (the memlock limit) costs only that. */
+ * trimmed. MADV_HUGEPAGE is advised but shmem follows shmem_enabled, not it. The pages are held
+ * against swap as pin_pieces' are (lock_pinned). */
 void* pin_pieces_file(int64_t bytes, int fd, int64_t foff) {
     std::vector<hsa_agent_t> cards;
     for (const Dev& d : G().dev) cards.push_back(d.agent);
@@ -4796,17 +4823,16 @@ void* pin_pieces_file(int64_t bytes, int fd, int64_t foff) {
 
     if (len >= ((int64_t)2 << 20)) (void)::madvise(p, (size_t)len, MADV_HUGEPAGE);
     (void)::madvise(p, (size_t)len, MADV_DONTFORK);
-    if (::mlock2(p, (size_t)len, MLOCK_ONFAULT) != 0)
-        RAD_WARN("device: the shared file range %p (%s) could not be locked against swap (mlock2: "
-                 "%s)", (void*)p, humanb(len).c_str(), std::strerror(errno));
+    const bool locked = lock_pinned(p, len);
     prefer_numa_node(p, len, current_card_numa_node());
 
     if (!lock_pieces(p, len, bytes, cards, "rad_dev_map_file")) {
+        pin_lock_forget(len, locked, &pin_lock_tally());
         ::munmap(p, (size_t)len);
         return nullptr;
     }
     std::lock_guard<std::mutex> lk(g_pinned_mu);
-    g_pinned.emplace((uintptr_t)p, Pinned{len, nullptr});
+    g_pinned.emplace((uintptr_t)p, Pinned{len, nullptr, locked});
     return p;
 }
 
@@ -4830,6 +4856,7 @@ void unpin_pieces(void* p) {
         return;
     }
     const int64_t len = r.len;
+    pin_lock_forget(len, r.locked, &pin_lock_tally());
     for (int64_t off = 0; off < len; off += kPinPiece) {
         const hsa_status_t st = hsa_amd_memory_unlock((char*)p + off);
         if (st != HSA_STATUS_SUCCESS)

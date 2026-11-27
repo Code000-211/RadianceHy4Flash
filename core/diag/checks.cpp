@@ -308,6 +308,22 @@ void check_memory(const Facts& f, const RunFacts& r, std::vector<Finding>* out) 
             "raise the container's memory limit or lower the pools");
 }
 
+/* #272: pinned host memory whose mlock was refused. The cards map it without pinning a page, so
+ * reclaim may swap it out, and every swap-out evicts all of the process's queues on every card. */
+void check_pinned_unlocked(const Facts& f, const RunFacts& r, std::vector<Finding>* out) {
+    if (r.pinned_unlocked_bytes <= 0) return;
+    const int64_t lim = f.host.memlock_soft;
+    add(out, Finding::Warn, "pinned-unlocked",
+        fmt("%s of the pinned host memory is not locked against swap (RLIMIT_MEMLOCK %s)",
+            humanb(r.pinned_unlocked_bytes).c_str(),
+            lim == -2 ? "unlimited" : lim < 0 ? "unknown" : humanb(lim).c_str()),
+        "the cards map those pages without pinning them, so under memory pressure the kernel may "
+        "swap them out; each swap-out evicts every queue of this process on every card until "
+        "the pages are read back in, and all cards stop together for that long",
+        "Docker: --ulimit memlock=-1; systemd: LimitMEMLOCK=infinity; otherwise memlock in "
+        "/etc/security/limits.conf");
+}
+
 void check_memlock(const Facts& f, const RunFacts& r, std::vector<Finding>* out) {
     if (f.host.memlock_soft == -2 || f.host.memlock_soft < 0) return;
     if (r.locked_bytes > 0 || r.ngram_placement != "disk") return;
@@ -445,6 +461,7 @@ std::vector<Finding> check(const Facts& f, const RunFacts& r) {
     check_huge_pages(f, r, &out);
     check_iommu(f, r, &out);
     check_memlock(f, r, &out);
+    check_pinned_unlocked(f, r, &out);
     check_cpu(f, &out);
     /* Refusals, then warnings, then notes; stable, so each group keeps the order above. */
     std::stable_sort(out.begin(), out.end(),
