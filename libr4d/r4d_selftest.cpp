@@ -24375,7 +24375,9 @@ static void moefuse_perf(const Plugin& pl, int64_t rows, int iters) {
  * weight + input + output and its TFLOP/s; weights rotate over copies past the last-level cache,
  * as in bf16_perf. */
 /* pad: x's pitch past K. 5 stages x a value at a time in the staged prefill form; 0 at a K that is
- * a multiple of 8 stages it 16 bytes at a time, as the router's contiguous rows do. */
+ * a multiple of 8 stages it 16 bytes at a time, as the router's contiguous rows do. In the verify
+ * form (17-63 rows at N 512+, 32-63 at N 256-511) an even pitch and K stage 4 bytes at a time,
+ * an odd one 2 bytes; above 56 rows only the 2-byte staging takes it. */
 static void f32_forms(const Plugin& pl, int64_t M, int64_t N, int64_t K, int iters, bool timed,
                       int64_t pad = 5) {
     const RadKernelInfo* r = find(pl, "gemm_nt_f32_bf16");
@@ -24441,11 +24443,12 @@ static void f32_forms(const Plugin& pl, int64_t M, int64_t N, int64_t K, int ite
             std::memcpy(&want[(size_t)(row * yp + c) * 4], &lane[0], 4);
         }
     const bool same = rc == RAD_OK && got == want;
+    const std::string pitch = pad == 5 ? "" : pad ? fmt(" (pitch K+%lld)", (long long)pad) : " (pitch K)";
     size_t first = 0;
     if (rc == RAD_OK && !same)
         while (first < got.size() && got[first] == want[first]) ++first;
     ok(fmt("gemm_nt_f32 at M=%lld N=%lld K=%lld%s: byte-identical to the host arithmetic",
-           (long long)M, (long long)N, (long long)K, pad == 5 ? "" : " (pitch K)").c_str(),
+           (long long)M, (long long)N, (long long)K, pitch.c_str()).c_str(),
        same, rc != RAD_OK ? fmt("rc=%d", rc) : same ? "" : fmt("first byte %zu", first));
     if (!timed && same) {
         ts[1].dtype = RAD_BF16;
@@ -24459,7 +24462,7 @@ static void f32_forms(const Plugin& pl, int64_t M, int64_t N, int64_t K, int ite
         std::vector<uint8_t> packed_y(ybytes);
         if (rc == RAD_OK) st_memcpy(packed_y.data(), d_y, ybytes, hipMemcpyDeviceToHost);
         ok(fmt("gemm_nt_f32 stored bf16 vs widened f32 at M=%lld N=%lld K=%lld%s",
-               (long long)M, (long long)N, (long long)K, pad == 5 ? "" : " (pitch K)").c_str(),
+               (long long)M, (long long)N, (long long)K, pitch.c_str()).c_str(),
            rc == RAD_OK && packed_y == got);
     }
     if (timed && rc == RAD_OK) {
@@ -39439,6 +39442,21 @@ static void device_phase(const Plugin& pl) {
         f32_forms(pl, 400, 256, 3072, 0, false, 0);
         f32_forms(pl, 1024, 128, 3072, 0, false);
         f32_forms(pl, 775, 130, 1000, 0, false, 0);
+        /* The verify form (x staged transposed: 17-63 rows from N 512, 32-63 at N 256-511) at the
+         * router's widths a rank, K 3072, x's rows contiguous and padded, each side of its bounds
+         * (N 128 and 255, N 256 at 31 rows and N 511 at 17 stay on 8x1); and short of a whole
+         * stage and step, N no multiple of 4. Above 56 rows x's contiguous rows (4-byte staging)
+         * keep 8x1 and a pitch K+5 (2-byte staging) does not: N 512 at 56 and 57 rows, both. */
+        f32_forms(pl, 32, 128, 3072, 0, false, 0);
+        f32_forms(pl, 32, 255, 3072, 0, false, 0);
+        f32_forms(pl, 31, 256, 3072, 0, false, 0);
+        f32_forms(pl, 32, 256, 3072, 0, false, 0);
+        f32_forms(pl, 17, 511, 3072, 0, false, 8);
+        f32_forms(pl, 17, 512, 3072, 0, false, 8);
+        f32_forms(pl, 63, 259, 1000, 0, false, 0);
+        f32_forms(pl, 56, 512, 3072, 0, false, 0);
+        f32_forms(pl, 57, 512, 3072, 0, false, 0);
+        f32_forms(pl, 57, 512, 3072, 0, false);
     }
     if (sel("dsa_score_fp8")) {
         dsa_score_check(pl, 1, 17);
