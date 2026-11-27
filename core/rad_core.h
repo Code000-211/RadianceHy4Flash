@@ -141,6 +141,9 @@ const char* table_placement_name(TablePlacement p);
  * the global one. Engine::resolve_table_placement calls it as it fills ngram_resolved and
  * ngram_layer_resolved (core/config.cpp holds the snapshot). */
 void config_note_ngram_resolved(int layer, TablePlacement p);
+/* Clear the snapshot at the start of a resolve pass (core/config.cpp): the snapshot is that
+ * pass's answer, and a resolve that names no layer must not inherit an earlier engine's. */
+void config_reset_ngram_resolved();
 /* --draft-window: how many drafts a step verifies per sequence (core/sched/draft.h).
  *   Fixed     every sequence drafts --num-speculative-tokens.
  *   Adaptive  that is the ceiling; head depth per step and each sequence's stop follow measured

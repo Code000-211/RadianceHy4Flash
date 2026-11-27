@@ -609,6 +609,9 @@ int Engine::resolve_table_placement(const std::vector<VramFacts>& facts,
                                     int64_t ngram_bytes, bool ngram_device, bool ngram_host,
                                     int64_t host_late,
                                     const std::map<int, int64_t>& ngram_layer_bytes) {
+    /* The snapshot the arch prefetch gate reads is this pass's answer, not a running history:
+     * a later resolve without per-layer entries must not keep an earlier engine's. */
+    config_reset_ngram_resolved();
     const int64_t MiB = (int64_t)1 << 20;
     int64_t emb_max = 0;
     for (int64_t b : emb_bytes) emb_max = std::max(emb_max, b);
@@ -4294,12 +4297,15 @@ int Engine::load_weights() {
                 /* --ngram-placement ram: the gather reads a copy instead of the mapping: pinned
                  * memory for a device kernel on the zero-copy site, or locked memory for the host
                  * gather. If auto's copy fails, the table stays in the container (a card's gather
-                 * moves to the host); if `ram` was asked for, startup fails. */
+                 * moves to the host); if `ram` was asked for, startup fails. A reader-identified
+                 * table the naming does not reach (ng_layer < 0: not blk.<l>.engram_table, e.g.
+                 * rad_block_ple.h's) takes the GLOBAL resolved placement, whose copy the resolver
+                 * budgeted -- the share directory and the asked-for refusal fall back with it. */
                 const int ng_layer = is_ngram_table(r->program, (rad_weight)i)
                                          ? ngram_table_layer(w.name) : -1;
                 const TablePlacement ng_eff =
                     ng_layer >= 0 ? cfg_.ngram_effective(ng_layer) : cfg_.ngram_resolved;
-                if (ng_eff == TablePlacement::Ram && ng_layer >= 0) {
+                if (ng_eff == TablePlacement::Ram) {
                     const bool card = w.site == Site::DeviceZeroCopy;
                     void* copy = nullptr;
                     std::string why;
@@ -4339,7 +4345,7 @@ int Engine::load_weights() {
                 const std::string& ng_disk_dir = ng_layer >= 0 ? cfg_.ngram_disk_dir_for(ng_layer)
                                                                : cfg_.ngram_disk_dir;
                 if (ng_eff == TablePlacement::Disk && !ng_disk_dir.empty() &&
-                    ng_layer >= 0 && n >= kTableShareMin) {
+                    n >= kTableShareMin) {
                     void* m = nullptr;
                     for (size_t k = 0; k < table_files_.size() && !m; ++k)
                         if (table_file_src_[k] == w.host_ptr) m = table_files_[k].base;

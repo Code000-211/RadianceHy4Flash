@@ -238,6 +238,7 @@ private:
     friend struct EngineBaseWeightsTestAccess;
     friend struct TableFillTestAccess;
     friend struct TableResolveTestAccess;
+    friend struct LoadGateTestAccess;
     /* One thread per tensor-parallel rank, each owning one device. Ranks share the address
      * space, so there is no IPC or serialisation and the step batch is shared by pointer rather
      * than broadcast (spec §1). */

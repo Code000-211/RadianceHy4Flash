@@ -592,6 +592,14 @@ void config_note_ngram_resolved(int layer, TablePlacement p) {
     g_ngram_resolved[layer] = static_cast<int>(p);
 }
 
+/* The snapshot belongs to one resolve pass: Engine::resolve_table_placement clears it before
+ * recording its own answers, so a later resolve without per-layer entries does not keep an
+ * earlier engine's per-layer answers (the per-step prefetch gate reads rad_ngram_layer_resolved,
+ * and a stale ram answer there reads a table twice). */
+void config_reset_ngram_resolved() {
+    g_ngram_resolved.clear();
+}
+
 extern "C" int rad_ngram_layer_resolved(int layer) {
     const auto it = g_ngram_resolved.find(layer);
     if (it != g_ngram_resolved.end()) return it->second;
