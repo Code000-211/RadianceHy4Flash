@@ -1549,7 +1549,12 @@ void Scheduler::push_exact_keys() {
 
 void Scheduler::set_span_min(int64_t tokens) {
     span_min_ = tokens > 0 ? tokens : 0;
+    log_span_min();
+    /* Last, once the bound is final: the cache's span bit is the bound chunks are cut by. */
     push_exact_keys();
+}
+
+void Scheduler::log_span_min() const {
     if (geo_.span <= 1) return;
     if (cfg_.prefill_span_min >= 0) {
         /* The deployment's own bound (--prefill-span-min), whatever the experts' placement. */

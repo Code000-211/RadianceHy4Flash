@@ -631,6 +631,8 @@ private:
 #endif
     /* --prefix-resume exact: hands the prefix cache the grid and the span rule (exact_keys). */
     void push_exact_keys();
+    /* set_span_min's report of the bound it set. */
+    void log_span_min() const;
     Program*      prog_ = nullptr;
     Config        cfg_{};
     ChunkGeometry geo_{};
