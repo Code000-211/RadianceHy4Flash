@@ -3429,6 +3429,78 @@ TEST(dfly2_takes_cast_row_topk_where_served_and_the_cast_pair_otherwise) {
     }
 }
 
+/* K-21: at the head's matvec band (a round of at most two sequences, the width logits_gemm picks
+ * its matvec for) one op does the head, the f32 -> bf16 rounding cast_row_topk makes and row_topk's
+ * stage 1: logits_topk, fed the head's plane and writing cast_row_topk's idx/val (and, sharded,
+ * the pairs the gather needs). A wider round keeps the head, a tap of the f32 plane still has to
+ * see that plane, and a library without the row falls back to the same pair as before. */
+TEST(dfly2_takes_the_fused_head_at_the_matvec_band) {
+    const int depth = 5;
+    for (int world : { 1, 2 }) {
+        DeclDfly d(depth, dfly_meta(), world, 0, bf16_encs, {}, 2);   /* max_seqs 2: M <= 2 */
+        REQUIRE_EQ(d.rc, RAD_OK);
+        RadBuilder& b = d.b;
+        const auto& df = d.df();
+        for (const auto& S : df.steps) {
+            CHECK(S.op_topk_f != 0);
+            CHECK_EQ(S.op_head, 0);
+            CHECK_EQ(S.op_ctopk, 0);
+            CHECK_EQ(S.op_lcast, 0);
+            CHECK_EQ(S.op_topk, 0);
+            const RecOp* o = b.op_of(S.op_topk_f);
+            REQUIRE(o);
+            CHECK_EQ(pstr(o, "dtype"), std::string("bf16"));
+            CHECK_EQ(pint(o, "M"), 1);                 /* the range's low bound: [1, max_seqs] */
+            CHECK_EQ(pint(o, "n_vocab"), 320 / world);
+            /* the activation's own row width */
+            CHECK_EQ(pint(o, "n_embd"), b.bufs[o->reads[0] - 1].d.shape[1]);
+            const int64_t R = pint(o, "R");
+            CHECK(R >= 1 && R <= 8);
+            REQUIRE_EQ(o->w.size(), (size_t)1);        /* the head's plane, read as a weight */
+            CHECK_EQ(o->reads.size(), (size_t)1);      /* the activation */
+            CHECK_EQ(o->writes.size(), (size_t)(world > 1 ? 3 : 2));
+            if (world > 1) CHECK_EQ(pint(o, "vocab_off"), 0);
+        }
+        auto trunk = kit(b, std::vector<int>(2, depth + 1), {});
+        trunk->b.positions_h = trunk->pos.data();
+        auto ctxp = context_pass(b, *trunk);
+        Query qp(b, 2, depth + 1, depth);
+        auto ps = run_passes(b, hyv4flash::step, { trunk.get(), ctxp.get(), qp.k.get() });
+        for (const auto& c : ps) {
+            if (!c->step_fail.empty()) fprintf(stderr, "%s\n", c->step_fail.c_str());
+            CHECK(c->step_fail.empty());
+        }
+        CHECK_LINT(b, ps[0].get(), ps[1].get(), ps[2].get());
+        const auto q = issued_ops(b, *ps[2]);
+        auto count = [&](const char* op) {
+            return (int64_t)std::count(q.begin(), q.end(), std::string(op));
+        };
+        CHECK_EQ(count("logits_topk"), (int64_t)depth);   /* one a round, no head, no cast */
+        CHECK_EQ(count("logits_gemm"), 0);
+        CHECK_EQ(count("cast_row_topk"), 0);
+        CHECK_EQ(count("row_topk"), 0);
+    }
+    /* The refusals: a library without the row keeps the pair; so does a tap of the f32 plane. */
+    {
+        DeclDfly d(depth, dfly_meta(), 1, 0, bf16_encs, { "logits_topk" }, 2);
+        REQUIRE_EQ(d.rc, RAD_OK);
+        for (const auto& S : d.df().steps) {
+            CHECK_EQ(S.op_topk_f, 0);
+            CHECK(S.op_head != 0 && S.op_ctopk != 0);
+        }
+    }
+    {
+        setenv("RADIANCE_HY4_TAPS", "1", 1);
+        DeclDfly d(depth, dfly_meta(), 1, 0, bf16_encs, {}, 2);
+        unsetenv("RADIANCE_HY4_TAPS");
+        REQUIRE_EQ(d.rc, RAD_OK);
+        for (const auto& S : d.df().steps) {
+            CHECK_EQ(S.op_topk_f, 0);           /* the tap reads the f32 plane behind the head */
+            CHECK(S.op_head != 0 && S.op_ctopk != 0);
+        }
+    }
+}
+
 /* D-06 (#91): DFly2 also serves a short block (rad_drafter_short_block) of 4 rows, the anchor and 3
  * masks, which the core stages under load (--draft-short-from): 3 proposals, two chain rounds fewer
  * at depth 5. The draft is causal (dfly_sel gives a row the keys up to its own position), so the
