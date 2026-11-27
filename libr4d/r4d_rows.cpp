@@ -200,8 +200,10 @@ static const RadParamSpec pAttnDense[] = {
     P_STR("dtype"),
     P_F64O("scale"),
     /* Selects the query-block height; a host-side bound on the cu_seqlens segments. Absent, the
-     * shim passes the total token count, a valid bound that picks the tall arm (speed only). */
-    P_INTO("max_seqlen"),
+     * shim passes the total token count, a valid bound that picks the tall arm (speed only). A
+     * capacity: the sizing declare runs at a smaller max_tok and may declare a smaller bound than
+     * the real one the kernel was chosen with. */
+    { "max_seqlen", RAD_P_INT, RAD_OPTIONAL, RAD_PROLE_CAPACITY },
     /* attn_paged's window over a segment's own positions (docs/OPS.md); 0 is none. */
     P_INTO("window"),
     /* cu_seqlens read in units that many rows apart, and blocks of `block` rows from a segment's
@@ -1250,6 +1252,8 @@ static const RadOperandSpec oMoeGemmQ[] = {
     { "w_odd_scale",   RAD_OPD_WTAB, 0 },
     { "y",             RAD_OPD_OUT,  0 },
     { "split",         RAD_OPD_IN,   1 },
+    { "w2",            RAD_OPD_INOUT, 1 },
+    { "w2_tail",       RAD_OPD_INOUT, 1 },
 };
 /* The same GEMM over four classes by expert number mod 4: `w`/`w_scale` hold class 0 at [N, K],
  * `w_q`/`w_q_scale` class q at [N_q, K_q], expert e at entry e / 4 of class e % 4. Four ranks
@@ -1277,6 +1281,8 @@ static const RadOperandSpec oMoeGemmQMod4[] = {
     { "w_3_scale",     RAD_OPD_WTAB, 0 },
     { "y",             RAD_OPD_OUT,  0 },
     { "split",         RAD_OPD_IN,   1 },
+    { "w2",            RAD_OPD_INOUT, 1 },
+    { "w2_tail",       RAD_OPD_INOUT, 1 },
 };
 static const RadParamSpec pMoeGather[] = {
     P_INT("M"), P_INT("n"), P_INT("top_k"), P_STR("dtype"),
@@ -2291,7 +2297,9 @@ static const RadOperandSpec oRouterSigmoidScatter[] = {
     { "ids", RAD_OPD_OUT, 0 },          { "weights", RAD_OPD_OUT, 0 },
     { "sorted_tok", RAD_OPD_OUT, 0 },   { "expert_offset", RAD_OPD_OUT, 0 },
     { "expert_count", RAD_OPD_OUT, 0 }, { "gate", RAD_OPD_OUT, 1 },
-    { "inverse", RAD_OPD_OUT, 1 }
+    { "inverse", RAD_OPD_OUT, 1 },
+    /* The layer's W2 control block (abi/rad_w2.h): present, the launch ends with the plan. */
+    { "w2", RAD_OPD_INOUT, 1 }
 };
 /* `logit_softcap`'s, matching ref's `pMnCap` (spec §2.3). `cap` must be > 0; the op refuses a
  * non-positive cap (a division by zero in every lane). */
@@ -6730,8 +6738,13 @@ static const RadConstraint cLogitsVocab[] = { C_DIV("n_embd", 256), C_IN("dtype"
  * computes every output element with the same WMMAs in the same order (a token's bytes depend on
  * its own row only), so the axis moves time, not bits (tests/r4d_emu/test_mla_kv.cpp walks it). */
 static const int64_t kMlaKvMb[] = { 0, 1, 2, 4, 8 };
+/* stage (expand only, K-50): 0 = the workgroup that takes four token tiles on the aligned unchained
+ * form stages their latent block in LDS once for four column tiles; 1 = every workgroup loads it
+ * itself (the A/B arm). Bit-neutral like mb. */
+static const int64_t kMlaKvStage[] = { 0, 1 };
 static const RadTunable tMlaKv[] = {
   { "mb", kMlaKvMb, NELEM(kMlaKvMb), 0, "16-token tiles a wave shares each kv_b fragment over; 0 = by M (1 up to 16 rows, 4 past them)" },
+  { "stage", kMlaKvStage, NELEM(kMlaKvStage), 0, "expand at four token tiles: 0 = stage the tokens' latent block in LDS once for four column tiles, 1 = each workgroup loads it itself" },
 };
 
 /* The prefetch's workgroups. It runs beside a collective or a latency-bound kernel and should fill

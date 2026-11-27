@@ -92,8 +92,10 @@ struct Dfly {
     bool coupled = false;
     /* RADIANCE_HY4_DFLY_TEST_BREAK (tests only, kernels/dfly2.md §6.4): `store_late` stores the
      * draft rows after the attention, `nsel_keep` leaves the selection snapshot uncleared on a
-     * step that does not select. Each must be caught by the parity check; neither changes text. */
-    bool break_store_late = false, break_nsel_keep = false;
+     * step that does not select. Each must be caught by the parity check; neither changes text.
+     * `chain_rows` (D-02) makes every chain round read round 0's rows of the hoisted gather and
+     * norm, which changes the proposals from the second on; the arch test's replay catches it. */
+    bool break_store_late = false, break_nsel_keep = false, break_chain_rows = false;
     std::string why;                /* why a declared drafter is not served */
     std::string why_buf;            /* storage for a reason built from an encoding (the manifest) */
     std::vector<std::function<int()>> defer;   /* quantised linears' manifest entries, kept until served is known */
@@ -138,6 +140,7 @@ struct Dfly {
         const char* br = std::getenv("RADIANCE_HY4_DFLY_TEST_BREAK");
         break_store_late = br && std::strstr(br, "store_late");
         break_nsel_keep = br && std::strstr(br, "nsel_keep");
+        break_chain_rows = br && std::strstr(br, "chain_rows");
         char buf[256];
         why.clear();
         auto no = [&](const char* fmt, auto... a) {
@@ -343,8 +346,8 @@ struct Dfly {
         rad_buf tap_tab = 0;
     };
     struct Step {
-        rad_buf rowk = 0;
-        rad_op op_rowk = 0, op_zk = 0, op_pe = 0, op_hn = 0, op_en = 0,
+        rad_buf rowk = 0;   /* the chain's one row-index plane (Dfly::rowk); round k fills rows k */
+        rad_op op_rowk = 0, op_pe = 0, op_en = 0,
                op_silu = 0, op_add = 0, op_head = 0, op_lcast = 0, op_topk = 0, op_ctopk = 0,
                op_tok = 0, op_prev = 0, op_gcp = 0, op_ucp = 0;
         rad_op op_rowk_lo = 0;   /* rowk at the short block's stride (rounds < block_lo - 1) */
@@ -361,10 +364,11 @@ struct Dfly {
     rad_weight token = 0, head = 0, fusion = 0, f_enorm = 0, f_hnorm = 0, f_gate = 0, c_hnorm = 0,
                c_enorm = 0, c_gate = 0, c_up = 0, c_down = 0, out_norm = 0;
     rad_buf final_hidden = 0;
-    rad_buf emb = 0, x = 0, xn = 0, y = 0, ffgu = 0, ffo = 0, qa = 0, q = 0, q_nope = 0, q_rope = 0,
+    rad_buf x = 0, xn = 0, y = 0, ffgu = 0, ffo = 0, qa = 0, q = 0, q_nope = 0, q_rope = 0,
             row = 0, q_lat = 0, lat = 0, ao = 0, gt = 0, ag = 0, o = 0, z = 0;
     rad_buf qa_raw = 0;   /* D-01: q_a's output, which a fused q residual norm reads */
     rad_buf row0 = 0, ea = 0, th = 0, cat = 0, fu = 0;
+    rad_buf rowk = 0;   /* [depth, seqs] k-major: every round's rows of z, for the one gather */
     rad_buf zk = 0, pe = 0, ccat = 0, cg = 0, cup = 0, cgu = 0, cff = 0, cd = 0, zc = 0, logits = 0, lbf = 0,
             cidx = 0, cval = 0, prev = 0, tokens = 0;
     rad_buf pairs = 0, gath = 0;   /* TP: this rank's top-R as (id, value) pairs, every rank's */
@@ -377,7 +381,8 @@ struct Dfly {
     struct ChainCodes { int64_t k = 0, g8 = 0; rad_buf q8 = 0, s8 = 0; };
     std::vector<ChainCodes> chain_codes;
     Proj p_fuse, c_g, c_u, c_d;   /* the fusion and the correction's three linears */
-    rad_op op_embed = 0, op_xcopy = 0, op_row0 = 0, op_ea = 0, op_th = 0, op_fen = 0, op_fhn = 0,
+    rad_op op_zk = 0, op_hn = 0;   /* D-02: every round's z rows and their norm, one launch each */
+    rad_op op_embed = 0, op_row0 = 0, op_ea = 0, op_th = 0, op_fen = 0, op_fhn = 0,
            op_fgate = 0, op_fadd = 0, op_scatter = 0, op_final = 0, op_sabotage = 0;
     rad_op op_final_add = 0;   /* D-01: the last add with the final norm in one launch */
     rad_op op_row0_lo = 0;   /* row0 at the short block's stride */
@@ -494,7 +499,6 @@ struct Dfly {
         };
         const int64_t Vr = g.n_vocab;
         tokens = i32("tokens", { S, depth }, RAD_BUF_PERSIST);
-        emb = bf("embed", { Md, E });
         x = bf("x", { Md, E });
         xn = bf("xn", { Md, E });
         y = bf("y", { Md, E });
@@ -517,9 +521,17 @@ struct Dfly {
         th = bf("target_hidden", { S, E });
         cat = bf("fusion_in", { S, 2 * E });
         fu = bf("fusion_out", { S, E });
-        zk = bf("chain_hidden", { S, E });
+        /* D-02 (#88): the chain's rows of z do not change once the final norm has run, so every
+         * round's are gathered and normalised in one launch each, k-major (round k at rows
+         * [k * n, (k + 1) * n) of a pass of n sequences), and each round reads its own rows. A row's
+         * norm does not depend on how many rows its launch carries (libr4d's kR4dSumLanes), so the
+         * bytes are the per-round launches'. */
+        rowk = i32("rowk", { depth * S });
+        zk = bf("chain_hidden", { depth * S, E });
+        /* The anchors' raw embeddings from the fusion (B) through round 0, then each round's
+         * previous proposal's. */
         pe = bf("chain_prev_embed", { S, E });
-        ccat = bf("chain_in", { S, 2 * E });
+        ccat = bf("chain_in", { depth * S, 2 * E });
         /* gate and up each into a buffer of its own, then copied into the halves silu_mul reads: a GEMM
          * output as a column half of one [S, 2E] buffer is strided once two sequences draft, and
          * libr4d's GEMMs refuse a strided output (the copies are exact, so the bytes are unchanged).
@@ -553,9 +565,9 @@ struct Dfly {
             gath = decl_b(b, nm.f("dfly.cand_gathered"), RAD_F32, { S, s.world * R, 2 });
             if (!pairs || !gath) return RAD_E_INVAL;
         }
-        if (!tokens || !emb || !x || !xn || !y || !ffgu || !ffo || !qa || !q || !q_nope ||
+        if (!tokens || !x || !xn || !y || !ffgu || !ffo || !qa || !q || !q_nope ||
             !q_rope || !row || !q_lat || !lat || !ao || !gt || !ag || !o || !z || !row0 || !ea ||
-            !th || !cat || !fu || !zk || !pe || !ccat || !cg || !cup || !cgu || !cff || !cd || !zc || !logits ||
+            !th || !cat || !fu || !rowk || !zk || !pe || !ccat || !cg || !cup || !cgu || !cff || !cd || !zc || !logits ||
             !lbf || !cidx || !cval || !prev)
             return RAD_E_INVAL;
         for (int64_t i = 0; i < layers; ++i) {
@@ -577,7 +589,8 @@ struct Dfly {
          * Lin over the container's own encoding (this rank's slice at TP, as the trunk's). */
         auto linear = [&](Proj& p, const std::string& base, int grp, int64_t rows, int64_t n_out,
                         int64_t n_in, rad_weight plain_w, rad_buf in, rad_buf out, int shard,
-                        std::initializer_list<int64_t> parts, bool persist = false) -> int {
+                        std::initializer_list<int64_t> parts, bool persist = false,
+                        int64_t code_rows = 0) -> int {
             const std::string wn = base + ".weight";
             const char* wnc = nm.f("%s", wn.c_str());
             if (!quantised(b, wnc)) {
@@ -606,9 +619,10 @@ struct Dfly {
                     c.k = n_in;
                     c.g8 = g8;
                     c.q8 = decl_b(b, nm.f("dfly.chain_codes.%lld.%lld.q8", (long long)n_in, (long long)g8),
-                                  RAD_I8, { rows, n_in }, RAD_BUF_PERSIST);
+                                  RAD_I8, { code_rows ? code_rows : rows, n_in }, RAD_BUF_PERSIST);
                     c.s8 = decl_b(b, nm.f("dfly.chain_codes.%lld.%lld.s8", (long long)n_in, (long long)g8),
-                                  RAD_F32, { rows, (n_in + g8 - 1) / g8 }, RAD_BUF_PERSIST);
+                                  RAD_F32, { code_rows ? code_rows : rows, (n_in + g8 - 1) / g8 },
+                                  RAD_BUF_PERSIST);
                     if (!c.q8 || !c.s8) return RAD_E_INVAL;
                     chain_codes.push_back(c);
                     p.q8 = c.q8;
@@ -638,27 +652,26 @@ struct Dfly {
                       {}, {}, { out });
         };
 
-        /* A: the block's embeddings, kept raw for the chain's first step. */
+        /* A: the block's embeddings, straight into the residual (D-02: no copy of the block). */
         op_embed = mk(b, "embed_lookup",
                       { RAD_RANGE("M", 1, Md), RAD_INT("n_embd", E), RAD_INT("n_vocab", s.n_vocab),
                         RAD_STR("dtype", "bf16") },
-                      { token }, {}, { emb });
-        op_xcopy = decl_copy(b, Md, E, RAD_BF16, emb, x);
+                      { token }, {}, { x });
         HY4_NEED(op_embed, "embed_lookup");
-        HY4_NEED(op_xcopy, "cast");
-        RAD_ARCH_TRY(t_embed.declare(b, nm, Md, "dfly.embed", -1, RAD_BF16, E, emb));
-        /* B: the fusion into each anchor row. */
+        RAD_ARCH_TRY(t_embed.declare(b, nm, Md, "dfly.embed", -1, RAD_BF16, E, x));
+        /* B: the fusion into each anchor row. The anchors' raw embeddings are gathered once, before
+         * the fusion overwrites those rows of x, and kept in `pe` for the chain's first round. */
         op_row0 = iota(0, row0, block);
         if (block_lo) op_row0_lo = iota(0, row0, block_lo);
-        op_ea = gather(S, emb, row0, ea);
+        op_ea = gather(S, x, row0, pe);
         op_th = gather(S, final_hidden, 0, th);
-        op_fen = decl_rmsnorm(b, S, E, s.eps, f_enorm, ea, cat);
+        op_fen = decl_rmsnorm(b, S, E, s.eps, f_enorm, pe, cat);
         op_fhn = decl_rmsnorm(b, S, E, s.eps, f_hnorm, th, cat);
         const int gtop = (int)(s.n_layer + layers);   /* the drafter's model-level weights' group */
         RAD_ARCH_TRY(linear(p_fuse, "dfly.fusion", gtop, S, E, 2 * E, fusion, cat, fu, RAD_SHARD_NONE, {}));
         op_fgate = mk(b, "mul_weight", { RAD_RANGE("M", 1, S), RAD_INT("n", E), RAD_STR("dtype", "bf16") },
                       { f_gate }, { fu }, { fu });
-        op_fadd = add(S, ea, fu, ea);
+        op_fadd = add(S, pe, fu, ea);
         op_scatter = mk(b, "scatter_rows",
                         { RAD_RANGE("M", 1, S), RAD_INT("n", E), RAD_STR("dtype", "bf16") }, {},
                         { ea, row0, x }, { x });
@@ -921,25 +934,33 @@ struct Dfly {
         /* The correction's linears once, their ops issued by every step: gate and up by rows, down
          * by columns, so each rank reads 1/world of each and the down's partial sum is reduced
          * exactly once a step before the residual. */
-        RAD_ARCH_TRY(linear(c_g, "dfly.correct_gate", gtop, S, Ew, 2 * E, c_gate, ccat, cg, RAD_SHARD_ROW, {}, true));
-        RAD_ARCH_TRY(linear(c_u, "dfly.correct_up", gtop, S, Ew, 2 * E, c_up, ccat, cup, RAD_SHARD_ROW, {}, true));
+        /* The codes of gate's and up's input hold a round a row block, as `ccat` does. */
+        RAD_ARCH_TRY(linear(c_g, "dfly.correct_gate", gtop, S, Ew, 2 * E, c_gate, ccat, cg, RAD_SHARD_ROW, {}, true, depth * S));
+        RAD_ARCH_TRY(linear(c_u, "dfly.correct_up", gtop, S, Ew, 2 * E, c_up, ccat, cup, RAD_SHARD_ROW, {}, true, depth * S));
         RAD_ARCH_TRY(linear(c_d, "dfly.correct_down", gtop, S, E, Ew, c_down, cff, cd, RAD_SHARD_COL, {}, true));
+        /* Every round's rows of z (declared in the order they are issued: the rows, the gather,
+         * the norm, then the rounds). */
+        for (int64_t k = 0; k < depth; ++k) {
+            Step& st = steps[(size_t)k];
+            st.rowk = rowk;
+            st.op_rowk = iota(k + 1, st.rowk, block);
+            if (block_lo && k < block_lo - 1) st.op_rowk_lo = iota(k + 1, st.rowk, block_lo);
+            HY4_NEED(st.op_rowk, "iota");
+            HY4_NEED(!(block_lo && k < block_lo - 1) || st.op_rowk_lo, "iota");
+        }
+        op_zk = gather(depth * S, z, rowk, zk);
+        op_hn = decl_rmsnorm(b, depth * S, E, s.eps, c_hnorm, zk, ccat);
+        HY4_NEED(op_zk, "gather_rows");
+        HY4_NEED(op_hn, "rmsnorm");
         for (int64_t k = 0; k < depth; ++k) {
             Step& st = steps[(size_t)k];
             const int ki = (int)k;
-            st.rowk = i32(nm.f("rowk.%lld", (long long)k), { S });
-            if (!st.rowk) return RAD_E_INVAL;
-            st.op_rowk = iota(k + 1, st.rowk, block);
-            if (block_lo && k < block_lo - 1) st.op_rowk_lo = iota(k + 1, st.rowk, block_lo);
-            st.op_zk = gather(S, z, st.rowk, zk);
-            if (k == 0)
-                st.op_pe = gather(S, emb, row0, pe);
-            else
+            /* Round 0 reads the anchors' embeddings the fusion kept in `pe`. */
+            if (k > 0)
                 st.op_pe = mk(b, "embed_lookup",
                               { RAD_RANGE("M", 1, S), RAD_INT("n_embd", E),
                                 RAD_INT("n_vocab", s.n_vocab), RAD_STR("dtype", "bf16") },
                               { token }, { prev }, { pe });
-            st.op_hn = decl_rmsnorm(b, S, E, s.eps, c_hnorm, zk, ccat);
             st.op_en = decl_rmsnorm(b, S, E, s.eps, c_enorm, pe, ccat);
             st.op_gcp = decl_copy(b, S, Ew, RAD_BF16, cg, cgu);
             st.op_ucp = decl_copy(b, S, Ew, RAD_BF16, cup, cgu);
@@ -1032,10 +1053,8 @@ struct Dfly {
             }
             st.op_tok = decl_copy(b, S, 1, RAD_I32, cidx, tokens);
             st.op_prev = decl_copy(b, S, 1, RAD_I32, cidx, prev);
-            HY4_NEED(st.op_rowk, "iota");
-            HY4_NEED(!(block_lo && k < block_lo - 1) || st.op_rowk_lo, "iota");
-            HY4_NEED(st.op_zk && st.op_pe, "gather_rows / embed_lookup");
-            HY4_NEED(st.op_hn && st.op_en, "rmsnorm");
+            HY4_NEED(k == 0 || st.op_pe, "embed_lookup");
+            HY4_NEED(st.op_en, "rmsnorm");
             HY4_NEED(c_g.ok() && c_u.ok() && c_d.ok() && st.op_add && st.op_silu,
                      "gemm_nt / silu_mul / add");
             HY4_NEED(st.op_head, "logits_gemm");
@@ -1154,18 +1173,17 @@ struct Dfly {
             RAD_ISSUE_N(c, t_anchor.op, n, src, brows(t_anchor.buf, n));
         }
         /* A */
-        RAD_ISSUE_N(c, op_embed, M, praw(batch->token_ids, RAD_I32, M), RAD_W(token), brows(emb, M));
-        t_embed.step(c, brows(emb, M), M);
-        RAD_ISSUE_N(c, op_xcopy, M, brows(emb, M), brows(x, M));
+        RAD_ISSUE_N(c, op_embed, M, praw(batch->token_ids, RAD_I32, M), RAD_W(token), brows(x, M));
+        t_embed.step(c, brows(x, M), M);
         /* B */
         RAD_ISSUE_N(c, blk == block ? op_row0 : op_row0_lo, n, brows(row0, n));
-        RAD_ISSUE_N(c, op_ea, n, brows(emb, M), brows(row0, n), brows(ea, n));
+        RAD_ISSUE_N(c, op_ea, n, brows(x, M), brows(row0, n), brows(pe, n));
         RAD_ISSUE_N(c, op_th, n, RAD_B(final_hidden), src, brows(th, n));
-        RAD_ISSUE_N(c, op_fen, n, brows(ea, n), RAD_W(f_enorm), bcol(cat, 0, E, n));
+        RAD_ISSUE_N(c, op_fen, n, brows(pe, n), RAD_W(f_enorm), bcol(cat, 0, E, n));
         RAD_ISSUE_N(c, op_fhn, n, brows(th, n), RAD_W(f_hnorm), bcol(cat, E, E, n));
         run(c, p_fuse, cat, fu, n);
         RAD_ISSUE_N(c, op_fgate, n, brows(fu, n), RAD_W(f_gate), brows(fu, n));
-        RAD_ISSUE_N(c, op_fadd, n, brows(ea, n), brows(fu, n), brows(ea, n));
+        RAD_ISSUE_N(c, op_fadd, n, brows(pe, n), brows(fu, n), brows(ea, n));
         t_fused.step(c, brows(ea, n), n);
         RAD_ISSUE_N(c, op_scatter, n, brows(ea, n), brows(row0, n), brows(x, M));
         if (op_ident) RAD_ISSUE_N(c, op_ident, n * ident_w, bcol_at(ident, 0, ident_w, 0, ident_w, n));
@@ -1304,25 +1322,46 @@ struct Dfly {
         else
             RAD_ISSUE_N(c, op_final, M, brows(x, M), RAD_W(out_norm), brows(z, M));
         t_final.step(c, brows(z, M), M);
-        /* F */
+        /* F. Every round's rows of z and their norm first, one launch each over rounds * n rows
+         * (D-02), round k at rows [k * n, (k + 1) * n). */
+        const int64_t RN = rounds * n;
         for (int64_t k = 0; k < rounds; ++k) {
             const Step& st = steps[(size_t)k];
-            RAD_ISSUE_N(c, blk == block ? st.op_rowk : st.op_rowk_lo, n, brows(st.rowk, n));
-            RAD_ISSUE_N(c, st.op_zk, n, brows(z, M), brows(st.rowk, n), brows(zk, n));
-            if (k == 0)
-                RAD_ISSUE_N(c, st.op_pe, n, brows(emb, M), brows(row0, n), brows(pe, n));
-            else
-                RAD_ISSUE_N(c, st.op_pe, n, brows(prev, n), RAD_W(token), brows(pe, n));
-            RAD_ISSUE_N(c, st.op_hn, n, brows(zk, n), RAD_W(c_hnorm), bcol(ccat, 0, E, n));
-            RAD_ISSUE_N(c, st.op_en, n, brows(pe, n), RAD_W(c_enorm), bcol(ccat, E, E, n));
-            run(c, c_g, ccat, cg, n);
-            run(c, c_u, ccat, cup, n);
+            RAD_ISSUE_N(c, blk == block ? st.op_rowk : st.op_rowk_lo, n, brow_slice(rowk, k * n, n, 1));
+        }
+        RAD_ISSUE_N(c, op_zk, RN, brows(z, M), brows(rowk, RN), brows(zk, RN));
+        RAD_ISSUE_N(c, op_hn, RN, brows(zk, RN), RAD_W(c_hnorm), bcol(ccat, 0, E, RN));
+        /* gate and up read one input: where both are int8 linears of one code form they share the
+         * chain's code pair, so up reads the codes gate's quantiser has just written (the same op
+         * over the same rows) instead of writing them again. */
+        const bool up_fed = c_g.q && c_u.q && c_g.q8 && c_g.q8 == c_u.q8 && c_g.s8 == c_u.s8 &&
+                            c_g.lin.op_q && c_g.lin.form.same(c_u.lin.form);
+        /* A correction linear over round rows [r0, r0 + n) of `ccat`, into rows [0, n) of `out`. */
+        auto corr = [&](const Proj& p, int64_t r0, rad_buf out, bool codes_ready) {
+            if (!p.q) {
+                RAD_ISSUE_N(c, p.op, n, brow_slice(ccat, r0, n, 2 * E), RAD_W(p.w), brows(out, n));
+                return;
+            }
+            ActFP8 a{};
+            a.x = ccat;
+            a.q8 = p.q8;
+            a.s8 = p.s8;
+            if (p.q8) a.g8 = p.g8;
+            p.lin.step(c, a, out, 0, r0, n, 0, codes_ready);
+        };
+        for (int64_t k = 0; k < rounds; ++k) {
+            const Step& st = steps[(size_t)k];
+            const int64_t r0 = break_chain_rows ? 0 : k * n;
+            if (k > 0) RAD_ISSUE_N(c, st.op_pe, n, brows(prev, n), RAD_W(token), brows(pe, n));
+            RAD_ISSUE_N(c, st.op_en, n, brows(pe, n), RAD_W(c_enorm), bcol_at(ccat, r0, 2 * E, E, E, n));
+            corr(c_g, r0, cg, false);
+            corr(c_u, r0, cup, up_fed);
             RAD_ISSUE_N(c, st.op_gcp, n, brows(cg, n), bcol(cgu, 0, Ew, n));
             RAD_ISSUE_N(c, st.op_ucp, n, brows(cup, n), bcol(cgu, Ew, Ew, n));
             RAD_ISSUE_N(c, st.op_silu, n, brows(cgu, n), brows(cff, n));
             run(c, c_d, cff, cd, n);
             issue_all_reduce(c, op_ar_c, cd, n, E);
-            RAD_ISSUE_N(c, st.op_add, n, brows(zk, n), brows(cd, n), brows(zc, n));
+            RAD_ISSUE_N(c, st.op_add, n, brow_slice(zk, r0, n, E), brows(cd, n), brows(zc, n));
             st.t_corr.step(c, brows(zc, n), n);
             RAD_ISSUE_N(c, st.op_head, n, brows(zc, n), RAD_W(head), brows(logits, n));
             st.t_logits.step(c, brows(logits, n), n);
@@ -1347,7 +1386,8 @@ struct Dfly {
                             brows(couple_draws, n), RAD_B(couple_state));
             }
             RAD_ISSUE_N(c, st.op_tok, n, bcol(cidx, 0, 1, n), bcol(tokens, k, 1, n));
-            RAD_ISSUE_N(c, st.op_prev, n, bcol(cidx, 0, 1, n), brows(prev, n));
+            /* The next round's embedding reads `prev`; the last round has no reader. */
+            if (k + 1 < rounds) RAD_ISSUE_N(c, st.op_prev, n, bcol(cidx, 0, 1, n), brows(prev, n));
         }
         if (op_sabotage) RAD_ISSUE_N(c, op_sabotage, n, brows(tokens, n));
         t_tokens.step(c, brows(tokens, n), n);

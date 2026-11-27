@@ -8197,6 +8197,28 @@ static void iqr_dual_case(const Plugin& pl, const IqrCase& f, int64_t M, int64_t
     dfree_all();
 }
 
+/* The run-tile grid's tiles at these offsets over T output rows: each run, clamped to T, in
+ * 16-row tiles from its own first row (r4d_moe.hip's moe_down_dec numbering). */
+static int64_t moe_run_tiles(const std::vector<int32_t>& off, int64_t ne, int64_t T) {
+    int64_t n = 0;
+    for (int64_t e = 0; e < ne; ++e) {
+        const int64_t a = std::min<int64_t>(off[(size_t)e], T);
+        const int64_t b = std::min<int64_t>(off[(size_t)e + 1], T);
+        if (b > a) n += (b - a + 15) / 16;
+    }
+    return n;
+}
+/* Tile-block counts for the run-tile grid's pin (r4d_moe_gemm_pin_run_grid): one, two and three
+ * blocks serving every tile in turn, one fewer than the tiles, as many, and one more. */
+static std::vector<int> moe_grid_pins(int64_t ntile) {
+    std::vector<int> v;
+    for (const int64_t g : { (int64_t)1, (int64_t)2, (int64_t)3, ntile - 1, ntile, ntile + 1 })
+        if (g >= 1 && std::find(v.begin(), v.end(), (int)g) == v.end()) v.push_back((int)g);
+    return v;
+}
+
+#include "r4d_selftest_w2.h"   /* moe_w2_split_case: a routed GEMM split under W2 */
+
 /* moe_gemm_iqr against the dense IQR GEMM over the same expert buffers. Every expert is an IQR
  * weight (the computed trellis under one f32 scale a row, `run` rows a trellis run), in two classes
  * of their own rows and K; the routing is random with `drop` trailing dropped slots. The grouped
@@ -8263,6 +8285,7 @@ static void moe_iqr_case(const Plugin& pl, const MoeIqrShape& sh) {
                                  PI("K_odd", Kc[1]), PI("group", 128), PS("dtype", "i8a8h"),
                                  PI("parts", sh.parts) };
     std::vector<void*> d_w((size_t)E), d_s((size_t)E);
+    std::vector<size_t> w_bytes((size_t)E, 0);
     RadLayout lw[2], ls[2];
     for (int64_t e = 0; e < E; ++e) {
         const int q = (int)(e & 1);
@@ -8314,6 +8337,7 @@ static void moe_iqr_case(const Plugin& pl, const MoeIqrShape& sh) {
         }
         d_w[(size_t)e] = dalloc(wq.size());
         d_s[(size_t)e] = dalloc(wsc.size());
+        w_bytes[(size_t)e] = wq.size();
         if (!d_w[(size_t)e] || !d_s[(size_t)e]) { ok(nm, false, "hipMalloc failed"); dfree_all(); return; }
         st_memcpy(d_w[(size_t)e], wq.data(), wq.size(), hipMemcpyHostToDevice);
         st_memcpy(d_s[(size_t)e], wsc.data(), wsc.size(), hipMemcpyHostToDevice);
@@ -8379,6 +8403,36 @@ static void moe_iqr_case(const Plugin& pl, const MoeIqrShape& sh) {
     if (rq != RAD_OK) { ok(nm, false, "rc " + std::to_string(rq)); dfree_all(); return; }
     std::vector<uint16_t> y((size_t)(Tr * N));
     st_memcpy(y.data(), d_y, y.size() * 2, hipMemcpyDeviceToHost);
+    /* The same launch split under W2 (the decode grid's shapes): the plain bytes in two launches. */
+    moe_w2_split_case(nm, r, ts, ps, d_y, off, E, Tr, N, !sh.sorted, [&](int64_t e) {
+        return std::make_pair(d_w[(size_t)e], w_bytes[(size_t)e]);
+    });
+
+    /* The decode band's run-tile grid at fewer tile blocks than the launch has tiles (a block
+     * serving several in turn), at as many and at one more: byte for byte the rule's launch. */
+    using GridPinFn = void (*)(int);
+    const GridPinFn pin_grid = (GridPinFn)dlsym(pl.h, "r4d_moe_gemm_pin_run_grid");
+    if (2 * Tr <= 3 * E) {
+        const int64_t ntile = moe_run_tiles(off, E, Tr);
+        if (!pin_grid) ok((std::string(nm) + ": run-tile grid pins").c_str(), false, "no pin");
+        for (const int g : pin_grid ? moe_grid_pins(ntile) : std::vector<int>()) {
+            std::vector<uint16_t> poison((size_t)(Tr * N), h_to_bf16(77.0f));
+            st_memcpy(d_y, poison.data(), poison.size() * 2, hipMemcpyHostToDevice);
+            pin_grid(g);
+            const int rg = launch(r, ts, ps);
+            pin_grid(0);
+            std::vector<uint16_t> yg((size_t)(Tr * N));
+            st_memcpy(yg.data(), d_y, yg.size() * 2, hipMemcpyDeviceToHost);
+            int64_t diff = 0;
+            for (size_t i = 0; i < y.size(); ++i) diff += yg[i] != y[i];
+            ok((std::string(nm) + ": " + std::to_string(g) + " tile blocks for " +
+                std::to_string(ntile) + " tiles, byte for byte").c_str(),
+               rg == RAD_OK && diff == 0,
+               rg != RAD_OK ? "rc " + std::to_string(rg)
+                            : std::to_string(diff) + " of " + std::to_string(y.size()) +
+                                  " outputs differ from the rule's grid");
+        }
+    }
 
     /* The reference, a run's rows at a time through the dense row over the same buffers. */
     std::vector<float> want((size_t)(Tr * N), 0.0f);
@@ -24388,7 +24442,9 @@ static void moefuse_perf(const Plugin& pl, int64_t rows, int iters) {
  * weight + input + output and its TFLOP/s; weights rotate over copies past the last-level cache,
  * as in bf16_perf. */
 /* pad: x's pitch past K. 5 stages x a value at a time in the staged prefill form; 0 at a K that is
- * a multiple of 8 stages it 16 bytes at a time, as the router's contiguous rows do. */
+ * a multiple of 8 stages it 16 bytes at a time, as the router's contiguous rows do. In the verify
+ * form (17-63 rows at N 512+, 32-63 at N 256-511) an even pitch and K stage 4 bytes at a time,
+ * an odd one 2 bytes; above 56 rows only the 2-byte staging takes it. */
 static void f32_forms(const Plugin& pl, int64_t M, int64_t N, int64_t K, int iters, bool timed,
                       int64_t pad = 5) {
     const RadKernelInfo* r = find(pl, "gemm_nt_f32_bf16");
@@ -24454,11 +24510,12 @@ static void f32_forms(const Plugin& pl, int64_t M, int64_t N, int64_t K, int ite
             std::memcpy(&want[(size_t)(row * yp + c) * 4], &lane[0], 4);
         }
     const bool same = rc == RAD_OK && got == want;
+    const std::string pitch = pad == 5 ? "" : pad ? fmt(" (pitch K+%lld)", (long long)pad) : " (pitch K)";
     size_t first = 0;
     if (rc == RAD_OK && !same)
         while (first < got.size() && got[first] == want[first]) ++first;
     ok(fmt("gemm_nt_f32 at M=%lld N=%lld K=%lld%s: byte-identical to the host arithmetic",
-           (long long)M, (long long)N, (long long)K, pad == 5 ? "" : " (pitch K)").c_str(),
+           (long long)M, (long long)N, (long long)K, pitch.c_str()).c_str(),
        same, rc != RAD_OK ? fmt("rc=%d", rc) : same ? "" : fmt("first byte %zu", first));
     if (!timed && same) {
         ts[1].dtype = RAD_BF16;
@@ -24472,7 +24529,7 @@ static void f32_forms(const Plugin& pl, int64_t M, int64_t N, int64_t K, int ite
         std::vector<uint8_t> packed_y(ybytes);
         if (rc == RAD_OK) st_memcpy(packed_y.data(), d_y, ybytes, hipMemcpyDeviceToHost);
         ok(fmt("gemm_nt_f32 stored bf16 vs widened f32 at M=%lld N=%lld K=%lld%s",
-               (long long)M, (long long)N, (long long)K, pad == 5 ? "" : " (pitch K)").c_str(),
+               (long long)M, (long long)N, (long long)K, pitch.c_str()).c_str(),
            rc == RAD_OK && packed_y == got);
     }
     if (timed && rc == RAD_OK) {
@@ -26503,6 +26560,14 @@ static void moe_w4_gemm(const Plugin& pl, int64_t Tr, const MoeW4Shape& sh, int 
      * inside the decode band. */
     const int64_t map_bytes = (1 + 2 * (ne + Tr / 16 + 2)) * 4;
     void* d_map = dalloc((size_t)map_bytes);
+    /* The down projection against an int8 activation (the engine's routed down at decode), split
+     * under W2: the plain bytes in two launches. A class's experts are stacked in one plane. */
+    if (act8 == 1 && sh.sorted_a && sh.parts == 1)
+        moe_w2_split_case(what, r, ts, ps, d_y, off, ne, Tr, N, false, [&](int64_t e) {
+            const int c = (int)(e & 1);
+            const size_t per = wq[c].size() / (size_t)nec[c];
+            return std::make_pair((void*)((char*)d_w[c] + (size_t)(e / 2) * per), per);
+        });
 
     /* The reference, once: every form must reproduce it. Rows are independent. */
     std::vector<double> ref((size_t)(Tr * N), 0.0);
@@ -36289,16 +36354,16 @@ static void hy4_mla_project_kv_case(const Plugin& pl) {
                 t.stride[0] = pitch;
                 return t;
             };
-            auto prm = [&](int64_t m, long long mb, long long chain, bool gate) {
+            auto prm = [&](int64_t m, long long mb, long long chain, bool gate, long long stage) {
                 std::vector<RadParam> ps = { PI("M", m), PI("heads", H), PI("k_dim", kd), PI("v_dim", vd),
                                              PI("latent_dim", L), PS("dtype", "bf16"), PI("mb", mb),
-                                             PI("chain", chain) };
+                                             PI("chain", chain), PI("stage", stage) };
                 if (!gate) ps.push_back(PS("mode", mode));
                 return ps;
             };
             /* y of rows [r0, r0 + m) through `r`, packed on the host */
             auto launch = [&](const RadKernelInfo* r, int64_t r0, int64_t m, long long mb, long long chain,
-                              bool pitched, bool gate) {
+                              bool pitched, bool gate, long long stage = 0) {
                 const int64_t xp = pitched ? XW + 3 : XW, wp = pitched ? L + 3 : L,
                               gp = pitched ? GW + 3 : GW, ypt = pitched ? YW + 3 : YW;
                 uint16_t* y = (uint16_t*)dalloc((size_t)(m * ypt + 8) * 2) + (pitched ? 1 : 0);
@@ -36306,7 +36371,7 @@ static void hy4_mla_project_kv_case(const Plugin& pl) {
                                               T2(pitched ? pw : dw, WR, L, wp) };
                 if (gate) ts.push_back(T2((pitched ? pg : dg) + r0 * gp, m, GW, gp));
                 ts.push_back(T2(y, m, YW, ypt));
-                std::vector<RadParam> ps = prm(m, mb, chain, gate);
+                std::vector<RadParam> ps = prm(m, mb, chain, gate, stage);
                 run_case(r, ts, ps);
                 std::vector<uint16_t> o((size_t)(m * YW)), rowb((size_t)ypt);
                 for (int64_t i = 0; i < m; ++i) {
@@ -36324,18 +36389,19 @@ static void hy4_mla_project_kv_case(const Plugin& pl) {
             std::string where;
             for (const long long chain : { 0, 1 })
                 for (const long long mb : { 0, 1, 2, 4, 8 })
-                    for (const int64_t m : { M, (int64_t)9 }) {
-                        const auto o = launch(row, 0, m, mb, chain, false, false);
-                        if (!std::equal(o.begin(), o.end(), alone.begin())) {
-                            same = false;
-                            where = fmt("M %lld mb %lld chain %lld", (long long)m, mb, chain);
+                    for (const long long stage : { 0, 1 })   /* K-50: the staged expansion (0) and kvp_body's (1) */
+                        for (const int64_t m : { M, (int64_t)9 }) {
+                            const auto o = launch(row, 0, m, mb, chain, false, false, stage);
+                            if (!std::equal(o.begin(), o.end(), alone.begin())) {
+                                same = false;
+                                where = fmt("M %lld mb %lld chain %lld stage %lld", (long long)m, mb, chain, stage);
+                            }
                         }
-                    }
             const auto tail = launch(row, 5, M - 5, 0, 0, false, false);
             if (!std::equal(tail.begin(), tail.end(), alone.begin() + 5 * YW)) { same = false; where = "rows 5.."; }
             const auto pit = launch(row, 0, M, 0, 0, true, false);
             if (pit != alone) { same = false; where = "pitched"; }
-            ok(fmt("mla_project_kv %s heads %lld: a token's bytes do not depend on M, mb, the chained form or "
+            ok(fmt("mla_project_kv %s heads %lld: a token's bytes do not depend on M, mb, stage, the chained form or "
                    "the operand layout", mode, (long long)H).c_str(), same, where);
             if (ab) continue;
             /* the fused gate against gate_mul over the expansion */
@@ -36351,11 +36417,15 @@ static void hy4_mla_project_kv_case(const Plugin& pl) {
             bool fsame = true;
             for (const long long chain : { 0, 1 })
                 for (const long long mb : { 0, 1, 4, 8 })
-                    for (const bool pitched : { false, true }) {
-                        if (pitched && (chain || mb)) continue;
-                        const auto o = launch(fused, 0, M, mb, chain, pitched, true);
-                        if (o != want) { fsame = false; where = fmt("mb %lld chain %lld%s", mb, chain, pitched ? " pitched" : ""); }
-                    }
+                    for (const long long stage : { 0, 1 })
+                        for (const bool pitched : { false, true }) {
+                            if (pitched && (chain || mb || stage)) continue;
+                            const auto o = launch(fused, 0, M, mb, chain, pitched, true, stage);
+                            if (o != want) {
+                                fsame = false;
+                                where = fmt("mb %lld chain %lld stage %lld%s", mb, chain, stage, pitched ? " pitched" : "");
+                            }
+                        }
             const auto o9 = launch(fused, 0, 9, 0, 1, false, true);
             if (!std::equal(o9.begin(), o9.end(), want.begin())) { fsame = false; where = "M 9 chained"; }
             ok(fmt("mla_expand_gate heads %lld == mla_project_kv expand + gate_mul, bit for bit", (long long)H).c_str(),
@@ -39321,6 +39391,8 @@ static void device_phase(const Plugin& pl) {
                 /* the run-tile grid: a decode step's rows */
                 { "decode gate/up", 4, 16, 128, 64, 4, 3, 768, 512, 2560, 2560, 2, false, 0 },
                 { "decode gate/up, a dropped slot", 4, 16, 128, 64, 4, 3, 768, 512, 2560, 2560, 2, false, 1 },
+                /* no tile at all: every slot dropped, the grid's blocks find none */
+                { "verify gate/up, every slot dropped", 4, 16, 128, 512, 4, 64, 512, 256, 1280, 1280, 2, false, 256 },
                 { "decode down", 4, 16, 256, 64, 4, 3, 2560, 2560, 512, 256, 1, true, 0 },
                 { "verify gate/up, runs of several rows", 4, 16, 128, 16, 4, 6, 768, 512, 2560, 2560, 2, false, 2 },
                 { "verify down", 3, 16, 256, 16, 4, 6, 2560, 2560, 512, 256, 1, true, 2 },
@@ -39353,7 +39425,11 @@ static void device_phase(const Plugin& pl) {
                 { "prefill down", 6, 16, 256, 8, 2, 96, 512, 512, 256, 256, 1, true, 0 },
                 { "prefill down", 2, 15, 256, 8, 2, 96, 512, 512, 256, 256, 1, true, 0 },
             };
+            const int w2_before = g_w2_split;
             for (const MoeIqrShape& sh : kIqr) moe_iqr_case(pl, sh);
+            /* The decode grid's shapes above took the W2 split (r4d_selftest_w2.h). */
+            ok("moe_gemm_iqr: W2 split launches ran on the decode grid", g_w2_split - w2_before >= 8,
+               fmt("%d shapes split, %d did not read the operand", g_w2_split - w2_before, g_w2_whole));
             /* a large prefill pass: the packed map's bytes against the run map's, at four bits and
              * at three (Hy4-flash's routed gate_up) */
             moe_iqr_pack_case(pl, 2048, false);
@@ -39380,6 +39456,7 @@ static void device_phase(const Plugin& pl) {
             moe_down_mt_case(pl, 4096);
             moe_down_mt_case(pl, 8192);
         }
+        const int w2_before8 = g_w2_split;
         for (const MoeW4Shape& sh : kShapes8)
             for (const int64_t t : { (int64_t)24, (int64_t)200, (int64_t)600 }) {
                 /* And the activation's scale per 256 of K where every class's K is whole ones. */
@@ -39392,6 +39469,12 @@ static void device_phase(const Plugin& pl) {
                     if (w8 || w8m) moe_w4_gemm(pl, t, sh, 0, false, w8m, 2, 2, ag);
                 }
             }
+        /* The down shapes inside the decode band took the W2 split (r4d_selftest_w2.h). */
+        if (w4 || w4m)
+            ok("moe_gemm_w4a8i8: W2 split launches ran on the sorted operand's decode kernel",
+               g_w2_split - w2_before8 >= 1,
+               fmt("%d launches split, %d did not read the operand so far", g_w2_split - w2_before8,
+                   g_w2_whole));
     }
 
     if (sel("glm_index_layout")) glm_index_layout_check(pl);
@@ -39544,6 +39627,21 @@ static void device_phase(const Plugin& pl) {
         f32_forms(pl, 400, 256, 3072, 0, false, 0);
         f32_forms(pl, 1024, 128, 3072, 0, false);
         f32_forms(pl, 775, 130, 1000, 0, false, 0);
+        /* The verify form (x staged transposed: 17-63 rows from N 512, 32-63 at N 256-511) at the
+         * router's widths a rank, K 3072, x's rows contiguous and padded, each side of its bounds
+         * (N 128 and 255, N 256 at 31 rows and N 511 at 17 stay on 8x1); and short of a whole
+         * stage and step, N no multiple of 4. Above 56 rows x's contiguous rows (4-byte staging)
+         * keep 8x1 and a pitch K+5 (2-byte staging) does not: N 512 at 56 and 57 rows, both. */
+        f32_forms(pl, 32, 128, 3072, 0, false, 0);
+        f32_forms(pl, 32, 255, 3072, 0, false, 0);
+        f32_forms(pl, 31, 256, 3072, 0, false, 0);
+        f32_forms(pl, 32, 256, 3072, 0, false, 0);
+        f32_forms(pl, 17, 511, 3072, 0, false, 8);
+        f32_forms(pl, 17, 512, 3072, 0, false, 8);
+        f32_forms(pl, 63, 259, 1000, 0, false, 0);
+        f32_forms(pl, 56, 512, 3072, 0, false, 0);
+        f32_forms(pl, 57, 512, 3072, 0, false, 0);
+        f32_forms(pl, 57, 512, 3072, 0, false);
     }
     if (sel("dsa_score_fp8")) {
         dsa_score_check(pl, 1, 17);

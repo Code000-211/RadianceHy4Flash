@@ -56,6 +56,8 @@ models:
     prefix-resume: nearest
     prefix-cache-mib: 16384           # host tier: finished conversations' KV moves to host RAM,
                                       # so the VRAM goes back to the experts
+    # prefix-cache-dir: /var/lib/radiance/prefix   # opt-in: the prefix cache survives a restart
+                                      # (below); it holds conversation text unencrypted
     busy-prefill-chunk: auto          # 512 halves decode stalls when long prompts arrive under load,
                                       # at about +60 % time to first token for those prompts
     checkpoint-slots: 128             # for many concurrent agentic sessions (default 64)
@@ -65,8 +67,11 @@ models:
     draft-verify: traversal
     draft-depth: adaptive
     draft-depth-load: on
-    draft-depth-load-from: 1          # depth rule priced per row, from one sequence
-    draft-suffix: on
+    draft-depth-load-from: 1          # depth rule priced per row, from one sequence (draft-depth-stop
+                                      # is then not read); the row price reads each step against its
+                                      # neighbours, so a drifting step time is no longer taken for it
+    draft-suffix: on                  # suffix steps from the conversation itself, and from earlier
+                                      # answers (draft-suffix-global-mib, 256 by default)
 ```
 
 Run it with:
@@ -75,12 +80,13 @@ Run it with:
 radiance --config hy4-tp2.yaml
 ```
 
-The Engram placement is the key here that decides what a start costs. `ram` reads the table into a
-private pinned copy at every start: four tables one after the other at 1.4 GB/s, about 42 s of a
-66 s startup. `ram=DIR` keeps that copy as a file, `DIR/ngram-<id>.tab`, in a tmpfs, so a start that
-finds it complete checks samples of it against the container and pins it where it lies instead of
-reading the table again. Measured on two R9700 at TP2 with this recipe (u3 container, 210 W, the
-engine answering `/health`):
+The Engram placement is the key here that decides what a start costs. `ram` reads the 60 GiB table
+into a private pinned copy at every start. The four tables are read beside one another and beside the
+pass over the container (they used to be read one after the other, 42 s of a 66 s startup), so the
+weights phase is the longer of the two rather than their sum. `ram=DIR` keeps that copy as a file,
+`DIR/ngram-<id>.tab`, in a tmpfs, so a start that finds it complete checks samples of it against the
+container and pins it where it lies instead of reading the table again. Measured on two R9700 at
+TP2 with this recipe (u3 container, 210 W, the engine answering `/health`):
 
 | Engram placement | starts, seconds to `/health` |
 |---|---|
@@ -115,6 +121,28 @@ Measured with this config (u3 container, TP2, 210 W power cap, sampled at T 0.9)
 | decode without speculation | about 75 tok/s | about 305 tok/s |
 | decode with DFly2 | about 140–150 tok/s | about 380–430 tok/s |
 | prefill | 3000–4100 tok/s, depending on prompt length | |
+
+Some of what makes this recipe faster has no key, since it is on by default. The routed experts take
+the resident ones first and copy the misses as whole units on a DMA budget ("Weg 2"): the routed block
+of a DFly2 eight-client verify pass is 1.0–1.1 ms shorter, and without a drafter its 34 MiB ring costs
+0.1–0.4 %. `RADIANCE_W2=0` turns it off; it acts on steps of 16 rows and more. The expert GEMM's
+tighter tile grid takes another 0.75 ms off that pass. The global suffix cache is on with
+`draft-suffix: on`. Its only measured gain is on answers asked again under load (+2.7 % per request
+at eight clients, TP4), and it costs nothing elsewhere. The output is byte-identical with each of them.
+
+Two keys are worth turning on where the host has the room for them:
+
+- `prefix-cache-dir: DIR` writes the prefix cache to `DIR` at a clean stop (SIGTERM), and also every
+  `prefix-cache-flush-s` (600 s) while the server is idle. The next start reads it back on first use.
+  On this pair a 24,608-token conversation answered its first request after a restart in 1.06 s, where
+  a cold prefill took 6.6–7.3 s. The answer and its top-5 logprobs were bit-identical to the cold run.
+  The directory is bounded by `prefix-cache-dir-mib` (default: the host tier plus the checkpoint
+  store). It holds the conversations as plain text, so give it a directory only the server can read.
+- `keep-container-cache: true` keeps the container in the page cache after the load. A restart then
+  took 17 s where it took 29–33 s without it, and the first start took 20 s longer (49 s against
+  28 s, buffered reads). It is kept only when the whole container (128.6 GiB) plus
+  `host-headroom-mib` is still free after the pins. With this recipe's pools that rules out a host of
+  170 GB: it says so at startup and drops the pages as usual.
 
 ## Example config: four R9700 at TP4
 
@@ -151,22 +179,30 @@ RADIANCE_HY4_PIPE=1 radiance --config hy4-tp4.yaml
 `RADIANCE_HY4_PIPE=1` runs a step as two row pieces and issues each piece's junction -- its `add`,
 its exact all-reduce and the norm the next layer reads -- on the step's second lane, beside the
 other piece's expert GEMMs. It needs a step of exactly one checkpoint interval, which is why the
-batch is two intervals wide and the span runs them as two steps; pieces under 1024 rows are not
-cut (`RADIANCE_HY4_PIPE_ROWS` moves that floor, `RADIANCE_HY4_PIPE_LANE` the lane).
+batch is two intervals wide and the span runs them as two steps. A step is cut only when both
+pieces have at least 1024 rows (`RADIANCE_HY4_PIPE_MIN` moves that floor, `RADIANCE_HY4_PIPE_ROWS`
+the cut, `RADIANCE_HY4_PIPE_LANE` the lane).
 `RADIANCE_HY4_PIPE_ATTN=1` (with the pipeline) cuts the attention core into the same two pieces,
 so piece 0's attention junction rides the second lane beside piece 1's attention instead of
 waiting; the output is the same bytes (`notes/backlog/measurements/P-17.md`).
 
-Measured at these settings on four R9700 (32 GB each, 210 W a card), a 10948-token prompt, three
-warm runs a config:
+Two bugs of the pipeline are fixed, so it is safe to use with current code. A staged pipelined step
+of 8192 rows could hang the four ranks on a long prompt (issue #2, fixed in #205). The pieces also
+read int8 codes that an earlier step had left behind (#282), so a long prompt's answer was off topic
+and changed with the requests sent before it. The first measurement here (5577.5 tok/s, +12.0 %) was
+taken with that bug. With the fix, on four R9700 (270 W a card, u4 container, the batch, interval
+and span above, no drafter), measured on nine cold prompts of about 11K tokens a side:
 
 | | |
 |---|---|
-| prefill, `checkpoint-interval: 4096` and the 8192-token batch, no pipeline | 4978.1 tok/s |
-| the same with `RADIANCE_HY4_PIPE=1` | **5577.5 tok/s** (+12.0 %, and +13.5 % over four ranks at the 2048-token intervals it ships with) |
-| decode, 1 / 8 clients | 147.2 / 551.8 tok/s, the same greedy tokens with and without the cut |
-| the cut's cost in memory | 0.05 GiB of activation arena and 0.32 GiB of the pools |
-| prefill with the cut, bit for bit | not the step run whole (`448a9473ec` against `e7001a8285`) |
+| prefill, `checkpoint-interval: 4096` and the 8192-token batch, no pipeline | 4849.1 tok/s |
+| the same with `RADIANCE_HY4_PIPE=1` | **5290.0 tok/s** (+9.1 %) |
+| decode, 1 client, no drafter | 118.9 tok/s either way |
+| long-prompt greedy output with the cut | the same in 3 of 3 runs and on topic; not bit for bit the step run whole (the same opening sentence, the first 14–64 of 64 greedy tokens equal) |
+
+Decode does not go through the cut: with DFly2 the first measurement (210 W) read 147.2 / 551.8
+tok/s at 1 / 8 clients, the same greedy tokens with and without the pipeline. The cut costs about
+0.1 GiB of activation arena (0.05 GiB at first, 0.04 GiB more with the fix) and 0.32 GiB of the pools.
 
 ## Build from source
 

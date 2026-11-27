@@ -122,6 +122,12 @@ bool share_file_exists(const std::string& dir, const std::string& id) {
     return ::access((dir + "/ngram-" + id + ".tab").c_str(), F_OK) == 0;
 }
 
+/* Whether a copy failed on the locked-memory limit: the machine's setting, not a defect. Every copy
+ * a case holds counts against the limit, so each is checked, not only the first (#235). */
+bool memlock_short(int rc, const std::string& why) {
+    return rc == RAD_E_NOMEM && why.find("mlock2") != std::string::npos;
+}
+
 }  // namespace
 
 /* The locked copy (a host gather reads it): two tables started before either is waited on, one
@@ -147,10 +153,11 @@ TEST(a_host_gathers_tables_read_before_the_join_and_are_published_after_it) {
     std::string why;
     const int rc = rad::TableFillTestAccess::copy(engine, src[1], n[1], off[1], false, &outa, &why);
     /* A locked-memory limit below the tables is the machine's setting, not a defect. */
-    if (rc == RAD_E_NOMEM && why.find("mlock2") != std::string::npos) SKIP("%s", why.c_str());
+    if (memlock_short(rc, why)) SKIP("%s", why.c_str());
     REQUIRE_EQ(rc, RAD_OK);
-    REQUIRE_EQ(rad::TableFillTestAccess::copy(engine, src[2], n[2], off[2], false, &outb, &why),
-               RAD_OK);
+    const int rb = rad::TableFillTestAccess::copy(engine, src[2], n[2], off[2], false, &outb, &why);
+    if (memlock_short(rb, why)) SKIP("%s", why.c_str());
+    REQUIRE_EQ(rb, RAD_OK);
     CHECK(outa != nullptr && outa != (const void*)src[1]);
     CHECK(outb != nullptr && outb != (const void*)src[2]);
     CHECK_EQ(rad::TableFillTestAccess::pending(engine), size_t(2));
@@ -173,8 +180,10 @@ TEST(a_host_gathers_tables_read_before_the_join_and_are_published_after_it) {
 
     /* A fill that read the wrong bytes is not published: the join fails the load and frees it. */
     void* bad = nullptr;
-    REQUIRE_EQ(rad::TableFillTestAccess::copy(engine, src[0], n[0], off[0] + 16, false, &bad, &why),
-               RAD_OK);
+    const int rbad =
+        rad::TableFillTestAccess::copy(engine, src[0], n[0], off[0] + 16, false, &bad, &why);
+    if (memlock_short(rbad, why)) SKIP("%s", why.c_str());
+    REQUIRE_EQ(rbad, RAD_OK);
     CHECK_EQ(rad::TableFillTestAccess::pending(engine), size_t(1));
     CHECK_EQ(rad::TableFillTestAccess::join(engine), (int)RAD_E_IO);
     CHECK_EQ(rad::TableFillTestAccess::pending(engine), size_t(0));

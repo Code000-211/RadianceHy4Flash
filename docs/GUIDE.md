@@ -4842,7 +4842,18 @@ the startup log says what is in force. `RADIANCE_ROUTE_TRACE=<file>` records ran
 `rad-heat-replay`, whose `--layer-min N` replays the trace with every layer held at N resident units
 (the thin layers raised at the start from the layers above N, so the slab does not grow, clamped to
 what the slab can hold; a swap whose demotion would take a layer under N is abandoned) and prints
-what the floor costs the hit rate. The exit report's `mover:` line counts promotions, demotions and
+what the floor costs the hit rate. "Weg 2" (on by default, `RADIANCE_W2=0` turns it off; issue #309,
+`abi/rad_w2.h`) runs a routed layer of a wide decode pass (`RADIANCE_W2_MIN_ROWS` rows and up,
+default 16: the verify passes of several sequences) resident experts first: the router's launch marks
+the routed experts that are off the card and posts at most `RADIANCE_W2_KMAX` of their whole units
+(default 8, under a budget by the layer's distinct routed experts, `RADIANCE_W2_WIN_US0` /
+`_WIN_US_EXPERT`) to the card's prefetch DMA queue, the gate_up, quantiser and down launches serve
+the resident experts while the copies cross the link, and a tail of the same three launches serves
+the misses from the copies that landed and in place otherwise (the copies' ring is ordinary device
+memory read behind a system-scope acquire; `RADIANCE_W2_RING=uncached` makes it uncached device
+memory instead). The text is unchanged by
+construction; the startup log says `W2 on` per rank and the exit log how many units landed. The
+exit report's `mover:` line counts promotions, demotions and
 prefetches, and a `stager:` line follows it whenever the prefill stager ran: the routed layers, the
 units it staged and their bytes, the copies, and the units no buffer had room for (read in place).
 
