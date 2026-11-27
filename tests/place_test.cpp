@@ -2210,6 +2210,115 @@ TEST(paced_promotions_go_out_at_the_marks_and_land_the_pool_bytes) {
     rad_stream_destroy(compute);
 }
 
+/* M-06: a share is sized in bytes, so the copies one mark sends fit the layer's PCIe-free stretch
+ * (the attention behind the post-FFN junction), whatever the units weigh. The first copy always
+ * goes: a cap under the smallest copy still paces, a copy a mark, and no mark is a no-op that
+ * leaves the copies for the un-paced flush. */
+TEST(a_marks_share_fits_the_byte_cap_and_never_sends_nothing) {
+    const int64_t copy = 1 * MiB;
+    const int64_t even[4] = {copy, copy, copy, copy};
+    CHECK_EQ(Mover::pace_fit(even, 0, copy), (size_t)0);            /* nothing held */
+    CHECK_EQ(Mover::pace_fit(even, 4, 0), (size_t)4);               /* 0: the count alone */
+    CHECK_EQ(Mover::pace_fit(even, 4, 2 * copy), (size_t)2);
+    CHECK_EQ(Mover::pace_fit(even, 4, 2 * copy + 1), (size_t)2);    /* no rounding up */
+    CHECK_EQ(Mover::pace_fit(even, 4, copy), (size_t)1);
+    CHECK_EQ(Mover::pace_fit(even, 4, 1), (size_t)1);               /* the first always goes */
+    CHECK_EQ(Mover::pace_fit(even, 2, 4 * copy), (size_t)2);        /* the quota, not the cap */
+
+    /* Units differ in size by class (1,499,904 B a rank slice on Hy4-flash, a wider expert
+     * several of those), so the prefix stops at the first copy that no longer fits. */
+    const int64_t mixed[3] = {copy, 3 * copy, copy};
+    CHECK_EQ(Mover::pace_fit(mixed, 3, 4 * copy), (size_t)2);
+    CHECK_EQ(Mover::pace_fit(mixed, 3, 3 * copy), (size_t)1);
+    CHECK_EQ(Mover::pace_fit(mixed, 2, 1), (size_t)1);
+}
+
+/* The cap reaches the mover: a held promotion larger than the whole budget still goes out at the
+ * mark, one a mark, where a cap read as a gate would send nothing and leave the copies to the next
+ * dispatch's un-paced flush. */
+TEST(a_paced_share_bigger_than_the_byte_cap_still_goes_out_one_a_mark) {
+    HeatFixture hf;
+    HeatEngine h;
+    CHECK_OK(h.init(hf.plan, HeatParams{}));
+    Mover m;
+    MoverConfig mc;
+    mc.pace_units = 8;                       /* the count alone would send the one held copy */
+    mc.pace_bytes = 1;                       /* under one copy's bytes */
+    CHECK_OK(m.init(hf.f.prog, hf.plan, mc));
+    REQUIRE(m.pacing());
+    RadStream compute = nullptr;
+    CHECK_OK(rad_stream_create(&compute, 0));
+    CHECK_OK(m.bind_compute_stream(compute));
+    ComputeWork work;
+    int d = 0;
+
+    auto pattern = [&](int32_t unit, int salt, std::vector<uint8_t>* want) {
+        const MoveUnit& mu = hf.plan.units[(size_t)unit];
+        void* p = m.residency()->lookup(mu.weights.front())->ptr;
+        want->resize((size_t)mu.bytes);
+        for (size_t k = 0; k < want->size(); ++k) (*want)[k] = (uint8_t)(k * 31 + 7 * salt + 1);
+        CHECK_OK(rad_memcpy_async(p, want->data(), mu.bytes, compute));
+        CHECK_OK(rad_stream_sync(compute));
+        return p;
+    };
+    auto landed_bytes = [&](int32_t unit) {
+        const MoveUnit& mu = hf.plan.units[(size_t)unit];
+        std::vector<uint8_t> got((size_t)mu.bytes);
+        CHECK_OK(rad_memcpy_async(got.data(), m.residency()->lookup(mu.weights.front())->ptr, mu.bytes,
+                                  compute));
+        CHECK_OK(rad_stream_sync(compute));
+        return got;
+    };
+    auto collect = [&](int32_t e) {
+        const int32_t ids[1] = {e};
+        const int32_t counts[1] = {10};
+        CHECK_OK(m.begin_dispatch(d++, &h));
+        work.run(compute);
+        h.observe_ids(0, ids, counts, 1);
+        std::vector<Swap> sw;
+        CHECK_OK(h.step(&sw));
+        m.pace_collect(true);
+        for (const Swap& s : sw) if (m.issue(s, &h) < 0) h.abandon(s);
+        CHECK_OK(m.balance(&h, false));
+        m.pace_collect(false);
+    };
+    auto settle = [&]() {
+        for (Deadline dl; any_busy(h, hf.plan) && !dl.passed();) {
+            CHECK_OK(m.begin_dispatch(d++, &h));
+            work.run(compute);
+            CHECK_OK(rad_stream_sync(compute));
+        }
+    };
+
+    const int32_t a = hf.unit_of_expert(7);
+    REQUIRE(h.tier(a) != Tier::VRAM);
+    std::vector<uint8_t> want;
+    void* const pooled = pattern(a, 1, &want);
+    collect(7);
+    REQUIRE_EQ(m.pace_held(), (size_t)1);
+    CHECK_OK(rad_stream_sync(compute));
+    CHECK_OK(rad_stream_sync(m.transfer_stream()));
+    CHECK_OK(m.publish_landed(&h));
+    CHECK(h.tier(a) != Tier::VRAM);          /* held: not landed yet */
+
+    m.pace_begin(8);
+    work.run(compute);
+    CHECK_OK(m.pace_mark(compute));
+    CHECK_EQ(m.pace_held(), (size_t)0);
+    CHECK_EQ(m.stats().paced_units, (uint64_t)1);
+    CHECK_EQ(m.stats().paced_marks, (uint64_t)1);
+    CHECK_OK(m.pace_mark(compute));                  /* nothing left: no list */
+    CHECK_EQ(m.stats().paced_marks, (uint64_t)1);
+    CHECK_OK(rad_stream_sync(compute));
+    CHECK_OK(rad_stream_sync(m.transfer_stream()));
+    CHECK_OK(m.publish_landed(&h));
+    CHECK(h.tier(a) == Tier::VRAM);
+    CHECK(m.residency()->lookup(hf.plan.units[(size_t)a].weights.front())->ptr != pooled);
+    CHECK(landed_bytes(a) == want);
+    settle();
+    rad_stream_destroy(compute);
+}
+
 namespace {
 int32_t resident_count(const HeatEngine& h, const Plan& p) {
     int32_t n = 0;

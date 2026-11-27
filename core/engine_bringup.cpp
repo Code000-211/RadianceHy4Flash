@@ -4082,6 +4082,16 @@ int Engine::load_weights() {
          * verify passes measured 3-7 % slower with it (notes/xs-1.md). */
         mc.pace_units = drafter_.kind == RAD_DRAFT_NONE ? -1 : 0;
         if (const char* e = std::getenv("RADIANCE_XS_PACE"); e && *e) mc.pace_units = std::atoi(e);
+        /* A share is capped in bytes (M-06): what a mark sends must fit the pass's PCIe-free
+         * stretch, the attention behind the post-FFN junction, and a unit's size differs by class,
+         * so a count does not express it. 27 GB/s is the measured h2d uplink of a lane
+         * (notes/backlog/refs/kernels/levers-tp2.md: 27.6 GB/s); 150 us of it is 4,050,000 B, ~2.7
+         * of Hy4-flash's 1,499,904 B rank slices a rank -- above the ~1 a layer X1 b paced, so the
+         * cap binds on a burst and not on the usual share, as E-M2 asks. RADIANCE_XS_PACE_BYTES
+         * sets it directly; 0 leaves the count alone. */
+        mc.pace_bytes = 150 * 27000;
+        if (const char* e = std::getenv("RADIANCE_XS_PACE_BYTES"); e && *e)
+            mc.pace_bytes = std::atoll(e);
         RAD_TRY(r->mover.init(r->program, r->plan, mc, &r->pools));
         /* What the mover took, before the first copy. Its slabs are allocated in init, so the pool
          * is as full as it will get; a load stopping with zero free is a placement failure, not

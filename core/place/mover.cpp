@@ -2091,14 +2091,32 @@ int Mover::pace_mark(RadStream cs) {
     ++pace_marks_;
     if (pace_held() == 0 || pace_quota_ <= 0 || !mover_) return RAD_OK;
     /* The share goes out behind the next dispatch on the compute stream (a ride: no packet of its
-     * own), i.e. once this layer's routed GEMMs are done. Refused while another ride waits on the
-     * stream; the share then waits only for the mover's own stream. */
+     * own), i.e. once the next layer's first dispatch has run. Refused while another ride waits on
+     * the stream; the share then waits only for the mover's own stream. */
     void* ride = nullptr;
     if (cs && rad_ride(cs, &ride) == RAD_OK && ride) RAD_TRY(rad_ride_wait(mover_, ride));
     const size_t n = std::min((size_t)pace_quota_, pace_held());
-    stats_.paced_units += (uint64_t)n;
+    /* M-06: no more bytes at a mark than the stretch behind it carries over the link, whatever
+     * the count allows. */
+    pace_bytes_.clear();
+    for (size_t i = 0; i < n; ++i) pace_bytes_.push_back(held_[held_next_ + i].seg.bytes);
+    const size_t send = pace_fit(pace_bytes_.data(), n, cfg_.pace_bytes);
+    stats_.paced_units += (uint64_t)send;
     ++stats_.paced_marks;
-    return send_held(n);
+    return send_held(send);
+}
+
+size_t Mover::pace_fit(const int64_t* bytes, size_t n, int64_t cap) {
+    if (cap <= 0) return n;                  /* no byte cap: the count alone */
+    size_t fit = 0;
+    int64_t sum = 0;
+    while (fit < n) {
+        const int64_t b = bytes[fit];
+        if (fit > 0 && sum + b > cap) break;
+        sum += b;
+        ++fit;
+    }
+    return fit;
 }
 
 int Mover::pace_flush() {
