@@ -117,10 +117,15 @@ void kvstream_host_add(KVStreamHostUse* use, const KVManager& kv) {
     use->max_rank_bytes = std::max(use->max_rank_bytes, c.host_bytes);
 }
 
-int kvstream_host_gate(const KVStreamHostUse& use, int n_ranks, int64_t still, int64_t headroom) {
+int kvstream_host_gate(const KVStreamHostUse& use, int n_ranks, int64_t still, int64_t headroom,
+                       int64_t wait_ms) {
     if (use.sum.host_bytes <= 0) return RAD_OK;
     std::string why;
-    if (lockable_room(use.sum.host_bytes, still, headroom, false, &why)) return RAD_OK;
+    /* A small shortfall is waited out (#273, wait_for_room). */
+    if (wait_for_room([&](std::string* w, int64_t* s) {
+            return lockable_room(use.sum.host_bytes, still, headroom, false, w, s);
+        }, use.sum.host_bytes + still + headroom, wait_ms, 5000, &why))
+        return RAD_OK;
     RAD_ERR("kv streaming: the host mirror for %lld streamed KV group(s) needs up to %s of "
             "pinned host memory a rank (%s over %d ranks), and %s. It holds one full context a "
             "sequence: lower --max-model-len or --max-num-seqs, or set --kv-resident 0 "

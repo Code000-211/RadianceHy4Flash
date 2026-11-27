@@ -938,6 +938,10 @@ struct Config {
      * config_parse divides it by --tp. */
     int64_t host_pool_mib = 0;
     int64_t host_headroom_mib = 4096; /* --host-headroom-mib: RAM left free for the system at startup */
+    /* --host-memory-wait-s: how long a startup a little short of host memory re-checks before it
+     * stops (#273: after the stuck-device exit the old process's memory takes about a minute to
+     * come back). 0 stops at the first refusal. */
+    int64_t host_memory_wait_s = 90;
     /* --keep-container-cache: leave the pages a load read into the page cache instead of dropping
      * them behind the read, so the next start reads the container at memory speed. Off by default:
      * those pages are the same spare RAM a host KV tier, a host prefix cache or a pinned table

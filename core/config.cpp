@@ -124,6 +124,11 @@ static const Flag g_flags[] = {
     "                                    pin equal shares of it (N / --tp each)" },
     { "--host-headroom-mib",  "N",      "host RAM to leave free for the system when radiance\n"
     "                                    pins its host memory at startup (default 4096)" },
+    { "--host-memory-wait-s", "S",      "when startup is a little short of host memory (at most 2\n"
+    "                                    GiB or an eighth of what it wants), re-check every 5 s for\n"
+    "                                    up to S seconds before stopping: a process that exited just\n"
+    "                                    before may still be releasing its memory (default 90; 0\n"
+    "                                    stops at once)" },
     { "--keep-container-cache", nullptr, "keep the container in the page cache after the load, so\n"
     "                                    later starts read it at memory speed rather than from disk:\n"
     "                                    the load reads it buffered for that, and only when\n"
@@ -818,6 +823,7 @@ int config_parse(int argc, char** argv, Config* c) {
                                                { if (!num(0, INT64_MAX, &c->gpu_headroom_mib)) return RAD_E_INVAL; }
         else if (S("--gpu-memory-mib"))         { if (!num(1, INT64_MAX, &c->gpu_memory_mib)) return RAD_E_INVAL; }
         else if (S("--host-headroom-mib"))      { if (!num(0, INT64_MAX, &c->host_headroom_mib)) return RAD_E_INVAL; }
+        else if (S("--host-memory-wait-s"))     { if (!num(0, 3600, &c->host_memory_wait_s)) return RAD_E_INVAL; }
         else if (S("--kv-cache-dtype")) {
             if (!(v = need(i))) return RAD_E_INVAL;
             if (!std::strcmp(v, "fp8_v4") || !std::strcmp(v, "k6_v4")) {
@@ -1844,6 +1850,7 @@ const ShowRow kShow[] = {
           return c.kv_resident > 0 ? num(c.kv_resident) : std::string("0 (off)"); } },
     { "--host-pool-mib",      [](const Config& c) { return num(c.host_pool_mib * std::max(c.tp, 1)); } },
     { "--host-headroom-mib",  [](const Config& c) { return num(c.host_headroom_mib); } },
+    { "--host-memory-wait-s", [](const Config& c) { return num(c.host_memory_wait_s); } },
     { "--embedding-placement", [](const Config& c) { return std::string(table_placement_name(c.embedding_placement)); } },
     { "--ngram-placement",    [](const Config& c) {
           std::string v = table_placement_name(c.ngram_placement);
