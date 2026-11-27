@@ -21,7 +21,8 @@ when a change ships without part of its item.
   could put two threads on one CPU.
 - **No test existed for it**, which AGENTS.md makes blocking on its own.
 
-The barrier half of the item is unaffected and ships in this PR.
+The barrier half is not part of this PR: it was withdrawn too, and what stands is the measurement in
+`notes/backlog/measurements/C-03.md` — not code.
 
 ## Reopen condition
 
