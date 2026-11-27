@@ -2779,6 +2779,27 @@ static inline long long r4d_moe_down_dec_g(long long T) {
     if (g_moe_down_dec_pin > 0) return g_moe_down_dec_pin;
     return T >= kMoeDownDecG4Rows ? 4 : T >= kMoeDownDecG2Rows ? 2 : 1;
 }
+/* The tile blocks of moe_gemm_iqr's decode grid (r4d_moe_iqr.hip). A pass's run tiles are bounded
+ * by min(T, n_expert) runs plus a tile per 16 rows, but a routed pass uses far fewer experts, and
+ * every block past its tiles still pays the run search (the offsets' loads, a scan, two barriers)
+ * before it finds none: at a DFly2 c8 verify (T 512) gate_up's 513 blocks a column group found
+ * 120-305 tiles (DFly2 and no-spec on Hy4-flash, every launch counted), and 512 more empty blocks
+ * a row cost the pass 2.5 ms. So the grid holds T / 2 + kRunGridBase tiles when that is below the
+ * bound, above every count seen at every T of the band (the counts' maxima run from 92 % of T at
+ * 96 rows to 47 % at 720); a launch with more tiles has its blocks serve them in turn, the same
+ * bytes. Below 128 rows the bound is smaller and stands. A constant rule of T, so recorded and live
+ * passes agree; pinnable for tests (g_moe_run_grid_pin).
+ *
+ * moe_down_dec_kernel keeps its bound: the same grid there was measured +0.2..0.5 ms a c8 verify
+ * pass slower (its empty blocks were never the cost -- 512 more a row did not show -- and the walk
+ * costs it 7-15 VGPRs and its SGPRs), notes/backlog/measurements/tight-grid.md. */
+constexpr long long kRunGridBase = 64;
+static int g_moe_run_grid_pin = 0;
+long long r4d_moe_run_grid(long long T, long long bound) {
+    const long long g = g_moe_run_grid_pin > 0 ? (long long)g_moe_run_grid_pin
+                                               : T / 2 + kRunGridBase;
+    return g < bound ? g : bound;
+}
 /* The map's upper bound, defined once so the scratch hook and the launcher agree exactly (or the
  * kernel writes past its arena). Each expert contributes one block plus one per FM rows beyond the
  * first; the dropped-slot tail at most T/FM plus one. */
@@ -3338,6 +3359,9 @@ extern "C" void r4d_moe_gemm_pin_down_mt(int pin) {
 extern "C" void r4d_moe_gemm_pin_down_dec(int pin) {
     g_moe_down_dec_pin = pin < (int)kMoeDownDecMaxG ? pin : (int)kMoeDownDecMaxG;
 }
+/* moe_gemm_iqr's decode grid's tile blocks for tests: n > 0 that many (at most the bound), else
+ * the rule (r4d_moe_run_grid). r4d_selftest compares the bytes across them. */
+extern "C" void r4d_moe_gemm_pin_run_grid(int n) { g_moe_run_grid_pin = n > 0 ? n : 0; }
 
 /* The four-bit forms (an E4M3 scale per 64 or 32 of K for w4nl64a8h / w4nl32a8h, else a bf16
  * scale per 128), the five-bit w5nl64a8h and the six-bit w6nl64a8h. */

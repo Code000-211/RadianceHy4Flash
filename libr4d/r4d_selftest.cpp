@@ -8197,6 +8197,26 @@ static void iqr_dual_case(const Plugin& pl, const IqrCase& f, int64_t M, int64_t
     dfree_all();
 }
 
+/* The run-tile grid's tiles at these offsets over T output rows: each run, clamped to T, in
+ * 16-row tiles from its own first row (r4d_moe.hip's moe_down_dec numbering). */
+static int64_t moe_run_tiles(const std::vector<int32_t>& off, int64_t ne, int64_t T) {
+    int64_t n = 0;
+    for (int64_t e = 0; e < ne; ++e) {
+        const int64_t a = std::min<int64_t>(off[(size_t)e], T);
+        const int64_t b = std::min<int64_t>(off[(size_t)e + 1], T);
+        if (b > a) n += (b - a + 15) / 16;
+    }
+    return n;
+}
+/* Tile-block counts for the run-tile grid's pin (r4d_moe_gemm_pin_run_grid): one, two and three
+ * blocks serving every tile in turn, one fewer than the tiles, as many, and one more. */
+static std::vector<int> moe_grid_pins(int64_t ntile) {
+    std::vector<int> v;
+    for (const int64_t g : { (int64_t)1, (int64_t)2, (int64_t)3, ntile - 1, ntile, ntile + 1 })
+        if (g >= 1 && std::find(v.begin(), v.end(), (int)g) == v.end()) v.push_back((int)g);
+    return v;
+}
+
 #include "r4d_selftest_w2.h"   /* moe_w2_split_case: a routed GEMM split under W2 */
 
 /* moe_gemm_iqr against the dense IQR GEMM over the same expert buffers. Every expert is an IQR
@@ -8387,6 +8407,32 @@ static void moe_iqr_case(const Plugin& pl, const MoeIqrShape& sh) {
     moe_w2_split_case(nm, r, ts, ps, d_y, off, E, Tr, N, !sh.sorted, [&](int64_t e) {
         return std::make_pair(d_w[(size_t)e], w_bytes[(size_t)e]);
     });
+
+    /* The decode band's run-tile grid at fewer tile blocks than the launch has tiles (a block
+     * serving several in turn), at as many and at one more: byte for byte the rule's launch. */
+    using GridPinFn = void (*)(int);
+    const GridPinFn pin_grid = (GridPinFn)dlsym(pl.h, "r4d_moe_gemm_pin_run_grid");
+    if (2 * Tr <= 3 * E) {
+        const int64_t ntile = moe_run_tiles(off, E, Tr);
+        if (!pin_grid) ok((std::string(nm) + ": run-tile grid pins").c_str(), false, "no pin");
+        for (const int g : pin_grid ? moe_grid_pins(ntile) : std::vector<int>()) {
+            std::vector<uint16_t> poison((size_t)(Tr * N), h_to_bf16(77.0f));
+            st_memcpy(d_y, poison.data(), poison.size() * 2, hipMemcpyHostToDevice);
+            pin_grid(g);
+            const int rg = launch(r, ts, ps);
+            pin_grid(0);
+            std::vector<uint16_t> yg((size_t)(Tr * N));
+            st_memcpy(yg.data(), d_y, yg.size() * 2, hipMemcpyDeviceToHost);
+            int64_t diff = 0;
+            for (size_t i = 0; i < y.size(); ++i) diff += yg[i] != y[i];
+            ok((std::string(nm) + ": " + std::to_string(g) + " tile blocks for " +
+                std::to_string(ntile) + " tiles, byte for byte").c_str(),
+               rg == RAD_OK && diff == 0,
+               rg != RAD_OK ? "rc " + std::to_string(rg)
+                            : std::to_string(diff) + " of " + std::to_string(y.size()) +
+                                  " outputs differ from the rule's grid");
+        }
+    }
 
     /* The reference, a run's rows at a time through the dense row over the same buffers. */
     std::vector<float> want((size_t)(Tr * N), 0.0f);
@@ -39152,6 +39198,8 @@ static void device_phase(const Plugin& pl) {
                 /* the run-tile grid: a decode step's rows */
                 { "decode gate/up", 4, 16, 128, 64, 4, 3, 768, 512, 2560, 2560, 2, false, 0 },
                 { "decode gate/up, a dropped slot", 4, 16, 128, 64, 4, 3, 768, 512, 2560, 2560, 2, false, 1 },
+                /* no tile at all: every slot dropped, the grid's blocks find none */
+                { "verify gate/up, every slot dropped", 4, 16, 128, 512, 4, 64, 512, 256, 1280, 1280, 2, false, 256 },
                 { "decode down", 4, 16, 256, 64, 4, 3, 2560, 2560, 512, 256, 1, true, 0 },
                 { "verify gate/up, runs of several rows", 4, 16, 128, 16, 4, 6, 768, 512, 2560, 2560, 2, false, 2 },
                 { "verify down", 3, 16, 256, 16, 4, 6, 2560, 2560, 512, 256, 1, true, 2 },
