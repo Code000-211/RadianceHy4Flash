@@ -1257,7 +1257,9 @@ extern "C" int64_t r4d_rad_logits_topk_scratch(const RadArgs* a) {
            (int64_t)sizeof(unsigned long long);
 }
 
-static int logits_topk_launch(const RadArgs* a, RadStream s) {
+/* The op's one row: the int8 head, logits_gemm_i8's plane and checks, with cast_row_topk's
+ * outputs in the same launch. */
+extern "C" int r4d_rad_logits_topk_i8(const RadArgs* a, RadStream s) {
     const RadTensor *x, *w, *idx, *val;
     long long M, n_vocab, n_embd, R;
     const int rc = logits_topk_params(a, &x, &w, &idx, &val, &M, &n_vocab, &n_embd, &R);
@@ -1312,9 +1314,4 @@ static int logits_topk_launch(const RadArgs* a, RadStream s) {
     if (M == 1) R4D_LTK(1u); else R4D_LTK(2u);
 #undef R4D_LTK
     return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
-}
-
-/* The op's one row: the int8 head, logits_gemm_i8's plane and checks. */
-extern "C" int r4d_rad_logits_topk_i8(const RadArgs* a, RadStream s) {
-    return logits_topk_launch(a, s);
 }
