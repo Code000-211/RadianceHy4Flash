@@ -218,22 +218,30 @@ struct Rope {
     double theta = 10000.0, scale = 1.0;
 };
 
-/* `stable` -1 leaves the parameter out (its default, 0). `scratch_cut` shortens the scratch;
- * `scr` (if given) gets the scratch's words after the call: the split form writes its slots' parts
- * there, the fused form only the accumulator of a row and head (`kAccWords` floats).
- * `rope` passes the optional `rope_pos` operand (and its parameters); `qr` replaces the rotary
- * operand's columns, so a folded launch can be compared with a rotated one. `sc` (if non-zero)
- * passes F-16's `sink_sc`: 64-token super-chunks at window 0 and in the selection form. */
-int launch(const Problem& p, bool sel, int form, std::vector<uint16_t>& out, int stable = -1,
-           int64_t scratch_cut = 0, std::vector<uint32_t>* scr = nullptr,
-           const Rope* rope = nullptr, const std::vector<uint16_t>* qr = nullptr, int hg = 0,
-           int64_t sc = 0) {
+/* One launch's optional operands: `stable` (-1 leaves the parameter out: its default, 0);
+ * `scratch_cut` shortens the scratch; `scr` (if given) gets the scratch's words after the call: the
+ * split form writes its slots' parts there, the fused form only the accumulator of a row and head
+ * (`kAccWords` floats); `rope` passes the optional `rope_pos` operand (and its parameters); `qr`
+ * replaces the rotary operand's columns, so a folded launch can be compared with a rotated one;
+ * `hg` picks the sixteen-head group where no form pin is set (K-59's rad-tune axis); `sc` (if
+ * non-zero) passes F-16's `sink_sc`: 64-token super-chunks at window 0 and in the selection form. */
+struct Opt {
+    int stable = -1;
+    int64_t scratch_cut = 0;
+    std::vector<uint32_t>* scr = nullptr;
+    const Rope* rope = nullptr;
+    const std::vector<uint16_t>* qr = nullptr;
+    int hg = 0;
+    int64_t sc = 0;
+};
+
+int launch(const Problem& p, bool sel, int form, std::vector<uint16_t>& out, Opt opt = {}) {
     const int M = p.rows();
     out.assign((size_t)M * p.heads * L, 0xffff);
     auto& P = const_cast<Problem&>(p);
     std::vector<RadTensor> t;
     t.push_back(tens(P.q.data(), RAD_BF16, { M, p.heads, L }));
-    t.push_back(tens(qr ? const_cast<uint16_t*>(qr->data()) : P.qr.data(), RAD_BF16,
+    t.push_back(tens(opt.qr ? const_cast<uint16_t*>(opt.qr->data()) : P.qr.data(), RAD_BF16,
                      { M, p.heads, R }));
     t.push_back(tens(P.kv.data(), RAD_BF16, { p.pages, 1, p.bs, W }));
     Params ps;
@@ -253,26 +261,26 @@ int launch(const Problem& p, bool sel, int form, std::vector<uint16_t>& out, int
     }
     ps.i("block_size", p.bs);
     ps.f("scale", kScale);
-    if (stable >= 0) ps.i("stable", stable);
+    if (opt.stable >= 0) ps.i("stable", opt.stable);
     /* K-59's rad-tune axis: the workgroup's sixteen-head groups (the form pin is the test hook and
      * wins over it; this picks the group where no pin is set). */
-    if (hg) ps.i("hg", hg);
-    if (sc) ps.i("sink_sc", sc);
-    if (rope && rope->pos) {
-        ps.f("rope_theta", rope->theta);
-        ps.f("rope_scale", rope->scale);
-        ps.v.push_back(RadParam{ "rope_mode", RAD_P_STR, 0, 0, rope->mode, 0.0 });
-        if (rope->sections) ps.v.push_back(
-            RadParam{ "rope_sections", RAD_P_STR, 0, 0, rope->sections, 0.0 });
+    if (opt.hg) ps.i("hg", opt.hg);
+    if (opt.sc) ps.i("sink_sc", opt.sc);
+    if (opt.rope && opt.rope->pos) {
+        ps.f("rope_theta", opt.rope->theta);
+        ps.f("rope_scale", opt.rope->scale);
+        ps.v.push_back(RadParam{ "rope_mode", RAD_P_STR, 0, 0, opt.rope->mode, 0.0 });
+        if (opt.rope->sections) ps.v.push_back(
+            RadParam{ "rope_sections", RAD_P_STR, 0, 0, opt.rope->sections, 0.0 });
     }
     t.push_back(tens(P.sinks.data(), RAD_F32, { p.heads }));
     t.push_back(tens(out.data(), RAD_BF16, { M, p.heads, L }));
-    if (rope && rope->pos)
-        t.push_back(rope->comps > 1
-                        ? tens(const_cast<int*>(rope->pos->data()), RAD_I32,
-                               { rope->comps, (int64_t)rope->pos->size() / rope->comps })
-                        : tens(const_cast<int*>(rope->pos->data()), RAD_I32,
-                               { (int64_t)rope->pos->size() }));
+    if (opt.rope && opt.rope->pos)
+        t.push_back(opt.rope->comps > 1
+                        ? tens(const_cast<int*>(opt.rope->pos->data()), RAD_I32,
+                               { opt.rope->comps, (int64_t)opt.rope->pos->size() / opt.rope->comps })
+                        : tens(const_cast<int*>(opt.rope->pos->data()), RAD_I32,
+                               { (int64_t)opt.rope->pos->size() }));
     RadArgs a{};
     a.t = t.data();
     a.n_t = (int)t.size();
@@ -284,14 +292,14 @@ int launch(const Problem& p, bool sel, int form, std::vector<uint16_t>& out, int
      * launches with an empty scratch, and the op answers with its own refusal (`sc` 32). */
     std::vector<char> scratch((size_t)(need > 0 ? need : 0) + 16);
     a.scratch = scratch.data() + ((16 - ((uintptr_t)scratch.data() & 15)) & 15);
-    a.scratch_bytes = need > scratch_cut ? need - scratch_cut : 0;
+    a.scratch_bytes = need > opt.scratch_cut ? need - opt.scratch_cut : 0;
     r4d_mla_sink_pin_form(form);
     const int rc = sel ? r4d_rad_mla_attn_sel_sink(&a, nullptr)
                        : r4d_rad_mla_attn_paged_sink(&a, nullptr);
     r4d_mla_sink_pin_form(0);
-    if (scr) {
+    if (opt.scr) {
         const uint32_t* w = (const uint32_t*)a.scratch;
-        scr->assign(w, w + a.scratch_bytes / 4);
+        opt.scr->assign(w, w + a.scratch_bytes / 4);
     }
     return rc;
 }
@@ -359,7 +367,7 @@ void check_forms(const std::string& name, const Problem& p, bool sel, int64_t sc
     for (int form : { 0, 1, 2, 3, 4 }) {
         if (form == 2 && p.heads <= 16) continue;
         std::vector<uint16_t> out;
-        const int rc = launch(p, sel, form, out, -1, 0, nullptr, nullptr, nullptr, 0, sc);
+        const int rc = launch(p, sel, form, out, { .sc = sc });
         char buf[128];
         if (rc != RAD_OK) {
             std::snprintf(buf, sizeof buf, "rc %d", rc);
@@ -382,7 +390,7 @@ void check_forms(const std::string& name, const Problem& p, bool sel, int64_t sc
 /* Each verify row's bytes against a one-row launch at its position over the same table. */
 void check_verify(const std::string& name, const Problem& p, int64_t sc = 0) {
     std::vector<uint16_t> all;
-    if (launch(p, false, 0, all, -1, 0, nullptr, nullptr, nullptr, 0, sc) != RAD_OK) {
+    if (launch(p, false, 0, all, { .sc = sc }) != RAD_OK) {
         report(name + " verify", false, "launch");
         return;
     }
@@ -403,7 +411,7 @@ void check_verify(const std::string& name, const Problem& p, int64_t sc = 0) {
             one.qr.assign(p.qr.begin() + (size_t)r * p.heads * R,
                           p.qr.begin() + (size_t)(r + 1) * p.heads * R);
             std::vector<uint16_t> o;
-            if (launch(one, false, 0, o, -1, 0, nullptr, nullptr, nullptr, 0, sc) != RAD_OK ||
+            if (launch(one, false, 0, o, { .sc = sc }) != RAD_OK ||
                 !std::equal(o.begin(), o.end(), all.begin() + (size_t)r * p.heads * L))
                 same = false;
         }
@@ -413,8 +421,8 @@ void check_verify(const std::string& name, const Problem& p, int64_t sc = 0) {
 void check_paged_vs_sel(const std::string& name, Problem p, int64_t sc = 0) {
     make_sel_from_paged(p);
     std::vector<uint16_t> a, b;
-    const int ra = launch(p, false, 0, a, -1, 0, nullptr, nullptr, nullptr, 0, sc),
-              rb = launch(p, true, 0, b, -1, 0, nullptr, nullptr, nullptr, 0, sc);
+    const int ra = launch(p, false, 0, a, { .sc = sc }),
+              rb = launch(p, true, 0, b, { .sc = sc });
     report(name + " paged(window 0) == sel (bytes)", ra == RAD_OK && rb == RAD_OK && a == b);
     check_forms(name, p, true, sc);
 }
@@ -468,7 +476,7 @@ void check_stable(const std::string& name, const Problem& p, bool forms_pins = t
                   int64_t sc = 0) {
     const std::vector<double> want = ref_paged(p);
     std::vector<uint16_t> all;
-    int rc = launch(p, false, 0, all, 1, 0, nullptr, nullptr, nullptr, 0, sc);
+    int rc = launch(p, false, 0, all, { .stable = 1, .sc = sc });
     double err = 0;
     const bool ok = rc == RAD_OK && close_to(all, want, err);
     char buf[96];
@@ -480,7 +488,7 @@ void check_stable(const std::string& name, const Problem& p, bool forms_pins = t
         for (int i = 0; same && i < p.qlen[s]; ++i) {
             std::vector<uint16_t> o;
             const int r = p.cu[s] + i;
-            same = launch(one_row(p, s, i), false, 0, o, 1, 0, nullptr, nullptr, nullptr, 0, sc) ==
+            same = launch(one_row(p, s, i), false, 0, o, { .stable = 1, .sc = sc }) ==
                        RAD_OK &&
                    std::equal(o.begin(), o.end(), all.begin() + (size_t)r * p.heads * L);
         }
@@ -490,7 +498,7 @@ void check_stable(const std::string& name, const Problem& p, bool forms_pins = t
         for (int form : { 1, 2, 3, 5, 6 }) {
             if ((form == 2 && p.heads <= 16) || (form == 5 && p.heads <= 32)) continue;
             std::vector<uint16_t> o;
-            forms = forms && launch(p, false, form, o, 1, 0, nullptr, nullptr, nullptr, 0, sc) ==
+            forms = forms && launch(p, false, form, o, { .stable = 1, .sc = sc }) ==
                                   RAD_OK &&
                               o == all;
         }
@@ -507,7 +515,7 @@ void check_stable(const std::string& name, const Problem& p, bool forms_pins = t
             char hgbuf[160] = "";
             for (int g : { 1, 2, 4 }) {
                 std::vector<uint16_t> o;
-                const int rca = launch(p, false, 0, o, 1, 0, nullptr, nullptr, nullptr, g, sc);
+                const int rca = launch(p, false, 0, o, { .stable = 1, .hg = g, .sc = sc });
                 const bool fits = (long)p.heads > 16 * (g / 2);
                 const bool ok_g = fits ? (rca == RAD_OK && o == all) : (rca != RAD_OK);
                 if (!ok_g)
@@ -524,7 +532,7 @@ void check_stable(const std::string& name, const Problem& p, bool forms_pins = t
         make_sel_from_paged(q);
         std::vector<uint16_t> b;
         report(name + " stable 1: paged(window 0) == sel (bytes)",
-               launch(q, true, 0, b, 1, 0, nullptr, nullptr, nullptr, 0, sc) == RAD_OK && b == all);
+               launch(q, true, 0, b, { .stable = 1, .sc = sc }) == RAD_OK && b == all);
     }
 }
 
@@ -567,7 +575,7 @@ void check_verify_cap(std::mt19937& rng) {
             make_paged(p, { rows }, { 600 }, 8, 4, window, true, rng);
             std::vector<uint16_t> o;
             std::vector<uint32_t> scr;
-            const int rc = launch(p, false, 0, o, 1, 0, &scr);
+            const int rc = launch(p, false, 0, o, { .stable = 1, .scr = &scr });
             bool parts = false;
             for (size_t i = (size_t)rows * p.heads * kAccWords; i < scr.size(); ++i)
                 parts = parts || scr[i] != 0;
@@ -580,7 +588,7 @@ void check_verify_cap(std::mt19937& rng) {
                 make_sel_from_paged(q);
                 std::vector<uint16_t> b;
                 report("stable 1 w0: 48 rows, paged == the selection form (bytes)",
-                       launch(q, true, 0, b, 1) == RAD_OK && b == o);
+                       launch(q, true, 0, b, { .stable = 1 }) == RAD_OK && b == o);
             }
         }
 }
@@ -600,8 +608,8 @@ void check_sink_sc(std::mt19937& rng) {
     Problem p;
     make_paged(p, { 2, 2, 2 }, { 300, 610, 1100 }, 8, 4, 0, true, rng);
     std::vector<uint16_t> def, tight;
-    const int rc_def = launch(p, false, 0, def, 1),
-              rc_tight = launch(p, false, 0, tight, 1, 0, nullptr, nullptr, nullptr, 0, 64);
+    const int rc_def = launch(p, false, 0, def, { .stable = 1 }),
+              rc_tight = launch(p, false, 0, tight, { .stable = 1, .sc = 64 });
     const std::vector<double> want = ref_paged(p);
     double e_def = 0, e_tight = 0;
     const bool ok_def = rc_def == RAD_OK && close_to(def, want, e_def),
@@ -641,8 +649,8 @@ void check_sink_sc(std::mt19937& rng) {
         Problem w;
         make_paged(w, { 2, 2 }, { 600, 500 }, 8, 4, 512, true, rng);
         std::vector<uint16_t> a, b;
-        const bool ok = launch(w, false, 0, a, 1) == RAD_OK &&
-                        launch(w, false, 0, b, 1, 0, nullptr, nullptr, nullptr, 0, 64) == RAD_OK &&
+        const bool ok = launch(w, false, 0, a, { .stable = 1 }) == RAD_OK &&
+                        launch(w, false, 0, b, { .stable = 1, .sc = 64 }) == RAD_OK &&
                         a == b;
         report("sc 64 w512: a window's launches are untouched (bytes)", ok);
         report("sc 64 w512: and their scratch is the law's",
@@ -652,7 +660,7 @@ void check_sink_sc(std::mt19937& rng) {
      * the two laws. */
     {
         std::vector<uint16_t> o;
-        const int rc = launch(p, false, 0, o, 1, 0, nullptr, nullptr, nullptr, 0, 32);
+        const int rc = launch(p, false, 0, o, { .stable = 1, .sc = 32 });
         std::snprintf(buf, sizeof buf, "launch %d, scratch %lld", rc,
                       (long long)hook_size(p, false, 1, 32));
         report("sc 32: refused by the launch and by the hook",
@@ -713,13 +721,13 @@ void stable_suite(std::mt19937& rng, bool quick) {
         Problem p;
         make_paged(p, { 3, 2 }, { 700, 90 }, 16, 4, 512, true, rng);
         std::vector<uint16_t> a, b, c;
-        launch(p, false, 0, a, 1);
+        launch(p, false, 0, a, { .stable = 1 });
         report("stable 0 == stable 1 below the row cap (bytes)",
-               launch(p, false, 0, b, 0) == RAD_OK && launch(p, false, 0, c, -1) == RAD_OK &&
+               launch(p, false, 0, b, { .stable = 0 }) == RAD_OK && launch(p, false, 0, c) == RAD_OK &&
                    a == b && a == c);
         for (int window : { 512, 0 }) {
             p.window = window;
-            launch(p, false, 0, a, 1);
+            launch(p, false, 0, a, { .stable = 1 });
             Problem wide = p;
             const int extra = 700;
             wide.bt.assign((size_t)2 * (p.blocks + extra), -1);
@@ -728,14 +736,14 @@ void stable_suite(std::mt19937& rng, bool quick) {
                           wide.bt.begin() + (size_t)s * (p.blocks + extra));
             wide.blocks = p.blocks + extra;
             report("stable 1 w" + std::to_string(window) + ": table width moves no bit",
-                   launch(wide, false, 0, b, 1) == RAD_OK && a == b);
+                   launch(wide, false, 0, b, { .stable = 1 }) == RAD_OK && a == b);
         }
         p.window = 512; /* the hook's count is the launch's: a paged window 0 sizes for 20 slots */
         /* the split form's partials do not fit: the fused form, the same bytes */
         std::vector<uint16_t> want;
-        launch(p, false, 0, want, 1);
+        launch(p, false, 0, want, { .stable = 1 });
         report("stable 1: no room for the partials runs the fused form (bytes)",
-               launch(p, false, 0, a, 1, 16) == RAD_OK && a == want);
+               launch(p, false, 0, a, { .stable = 1, .scratch_cut = 16 }) == RAD_OK && a == want);
         /* no room for the accumulator either (5 rows x 16 heads x 516 floats): refused */
         const int64_t keep = (int64_t)5 * 16 * 516 * 4 - 16;
         std::vector<uint16_t> tmp;
@@ -755,10 +763,10 @@ void stable_suite(std::mt19937& rng, bool quick) {
                 need = r4d_rad_mla_attn_paged_sink_scratch(&args);
             }
             report("stable 1: no room for the accumulator refused (RAD_E_SCRATCH)",
-                   launch(q, false, 0, tmp, 1, need - keep) == RAD_E_SCRATCH);
+                   launch(q, false, 0, tmp, { .stable = 1, .scratch_cut = need - keep }) == RAD_E_SCRATCH);
         }
-        report("stable 0: short scratch runs unsplit", launch(p, false, 0, a, 0, 16) == RAD_OK);
-        report("stable 2 refused", launch(p, false, 0, a, 2) == RAD_E_SHAPE);
+        report("stable 0: short scratch runs unsplit", launch(p, false, 0, a, { .stable = 0, .scratch_cut = 16 }) == RAD_OK);
+        report("stable 2 refused", launch(p, false, 0, a, { .stable = 2 }) == RAD_E_SHAPE);
     }
     /* stable 0 past the row cap runs unsplit: within the bound, and still the reference */
     {
@@ -766,7 +774,7 @@ void stable_suite(std::mt19937& rng, bool quick) {
         make_paged(p, { 20 }, { 600 }, 8, 4, 512, true, rng);
         std::vector<uint16_t> o;
         double err;
-        const bool ok = launch(p, false, 0, o, 0) == RAD_OK && close_to(o, ref_paged(p), err);
+        const bool ok = launch(p, false, 0, o, { .stable = 0 }) == RAD_OK && close_to(o, ref_paged(p), err);
         report("stable 0 past 16 rows (unsplit) vs f64", ok);
     }
     check_verify_cap(rng);
@@ -825,9 +833,9 @@ void check_rope(std::mt19937& rng) {
         gptj.pos = &pos;
         std::vector<uint16_t> want, rot = p.qr;
         const bool rope_ok = rope_apply(rot, M, p.heads, pos, gptj) == RAD_OK;
-        const bool base = launch(p, sel, 0, want, 1, 0, nullptr, nullptr, &rot) == RAD_OK;
+        const bool base = launch(p, sel, 0, want, { .stable = 1, .qr = &rot }) == RAD_OK;
         std::vector<uint16_t> got;
-        const bool fold = launch(p, sel, 0, got, 1, 0, nullptr, &gptj) == RAD_OK;
+        const bool fold = launch(p, sel, 0, got, { .stable = 1, .rope = &gptj }) == RAD_OK;
         report(tag + " folded rotary == rope then sink (bytes)", rope_ok && base && fold && got == want);
         /* imrope: three position planes, the sections the rope launch takes */
         std::vector<int> planes((size_t)3 * M);
@@ -840,9 +848,9 @@ void check_rope(std::mt19937& rng) {
         imrope.sections = "11 10 11";
         std::vector<uint16_t> want3, rot3 = p.qr;
         const bool rope3 = rope_apply(rot3, M, p.heads, planes, imrope) == RAD_OK;
-        const bool base3 = launch(p, sel, 0, want3, 1, 0, nullptr, nullptr, &rot3) == RAD_OK;
+        const bool base3 = launch(p, sel, 0, want3, { .stable = 1, .qr = &rot3 }) == RAD_OK;
         std::vector<uint16_t> got3;
-        const bool fold3 = launch(p, sel, 0, got3, 1, 0, nullptr, &imrope) == RAD_OK;
+        const bool fold3 = launch(p, sel, 0, got3, { .stable = 1, .rope = &imrope }) == RAD_OK;
         report(tag + " folded imrope == rope then sink (bytes)",
                rope3 && base3 && fold3 && got3 == want3);
         /* neox pairs a column with one half a head away: no lane holds both, refused */
@@ -851,13 +859,13 @@ void check_rope(std::mt19937& rng) {
         neox.mode = "neox";
         std::vector<uint16_t> tmp;
         report(tag + " folded neox refused (RAD_E_UNSUPPORTED)",
-               launch(p, sel, 0, tmp, 1, 0, nullptr, &neox) == RAD_E_UNSUPPORTED);
+               launch(p, sel, 0, tmp, { .stable = 1, .rope = &neox }) == RAD_E_UNSUPPORTED);
         /* a [3, M] plane with one-component positions is not a shape rope accepts either */
         Rope bad;
         bad.pos = &planes;
         bad.comps = 3;
         report(tag + " folded gptj with three planes refused (RAD_E_SHAPE)",
-               launch(p, sel, 0, tmp, 1, 0, nullptr, &bad) == RAD_E_SHAPE);
+               launch(p, sel, 0, tmp, { .stable = 1, .rope = &bad }) == RAD_E_SHAPE);
         /* the fold is a row's own: two rows of one launch == one row each, position included */
         if (!sel) {
             for (int r = 0; r < 2; ++r) {
@@ -877,7 +885,7 @@ void check_rope(std::mt19937& rng) {
                 Rope rp;
                 rp.pos = &onepos;
                 std::vector<uint16_t> solo;
-                const bool ok = launch(one, false, 0, solo, 1, 0, nullptr, &rp) == RAD_OK;
+                const bool ok = launch(one, false, 0, solo, { .stable = 1, .rope = &rp }) == RAD_OK;
                 report("folded rotary row " + std::to_string(r) + " == its one-row launch",
                        ok && std::equal(solo.begin(), solo.end(),
                                         got.begin() + (size_t)r * p.heads * L));
