@@ -551,47 +551,54 @@ __device__ __forceinline__ void mla_sink_rows_body(
 
 /* A workgroup a (row, head), thread t holding columns 4t..4t+3: a batch of slots' maximum and
  * partial loaded at once (no serial dependency between the loads), then the slots with a visible key
- * folded in ascending order (sink_fold, the fused form's rule) and the sink once. An empty slot
- * (den 0) wrote only its maximum and denominator; its values are not read. A batch is the default
- * law's slot count (kMaxSplitsFull), so a launch of that law is one pass -- the load-then-fold it
- * has always done -- and the widest law's 40 slots are two: the folds' order and their arithmetic
- * are the same either way. */
+ * folded in ascending order (sink_fold, the fused form's rule). An empty slot (den 0) wrote only its
+ * maximum and denominator; its values are not read. A batch is the default law's slot count
+ * (kMaxSplitsFull), so a launch of that law is one pass -- the load-then-fold it has always done,
+ * and the one call the default law makes -- and the widest law's 40 slots are two: the folds' order
+ * and their arithmetic are the same either way. */
+__device__ __forceinline__ void merge_sink_slots(float4& value, float& acc_m, float& den,
+                                                 const float* src, int base, int n, int t) {
+    float part_max[kMaxSplitsFull], part_den[kMaxSplitsFull];
+    float4 part[kMaxSplitsFull];
+#pragma unroll
+    for (int s = 0; s < kMaxSplitsFull; ++s)
+        if (s < n) {
+            const float* p = src + (base + s) * PART;
+            part_max[s] = p[D];
+            part_den[s] = p[D + 1];
+            part[s] = part_den[s] > 0 ? *(const float4*)(p + 4 * t) : make_float4(0, 0, 0, 0);
+        }
+#pragma unroll
+    for (int s = 0; s < kMaxSplitsFull; ++s) {
+        if (!(s < n && part_den[s] > 0)) continue;
+        if (!(den > 0)) {
+            acc_m = part_max[s];
+            den = part_den[s];
+            value = part[s];
+            continue;
+        }
+        const SinkFold f = sink_fold(acc_m, part_max[s]);
+        den = fmaf(part_den[s], f.b, den * f.a);
+        acc_m = f.m;
+        value.x = fmaf(part[s].x, f.b, value.x * f.a);
+        value.y = fmaf(part[s].y, f.b, value.y * f.a);
+        value.z = fmaf(part[s].z, f.b, value.z * f.a);
+        value.w = fmaf(part[s].w, f.b, value.w * f.a);
+    }
+}
+
 __device__ __forceinline__ void merge_sink_body(const float* scratch, const float* sinks,
                                                 uint16_t* out, SinkMeta m) {
     const int t = threadIdx.x, head = blockIdx.y, r = blockIdx.x;
     const float* src = scratch + ((long)r * m.heads + head) * m.splits * PART;
     float4 value = make_float4(0, 0, 0, 0);
     float acc_m = -INFINITY, den = 0;
-    for (int base = 0; base < m.splits; base += kMaxSplitsFull) {
-        const int n = min(kMaxSplitsFull, m.splits - base);
-        float part_max[kMaxSplitsFull], part_den[kMaxSplitsFull];
-        float4 part[kMaxSplitsFull];
-#pragma unroll
-        for (int s = 0; s < kMaxSplitsFull; ++s)
-            if (s < n) {
-                const float* p = src + (base + s) * PART;
-                part_max[s] = p[D];
-                part_den[s] = p[D + 1];
-                part[s] = part_den[s] > 0 ? *(const float4*)(p + 4 * t) : make_float4(0, 0, 0, 0);
-            }
-#pragma unroll
-        for (int s = 0; s < kMaxSplitsFull; ++s) {
-            if (!(s < n && part_den[s] > 0)) continue;
-            if (!(den > 0)) {
-                acc_m = part_max[s];
-                den = part_den[s];
-                value = part[s];
-                continue;
-            }
-            const SinkFold f = sink_fold(acc_m, part_max[s]);
-            den = fmaf(part_den[s], f.b, den * f.a);
-            acc_m = f.m;
-            value.x = fmaf(part[s].x, f.b, value.x * f.a);
-            value.y = fmaf(part[s].y, f.b, value.y * f.a);
-            value.z = fmaf(part[s].z, f.b, value.z * f.a);
-            value.w = fmaf(part[s].w, f.b, value.w * f.a);
-        }
-    }
+    /* One batch (the default law, and every window's) is the single pass this kernel has always
+     * made; only the widest law (F-16's `sink_sc` 64) asks for the second. */
+    const int first = min(kMaxSplitsFull, m.splits);
+    merge_sink_slots(value, acc_m, den, src, 0, first, t);
+    if (m.splits > kMaxSplitsFull)
+        merge_sink_slots(value, acc_m, den, src, kMaxSplitsFull, m.splits - kMaxSplitsFull, t);
     const float inv = sink_inv(acc_m, den, sinks[(long)head * m.ss]);
     uint16_t* const o = out + (long)r * m.orr + (long)head * m.oh + 4 * t;
     o[0] = f32_to_bf16(value.x * inv);
@@ -633,6 +640,10 @@ __global__ __launch_bounds__(128) void merge_sink(const float* scratch, const fl
     merge_sink_body(scratch, sinks, out, m);
     if (CH::on) r4d_chain_done();
 }
+
+/* The op's `sink_sc` is the law (0, absent) or F-16's opt-in (64), and the sink's one check of it
+ * for both hooks: a launch and a scratch agree on the slots, or neither runs. */
+bool sink_sc_ok(long sc) { return sc == 0 || sc == kSinkScTight; }
 
 /* An op's super-chunk: 64 with a window, 128 at window 0 and in the selection form (64 there too
  * where the op's `sink_sc` names it: F-16's opt-in). A function of the op, the window and that
@@ -698,7 +709,7 @@ int sink_body(const RadArgs* a, RadStream stream) {
      * place of the law's 128; absent or 0 is the law, and a window's own super-chunk is not this
      * parameter's. */
     const long stable = r4d_geti_or(a, "stable", 0), sc = r4d_geti_or(a, "sink_sc", 0);
-    if (sc != 0 && sc != kSinkScTight) return RAD_E_UNSUPPORTED;
+    if (!sink_sc_ok(sc)) return RAD_E_UNSUPPORTED;
     heads_view(q, heads, D);
     heads_view(qr, heads, RD);
     heads_view(o, heads, D);
@@ -907,7 +918,7 @@ int64_t sink_scratch(const RadArgs* a, bool sel) {
     if (heads < 1 || heads > 64 || rows < 1 || rows > 65535 || window < 0 || stable < 0 ||
         stable > 1)
         return RAD_E_SHAPE;
-    if (sc != 0 && sc != kSinkScTight) return RAD_E_UNSUPPORTED;
+    if (!sink_sc_ok(sc)) return RAD_E_UNSUPPORTED;
     const int slots = sel && blocks > 0 && bs > 0 ? sink_slots(true, 0, blocks * bs, sc)
                                                   : sink_law(sel, window, sc);
     if (slots <= 1) return 0;
