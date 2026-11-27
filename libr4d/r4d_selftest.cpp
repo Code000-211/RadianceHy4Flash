@@ -20179,11 +20179,13 @@ static void moe_perf(const Plugin& pl, int64_t Mtok, int iters, int64_t E = 512,
     int nforms = (pl.pin_moe ? (pl.pin_fk ? 4 : 3) : 1) + (w6_only && pl.pin_moe ? 1 : 0);
     /* R4D_PERF_MOE_ONLY: only the rows whose name it is (e.g. "down g64 i8"), and only their first
      * form and the down tile's M tiles a block (R4D_PERF_MOE_MT: r4d_moe_gemm_pin_down_mt's values,
-     * 2 and 4, comma separated). */
+     * 2 and 4, comma separated; `4:n` also pins the 64-row block's column tiles a block to n, 1 to
+     * 3, r4d_moe_gemm_pin_down_ng's values, e.g. "4:1,4:2,4:3"). */
     const char* only = std::getenv("R4D_PERF_MOE_ONLY");
     typedef void (*PinFn)(int);
     const PinFn pin_dmt = (PinFn)dlsym(pl.h, "r4d_moe_gemm_pin_down_mt");
-    std::vector<int> mts;
+    const PinFn pin_dng = (PinFn)dlsym(pl.h, "r4d_moe_gemm_pin_down_ng");
+    std::vector<int> mts, ngs;
     if (only) {
         nforms = 1;
         const char* ev = std::getenv("R4D_PERF_MOE_MT");
@@ -20192,10 +20194,14 @@ static void moe_perf(const Plugin& pl, int64_t Mtok, int iters, int64_t E = 512,
             size_t j = ps_.find(',', i);
             if (j == std::string::npos) j = ps_.size();
             mts.push_back(std::atoi(ps_.substr(i, j - i).c_str()));
+            const size_t c = ps_.find(':', i);
+            ngs.push_back(c < j ? std::atoi(ps_.substr(c + 1, j - c - 1).c_str()) : 0);
             i = j + 1;
         }
     }
     if (!pin_dmt || mts.empty()) mts.assign(1, 0);
+    if (!pin_dng) ngs.clear();
+    ngs.resize(mts.size(), 0);
     int64_t ent32 = 0, ent64 = 0, ent128 = 0, usedn = 0;
     for (int64_t e = 0; e < E; ++e) {
         const int64_t n = (int64_t)by_e[(size_t)e].size();
@@ -20381,6 +20387,7 @@ static void moe_perf(const Plugin& pl, int64_t Mtok, int iters, int64_t E = 512,
             if (pl.pin_moe) pl.pin_moe(pinned < 0 ? 0 : pinned == 3 ? 2 : pinned + 1);
             if (pl.pin_fk) pl.pin_fk(pinned < 0 ? 0 : pinned == 3 ? 2 : 1);
             if (pin_dmt && mts[mi]) pin_dmt(mts[mi]);
+            if (pin_dng) pin_dng(ngs[mi]);
             const int rc = ra->launch(&a, nullptr);
             if (rc != RAD_OK || st_stream_sync(nullptr) != hipSuccess) {
                 std::printf("  %-12s form %-4s  rc=%d (not served)\n", pname.c_str(), form.c_str(), rc);
@@ -20403,6 +20410,7 @@ static void moe_perf(const Plugin& pl, int64_t Mtok, int iters, int64_t E = 512,
             st_memcpy(got.data(), d_y, got.size() * 2, hipMemcpyDeviceToHost);
             std::string same = "";
             if (mts[mi]) same = "  rows/block pin " + std::to_string(mts[mi]);
+            if (ngs[mi]) same += "  column tiles/block pin " + std::to_string(ngs[mi]);
             if (f == 0 && mi == 0) {
                 first = got;
                 /* A hash of the first form's bytes, to compare builds; the inputs are a fixed
@@ -20425,6 +20433,7 @@ static void moe_perf(const Plugin& pl, int64_t Mtok, int iters, int64_t E = 512,
         if (pl.pin_moe) pl.pin_moe(0);
         if (pl.pin_fk) pl.pin_fk(0);
         if (pin_dmt) pin_dmt(-1);
+        if (pin_dng) pin_dng(0);
     }
 }
 
@@ -20433,7 +20442,8 @@ static void moe_perf(const Plugin& pl, int64_t Mtok, int iters, int64_t E = 512,
  * x 384:256, w4nl64 against an int8 activation), over one routing of `Mtok` tokens at 512 experts
  * and top 10: a measured routing's shape (lognormal run lengths) with every length around the
  * blocks' bounds planted, and a dropped tail. The 32-row block is the form moe_w4_gemm holds
- * against the host decode. */
+ * against the host decode. Then the 64-row block's column tiles a block (g_moe_down_ng_pin): one
+ * and two against the same bytes, and three refused at a width that is not whole triples. */
 static void moe_down_mt_case(const Plugin& pl, int64_t Mtok) {
     if (!sel("moe_gemm_w4a8i8")) return;
     const int64_t E = 512, top_k = 10, Tr = Mtok * top_k, drop = 37, group = 128;
@@ -20582,6 +20592,21 @@ static void moe_down_mt_case(const Plugin& pl, int64_t Mtok) {
                       std::to_string(first / N) + " column " + std::to_string(first % N)
                 : "the 32-row block's bytes");
     }
+    if (const PinFn pin_ng = (PinFn)dlsym(pl.h, "r4d_moe_gemm_pin_down_ng")) {
+        for (const int g : { 1, 2, 3 }) {
+            const std::string what = std::string(nm) + ": pin 4, " + std::to_string(g) + " column tile(s) a block";
+            pin_ng(g);
+            const bool ran = run_pin(4, y);
+            pin_ng(0);
+            if (g == 3) { ok(what.c_str(), !ran, ran ? "launched at a width of five tiles" : "refused"); continue; }
+            if (!ran) { ok(what.c_str(), false, "launch failed"); continue; }
+            int64_t diff = 0;
+            for (size_t i = 0; i < y.size(); ++i) diff += y[i] != y0[i];
+            ok(what.c_str(), diff == 0,
+               diff ? std::to_string(diff) + " elements differ from the 32-row block's" : "the 32-row block's bytes");
+        }
+    } else
+        ok((std::string(nm) + ": column tiles pin").c_str(), false, "r4d_moe_gemm_pin_down_ng absent");
     /* K-59's `dmt` axis (rad-tune's): the two M tiles a block reached by the parameter with the test
      * hook off, over the 32-row block's bytes, and a value that is neither refused rather than taken
      * as the rule. */
