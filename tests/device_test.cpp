@@ -1603,6 +1603,77 @@ TEST(a_dma_lists_mark_stays_out_of_the_pool_until_the_engine_has_read_it) {
     rad_ride_release(first, nullptr, 0);
 }
 
+/* RAD_XP_DONE_EACH (W2's lists, issue #309): the done word is written behind every range of the
+ * list, counting them, so a reader sees how many have landed while the list still copies. The
+ * engine is held on the list's mark with the gate closed: nothing is written; opened, the word ends
+ * at done_val + n and every range holds its source's bytes. Without the flag the word is written
+ * once, as done_val. The ring is uncached device memory, as W2's, the word behind its last slot. */
+TEST(a_dma_list_can_count_its_ranges_into_the_done_word) {
+    if (rad::device_is_host()) SKIP("a card only");
+    if (!rad_xp_supported(0)) SKIP("no prefetch DMA queue on this card");
+    constexpr int kN = 5;
+    constexpr int64_t kB = 256 << 10;
+    Stream held;
+    DevBuf<uint8_t> src(kN * kB, RAD_MEM_HOST_PINNED), back(kN * kB, RAD_MEM_HOST_PINNED);
+    DevBuf<uint32_t> word_h(64, RAD_MEM_HOST_PINNED);
+    uint8_t* ring = (uint8_t*)rad_dev_alloc_uncached(kN * kB + 4096);
+    REQUIRE(src && back && word_h && ring != nullptr);
+    uint32_t* word = (uint32_t*)(ring + kN * kB);
+    for (int64_t i = 0; i < kN * kB; ++i) ((uint8_t*)src.p)[i] = (uint8_t)(i * 131 + (i >> 9));
+    CHECK_OK(rad_memset_async(ring, 0, kN * kB + 4096, held.s));
+    CHECK_OK(rad_stream_sync(held.s));
+    auto read_word = [&] {
+        uint32_t v = 0xdeadbeef;
+        if (rad_memcpy_async(word_h.p, word, 4, held.s) >= 0 && rad_stream_sync(held.s) >= 0)
+            v = *(volatile uint32_t*)word_h.p;
+        return v;
+    };
+    uint64_t s[kN], d[kN], b[kN];
+    for (int i = 0; i < kN; ++i) {
+        s[i] = (uint64_t)(uintptr_t)rad_dev_device_ptr((uint8_t*)src.p + i * kB);
+        d[i] = (uint64_t)(uintptr_t)(ring + i * kB);
+        b[i] = (uint64_t)kB;
+    }
+    const uint32_t base = 41u << 4;
+    REQUIRE_EQ(rad_xp_list(0, nullptr, kN, s, d, b, word, base, RAD_XP_NO_YIELD | RAD_XP_DONE_EACH), RAD_OK);
+    const auto t0 = std::chrono::steady_clock::now();
+    uint32_t seen = 0, last = 0;
+    bool monotone = true;
+    while (std::chrono::steady_clock::now() - t0 < std::chrono::seconds(5)) {
+        const uint32_t v = read_word();
+        if (v) {
+            monotone = monotone && v >= last && v > base && v <= base + kN;
+            last = v;
+            ++seen;
+        }
+        if (v == base + kN) break;
+    }
+    CHECK(seen > 0);
+    CHECK(monotone);                                  /* only ever this list's counts, rising */
+    CHECK_EQ(read_word(), base + (uint32_t)kN);
+    while (rad_xp_behind(0) > 0 && std::chrono::steady_clock::now() - t0 < std::chrono::seconds(6))
+        std::this_thread::yield();
+    CHECK_OK(rad_memcpy_async(back.p, ring, kN * kB, held.s));
+    CHECK_OK(rad_stream_sync(held.s));
+    CHECK_EQ(std::memcmp(back.p, src.p, (size_t)(kN * kB)), 0);
+
+    /* Without the flag: one write behind the whole list. */
+    REQUIRE_EQ(rad_xp_list(0, nullptr, 2, s, d, b, word, 7, RAD_XP_NO_YIELD), RAD_OK);
+    const auto t1 = std::chrono::steady_clock::now();
+    uint32_t v = 0;
+    bool only = true;
+    while (std::chrono::steady_clock::now() - t1 < std::chrono::seconds(5)) {
+        v = read_word();
+        only = only && (v == base + kN || v == 7u);
+        if (v == 7u) break;
+    }
+    CHECK_EQ(v, 7u);
+    CHECK(only);
+    while (rad_xp_behind(0) > 0 && std::chrono::steady_clock::now() - t1 < std::chrono::seconds(6))
+        std::this_thread::yield();
+    rad_dev_free_uncached(ring);
+}
+
 /* A host wait on a stream at a closed gate could only end when the waiting thread opened it, so it
  * is refused with RAD_E_STATE instead of hanging, and works again once the gate is open. */
 TEST(a_host_wait_on_a_gated_stream_is_refused_not_a_deadlock) {

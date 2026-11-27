@@ -7,7 +7,10 @@
  * where the chain wrote the row and copied it back; both are the chain's bytes or this test fails:
  * the row whole, at one pitch and at a padded one (its padding columns untouched), the cache whole
  * (its untouched blocks untouched), with a bf16 and an f32 gain, with a negative slot and a slot
- * past the blocks, at one token and at five. */
+ * past the blocks, at one token and at five.
+ *
+ * Also DFly2's chain (D-02, #88): one gather_rows and one rmsnorm over every round's rows against
+ * a launch of each a round (hoist()). */
 #include "ref_host.h"
 #include "r4d_plugin.h"
 
@@ -226,6 +229,75 @@ Cfg base() {
     return c;
 }
 
+
+/* D-02 (#88): DFly2's chain reads rows k + 1 of every sequence's block of the final norm in round
+ * k. The plugin now gathers every round's rows in one launch and normalises them in one launch,
+ * the norm into the first half of a [rounds * n, 2E] plane, where it issued a gather and a norm of
+ * n rows a round. Held here to those per-round launches byte for byte: at one sequence and at
+ * sixteen the hoisted launch is on either side of the row count the norm's block width turns on
+ * (r4d_act_threads), and a row's bytes must not depend on it. The plane's other half is the
+ * embedding norm's, written a round later: neither form may touch it. */
+int hoist(int n, int rounds, int E, uint32_t seed) {
+    const int blk = rounds + 1, Mz = n * blk, RN = rounds * n, P = 2 * E;
+    std::mt19937 rng(seed);
+    std::uniform_real_distribution<float> u(-3.0f, 3.0f);
+    std::vector<uint16_t> z((size_t)Mz * E), gain((size_t)E), plane0((size_t)RN * P);
+    for (auto& x : z) x = f2b(u(rng));
+    for (auto& x : gain) x = f2b(u(rng));
+    for (auto& x : plane0) x = f2b(u(rng));
+    std::vector<int32_t> idx((size_t)RN);
+    for (int k = 0; k < rounds; ++k)
+        for (int s = 0; s < n; ++s) idx[(size_t)(k * n + s)] = s * blk + k + 1;   /* iota(k + 1, step blk) */
+    auto gather = [&](int32_t* ix, uint16_t* y, int M) {
+        std::vector<RadTensor> t{ tens(z.data(), RAD_BF16, { Mz, E }), tens(ix, RAD_I32, { M }),
+                                  tens(y, RAD_BF16, { M, E }) };
+        std::vector<RadParam> p{ pi("M", M), pi("n", E), ps("dtype", "bf16") };
+        RadArgs a = mk(t, p);
+        return r4d_rad_gather_rows(&a, nullptr);
+    };
+    auto norm = [&](uint16_t* x, uint16_t* y, int M) {
+        std::vector<RadTensor> t{ tens(x, RAD_BF16, { M, E }), tens(gain.data(), RAD_BF16, { E }),
+                                  tens(y, RAD_BF16, { M, E }, { P, 1 }) };
+        std::vector<RadParam> p{ pi("M", M), pi("n", E), pf("eps", 1e-6), ps("dtype", "bf16") };
+        RadArgs a = mk(t, p);
+        return r4d_rad_rmsnorm(&a, nullptr);
+    };
+    /* a launch a round, each into the first n rows of its buffers (kept here a round) */
+    std::vector<uint16_t> zkR((size_t)RN * E, 0), plR = plane0;
+    int rc = RAD_OK;
+    for (int k = 0; k < rounds && rc == RAD_OK; ++k) {
+        std::vector<uint16_t> zk((size_t)n * E), cc(plane0.begin(), plane0.begin() + (size_t)n * P);
+        rc = gather(idx.data() + (size_t)k * n, zk.data(), n);
+        if (rc == RAD_OK) rc = norm(zk.data(), cc.data(), n);
+        std::memcpy(zkR.data() + (size_t)k * n * E, zk.data(), zk.size() * 2);
+        for (int r = 0; r < n; ++r)
+            std::memcpy(plR.data() + ((size_t)k * n + r) * P, cc.data() + (size_t)r * P, (size_t)E * 2);
+    }
+    /* one launch each */
+    std::vector<uint16_t> zkH((size_t)RN * E, 0), plH = plane0;
+    int rc2 = gather(idx.data(), zkH.data(), RN);
+    if (rc2 == RAD_OK) rc2 = norm(zkH.data(), plH.data(), RN);
+    if (rc != RAD_OK || rc2 != RAD_OK) {
+        std::printf("hoist n%d rounds%d E%d: launch failed (a round %d, hoisted %d)\n", n, rounds, E, rc, rc2);
+        return 1;
+    }
+    int bad = 0, pad = 0;
+    for (size_t i = 0; i < zkH.size(); ++i) bad += zkH[i] != zkR[i];
+    for (int r = 0; r < RN; ++r)
+        for (int j = 0; j < P; ++j) {
+            const size_t o = (size_t)r * P + (size_t)j;
+            if (j < E) bad += plH[o] != plR[o];
+            else       pad += plH[o] != plane0[o];
+        }
+    /* the gathered rows are z's own */
+    for (int i = 0; i < RN; ++i)
+        bad += std::memcmp(zkH.data() + (size_t)i * E, z.data() + (size_t)idx[(size_t)i] * E, (size_t)E * 2) != 0;
+    if (bad || pad)
+        std::printf("hoist n%d rounds%d E%d: %d byte(s) differ from the per-round launches, %d of "
+                    "the other half written\n", n, rounds, E, bad, pad);
+    return (bad || pad) ? 1 : 0;
+}
+
 }  // namespace
 
 int main() {
@@ -288,6 +360,15 @@ int main() {
         c.slot = { 0, 8 };
         c.pos = { 3, 7 };
         fails += one(c);
+    }
+    {   /* D-02: the chain's hoisted gather and norm, at the stream counts and depths served. */
+        int h = 0, cases = 0;
+        for (int E : { 256, 1000, 1536, 4096 })
+            for (int n : { 1, 2, 8, 16 })
+                for (int rounds = 1; rounds <= 5; ++rounds, ++cases)
+                    h += hoist(n, rounds, E, (uint32_t)(E + 31 * n + rounds));
+        std::printf("chain hoist (D-02): %d case(s), %s\n", cases, h ? "FAIL" : "ok");
+        fails += h;
     }
     std::printf("row front: %d failure(s)\n", fails);
     return fails ? 1 : 0;

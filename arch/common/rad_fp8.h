@@ -709,7 +709,14 @@ inline int GateQuantFP8::declare(RadBuilder* b, const Geom& g, rad_buf gate_up, 
                { gate_up }, { a.x });
         return op ? RAD_OK : RAD_E_INVAL;
     }
-    if (!gate_up || !a.x || !a.cq() || !a.cs() || n <= 0) return RAD_E_INVAL;
+    /* What the plane is for, form by form: `relu2` (601), any clamp (634) and the bf16 line (699)
+     * read or write it and demand it; the chain below writes it and demands it through `want_x`
+     * (733, where a missing plane already returns the error). What is left -- this path -- is the
+     * gated quantiser, which writes the codes and nothing else: `bf16_out` false says exactly that,
+     * and `wr` names two writes at the bottom. So an architecture that declares no plane for that
+     * form passes 0 and gets the row it actually runs (P-11b: the plane was arena nothing read, and
+     * refusing it here turned the fused gate off). */
+    if (!gate_up || !a.cq() || !a.cs() || n <= 0) return RAD_E_INVAL;
     /* Rotated codes feed a four-bit expert, which reads E4M3 only. */
     if (rot && a.q8_fed) return RAD_E_INVAL;
     /* Rotated int8 codes (ActFP8::q8_rot) feed a down projection stored at i8a8h:
@@ -723,8 +730,10 @@ inline int GateQuantFP8::declare(RadBuilder* b, const Geom& g, rad_buf gate_up, 
                                RAD_INT("group", a.cg()), RAD_STR("dtype", g.dtype),
                                RAD_STR("act", act_name)),
                     RAD_NOWEIGHTS);
-    /* The rotated op's chain, which writes the bf16 plane whether or not a consumer asked. */
-    if (!op && rot && std::strcmp(act_name, "silu") == 0) {
+    /* The rotated op's chain, which writes the bf16 plane whether or not a consumer asked: the one
+     * form here that reads the plane, so it is asked for with `a.x` (P-11b). A gate that got the
+     * codes-only row above never comes here. */
+    if (!op && rot && a.x && std::strcmp(act_name, "silu") == 0) {
         want_x = true;
         op = rw(b, RAD_OP(b, "silu_mul",
                    RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("n", n), RAD_STR("dtype", g.dtype)),
@@ -738,6 +747,10 @@ inline int GateQuantFP8::declare(RadBuilder* b, const Geom& g, rad_buf gate_up, 
         return op && op_q ? RAD_OK : RAD_E_INVAL;
     }
     if (!op) return RAD_E_INVAL;
+    /* A caller that asked for the product (`bf16_out` true, which is what sets `want_x`) must have
+     * declared one; only the codes-only form may arrive here without a plane, and it arrives with
+     * `want_x` false. Without this a gate could declare a row that writes buffer 0. */
+    if (want_x && !a.x) return RAD_E_INVAL;
     const rad_buf wr[3] = { a.cq(), a.cs(), a.x };
     rad_op_reads (b, op, &gate_up, 1);
     rad_op_writes(b, op, wr, want_x ? 3 : 2);

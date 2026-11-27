@@ -740,6 +740,10 @@ void r4d_moe_gather_pin_form(int form);
 // column tiles a block (capped at 16, refused on a shape it does not serve). Applies inside the
 // decode form only, which r4d_moe_gemm_pin_prefill(2) pins. Bit-identical.
 void r4d_moe_gemm_pin_down_dec(int pin);
+// Test hook: pins the tile blocks of moe_gemm_iqr's decode grid (the run-tile grid). 0 is the
+// launcher's rule (r4d_moe_run_grid: T / 2 + 64 at most the tile bound), n > 0 n
+// blocks (at most the bound), each serving the tiles past the grid in turn. Bit-identical.
+void r4d_moe_gemm_pin_run_grid(int n);
 // Test hook: pins the gated residual read's prefill tile. 0 is the launcher's rule, 1 the decode
 // tiles' kernels at 128 rows (hc_down_tiled, then hc_up_tiled into `ubuf` and hc_mix), 2 the wide
 // kernels (refusing shapes they are not built for), 3 the PF2 kernels with the wide kernel as their
