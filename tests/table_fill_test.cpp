@@ -18,6 +18,7 @@
 #include "rad_runtime.h"
 
 #include <fcntl.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -69,12 +70,17 @@ struct TableResolveTestAccess {
     static int64_t on_card(Engine& e) { return e.ngram_on_card_bytes_; }
 };
 
-/* The real load over the minimal state load_weights walks: one rank, the sentinel and one
- * reader-identified n-gram table (read only by a host `embed_lookup_q`), a plan that places the
- * table on the mapped tier, and the pools. The name must not parse as blk.<l>.engram_table: the
- * gate's global fallback is what the tests below drive. */
+/* The real load over the minimal state load_weights walks: one rank, the sentinel and one or
+ * more reader-identified n-gram tables (read only by a host `embed_lookup_q`), each on the
+ * mapped tier with its own host-gather unit, and the pools. A name that does not parse as
+ * blk.<l>.engram_table (layer -1) drives the gate's global fallback; a name that does drives
+ * the per-layer path. */
 struct LoadGateTestAccess {
     static int prepare(Engine& e, const std::string& name, int64_t bytes) {
+        return prepare_layers(e, { name }, { bytes });
+    }
+    static int prepare_layers(Engine& e, const std::vector<std::string>& names,
+                              const std::vector<int64_t>& bytes) {
         EngineScope scope(e.owner_, "load-gate-test");
         auto rank = std::make_unique<Engine::Rank>();
         CtxDesc desc; desc.program = &rank->program;
@@ -84,53 +90,58 @@ struct LoadGateTestAccess {
         p.weights.resize(1);                    /* index 0 is the sentinel */
         p.ctx.rank       = 0;
         p.ctx.world_size = 1;
-        WeightInfo w;
-        w.name   = name;
-        w.source = name;
-        w.decl.dtype = RAD_U8;                  /* one byte per element: bytes are exact */
-        w.decl.rank  = 2;
-        w.decl.shape[0] = bytes / 2;
-        w.decl.shape[1] = 1;
-        w.decl.access = RAD_ACCESS_VOCAB;
-        w.decl.group.layer  = -1;
-        w.decl.group.expert = -1;
-        w.enc         = rad_enc_plain(RAD_BF16);
-        w.enc_known   = true;
-        w.n_sel       = 1;
-        w.sel[0]      = 0;
-        w.sel_rows[0] = bytes / 2;
-        w.sel_cols[0] = 1;
-        w.stored_bytes  = bytes;
-        w.logical_bytes = bytes;
-        p.weights.push_back(w);
-        OpInfo o;                               /* the reader that identifies the table */
-        o.op      = "embed_lookup_q";
-        o.index   = 0;
-        o.weights = { 1 };
-        p.ops.push_back(o);
-        p.weights[1].first_use_op = 0;
-        p.weights[1].last_use_op  = 0;
-        /* The plan: the table on the mapped tier, read where it lies until the gate moves it. */
-        rank->plan.weight.resize(2);
-        rank->plan.weight[1].tier  = Tier::Mapped;
-        rank->plan.weight[1].site  = Site::Host;
-        rank->plan.weight[1].unit  = 0;
-        rank->plan.weight[1].bytes = bytes;
-        MoveUnit mu;
-        mu.tier    = Tier::Mapped;
-        mu.site    = Site::Host;
-        mu.bytes   = bytes;
-        mu.weights = { 1 };
-        mu.offset  = { 0 };
-        rank->plan.units.push_back(mu);
-        rank->plan.unit_of_weight = { -1, 0 };
+        rank->plan.weight.resize(1);
+        rank->plan.unit_of_weight = { -1 };
+        for (size_t k = 0; k < names.size(); ++k) {
+            WeightInfo w;
+            w.name   = names[k];
+            w.source = names[k];
+            w.decl.dtype = RAD_U8;              /* one byte per element: bytes are exact */
+            w.decl.rank  = 2;
+            w.decl.shape[0] = bytes[k] / 2;
+            w.decl.shape[1] = 1;
+            w.decl.access = RAD_ACCESS_VOCAB;
+            w.decl.group.layer  = -1;           /* the layer, if any, is in the name */
+            w.decl.group.expert = -1;
+            w.enc         = rad_enc_plain(RAD_BF16);
+            w.enc_known   = true;
+            w.n_sel       = 1;
+            w.sel[0]      = 0;
+            w.sel_rows[0] = bytes[k] / 2;
+            w.sel_cols[0] = 1;
+            w.stored_bytes  = bytes[k];
+            w.logical_bytes = bytes[k];
+            p.weights.push_back(w);
+            OpInfo o;                           /* the reader that identifies the table */
+            o.op      = "embed_lookup_q";
+            o.index   = (int32_t)p.ops.size();
+            o.weights = { (rad_weight)(k + 1) };
+            p.ops.push_back(o);
+            p.weights[k + 1].first_use_op = o.index;
+            p.weights[k + 1].last_use_op  = o.index;
+            /* The plan: the table on the mapped tier, read where it lies until the gate moves
+             * it. */
+            rank->plan.weight.resize(k + 2);
+            rank->plan.weight[k + 1].tier  = Tier::Mapped;
+            rank->plan.weight[k + 1].site  = Site::Host;
+            rank->plan.weight[k + 1].unit  = (int32_t)rank->plan.units.size();
+            rank->plan.weight[k + 1].bytes = bytes[k];
+            MoveUnit mu;
+            mu.tier    = Tier::Mapped;
+            mu.site    = Site::Host;
+            mu.bytes   = bytes[k];
+            mu.weights = { (rad_weight)(k + 1) };
+            mu.offset  = { 0 };
+            rank->plan.units.push_back(mu);
+            rank->plan.unit_of_weight.push_back((int32_t)rank->plan.units.size() - 1);
+        }
         e.ranks_.push_back(std::move(rank));
         return RAD_OK;
     }
     static int   load(Engine& e) { return e.load_weights(); }
-    static void* ptr(Engine& e) { return e.ranks_[0]->program.weights[1].ptr; }
-    static void* published(Engine& e) {
-        const WeightSlot* sl = e.ranks_[0]->mover.residency()->lookup((rad_weight)1);
+    static void* ptr(Engine& e, size_t i = 1) { return e.ranks_[0]->program.weights[i].ptr; }
+    static void* published(Engine& e, size_t i = 1) {
+        const WeightSlot* sl = e.ranks_[0]->mover.residency()->lookup((rad_weight)i);
         return sl ? sl->ptr : nullptr;
     }
 };
@@ -746,6 +757,50 @@ struct GateContainer {
     }
 };
 
+/* A container holding several tables, for the named-layer cases: each table's bytes, plane
+ * offset and mapped pointer, indexed in the order written. */
+struct GateMulti {
+    std::string                       path;
+    std::vector<std::vector<uint8_t>> want;
+    std::vector<const uint8_t*>       src;
+    std::vector<int64_t>              off, n;
+    std::unique_ptr<rad::RadFile>     file;
+
+    bool write(const std::string& p,
+               const std::vector<std::pair<std::string, int64_t>>& ws) {
+        path = p;
+        rad::RadWriter writer;
+        if (writer.begin(path.c_str()) < 0) return false;
+        writer.set_arch("radtest");
+        for (size_t k = 0; k < ws.size(); ++k) {
+            want.push_back(pattern_bytes(ws[k].second, 0x5eed0000u + (unsigned)k));
+            rad::RadWriter::Weight w;
+            w.name = ws[k].first;
+            w.enc  = rad_enc_plain(RAD_BF16);
+            w.rank = 2;
+            w.shape[0] = ws[k].second / 2;   /* bf16: two bytes a row */
+            w.shape[1] = 1;
+            const void* planes[] = { want[k].data() };
+            if (writer.add_weight(w, planes) < 0) return false;
+        }
+        return writer.finish() == RAD_OK;
+    }
+    int open(const std::vector<std::string>& names) {
+        file = std::make_unique<rad::RadFile>();
+        if (file->open(path.c_str()) < 0) return -1;
+        for (size_t k = 0; k < names.size(); ++k) {
+            const RadFileEntry* e = file->find(names[k]);
+            if (!e) return -1;
+            const RadFilePlane& p = file->plane(*e, 0);
+            src.push_back(file->data(p));
+            off.push_back((int64_t)p.offset);
+            n.push_back((int64_t)p.bytes);
+            if (n[k] != (int64_t)want[k].size()) return -1;
+        }
+        return 0;
+    }
+};
+
 }  // namespace
 
 /* Finding 1 (round 3): the global ram copy reaches every reader-identified table, not only the
@@ -828,6 +883,141 @@ TEST(an_unnamed_ngram_table_takes_the_global_disk_dir_file_through_the_load) {
     const std::string id = rad::table_share_id(config.model, c.off, c.n);
     REQUIRE(!id.empty());
     CHECK(::access((dir + "/ngram-" + id + ".bin").c_str(), F_OK) == 0);
+}
+
+/* Finding 1 (round 4): the gate asks the LAYER, not the global resolve, for a table the naming
+ * reaches. Under a global disk, blk.1's ram and blk.2's disk=DIR are the named layers' own
+ * placements -- neither takes the ngram_resolved fallback: the ram layer gets the locked copy
+ * (published through the residency table, byte-identical), the disk layer its own file under
+ * its own directory. Under the global fallback blk.1 would sit in the container (disk, no
+ * directory) and blk.2's file would wait for a global directory that was never named. */
+TEST(named_layers_take_their_own_placement_through_the_load) {
+    const std::vector<std::string> names = { "blk.1.engram_table.weight",
+                                             "blk.2.engram_table.weight" };
+    const int64_t n1 = 3ll << 20;                 /* the ram layer: a locked copy */
+    const int64_t n2 = rad::kTableShareMin;       /* the disk=DIR layer: its own file */
+    GateMulti c;
+    REQUIRE(c.write(radtest::tmp_path("load-gate-named.rad"),
+                    { { names[0], n1 }, { names[1], n2 } }));
+    REQUIRE_EQ(c.open(names), 0);
+    const std::string dir2 = radtest::tmp_path("load-gate-named-disk2");
+    REQUIRE(::mkdir(dir2.c_str(), 0777) == 0);
+
+    rad::Config config;
+    config.model = c.path;
+    config.ngram_placement = rad::TablePlacement::Disk;   /* global: disk, no directory */
+    config.ngram_resolved  = rad::TablePlacement::Disk;
+    config.ngram_layer_asked    = { { 1, rad::TablePlacement::Ram },
+                                    { 2, rad::TablePlacement::Disk } };
+    config.ngram_layer_resolved = { { 1, rad::TablePlacement::Ram },
+                                    { 2, rad::TablePlacement::Disk } };
+    config.ngram_layer_disk_dir = { { 2, dir2 } };        /* the 2=disk=DIR */
+    config.vram_weights_mib = 64; config.vram_kv_mib = 1; config.host_pool_mib = 64;
+    rad::Engine engine(config);
+    rad::EngineScope owner(engine.owner(), "load-gate-named");
+    REQUIRE_EQ(rad::LoadGateTestAccess::prepare_layers(engine, names, { n1, n2 }), RAD_OK);
+    rad::TableFillTestAccess::hold(engine, std::move(c.file));
+    const int rc = rad::LoadGateTestAccess::load(engine);
+    if (rc == RAD_E_NOMEM) SKIP("the machine cannot lock the table (RLIMIT_MEMLOCK)");
+    REQUIRE_EQ(rc, RAD_OK);
+    /* One locked copy and one table file: the two named layers' own paths, and no third. */
+    CHECK_EQ(rad::TableFillTestAccess::locked(engine), size_t(1));
+    CHECK_EQ(rad::TableFillTestAccess::files(engine), size_t(1));
+    /* blk.1: the ram path -- the copy, not the container the global disk leaves. */
+    void* const p1 = rad::LoadGateTestAccess::ptr(engine, 1);
+    CHECK(p1 != nullptr && p1 != (void*)c.src[0]);
+    CHECK(same_as(p1, c.want[0].data(), n1));
+    CHECK(rad::LoadGateTestAccess::published(engine, 1) == p1);
+    /* blk.2: its own file under the NAMED directory -- the global names none, so the
+     * fallback would have left the table in the container. */
+    void* const p2 = rad::LoadGateTestAccess::ptr(engine, 2);
+    CHECK(p2 != nullptr && p2 != (void*)c.src[1]);
+    CHECK(same_as(p2, c.want[1].data(), n2));
+    const std::string id2 = rad::table_share_id(config.model, c.off[1], c.n[1]);
+    REQUIRE(!id2.empty());
+    CHECK(::access((dir2 + "/ngram-" + id2 + ".bin").c_str(), F_OK) == 0);
+}
+
+/* Finding 1 (round 4), the refusal: a named ram layer whose copy cannot be made stops startup
+ * -- ngram_layer_asked.count(ng_layer) -- because the operator asked for that layer in
+ * memory. The global placement being disk is no licence to demote it to the container the way
+ * auto's failed copy is. RLIMIT_MEMLOCK under the table is the machine's own way of failing
+ * the locked copy. */
+TEST(a_named_ram_layer_whose_copy_cannot_be_made_refuses_startup) {
+    const std::string name = "blk.1.engram_table.weight";
+    const int64_t n = 3ll << 20;
+    GateContainer c;
+    REQUIRE(c.write(radtest::tmp_path("load-gate-refuse.rad"), n, name));
+    REQUIRE_EQ(c.open(name), 0);
+    rad::Config config;
+    config.model = c.path;
+    config.ngram_placement = rad::TablePlacement::Disk;
+    config.ngram_resolved  = rad::TablePlacement::Disk;
+    config.ngram_layer_asked    = { { 1, rad::TablePlacement::Ram } };
+    config.ngram_layer_resolved = { { 1, rad::TablePlacement::Ram } };
+    config.vram_weights_mib = 64; config.vram_kv_mib = 1; config.host_pool_mib = 64;
+    rad::Engine engine(config);
+    rad::EngineScope owner(engine.owner(), "load-gate-refuse");
+    REQUIRE_EQ(rad::LoadGateTestAccess::prepare(engine, name, n), RAD_OK);
+    rad::TableFillTestAccess::hold(engine, std::move(c.file));
+    struct rlimit was, low;
+    REQUIRE_EQ(::getrlimit(RLIMIT_MEMLOCK, &was), 0);
+    if ((was.rlim_cur != RLIM_INFINITY && was.rlim_cur <= (rlim_t)(1ll << 20)) ||
+        (was.rlim_max != RLIM_INFINITY && was.rlim_max < (rlim_t)(1ll << 20)))
+        SKIP("the machine already caps memlock under the table");
+    low.rlim_cur = (rlim_t)(1ll << 20);   /* under the table's 4 MiB aligned copy */
+    low.rlim_max = was.rlim_max;          /* the hard limit untouched */
+    REQUIRE_EQ(::setrlimit(RLIMIT_MEMLOCK, &low), 0);
+    const int rc = rad::LoadGateTestAccess::load(engine);
+    (void)::setrlimit(RLIMIT_MEMLOCK, &was);
+    CHECK_EQ(rc, (int)RAD_E_NOMEM);
+}
+
+/* Finding 3 (round 4): the vram fit check charges the card only for the tables the global
+ * placement actually puts there, exactly as the ram check adds the global share only under a
+ * global ram. `1=vram` under a global disk is tested on layer 1's bytes alone: a card that
+ * holds that table and not the whole passes the ask. The old accounting added the unasked
+ * layers whatever the global said and refused this boot. */
+TEST(a_vram_layer_under_a_global_disk_is_fitted_on_its_own_bytes) {
+    const int64_t MiB = (int64_t)1 << 20;
+    /* A card's claim is its capacity less the driver drift (16 MiB), the headroom (96) and
+     * the arena: 2 GiB leaves 1872 MiB. Layer 1's 1 GiB fits; the whole 2 GiB table does not. */
+    auto card = [](int64_t cap) {
+        rad::VramFacts f{};
+        f.capacity   = cap;
+        f.free       = cap;
+        f.arena      = 64 * MiB;
+        f.kv_ceiling = 300 * MiB;
+        return std::vector<rad::VramFacts>{ f };
+    };
+    const std::vector<int64_t> no_emb;
+    const std::vector<rad::WeightFootprint> no_wfs;
+    {   /* The card holds the named layer's table and not the global's: the ask passes. */
+        rad::Config config;
+        config.ngram_placement = rad::TablePlacement::Disk;
+        config.ngram_layer_asked = { { 1, rad::TablePlacement::Vram } };
+        rad::Engine engine(config);
+        rad::EngineScope owner(engine.owner(), "resolve-vram-layer-own-bytes");
+        const int rc = rad::TableResolveTestAccess::resolve(
+            engine, card(2048 * MiB), no_emb, no_wfs, 0, 2048 * MiB, true, true, 0,
+            { { 1, 1024 * MiB } });
+        REQUIRE_EQ(rc, RAD_OK);
+        const rad::Config& c = rad::TableResolveTestAccess::cfg(engine);
+        CHECK(c.ngram_effective(1) == rad::TablePlacement::Vram);
+        CHECK(c.ngram_resolved == rad::TablePlacement::Disk);
+        CHECK_EQ(rad::TableResolveTestAccess::on_card(engine), (int64_t)1024 * MiB);
+    }
+    {   /* The ask itself does not fit: the fix is not a rubber stamp. */
+        rad::Config config;
+        config.ngram_placement = rad::TablePlacement::Disk;
+        config.ngram_layer_asked = { { 1, rad::TablePlacement::Vram } };
+        rad::Engine engine(config);
+        rad::EngineScope owner(engine.owner(), "resolve-vram-layer-still-refused");
+        const int rc = rad::TableResolveTestAccess::resolve(
+            engine, card(2048 * MiB), no_emb, no_wfs, 0, 2049 * MiB, true, true, 0,
+            { { 1, 2048 * MiB } });
+        CHECK_EQ(rc, (int)RAD_E_NOMEM);
+    }
 }
 
 /* Finding 2 (round 3): the snapshot rad_ngram_layer_resolved answers is one resolve pass's, not

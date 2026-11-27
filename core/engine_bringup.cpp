@@ -760,7 +760,14 @@ int Engine::resolve_table_placement(const std::vector<VramFacts>& facts,
         int64_t fixed = 0;
         for (size_t i = 0; i < with.size(); ++i) {
             VramFacts& f = with[i];
-            f.statics += ngram_bytes + ng_asked_vram;
+            /* The unasked layers' bytes reach the card only where the global placement actually
+             * puts them: vram as asked, or auto while this trial is the one deciding. Mirror the
+             * ram check below, which adds the global share only when ng == Ram -- otherwise
+             * `1=vram` under a global disk is fitted as if every table sat on the card. */
+            f.statics += (ng == TablePlacement::Vram || ng == TablePlacement::Auto
+                              ? ngram_bytes
+                              : 0) +
+                         ng_asked_vram;
             if (emb == TablePlacement::Ram) f.statics -= emb_bytes[i];
             if (tw == TablePlacement::Ram) f.statics -= tower_bytes[i];
             fixed = std::max(fixed, f.statics);
