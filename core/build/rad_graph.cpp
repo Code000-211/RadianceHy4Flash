@@ -253,7 +253,7 @@ std::string dump_graph_str(const Program& p, const std::vector<std::string>* err
     for (size_t i = 0; i < big.size() && i < 5; ++i) {
         std::string life_suffix;
         if (big[i]->runs.size() > 1) life_suffix = fmt(" in %zu runs", big[i]->runs.size());
-        else if (big[i]->full_write) life_suffix = " (rewritten whole)";
+        else if (big[i]->full_write) life_suffix = " (full write)";
         s += fmt("    %-32s %12s  %-9s live [%d,%d]%s @ %lld\n", big[i]->name.c_str(),
                  humanb(big[i]->bytes).c_str(), bld_buf_kind_name(big[i]->decl.kind),
                  big[i]->first_def, big[i]->last_use, life_suffix.c_str(),

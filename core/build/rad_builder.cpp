@@ -903,14 +903,13 @@ int Builder::buf_concurrent(rad_buf b) {
     return RAD_OK;
 }
 
-/* See rad_buf_full_write. Recorded here and applied by liveness at finish(). */
+/* See rad_buf_full_write. Recorded on the buffer and applied by liveness at finish(). */
 int Builder::buf_full_write(rad_buf b) {
     if (finished_) {
         err(RAD_E_STATE, "buf_full_write after declare finished");
         return RAD_E_STATE;
     }
     if (b == 0 || b >= prog_.buffers.size()) return RAD_E_INVAL;
-    full_write_bufs_.insert(b);
     prog_.buffers[b].full_write = true;
     return RAD_OK;
 }
@@ -2734,10 +2733,11 @@ void Builder::finish_buffer_liveness() {
         if ((rad_buf)i == prog_.logits_buf || (rad_buf)i == prog_.pooled_buf) b.last_use = last_op;
 
         /* The runs of its liveness. A buffer its plugin declared rad_buf_full_write is dead
-         * between its use-runs: every op that writes it writes all of it, so the values before a
-         * gap are gone the moment the next run's first op lands. One run per such start, which is
-         * what lets an attention scratch and a MoE scratch that never coexist in a layer share
-         * one region instead of each holding bytes for the whole step. */
+         * between its use-runs: each run writes the bytes that run reads (abi/rad_builder.h), so
+         * no value has to survive a gap and the buffers of the next run's first op may take the
+         * bytes. One run per stretch of uses, which is what lets an attention scratch and a MoE
+         * scratch that never coexist in a layer share one region instead of each holding bytes
+         * for the whole step. */
         build_runs(i);
     }
 

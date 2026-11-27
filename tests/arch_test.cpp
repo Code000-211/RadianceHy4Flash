@@ -9617,8 +9617,8 @@ TEST(the_step_lint_reports_each_rule_it_checks) {
         CHECK(any_has(p.lint({ { p.wA, RAD_B(p.A) }, { mm, half } }), "not contiguous"));
         CHECK_EQ(report_lint(p.lint({ { p.wA, RAD_B(p.A) }, { mm, whole } })), (size_t)0);
     }
-    {   /* rad_buf_full_write: a buffer rewritten whole at every stretch of uses has one run per
-         * stretch, and an op inside the envelope but between two runs is still undeclared (the
+    {   /* rad_buf_full_write: a buffer whose every stretch of uses writes what it reads has one run
+         * per stretch, and an op inside the envelope but between two runs is still undeclared (the
          * packer lends those bytes to another buffer). A buffer written at op 1, read at op 2 and
          * written again at op 5 lives 1..2 and 5..5, so op 4 may not touch it. */
         LintProgram p;

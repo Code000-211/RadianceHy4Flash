@@ -345,10 +345,10 @@ TEST(liveness_packing) {
     CHECK_EQ(rep.n_unknown_live, 0);
 }
 
-/* Multi-interval liveness (rad_buf_full_write): a buffer rewritten whole at every run of uses is
- * dead between the runs, so a buffer live only in a gap takes its bytes. This is the P-11 shape: an
- * attention scratch used in ops 1..2 and again in 5..6, and a MoE scratch used in 3..4, which
- * never coexist. */
+/* Multi-interval liveness (rad_buf_full_write): a buffer whose every run writes the bytes that run
+ * reads is dead between the runs, so a buffer live only in a gap takes its bytes. This is the P-11
+ * shape: an attention scratch used in ops 1..2 and again in 5..6, and a MoE scratch used in 3..4,
+ * which never coexist. */
 TEST(multi_interval_liveness_lends_the_bytes_between_runs) {
     Program p;
     p.buffers.emplace_back();

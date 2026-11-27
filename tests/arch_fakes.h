@@ -138,8 +138,8 @@ struct RadBuilder {
 
     /* The buffers named to rad_buf_concurrent: the ones a second lane touches. */
     std::vector<rad_buf> concurrent;
-    /* The buffers named to rad_buf_full_write: every writer of one writes all of it, so liveness
-     * gives them one run per stretch of uses and the bytes between two runs are free. */
+    /* The buffers named to rad_buf_full_write: each run of one writes the bytes that run reads, so
+     * liveness gives them one run per stretch of uses and the bytes between two runs are free. */
     std::vector<rad_buf> full_write;
     /* The second lane's window (rad_lane1_window_begin), first and last op index; -1 when none. */
     int32_t lane1_w0 = -1, lane1_w1 = -1;
@@ -425,7 +425,7 @@ extern "C" int rad_buf_concurrent(RadBuilder* b, rad_buf buf) {
     b->concurrent.push_back(buf);
     return RAD_OK;
 }
-/* Recorded: a buffer every writer of which writes all of it (multi-interval liveness), applied by
+/* Recorded: a buffer whose runs write the bytes they read (multi-interval liveness), applied by
  * liveness() and checked by lint_step as the real builder and runtime check it. */
 extern "C" int rad_buf_full_write(RadBuilder* b, rad_buf buf) {
     if (!b || !buf) return RAD_E_INVAL;
@@ -997,8 +997,9 @@ std::vector<Live> liveness(const RadBuilder& b) {
         l.lo = first[h];
         l.hi = last[h];
         if ((rad_buf)h == b.logits || (rad_buf)h == b.pooled) l.hi = last_op;
-        /* One run per stretch of declared uses when every writer writes all of the buffer: the
-         * values before a gap are gone the moment the next run's first write lands. */
+        /* One run per stretch of declared uses when each run writes the bytes it reads: no value
+         * has to survive a gap, so the buffer is dead from its last read to the next run's first
+         * write. */
         if (full.count((rad_buf)h)) {
             int32_t lo = -1, hi = -1;
             bool read_since = false;

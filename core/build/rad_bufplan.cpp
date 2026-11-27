@@ -8,10 +8,11 @@
  * is correct for every step.
  *
  * A buffer's life is a list of runs, not one interval (BufferInfo::runs). A buffer its plugin
- * declared rad_buf_full_write is rewritten whole by every op that writes it, so it is dead between
- * its use-runs: an attention scratch and a MoE scratch that never coexist inside a layer then share
- * one region instead of each holding bytes for the whole step. Every other buffer has the single
- * run [first_def, last_use].
+ * declared rad_buf_full_write has no value the plan must keep between its runs: each run writes
+ * the bytes that run reads (abi/rad_builder.h), so the buffer is dead between them, and an
+ * attention scratch and a MoE scratch that never coexist inside a layer share one region instead
+ * of each holding bytes for the whole step. Every other buffer has the single run
+ * [first_def, last_use].
  *
  * The packer is greedy interval colouring, largest first: each buffer takes the lowest aligned
  * offset that collides with no placed buffer whose life overlaps any of its runs. O(n^2) in the

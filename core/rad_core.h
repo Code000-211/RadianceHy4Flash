@@ -251,9 +251,10 @@ inline bool weight_file_direct(const WeightInfo& w, int world_size) {
 }
 
 /* One run of a buffer's liveness: the ops lo..hi, inclusive, over which its bytes must hold a
- * value. A buffer has one run unless it was declared rad_buf_full_write, in which case every op
- * that writes it writes all of it and it is dead between its runs — the plan may lend its bytes
- * to another buffer in the gaps (spec §3.1, multi-interval liveness). */
+ * value. A buffer has one run unless it was declared rad_buf_full_write, in which case each run
+ * writes the bytes that run reads (abi/rad_builder.h) and the buffer is dead between its runs —
+ * the plan may lend its bytes to another buffer in the gaps (spec §3.1, multi-interval
+ * liveness). */
 struct BufRun {
     int32_t lo = 0, hi = -1;
     bool covers(int32_t t) const { return lo <= t && t <= hi; }
@@ -271,8 +272,8 @@ struct BufferInfo {
     /* The same life as runs, always at least one (a buffer live from the start of the program
      * has the single run [0, last_op]). first_def / last_use are the envelope of these. */
     std::vector<BufRun> runs;
-    /* rad_buf_full_write: every declared write of this buffer covers all of it, so its bytes are
-     * free between its runs. */
+    /* rad_buf_full_write: every run of this buffer writes the bytes that run reads, so its bytes
+     * are free between the runs. */
     bool        full_write = false;
     int64_t     arena_offset = -1;
     void*       ptr = nullptr;
