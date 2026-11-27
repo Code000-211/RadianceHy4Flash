@@ -496,6 +496,17 @@ if(TARGET kbench_mutant_test AND TARGET rad-kbench AND TARGET libref)
   endif()
 endif()
 
+# The recorded fixtures replayed against the libraries this build made, with no model and no card
+# (scripts/kbench-fixtures.sh). This is the gate for a recording the code has outgrown: the tell is
+# that even the reference library disagrees with its own recording, which no re-run of a kernel test
+# can fix -- only re-recording can (T-05, the stale gpu-mini junction fixtures).
+if(TARGET rad-kbench AND EXISTS ${CMAKE_SOURCE_DIR}/data/kernels_hy4.rkb)
+  add_test(NAME kbench_fixtures COMMAND ${CMAKE_SOURCE_DIR}/scripts/kbench-fixtures.sh)
+  set_tests_properties(kbench_fixtures PROPERTIES
+    TIMEOUT 1800
+    ENVIRONMENT "KN=$<TARGET_FILE:rad-kbench>;RADIANCE_HOME=${RAD_PLUGIN_OUT}")
+endif()
+
 # ================================================================== rad-heat-replay's floor
 #
 # heat_replay_test runs rad-heat-replay itself on a synthetic route trace, so it needs the tool

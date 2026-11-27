@@ -812,7 +812,8 @@ extern "C" int r4d_shape_router_sigmoid_topk_scatter(const RadParam* p, int n_p,
                              opd((uint32_t)RAD_I32, nl + 1),
                              opd((uint32_t)RAD_I32, nl),
                              opd((uint32_t)RAD_BF16, M, 1),
-                             opd((uint32_t)RAD_I32, M * k) };
+                             opd((uint32_t)RAD_I32, M * k),
+                             opd_none() /* w2 -- optional */ };
     R4D_PICK(l);
 }
 extern "C" int r4d_shape_dsa_pool(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
@@ -1834,6 +1835,8 @@ static int moe_gemm_q_shape(const RadParam* p, int n_p, int operand, RadOpdDesc*
         opd((uint32_t)RAD_BF16, ne1, srows(N1), (K1 + g - 1) / g),   /* w_odd_scale */
         opd(D, M * k, N),                                 /* y, in sorted order */
         opd_none(),                                       /* split -- optional */
+        opd_none(),                                       /* w2 -- optional */
+        opd_none(),                                       /* w2_tail -- optional */
     };
     R4D_PICK(l);
 }
@@ -1885,6 +1888,8 @@ static int moe_gemm_q_mod4_shape(const RadParam* p, int n_p, int operand, RadOpd
         wq(1), sq(1), wq(2), sq(2), wq(3), sq(3),         /* classes 1, 2, 3 */
         opd(D, M * k, N),                                 /* y -- in SORTED order */
         opd_none(),                                       /* split -- optional */
+        opd_none(),                                       /* w2 -- optional */
+        opd_none(),                                       /* w2_tail -- optional */
     };
     R4D_PICK(l);
 }

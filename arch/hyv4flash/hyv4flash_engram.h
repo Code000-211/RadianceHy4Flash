@@ -86,9 +86,10 @@ struct EngramWire {
                        RAD_DOMAIN_HOST);
         mask = decl_b(b, nm.f("eg.mask"), RAD_I32, { T });
         raw = decl_b(b, nm.f("eg.rows"), RAD_BF16, { T, W }, RAD_BUF_TRANSIENT, RAD_DOMAIN_HOST);
-        q = decl_b(b, nm.f("eg.rows.q"), RAD_F8E4M3, { T * H, HD });
-        qs = decl_b(b, nm.f("eg.rows.s"), RAD_F32, { T * H, 1 });
-        rt = decl_b(b, nm.f("eg.rows.rt"), RAD_BF16, { T, W });
+        /* The round trip's three planes are declared by Engram::declare, where the table's own
+         * encoding says whether the rows go through an E4M3 round trip at all (P-11b): a model whose
+         * table is already E4M3 -- hy4-flash-bf16-f32, the served u3 -- declares none, and the wire
+         * took arena for the whole program for nothing. */
         e = decl_b(b, nm.f("eg.normed"), RAD_BF16, { T, W });
         key = decl_b(b, nm.f("eg.key"), RAD_BF16, { T, s.hc * s.n_embd });
         val = decl_b(b, nm.f("eg.value"), RAD_BF16, { T, s.n_embd });
@@ -97,7 +98,7 @@ struct EngramWire {
             before = decl_b(b, nm.f("eg.before"), RAD_BF16, { T, s.hc * s.n_embd }, RAD_BUF_PERSIST);
             m1 = decl_b(b, nm.f("eg.minus_one"), RAD_BF16, { T, s.hc * s.n_embd }, RAD_BUF_PERSIST);
         }
-        return ids && ahead && mask && raw && q && qs && rt && e && key && val &&
+        return ids && ahead && mask && raw && e && key && val &&
                        (!taps_on() || (before && m1))
                    ? RAD_OK
                    : RAD_E_INVAL;
@@ -143,7 +144,7 @@ struct Engram {
 
     /* `rows` is the layer's table height (the sum of its head moduli). */
     int declare(RadBuilder* b, Names& nm, const Shape& shape, const Geom& geom, int l, int64_t rows,
-                const EngramWire& wire, rad_buf streams, rad_kvgroup history) {
+                EngramWire& wire, rad_buf streams, rad_kvgroup history) {
         s = shape;
         g = geom;
         w = wire;
@@ -201,6 +202,16 @@ struct Engram {
         /* The bf16 table is what the model reads only after each row's E4M3 round trip
          * (`engram_fp8_embedding`); the E4M3 table already is that (within one code step: HANDOFF). */
         roundtrip = table_bf16 && s.engram_fp8;
+        /* The round trip's planes, declared where the trip is known to be taken (P-11b). The
+         * model's Engram layers share them, so the first one that takes the trip declares them for
+         * every later one, and the handle reaches them through the wire's copy. */
+        if (roundtrip && !w.q) {
+            w.q  = decl_b(b, nm.f("eg.rows.q"), RAD_F8E4M3, { T * H, HD });
+            w.qs = decl_b(b, nm.f("eg.rows.s"), RAD_F32, { T * H, 1 });
+            w.rt = decl_b(b, nm.f("eg.rows.rt"), RAD_BF16, { T, W });
+            if (!w.q || !w.qs || !w.rt) return RAD_E_INVAL;
+            wire = w;
+        }
 
         const char* mn = nm.f("blk.%d.engram_token_map", l);
         RAD_ARCH_TRY(map_copy(b, mn, nm.ckpt("%s.lookup_table", ep)));

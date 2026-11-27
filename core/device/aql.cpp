@@ -3620,7 +3620,8 @@ int a_xp_list(int ord, void* mark, int n, const uint64_t* src, const uint64_t* d
                                    10u /* interval */ | (0xfffu << 16) /* retry forever */ };
         rc = dma_put(dq, gate, 6);
     }
-    for (int i = 0; rc == RAD_OK && i < n; ++i)
+    const bool each = done && (flags & RAD_XP_DONE_EACH);
+    for (int i = 0; rc == RAD_OK && i < n; ++i) {
         for (uint64_t o = 0; rc == RAD_OK && o < bytes[i]; o += kSdmaMaxCopy) {
             const uint64_t len = std::min(kSdmaMaxCopy, bytes[i] - o);
             const uint64_t sa = src[i] + o, da = dst[i] + o;
@@ -3628,7 +3629,15 @@ int a_xp_list(int ord, void* mark, int n, const uint64_t* src, const uint64_t* d
                                      (uint32_t)da, (uint32_t)(da >> 32) };
             rc = dma_put(dq, cp, 7);
         }
-    if (rc == RAD_OK && done) {
+        /* RAD_XP_DONE_EACH: the done word counts the ranges as they land. */
+        if (rc == RAD_OK && each) {
+            const uint64_t a = (uint64_t)(uintptr_t)done;
+            const uint32_t fence[4] = { kSdmaFence | (3u << 16) /* uncached */, (uint32_t)a, (uint32_t)(a >> 32),
+                                        done_val + (uint32_t)i + 1u };
+            rc = dma_put(dq, fence, 4);
+        }
+    }
+    if (rc == RAD_OK && done && !each) {
         const uint64_t a = (uint64_t)(uintptr_t)done;
         const uint32_t fence[4] = { kSdmaFence | (3u << 16) /* uncached */, (uint32_t)a, (uint32_t)(a >> 32),
                                     done_val };
@@ -5066,6 +5075,7 @@ const DeviceBackend* aql_backend_if_present(void) {
         g_aql.peer_launch = a_peer_launch;
         g_aql.cards_claim = a_cards_claim;
         g_aql.xp_supported = a_xp_supported;
+        g_aql.acquire_next = [] { set_next_fence(kFenceAcquireSystem); };
         g_aql.xp_stream_create = a_xp_stream_create;
         g_aql.ride = a_ride;
         g_aql.ride_wait = a_ride_wait;

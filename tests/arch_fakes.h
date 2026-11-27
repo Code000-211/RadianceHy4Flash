@@ -201,6 +201,13 @@ struct RadCtx {
     std::vector<StageRec> stages_next;
     /* The ops this fake's step dispatches to the host (rad_op_domain); every other op is device. */
     std::vector<rad_op>   host_ops;
+    /* rad_expert_w2: the control block every routed layer is handed for a pass of `w2_min_rows`
+     * rows and up; null (the default) is a core with RADIANCE_W2=0. `w2_asked` counts the calls. */
+    void*                 w2 = nullptr;
+    int64_t               w2_min_rows = 0;
+    int                   w2_asked = 0;
+    /* rad_expert_w2_tail: the issue index each call came in front of. */
+    std::vector<size_t>   w2_tails;
 };
 
 /* -------------------------------------------------------------------- the declare-side ABI */
@@ -635,6 +642,17 @@ extern "C" int rad_expert_prefetch(RadCtx* c, const RadPrefetchNext* next, rad_b
 }
 extern "C" int rad_expert_prefetch_mark(RadCtx* c) { (void)c; return RAD_OK; }
 extern "C" int rad_expert_prefetch_step(RadCtx* c, int layer) { (void)c; (void)layer; return RAD_OK; }
+extern "C" void rad_expert_w2_tail(RadCtx* c) {
+    if (c) c->w2_tails.push_back(c->issues.size());
+}
+/* W2 (abi/rad_w2.h): off unless the test set RadCtx::w2. */
+extern "C" void* rad_expert_w2(RadCtx* c, int layer, const rad_weight* first, int64_t n_place,
+                               int64_t rows) {
+    (void)layer;
+    if (!c) return nullptr;
+    ++c->w2_asked;
+    return c->w2 && first && n_place > 0 && rows >= c->w2_min_rows ? c->w2 : nullptr;
+}
 /* Never dereferenced: a plugin passes these through to rad_route_report or offsets one into a raw
  * operand. Each handle gets its own 2^36-byte window above any user-space address, tagged by
  * kind in the top bits, so the step lint can map a raw operand inside a buffer back to that buffer
