@@ -7,7 +7,7 @@ byte-identical.
 
 - **before** = `e3834473` (default branch, W2 on by default), **after** = `922518af` (this fix). The two arms of
   each pair run the same config and differ only in the build.
-- Measured by adamczhang's agent on RED-LINUX, 2026-11-27, 10:33–12:51 CT.
+- Measured by adamczhang's agent on RED-LINUX, 2026-11-27, 10:33–13:10 CT.
 
 ## 1. Setup
 
@@ -16,7 +16,7 @@ byte-identical.
 | GPUs | 4 × AMD Radeon AI PRO R9700 (gfx1201), 32 GiB, HIP 0–3 (PCI 03, 06, 09, 20:00.0). Root ports: x8 on 03/09, x4 on 06/20 (Gen5 links). Power cap 270 W, read back from `power1_cap` on all four. |
 | Host | Ryzen 9 9950X3D, 121 GiB RAM, kernel 7.0.0-44-generic, ROCm core 10.1.0 (no container), in-tree amdgpu |
 | Build | `cmake -G Ninja -DRAD_WITH_HIP=ON -DRAD_GPU_TARGETS=gfx1201`, ROCm 10.1 hipcc / clang, RelWithDebInfo; before and after built the same way |
-| Model | `hy4-flash-iqr-v4-u4.rad` (keptn), TP4; #309's case: `hy4-flash-iqr-v4-u3.rad`, TP2 on HIP 2,3 |
+| Model | `hy4-flash-iqr-v4-u4.rad` (keptn), TP4; #309's case: `hy4-flash-iqr-v4-u3.rad`, TP2 on HIP 0,2 (both x8), with HIP 2,3 (x8 + x4) as a side check |
 | Serving | `max-model-len` 524288, DFly2 `num-speculative-tokens` 5 (`draft-coupling on`, `draft-verify traversal`, `draft-depth adaptive`, `draft-depth-load on`, `draft-suffix on`), `ngram-placement: ram`, `placement: expert_tiered`, `host-pool-mib` 24000, `prefix-cache-mib` 2048, `checkpoint-slots` 128 |
 | Issue shape | `max-num-batched-tokens` 8192, `checkpoint-interval` 4096, `max-num-seqs` 16 |
 | Owner shape | `max-num-batched-tokens` 2048, `checkpoint-interval` 1984, `max-num-seqs` 16 |
@@ -116,12 +116,40 @@ same-build W2-off runs of §2 (767.2 / 773.3), so the fix leaves no remainder ag
 W2 counters on rank 0: before planned 112,750 / 114,636 / 111,684 routed layers, after 81,221 / 81,426 / 83,517.
 The roughly 31,000 a run that are gone are the out-of-band passes' layers, which now issue the switch-off step.
 
-## 5. #309's measured case (TP2, u3, DFly2 c8), one pair
+## 5. #309's measured case (TP2, u3, DFly2 c8), one pair a lane
 
-Same lane, HIP 2,3, u3, `host-pool-mib` 30000 (#309 measured at 39000; 30000 is what RAM holds beside the n-gram
-table), `max-num-seqs` 8, 2048 / 1984, `checkpoint-slots` 64, otherwise as §1. BetterBench c1 and c8, 96 requests,
-AQL stamps every 25th pass. Here W2 is fully at work: on rank 0, 77,736 routed layers planned, 263,440 misses,
-240,991 units posted, 93.3 % read from the ring (after: 77,203 / 268,232 / 245,114 / 93.8 %).
+The setup:
+- u3, `host-pool-mib` 30000 (#309 measured at 39000; 30000 is what RAM holds beside the n-gram table);
+- `max-num-seqs` 8, 2048 / 1984, `checkpoint-slots` 64, otherwise as §1;
+- BetterBench c1 and c8, 96 requests, AQL stamps every 25th pass;
+- the same before and after builds as §4, before then after on each lane.
+
+Here W2 is fully at work: every arm had about 75,000 routed layers planned, 263,000–275,000 misses, and 93–95 % of
+posted units read from the ring.
+
+**The x8 lane: HIP 0,2** (PCI 03:00.0 and 09:00.0, each behind an x8 Gen5 root port), 12:56–13:10 CT. Rank 0's
+counters: before 74,743 layers, 274,995 misses, 249,841 units posted, 95.4 % from the ring; after 75,440 / 274,556 /
+250,603 / 95.5 %.
+
+```
+b309 (before) 12:56:42 | 1 | 96/96 | 143.9 | 75.3 | 106.6† | 157.8 |
+b309 (before) 12:56:42 | 8 | 96/96 | 403.3 | 177.6 | 320.7† | 58.5 |
+a309 (after)  13:03:29 | 1 | 96/96 | 144.0 | 76.1 | 100.1† | 156.9 |
+a309 (after)  13:03:29 | 8 | 96/96 | 405.9 | 184.8 | 384.9† | 56.5 |
+```
+
+The c8 verify pass (tape of 1314 records), from `W2-tools/w2stamps.py <stamps> 1314 --on`, p50 a layer:
+
+| row | before | after |
+|---|---|---|
+| passes stamped | 66 | 52 |
+| gu first / dn first (µs) | 372.7 / 204.3 | 375.6 / 205.6 |
+| gu tail / dn tail (µs) | 33.2 / 20.4 | 33.6 / 20.5 |
+| routed span, router end → last dn end (µs) | 656.8 | 659.2 |
+| pass wall (ms, median) | 41.51 | 41.32 |
+
+**Side check, the x8 + x4 lane: HIP 2,3** (09:00.0 x8, 20:00.0 x4), 12:33–12:47 CT. Rank 0's counters: before
+77,736 layers, 263,440 misses, 240,991 units posted, 93.3 % from the ring; after 77,203 / 268,232 / 245,114 / 93.8 %.
 
 ```
 b309 (before) 12:33:20 | 1 | 96/96 | 138.7 | 103.2 | 147.3† | 153.8 |
@@ -130,18 +158,18 @@ a309 (after)  12:40:24 | 1 | 96/96 | 136.9 | 103.5 | 150.5† | 152.2 |
 a309 (after)  12:40:24 | 8 | 96/96 | 357.3 | 239.8 | 512.3† | 49.8 |
 ```
 
-The c8 verify pass (tape of 1314 records), from `W2-tools/w2stamps.py <stamps> 1314 --on`, p50 a layer:
-
-| row | before | after |
+| row (c8 verify pass, p50 a layer) | before | after |
 |---|---|---|
 | passes stamped | 68 | 65 |
 | gu first / dn first (µs) | 366.1 / 200.6 | 363.9 / 199.2 |
 | gu tail / dn tail (µs) | 31.6 / 19.6 | 31.2 / 19.3 |
-| routed span, router end → last dn end (µs) | 645.7 | 642.4 |
+| routed span (µs) | 645.7 | 642.4 |
 | pass wall (ms, median) | 43.28 | 43.44 |
 
-The launches are the same ones (82 gate_up, 82 down, 124 quantiser launches a pass on both sides) and the times
-are inside noise. Every pass of this shape lies inside the band, so the fix does not touch it.
+On both lanes the launches are the same (82 gate_up, 82 down and 124 quantiser launches a pass, before and after),
+and every row is within noise. Every pass of this shape lies inside the band, so the fix does not touch it. The two
+lanes differ from each other (c8 403–406 tok/s on x8 + x8 against 357 on x8 + x4), but before and after do not
+differ on either.
 
 ## 6. Output parity
 
@@ -156,7 +184,7 @@ SHA-1 over reasoning plus content. TP4, issue shape, 11:55–11:58 CT:
 | before | `RADIANCE_W2_MIN_ROWS=1` | df62699fb96f | d3f8497c0572 |
 
 With `MIN_ROWS=1` the single-stream passes take the form, with misses moving: rank 0 had 45 misses, 28 read from
-the ring and 14 in place (after); 46 / 29 / 14 (before). In the TP2 pair every arm's greedy probe gave
+the ring and 14 in place (after); 46 / 29 / 14 (before). In both TP2 pairs every arm's greedy probe gave
 adc8034a374c / 0078cb982726, before and after. Above the band the after build issues the switch-off step, which
 `hyv4flash_arch_test` checks issue for issue.
 
@@ -171,4 +199,4 @@ script. The cards' own links read 32 GT/s x16; the root ports behind them are x8
 |---|---|
 | output byte-identical | holds (§6) |
 | the targeted step faster (stamps) | out-of-band c16 verify pass 59.43 → 40.05 ms, routed launches 82 → 41 a kind (§3) |
-| end-to-end not worse | c16 +25.7 %, c8 −0.1 %, c1 +0.7 % (3 + 3 interleaved, §4); #309's c8 case level (§5) |
+| end-to-end not worse | c16 +25.7 %, c8 −0.1 %, c1 +0.7 % (3 + 3 interleaved, §4); #309's c8 case level on the x8 lane and the x8 + x4 lane (§5) |
