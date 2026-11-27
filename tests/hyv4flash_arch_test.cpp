@@ -2,6 +2,7 @@
  * `mini` geometry (ref/minicfg.py, the convert test's fixture) at one and two ranks, and its
  * `mini4` twin (twice the heads and experts) at one, two and four ranks, bf16. */
 #define RAD_ARCH_NO_EXPORTS 1
+#include "rad_w2.h"
 #include "arch_fakes.h"
 #include "rad_plugin.h"
 #include "../arch/hyv4flash/hyv4flash.cpp"
@@ -1832,6 +1833,152 @@ void undeclaring_encs(RadBuilder* b) {
     bf16_encs(b);
     for (const std::string& op : g_undecl) b->undeclared.insert(op);
 }
+/* W2 (abi/rad_w2.h, issue #309): the routed layer of a decode-phase step issued as one pass.
+ *
+ * With the core's switch off (rad_expert_w2 returns null) the step issues what it always did: no
+ * routed GEMM and no router carries a W2 operand. With it on, each routed layer's router carries
+ * the control block as its last operand (it plans there), its two routed GEMMs carry it as `w2`
+ * (the resident experts), and behind the first down GEMM comes the tail: gate_up, the gated
+ * quantiser's issues again, down, each GEMM with the block as `w2_tail` and at the pass height of the first
+ * launch (the same tile geometry and sums). Nothing else of the step changes: with the tail's
+ * three issues and the W2 operands taken out, the issues are the switch-off step's. A pass below
+ * the core's row threshold, and a prefill step, issue the switch-off step. */
+TEST(w2_splits_a_decode_passes_routed_layer_into_the_resident_launches_and_a_tail) {
+    /* Hy4-flash's served forms: an IQR gate_up and a six-bit codebook down. */
+    Declared d(+[](RadBuilder* b) {
+        bf16_encs(b);
+        b->encs[0].second = enc_trellis(RAD_U4, true);
+        b->encs[1].second = enc_nl64(6);
+    });
+    REQUIRE_EQ(d.rc, RAD_OK);
+    static char block[sizeof(RadW2Layer)];
+    auto opname = [&](const RecIssue& i) {
+        const RecOp* o = d.b.op_of(i.op);
+        return o ? o->op : std::string("<null>");
+    };
+    auto same = [](const RadOperand& a, const RadOperand& b) {
+        return a.kind == b.kind && a.dtype == b.dtype && a.handle == b.handle && a.raw == b.raw &&
+               a.offset == b.offset && a.rows == b.rows && a.cols == b.cols;
+    };
+    auto is_w2 = [&](const RadOperand& o) {
+        return o.kind == RAD_OPK_RAW && o.raw == (void*)block && o.dtype == RAD_U8 &&
+               o.rows == (int64_t)sizeof(RadW2Layer);
+    };
+    auto k = kit(d.b, { 1, 1, 1 }, {}, 0);
+    REQUIRE_EQ(k->b.phase, (int)RAD_PHASE_DECODE);
+
+    RadCtx off{ .b = &d.b, .batch = &k->b };
+    hyv4flash::step(&off, &k->b);
+    CHECK(off.step_fail.empty());
+    CHECK(off.w2_asked >= 2);          /* every routed layer asked, and was told no */
+    CHECK(off.w2_tails.empty());
+    int gemms_off = 0;
+    for (const RecIssue& i : off.issues) {
+        for (const RadOperand& o : i.opd) CHECK(!is_w2(o));
+        if (opname(i) == "moe_gemm_q") { ++gemms_off; CHECK_EQ(i.opd.size(), (size_t)9); }
+        if (opname(i) == "router_sigmoid_topk_scatter") CHECK(i.opd.size() <= (size_t)9);
+    }
+    CHECK_EQ(gemms_off, 4);            /* two MoE layers, gate_up and down */
+
+    RadCtx on{ .b = &d.b, .batch = &k->b };
+    on.w2 = block;
+    hyv4flash::step(&on, &k->b);
+    CHECK(on.step_fail.empty());
+    /* The routers plan, the first GEMMs carry `w2`, the tail's `w2_tail`. */
+    std::vector<size_t> gemm, tail_issue;
+    for (size_t x = 0; x < on.issues.size(); ++x) {
+        const RecIssue& i = on.issues[x];
+        if (opname(i) == "router_sigmoid_topk_scatter") {
+            REQUIRE_EQ(i.opd.size(), (size_t)10);
+            CHECK(is_w2(i.opd[9]));
+        }
+        if (opname(i) == "moe_gemm_q") gemm.push_back(x);
+    }
+    REQUIRE_EQ(gemm.size(), (size_t)8);
+    for (size_t l = 0; l < 2; ++l) {
+        const RecIssue &gu = on.issues[gemm[4 * l]], &dn = on.issues[gemm[4 * l + 1]];
+        const RecIssue &tgu = on.issues[gemm[4 * l + 2]], &tdn = on.issues[gemm[4 * l + 3]];
+        for (const RecIssue* f : { &gu, &dn }) {
+            REQUIRE_EQ(f->opd.size(), (size_t)11);
+            CHECK_EQ((int)f->opd[9].kind, (int)RAD_OPK_NONE);      /* split */
+            CHECK(is_w2(f->opd[10]));
+        }
+        for (const RecIssue* t : { &tgu, &tdn }) {
+            REQUIRE_EQ(t->opd.size(), (size_t)12);
+            CHECK_EQ((int)t->opd[9].kind, (int)RAD_OPK_NONE);
+            CHECK_EQ((int)t->opd[10].kind, (int)RAD_OPK_NONE);     /* w2: the tail's is the next */
+            CHECK(is_w2(t->opd[11]));
+        }
+        /* The tail is the first launches' ops over the same operands at the same height. */
+        CHECK_EQ(tgu.op, gu.op);
+        CHECK_EQ(tdn.op, dn.op);
+        CHECK_EQ(tgu.n, gu.n);
+        CHECK_EQ(tdn.n, dn.n);
+        for (size_t o = 0; o < 9; ++o) {
+            CHECK(same(tgu.opd[o], gu.opd[o]));
+            CHECK(same(tdn.opd[o], dn.opd[o]));
+        }
+        /* It sits right behind the first down GEMM: gate_up, the expert quantiser's issues again
+         * (in their order, the ones between the first GEMMs that read gate_up's output), down. */
+        REQUIRE_EQ(gemm[4 * l + 2], gemm[4 * l + 1] + 1);
+        REQUIRE(gemm[4 * l + 3] > gemm[4 * l + 2] + 1);
+        size_t at = gemm[4 * l] + 1;
+        for (size_t x = gemm[4 * l + 2] + 1; x < gemm[4 * l + 3]; ++x) {
+            const RecIssue& tq = on.issues[x];
+            bool found = false;
+            for (; at < gemm[4 * l + 1] && !found; ++at) {
+                const RecIssue& q = on.issues[at];
+                if (q.op != tq.op || q.n != tq.n || q.opd.size() != tq.opd.size()) continue;
+                found = true;
+                for (size_t o = 0; o < q.opd.size(); ++o) found = found && same(q.opd[o], tq.opd[o]);
+            }
+            CHECK(found);
+        }
+        /* the core is told right in front of the tail's first launch (where its ring is cached
+         * memory, that launch acquires) */
+        REQUIRE_EQ(on.w2_tails.size(), (size_t)2);
+        CHECK_EQ(on.w2_tails[l], gemm[4 * l + 2]);
+        for (size_t x = gemm[4 * l + 2]; x <= gemm[4 * l + 3]; ++x) tail_issue.push_back(x);
+    }
+    /* Without the tail and the W2 operands the step is the switch-off step. */
+    std::vector<RecIssue> rest;
+    for (size_t x = 0; x < on.issues.size(); ++x) {
+        if (std::find(tail_issue.begin(), tail_issue.end(), x) != tail_issue.end()) continue;
+        RecIssue i = on.issues[x];
+        while (!i.opd.empty() && (is_w2(i.opd.back()) || (i.opd.back().kind == RAD_OPK_NONE &&
+                                                           opname(i) == "moe_gemm_q")))
+            i.opd.pop_back();
+        rest.push_back(i);
+    }
+    REQUIRE_EQ(rest.size(), off.issues.size());
+    for (size_t x = 0; x < rest.size(); ++x) {
+        CHECK_EQ(rest[x].op, off.issues[x].op);
+        CHECK_EQ(rest[x].n, off.issues[x].n);
+        CHECK_EQ(rest[x].lane, off.issues[x].lane);
+        REQUIRE_EQ(rest[x].opd.size(), off.issues[x].opd.size());
+        for (size_t o = 0; o < rest[x].opd.size(); ++o) CHECK(same(rest[x].opd[o], off.issues[x].opd[o]));
+    }
+
+    /* A pass under the core's threshold is told no and issues the switch-off step. */
+    RadCtx narrow{ .b = &d.b, .batch = &k->b };
+    narrow.w2 = block;
+    narrow.w2_min_rows = 4;
+    hyv4flash::step(&narrow, &k->b);
+    REQUIRE_EQ(narrow.issues.size(), off.issues.size());
+    for (size_t x = 0; x < narrow.issues.size(); ++x) {
+        CHECK_EQ(narrow.issues[x].op, off.issues[x].op);
+        CHECK_EQ(narrow.issues[x].opd.size(), off.issues[x].opd.size());
+    }
+    /* A prefill step does not ask at all. */
+    auto pk = kit(d.b, {}, { 12 }, 0);
+    RadCtx pre{ .b = &d.b, .batch = &pk->b };
+    pre.w2 = block;
+    hyv4flash::step(&pre, &pk->b);
+    CHECK_EQ(pre.w2_asked, 0);
+    for (const RecIssue& i : pre.issues)
+        for (const RadOperand& o : i.opd) CHECK(!is_w2(o));
+}
+
 TEST(the_moe_gather_reads_the_sorts_inverse_table) {
     struct Case {
         const char* what;
@@ -2854,6 +3001,117 @@ TEST(a_sizing_declare_at_four_ranks_matches_with_the_pipeline_on_and_off) {
     }
 }
 
+/* #282: the pipelined prefill, run card-less. With the floor and the cut moved to the GEMMs' 64-row
+ * grain (RADIANCE_HY4_PIPE_MIN / _ROWS), a 128-row fresh prefill cuts 64 + 64, the shape a served
+ * 4096-row chunk takes at 2048 + 2048. The int8 recipe makes the junctions write the G-3b codes the
+ * feed-forward's and the attention's input linears read. Checked against the same graph declared
+ * with the pipeline off (the same ops, the sizing test above):
+ *  - every junction piece carries every buffer the whole step's issue of that op carries: a piece
+ *    without the codes left the linears behind it reading stale ones (on-card: long prompts off
+ *    topic, and different from run to run);
+ *  - every buffer an issue on the second lane touches is named concurrent (lane1_unnamed): the last
+ *    junction's pieces wrote `final_hidden` there unnamed, into bytes lane 0's arms could hold;
+ *  - the piped step is lint clean;
+ *  - a cut whose second piece is under the floor does not pipe (96 rows: 64 + 32), the gate's
+ *    both-pieces rule (it used to check the first piece only, so 1984 rows piped as 1024 + 960). */
+void pipe_i8_encs(RadBuilder* b) {
+    bf16_encs(b);   /* only the replicated linears int8: a rank's shard of the others is too narrow */
+    b->encs.insert(b->encs.begin(), { { "ffn_latent_in", enc_i8(true) }, { "attn_q_a.", enc_i8(true) } });
+}
+TEST(the_pipelined_prefill_pieces_are_the_whole_steps_junctions) {
+    const bool g3 = g3_fusions;
+    g3_fusions = true;
+    setenv("RADIANCE_HY4_PIPE_MIN", "64", 1);
+    setenv("RADIANCE_HY4_PIPE_ROWS", "64", 1);
+    auto declare = [](RadBuilder& b, MetaKV& mk, int world, bool pipe) {
+        if (pipe) setenv("RADIANCE_HY4_PIPE", "1", 1);
+        else unsetenv("RADIANCE_HY4_PIPE");
+        pipe_i8_encs(&b);
+        RadBuildCtx ctx = build_ctx(0, world);
+        G3Env g3env;
+        const int rc = hyv4flash::declare(&b, mk.meta(), &ctx);
+        unsetenv("RADIANCE_HY4_PIPE");
+        return rc;
+    };
+    /* The buffers each issue of `op` names, unioned over its issues. */
+    auto bufs_of = [](const RadCtx& c, rad_op op) {
+        std::set<rad_buf> v;
+        for (const RecIssue& is : c.issues)
+            if (is.op == op)
+                for (const RadOperand& od : is.opd)
+                    if (od.kind == RAD_OPK_BUF && od.handle) v.insert(od.handle);
+        return v;
+    };
+    for (int world : { 2, 4 }) {
+        MetaKV mk = mini_meta(true, 128, 256);
+        RadBuilder whole, piped;
+        REQUIRE_EQ(declare(whole, mk, world, false), RAD_OK);
+        REQUIRE_EQ(declare(piped, mk, world, true), RAD_OK);
+        REQUIRE_EQ(whole.ops.size(), piped.ops.size());
+        REQUIRE(buf_handle(piped, "trunk_codes.junc_ffn_in.256.128.q8") != 0);
+        auto kw = kit(whole, {}, { 128 });
+        auto kp = kit(piped, {}, { 128 });
+        kw->b.positions_h = kw->pos.data();
+        kp->b.positions_h = kp->pos.data();
+        auto vw = run_passes(whole, hyv4flash::step, { kw.get() }, 0, world);
+        auto vp = run_passes(piped, hyv4flash::step, { kp.get() }, 0, world);
+        CHECK(steps_ok(vw));
+        CHECK_PASSES(piped, vp);
+        const RadCtx& cw = *vw[0];
+        const RadCtx& cp = *vp[0];
+        /* It piped: the junctions ran as 64-row pieces, their reductions on the second lane. */
+        int lane1 = 0, pieces = 0, junctions = 0;
+        for (const RecIssue& is : cp.issues) {
+            lane1 += is.lane == 1;
+            const RecOp* o = piped.op_of(is.op);
+            if (o && o->op == "rmsnorm_ihc_junction") pieces += is.n == 64;
+        }
+        CHECK(lane1 > 0);
+        CHECK(pieces > 0);
+        /* Every buffer a junction declares it writes is an operand of every piece's issue (the
+         * whole step's issue passes them all; the reads may differ, the chain's add having taken
+         * `b`). At four ranks the whole step runs the same op, so its operands are compared too
+         * (at two the whole step takes the fused twin, another op). */
+        for (const RecIssue& is : cp.issues) {
+            const RecOp* o = piped.op_of(is.op);
+            if (!o || o->op != "rmsnorm_ihc_junction") continue;
+            ++junctions;
+            std::set<rad_buf> got;
+            for (const RadOperand& od : is.opd)
+                if (od.kind == RAD_OPK_BUF) got.insert(od.handle);
+            for (rad_buf h : o->writes)
+                if (!got.count(h)) {
+                    fprintf(stderr, "    world %d: a %lld-row junction issue leaves out '%s'\n",
+                            world, (long long)is.n, piped.bufs[h - 1].name.c_str());
+                    CHECK(got.count(h) != 0);
+                }
+        }
+        for (size_t k = 0; k < whole.ops.size(); ++k) {
+            if (whole.ops[k].op != "rmsnorm_ihc_junction") continue;
+            const std::set<rad_buf> w = bufs_of(cw, (rad_op)(k + 1)), p = bufs_of(cp, (rad_op)(k + 1));
+            if (!w.empty()) CHECK(w == p);
+        }
+        CHECK(junctions > 0);
+        CHECK_EQ(report_lint(lane1_unnamed(piped, view(vp))), (size_t)0);
+        /* 96 rows cut 64 + 32: the second piece is under the floor, so the step runs whole. */
+        auto k96 = kit(piped, {}, { 96 });
+        k96->b.positions_h = k96->pos.data();
+        auto v96 = run_passes(piped, hyv4flash::step, { k96.get() }, 0, world);
+        CHECK_PASSES(piped, v96);
+        int l96 = 0, short96 = 0;
+        for (const RecIssue& is : v96[0]->issues) {
+            l96 += is.lane == 1;
+            const RecOp* o = piped.op_of(is.op);
+            if (o && o->op == "rmsnorm_ihc_junction") short96 += is.n != 96;
+        }
+        CHECK_EQ(l96, 0);
+        CHECK_EQ(short96, 0);
+    }
+    unsetenv("RADIANCE_HY4_PIPE_MIN");
+    unsetenv("RADIANCE_HY4_PIPE_ROWS");
+    g3_fusions = g3;
+}
+
 /* The Engram table as E4M3 rows under a bf16 or an f32 scale a row (hy4-flash-bf16.recipe,
  * hy4-flash-bf16-f32.recipe): the scale view at the stored dtype, no runtime round trip. */
 TEST(the_engram_table_takes_a_bf16_or_an_f32_row_scale) {
@@ -3469,6 +3727,484 @@ TEST(dfly2_reads_quantised_linears_as_the_trunk_does) {
         CHECK(find_w(d.b, "dfly.blk.0.attn_q_a.scale") != nullptr);
         CHECK(find_w(d.b, "dfly.blk.0.attn_gate.scale") != nullptr);
     }
+}
+
+/* ------------------------------------------------------------------ D-02 (#88): the chain replayed
+ *
+ * The tests above read a tape's ops and counts. D-02 moves operands (every round's rows of z
+ * gathered and normalised in one launch, rounds reading row blocks of shared planes, the anchors'
+ * embeddings kept across the layers), so these replay a query pass's tape over symbolic values: a
+ * cell is a 64-bit name of the expression that produced it, operands resolved as the core resolves
+ * them (offset, rows, cols at the declared pitch). The ops the chain is made of are modelled by row
+ * (a copy keeps its cells, so a moved or merged launch gives the same cells exactly when it gives
+ * the same values); every other op is opaque, a function of all it reads. */
+namespace {
+struct Replay {
+    static uint64_t mix(uint64_t h, uint64_t v) {
+        h ^= v + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
+        h *= 0xff51afd7ed558ccdull;
+        return h ^ (h >> 33);
+    }
+    static uint64_t tag(const std::string& s) {
+        uint64_t h = 1469598103934665603ull;
+        for (unsigned char ch : s) h = (h ^ ch) * 1099511628211ull;
+        return h;
+    }
+    static uint64_t fold(const std::vector<uint64_t>& v) {
+        uint64_t h = tag("row");
+        for (uint64_t x : v) h = mix(h, x);
+        return h;
+    }
+    /* The modelled ops' values, which the test's own statement of the chain is written in. */
+    static uint64_t embed(uint64_t tok, int64_t c) { return mix(mix(tag("embed"), tok), (uint64_t)c); }
+    static uint64_t linear(const char* op, uint64_t w, uint64_t row, int64_t j) {
+        return mix(mix(mix(tag(op), w), row), (uint64_t)j);
+    }
+    static uint64_t silu_mul(uint64_t g, uint64_t u) { return mix(mix(tag("silu_mul"), g), u); }
+    static uint64_t add(uint64_t a, uint64_t b2) { return mix(mix(tag("add"), a), b2); }
+
+    /* An operand's cells, row major. */
+    struct View {
+        int64_t rows = 0, cols = 0;
+        std::vector<uint64_t*> at;       /* a buffer's cells */
+        std::vector<uint64_t>  own;      /* a raw operand's, a weight's or a cache's */
+        bool written = false, buf = false;
+        uint64_t get(int64_t r, int64_t c) const {
+            const size_t i = (size_t)(r * cols + c);
+            return buf ? *at[i] : own[i];
+        }
+        std::vector<uint64_t> row(int64_t r) const {
+            std::vector<uint64_t> v;
+            for (int64_t c = 0; c < cols; ++c) v.push_back(get(r, c));
+            return v;
+        }
+        std::vector<uint64_t> all() const {
+            std::vector<uint64_t> v;
+            for (int64_t r = 0; r < rows; ++r)
+                for (int64_t c = 0; c < cols; ++c) v.push_back(get(r, c));
+            return v;
+        }
+    };
+
+    const RadBuilder& b;
+    std::vector<std::vector<uint64_t>> mem;   /* by buffer handle */
+    std::vector<std::string> bad;
+    uint64_t spill = 0;
+    explicit Replay(const RadBuilder& bld) : b(bld), mem(bld.bufs.size() + 1) {
+        for (size_t h = 1; h <= b.bufs.size(); ++h) {
+            const RadBufDecl& d = b.bufs[h - 1].d;
+            int64_t n = 1;
+            for (uint32_t i = 0; i < d.rank; ++i) n *= d.shape[i];
+            /* what an earlier pass left there: a name of its own a cell */
+            const uint64_t t = tag("left in " + b.bufs[h - 1].name);
+            for (int64_t i = 0; i < n; ++i) mem[h].push_back(mix(t, (uint64_t)i));
+        }
+    }
+    View view(const RecOp& o, const RadOperand& od) {
+        View v;
+        if (od.kind == RAD_OPK_BUF) {
+            const RadBufDecl& d = b.bufs[od.handle - 1].d;
+            int64_t pitch = 1;
+            for (uint32_t i = 1; i < d.rank; ++i) pitch *= d.shape[i];
+            v.buf = true;
+            v.rows = od.rows > 0 ? od.rows : d.shape[0];
+            v.cols = od.cols > 0 ? od.cols : pitch;
+            v.written = in(o.writes, od.handle);
+            std::vector<uint64_t>& m = mem[od.handle];
+            for (int64_t r = 0; r < v.rows; ++r)
+                for (int64_t c = 0; c < v.cols; ++c) {
+                    const int64_t i = od.offset + r * pitch + c;
+                    if (i < 0 || (size_t)i >= m.size()) {
+                        bad.push_back(o.op + ": an operand past '" + b.bufs[od.handle - 1].name + "'");
+                        v.at.push_back(&spill);   /* keeps the view's size; `bad` fails the case */
+                        continue;
+                    }
+                    v.at.push_back(&m[(size_t)i]);
+                }
+        } else if (od.kind == RAD_OPK_RAW) {
+            v.rows = od.rows > 0 ? od.rows : 1;
+            v.cols = od.cols > 0 ? od.cols : 1;
+            for (int64_t i = 0; i < v.rows * v.cols; ++i)
+                v.own.push_back(od.dtype == RAD_I32 && od.raw
+                                    ? (uint64_t)(int64_t)((const int32_t*)od.raw)[i]
+                                    : mix(tag("raw"), (uint64_t)i));
+        } else if (od.kind == RAD_OPK_WEIGHT) {
+            v.rows = v.cols = 1;
+            v.own.push_back(tag("weight " + b.weights[od.handle - 1].name));
+        } else if (od.kind != RAD_OPK_NONE) {
+            v.rows = v.cols = 1;
+            v.own.push_back(mix(mix(tag("handle"), od.kind), mix((uint64_t)od.offset, (uint64_t)od.rows)));
+        }
+        return v;
+    }
+    void put(View& v, int64_t r, int64_t c, uint64_t x) { *v.at[(size_t)(r * v.cols + c)] = x; }
+
+    /* One issue. `after` sees it once its outputs are written. */
+    void issue(const RecIssue& is) {
+        const RecOp* op = b.op_of(is.op);
+        if (!op) { bad.push_back("a null op issued"); return; }
+        const RecOp& o = *op;
+        std::vector<View> v;
+        for (const RadOperand& od : is.opd) v.push_back(view(o, od));
+        auto need = [&](size_t n) {
+            if (v.size() >= n) return true;
+            bad.push_back(o.op + ": too few operands");
+            return false;
+        };
+        if (o.op == "iota") {
+            if (!need(1)) return;
+            const long long start = pint(&o, "start"), step = pint(&o, "step");
+            const RecParam* per = param(&o, "period");
+            for (int64_t i = 0; i < v[0].rows * v[0].cols; ++i)
+                *v[0].at[(size_t)i] = (uint64_t)(start + (per ? i % per->ival : i) * step);
+        } else if (o.op == "cast" && pstr(&o, "from") == pstr(&o, "to") && v.size() == 2 &&
+                   v[0].rows * v[0].cols == v[1].rows * v[1].cols) {   /* a copy, cell for cell */
+            const std::vector<uint64_t> x = v[0].all();
+            for (size_t i = 0; i < x.size(); ++i) *v[1].at[i] = x[i];
+        } else if (o.op == "embed_lookup") {
+            if (!need(3)) return;
+            for (int64_t r = 0; r < v[2].rows; ++r)
+                for (int64_t c = 0; c < v[2].cols; ++c) put(v[2], r, c, embed(v[0].get(r, 0), c));
+        } else if (o.op == "gather_rows") {
+            if (!need(3)) return;
+            for (int64_t r = 0; r < v[2].rows; ++r) {
+                const int64_t i = (int64_t)v[1].get(r, 0);
+                if (i < 0 || i >= v[0].rows || v[0].cols != v[2].cols) {
+                    bad.push_back("gather_rows: an index that is not a row of its source");
+                    return;
+                }
+                const std::vector<uint64_t> x = v[0].row(i);
+                for (int64_t c = 0; c < v[2].cols; ++c) put(v[2], r, c, x[(size_t)c]);
+            }
+        } else if (o.op == "scatter_rows") {
+            if (!need(3)) return;
+            for (int64_t r = 0; r < v[0].rows; ++r) {
+                const int64_t i = (int64_t)v[1].get(r, 0);
+                if (i < 0 || i >= v[2].rows) { bad.push_back("scatter_rows: a row out of range"); return; }
+                for (int64_t c = 0; c < v[0].cols; ++c) put(v[2], i, c, v[0].get(r, c));
+            }
+        } else if (o.op == "rmsnorm" || o.op == "gemm_nt" || o.op == "logits_gemm") {
+            if (!need(3)) return;
+            for (int64_t r = 0; r < v[2].rows; ++r) {
+                const uint64_t h = fold(v[0].row(r));   /* before the row is written: may be in place */
+                for (int64_t c = 0; c < v[2].cols; ++c)
+                    put(v[2], r, c, linear(o.op.c_str(), v[1].own[0], h, c));
+            }
+        } else if (o.op == "silu_mul") {
+            if (!need(2)) return;
+            for (int64_t r = 0; r < v[1].rows; ++r)
+                for (int64_t c = 0; c < v[1].cols; ++c)
+                    put(v[1], r, c, silu_mul(v[0].get(r, c), v[0].get(r, v[1].cols + c)));
+        } else if (o.op == "add") {
+            if (!need(3)) return;
+            for (int64_t r = 0; r < v[2].rows; ++r)
+                for (int64_t c = 0; c < v[2].cols; ++c)
+                    put(v[2], r, c, add(v[0].get(r, c), v[1].get(r, c)));
+        } else {
+            /* Opaque: each output cell a function of the op, its fixed parameters and everything
+             * it reads (an operand it only writes is not read). */
+            uint64_t h = tag(o.op);
+            for (const auto& p : o.p)
+                if (p.key != "M") h = mix(mix(h, tag(p.key + "=" + p.sval)), (uint64_t)p.ival);
+            for (size_t k = 0; k < v.size(); ++k)
+                if (!v[k].written || in(o.reads, is.opd[k].handle)) h = mix(h, fold(v[k].all()));
+            for (size_t k = 0; k < v.size(); ++k)
+                if (v[k].buf && v[k].written)
+                    for (size_t i = 0; i < v[k].at.size(); ++i)
+                        *v[k].at[i] = mix(mix(h, (uint64_t)k), (uint64_t)i);
+        }
+    }
+    /* A buffer's first `rows` rows. */
+    std::vector<uint64_t> rows_of(rad_buf h, int64_t rows) {
+        RecOp none;
+        return view(none, hyv4flash::brows(h, rows)).all();
+    }
+};
+
+/* A drafter declared as the server's: `seqs` drafting sequences at most. */
+struct DflyAt {
+    MetaKV mk;
+    RadBuilder b;
+    int rc = 0;
+    DflyAt(int depth, int world, int coupled, int64_t seqs, void (*encs)(RadBuilder*) = bf16_encs,
+           MetaKV m = dfly_meta())
+        : mk(std::move(m)) {
+        encs(&b);
+        RadBuildCtx ctx = spec_ctx(0, world, depth);
+        ctx.max_seqs = seqs;
+        ctx.draft_coupling = coupled;
+        const std::string err = stderr_of([&] { rc = hyv4flash::declare(&b, mk.meta(), &ctx); });
+        if (rc != RAD_OK) fputs(err.c_str(), stderr);
+    }
+    const hyv4flash::Dfly& df() const { return hyv4flash::models[0]->df; }
+    /* The query pass of `n` sequences at `blk` rows each, alone: what it reads of the trunk step
+     * is whatever that left. */
+    std::unique_ptr<RadCtx> query(int64_t n, int64_t blk, int world, Query** keep) {
+        *keep = new Query(b, n, blk, blk - 1);
+        auto c = std::make_unique<RadCtx>();
+        c->b = &b;
+        c->batch = &(*keep)->k->b;
+        c->world = world;
+        hyv4flash::step(c.get(), c->batch);
+        return c;
+    }
+};
+}  // namespace
+
+/* D-02: at every stream count the server runs (1, 2, 8, 16) and every depth to the configured one,
+ * full block and short, greedy and coupled, each chain round's corrected state is the header's
+ *
+ *   zc = z[k+1] + down(silu(gate(c)) * up(c)),   c = [hnorm(z[k+1]) | enorm(embed(prev))]
+ *
+ * over the rows the final norm wrote, prev the anchor's token and then each proposal, and proposal
+ * k is what the round's shortlist put first. Stated here from the modelled ops alone, so it holds
+ * the hoisted gather and norm, the rounds' row blocks and the kept anchor embeddings to the values
+ * the per-round launches gave. RADIANCE_HY4_DFLY_TEST_BREAK=chain_rows (every round reading round
+ * 0's rows) must fail it from the second round on. HY4_TEST_D02_DIGEST=1 prints a digest of every
+ * round's logits, shortlist and proposals a shape, to compare two trees (TP and int8 included,
+ * where the chain's linears are opaque here). */
+TEST(dfly2_chain_rounds_compute_the_headers_chain_at_every_served_shape) {
+    const bool digest = std::getenv("HY4_TEST_D02_DIGEST") != nullptr;
+    int64_t wrong = -1;   /* cells that differ from the header's; -1 until a run completes */
+    auto run = [&](int depth, int world, int coupled, int64_t n, int64_t blk, bool i8, bool broken) {
+        wrong = -1;
+        DflyAt d(depth, world, coupled, 16, i8 ? dfly_i8_encs : bf16_encs,
+                 i8 ? dfly_meta(1, true, 256) : dfly_meta());
+        REQUIRE_EQ(d.rc, RAD_OK);
+        const auto& df = d.df();
+        REQUIRE(df.served);
+        Query* qp = nullptr;
+        auto c = d.query(n, blk, world, &qp);
+        std::unique_ptr<Query> hold(qp);
+        if (!c->step_fail.empty()) fprintf(stderr, "%s\n", c->step_fail.c_str());
+        REQUIRE(c->step_fail.empty());
+        const int64_t rounds = blk - 1, E = df.E;
+        const RadBuilder& b = d.b;
+        Replay rp(b);
+        std::vector<uint64_t> Z, prev;   /* the final norm's rows; each sequence's previous token */
+        for (int64_t s = 0; s < n; ++s) prev.push_back((uint64_t)qp->k->tok[(size_t)(s * blk)]);
+        const uint64_t wh = Replay::tag("weight dfly.correct_hidden_norm.weight"),
+                       we = Replay::tag("weight dfly.correct_embed_norm.weight"),
+                       wg = Replay::tag("weight dfly.correct_gate.weight"),
+                       wu = Replay::tag("weight dfly.correct_up.weight"),
+                       wd = Replay::tag("weight dfly.correct_down.weight");
+        uint64_t dg = Replay::tag("digest");
+        int64_t heads = 0;
+        wrong = 0;
+        for (const RecIssue& is : c->issues) {
+            /* a round's head: its input against the header, before the head runs */
+            int64_t k = -1;
+            for (int64_t i = 0; i < rounds; ++i)
+                if (is.op == df.steps[(size_t)i].op_head) k = i;
+            if (k >= 0 && world == 1 && !i8) {
+                ++heads;
+                REQUIRE(!Z.empty());
+                const Replay::View zc = rp.view(*b.op_of(is.op), is.opd[0]);
+                REQUIRE_EQ(zc.rows, n);
+                REQUIRE_EQ(zc.cols, E);
+                for (int64_t s = 0; s < n; ++s) {
+                    const size_t row = (size_t)((s * blk + k + 1) * E);
+                    const std::vector<uint64_t> z(Z.begin() + (long)row, Z.begin() + (long)(row + E));
+                    std::vector<uint64_t> cc, pe, gu, act;
+                    for (int64_t j = 0; j < E; ++j) pe.push_back(Replay::embed(prev[(size_t)s], j));
+                    for (int64_t j = 0; j < E; ++j)
+                        cc.push_back(Replay::linear("rmsnorm", wh, Replay::fold(z), j));
+                    for (int64_t j = 0; j < E; ++j)
+                        cc.push_back(Replay::linear("rmsnorm", we, Replay::fold(pe), j));
+                    for (int64_t j = 0; j < df.Ew; ++j)
+                        act.push_back(Replay::silu_mul(Replay::linear("gemm_nt", wg, Replay::fold(cc), j),
+                                                       Replay::linear("gemm_nt", wu, Replay::fold(cc), j)));
+                    for (int64_t j = 0; j < E; ++j)
+                        wrong += zc.get(s, j) != Replay::add(z[(size_t)j],
+                                                             Replay::linear("gemm_nt", wd, Replay::fold(act), j));
+                }
+            }
+            rp.issue(is);
+            /* D-01 (#87) folds the last add into the final norm where a library serves add_rmsnorm */
+            if (is.op == (df.op_final_add ? df.op_final_add : df.op_final)) Z = rp.rows_of(df.z, n * blk);
+            for (int64_t i = 0; i < rounds; ++i) {
+                const auto& st = df.steps[(size_t)i];
+                if (is.op == st.op_head) dg = Replay::mix(dg, Replay::fold(rp.rows_of(df.logits, n)));
+                if (is.op == st.op_tok) {   /* the round's proposal, as it left the shortlist */
+                    const Replay::View t = rp.view(*b.op_of(is.op), is.opd[0]);
+                    dg = Replay::mix(dg, Replay::fold(rp.rows_of(df.cidx, n)));
+                    dg = Replay::mix(dg, Replay::fold(rp.rows_of(df.cval, n)));
+                    for (int64_t s = 0; s < n; ++s) {
+                        prev[(size_t)s] = t.get(s, 0);
+                        /* ... and where the core reads it: column i of the proposals */
+                        const Replay::View o = rp.view(*b.op_of(is.op), is.opd[1]);
+                        wrong += o.get(s, 0) != rp.rows_of(df.tokens, n)[(size_t)(s * depth + i)];
+                    }
+                }
+            }
+        }
+        for (size_t i = 0; i < rp.bad.size() && i < 4; ++i) fprintf(stderr, "    replay: %s\n", rp.bad[i].c_str());
+        CHECK_EQ(rp.bad.size(), (size_t)0);
+        if (world == 1 && !i8) CHECK_EQ(heads, rounds);
+        dg = Replay::mix(dg, Replay::fold(rp.rows_of(df.tokens, n)));
+        if (digest && !broken)
+            printf("    d02 digest depth %d world %d coupled %d n %lld block %lld %s: %016llx, %zu issues\n",
+                   depth, world, coupled, (long long)n, (long long)blk, i8 ? "int8" : "bf16",
+                   (unsigned long long)dg, c->issues.size());
+    };
+    for (int depth : { 1, 2, 3, 4, 5 })
+        for (int coupled : { 0, 1 })
+            for (int64_t n : { (int64_t)1, (int64_t)2, (int64_t)8, (int64_t)16 }) {
+                run(depth, 1, coupled, n, depth + 1, false, false);
+                CHECK_EQ(wrong, (int64_t)0);
+                if (depth >= 4) {
+                    run(depth, 1, coupled, n, 4, false, false);
+                    CHECK_EQ(wrong, (int64_t)0);
+                }
+                if (digest) {
+                    run(depth, 2, coupled, n, depth + 1, false, false);
+                    run(depth, 1, coupled, n, depth + 1, true, false);
+                    run(depth, 2, coupled, n, depth + 1, true, false);
+                }
+            }
+    /* the mutant: caught wherever there is a second round, harmless at depth 1 */
+    setenv("RADIANCE_HY4_DFLY_TEST_BREAK", "chain_rows", 1);
+    for (int64_t n : { (int64_t)1, (int64_t)2, (int64_t)16 }) {
+        run(5, 1, 0, n, 6, false, true);
+        CHECK(wrong > 0);
+        run(5, 1, 1, n, 4, false, true);
+        CHECK(wrong > 0);
+        run(1, 1, 0, n, 2, false, true);
+        CHECK_EQ(wrong, (int64_t)0);
+    }
+    unsetenv("RADIANCE_HY4_DFLY_TEST_BREAK");
+}
+
+/* D-02: what a query pass no longer launches. One gather and one norm for all the rounds' rows of
+ * z, the rounds' row indices in one plane; the block's embeddings written straight into the
+ * residual and the anchors' gathered once; no copy of the last round's proposal that nothing reads;
+ * and, where gate and up are int8 linears of one form, one quantiser a round for the two (up's
+ * GEMM reading the codes gate's wrote, at the round's rows). Per pass of r rounds that is
+ * 3 + 2 (r - 1) launches fewer than one launch a round and a block copy, and r more at int8. */
+TEST(dfly2_chain_launches_each_shared_step_once_a_pass) {
+    for (const bool i8 : { false, true })
+        for (int world : { 1, 2 })
+            for (int coupled : { 0, 1 })
+                for (int64_t n : { (int64_t)1, (int64_t)2, (int64_t)8, (int64_t)16 })
+                    for (int64_t blk : { (int64_t)6, (int64_t)4 }) {
+                        DflyAt d(5, world, coupled, 16, i8 ? dfly_i8_encs : bf16_encs,
+                                 i8 ? dfly_meta(1, true, 256) : dfly_meta());
+                        REQUIRE_EQ(d.rc, RAD_OK);
+                        const auto& df = d.df();
+                        REQUIRE(df.served);
+                        const RadBuilder& b = d.b;
+                        Query* qp = nullptr;
+                        auto c = d.query(n, blk, world, &qp);
+                        std::unique_ptr<Query> hold(qp);
+                        REQUIRE(c->step_fail.empty());
+                        const int64_t rounds = blk - 1, E = df.E;
+                        auto count = [&](rad_op h) {
+                            int64_t k = 0;
+                            for (const auto& is : c->issues) k += h && is.op == h;
+                            return k;
+                        };
+                        const auto q = issued_ops(b, *c);
+                        auto named = [&](const char* op) {
+                            return (int64_t)std::count(q.begin(), q.end(), std::string(op));
+                        };
+                        /* the hoisted pair, over every round's rows */
+                        CHECK_EQ(count(df.op_zk), (int64_t)1);
+                        CHECK_EQ(count(df.op_hn), (int64_t)1);
+                        CHECK_EQ(named("gather_rows"), (int64_t)3);   /* anchors, target hidden, chain */
+                        const RecIssue* zk = nullptr;
+                        const RecIssue* hn = nullptr;
+                        for (const auto& is : c->issues) {
+                            if (is.op == df.op_zk) zk = &is;
+                            if (is.op == df.op_hn) hn = &is;
+                        }
+                        REQUIRE(zk != nullptr && hn != nullptr);
+                        CHECK_EQ(zk->n, rounds * n);
+                        CHECK_EQ(zk->opd[1].rows, rounds * n);
+                        CHECK_EQ(hn->n, rounds * n);
+                        CHECK_EQ(hn->opd[2].cols, E);
+                        CHECK_EQ(hn->opd[2].offset, (int64_t)0);
+                        /* one row-index launch a round, each into its own rows of the plane */
+                        int64_t r = 0;
+                        for (const auto& is : c->issues)
+                            for (int64_t k = 0; k < rounds; ++k) {
+                                const auto& st = df.steps[(size_t)k];
+                                if (is.op != (blk == 6 ? st.op_rowk : st.op_rowk_lo)) continue;
+                                CHECK_EQ(is.opd[0].handle, df.rowk);
+                                CHECK_EQ(is.opd[0].offset, k * n);
+                                CHECK_EQ(is.opd[0].rows, n);
+                                ++r;
+                            }
+                        CHECK_EQ(r, rounds);
+                        /* the embeddings: the block's once, then one a round after the first */
+                        CHECK_EQ(named("embed_lookup"), rounds);
+                        /* the proposal copies: tokens every round, prev where a round follows */
+                        int64_t tok = 0, prev = 0;
+                        for (int64_t k = 0; k < rounds; ++k) {
+                            tok += count(df.steps[(size_t)k].op_tok);
+                            prev += count(df.steps[(size_t)k].op_prev);
+                        }
+                        CHECK_EQ(tok, rounds);
+                        CHECK_EQ(prev, rounds - 1);
+                        /* gate and up of a round read that round's rows of the shared input */
+                        if (!i8) {
+                            int64_t g = 0;
+                            for (const auto& is : c->issues)
+                                if (is.op == df.c_g.op || is.op == df.c_u.op) {
+                                    CHECK_EQ(is.opd[0].handle, df.ccat);
+                                    CHECK_EQ(is.opd[0].offset, (g / 2) * n * 2 * E);
+                                    CHECK_EQ(is.opd[0].rows, n);
+                                    ++g;
+                                }
+                            CHECK_EQ(g, 2 * rounds);
+                        } else {
+                            /* int8: one quantiser of the shared input a round, written and read at
+                             * the round's rows by both GEMMs */
+                            REQUIRE(df.c_g.q && df.c_u.q);
+                            CHECK_EQ(df.c_g.q8, df.c_u.q8);
+                            REQUIRE(df.c_g.lin.op_q != 0 && df.c_u.lin.op_q != 0);
+                            CHECK_EQ(count(df.c_g.lin.op_q), rounds);
+                            CHECK_EQ(count(df.c_u.lin.op_q), (int64_t)0);
+                            const int64_t K = 2 * E;
+                            int64_t kq = 0, kg = 0, ku = 0;
+                            for (const auto& is : c->issues) {
+                                if (is.op == df.c_g.lin.op_q) {
+                                    CHECK_EQ(is.opd[0].handle, df.ccat);
+                                    CHECK_EQ(is.opd[0].offset, kq * n * K);
+                                    CHECK_EQ(is.opd[1].handle, df.c_g.q8);
+                                    CHECK_EQ(is.opd[1].offset, kq * n * K);
+                                    ++kq;
+                                }
+                                if (is.op == df.c_g.lin.op) {
+                                    CHECK_EQ(is.opd[0].offset, kg * n * K);
+                                    ++kg;
+                                }
+                                if (is.op == df.c_u.lin.op) {
+                                    CHECK_EQ(kq, ku + 1);   /* behind this round's quantiser */
+                                    CHECK_EQ(is.opd[0].handle, df.c_g.q8);
+                                    CHECK_EQ(is.opd[0].offset, ku * n * K);
+                                    CHECK_EQ(is.opd[1].handle, df.c_g.s8);
+                                    ++ku;
+                                }
+                            }
+                            CHECK_EQ(kg, rounds);
+                            CHECK_EQ(ku, rounds);
+                            const RecBuf* q8 = find_b(b, b.bufs[df.c_g.q8 - 1].name);
+                            REQUIRE(q8 != nullptr);
+                            CHECK_EQ(q8->d.shape[0], (int64_t)(5 * 16));
+                        }
+                        /* the pass's launches: a fixed part and a part a round */
+                        const int64_t tp = world > 1 ? 1 : 0;
+                        /* D-04: no cast of the logits where the fused shortlist is served */
+                        const int64_t lcast = df.steps[0].op_ctopk ? 0 : 1;
+                        const int64_t a_round = 14 + lcast + (i8 ? 2 : 0) + 3 * tp + coupled;
+                        const int64_t fixed = (int64_t)c->issues.size() - rounds * a_round;
+                        if (blk == 6) {
+                            Query* q4 = nullptr;
+                            auto c4 = d.query(n, 4, world, &q4);
+                            std::unique_ptr<Query> hold4(q4);
+                            CHECK_EQ((int64_t)c4->issues.size(), fixed + 3 * a_round);
+                        }
+                    }
 }
 
 /* D-01 (#87): a draft layer takes the trunk's fused producers wherever a loaded kernel library
@@ -4163,4 +4899,273 @@ TEST(g3_junctions_write_the_codes_their_readers_take) {
     CHECK_EQ(with_codes(off.b), 0);
     /* every junction that writes codes removes the quantiser behind it */
     CHECK(had_on < count_op(off.b, "had_quant_act_i8g"));
+}
+
+/* P-11b. The buffer plan charges a transient the whole program when no op of the declared list
+ * names it (core/build/rad_bufplan.cpp; `radiance --debug-graph` prints the ones it counts, with
+ * the bytes), so each of them is arena the engine holds and never reads. The merge base's plan
+ * charged fifteen of them at TP2/2048; five are gone with this change -- the dense MLP's bf16
+ * product plane and the shared expert's, both declared now by the first layer that takes the
+ * unfused pair, and the Engram round trip's three, declared now by the first layer whose table is
+ * bf16 -- and the list below is what is left, a reason each, so a new plane no op names fails this
+ * test by its name.
+ *   moe.expert_ff.q / .s -- the routed arm's E4M3 product codes. An int8 arm's fused SwiGLU writes
+ *       the rotated int8 pair the down projection reads, so no op names them; MoeFP8's own rule
+ *       does ask for them (down_codebook_fp8 / down_supported,
+ *       arch/common/rad_block_moe_fp8.h), the mixed IQR-gate_up-behind-a-w6-down recipe with them.
+ *   moe.expert_ff -- the routed arm's bf16 product. The rig's dump names it (48 MiB at TP2/2048, 96
+ *       at TP4/8192): there the fused gated quantiser serves the expert gate and nothing reads the
+ *       plane. No plan of this fixture reaches that form -- at this geometry `silu_mul` is still
+ *       declared for the arm -- so the product is in none of the lists below. It stays in the arena
+ *       either way: MoeFP8::declare refuses a wire without it (the two tests of
+ *       quantised_experts_are_served_clamped), which is why this PR hands over the planes the arch
+ *       can place and not this one.
+ *   moe.latent.q / .s -- the same for the latent linear: the gather's output is read as the rotated
+ *       int8 pair, and MoeFP8::declare refuses a wire whose latent carries no codes at all.
+ *   ix.stage -- the indexer stages a closing group's raw keys through it, and the step issues that
+ *       path only where the library does not serve the fused key side (qsa_work_pool_tail).
+ * The sampler's four candidate planes are arena for the whole program for the same reason, but the
+ * sampler declares its ops with no operand lists at all (core/sample/sampler.cpp), so this builder
+ * never sees them; making the plan name them is a core change. */
+namespace {
+
+std::string dead_join(const std::vector<std::string>& v) {
+    std::string s;
+    for (const std::string& n : v) s += n + " ";
+    return s;
+}
+
+/* The plan's own rule: a transient no op of the declared list reads or writes. */
+std::vector<std::string> unused_transients(const RadBuilder& b) {
+    std::vector<std::string> dead;
+    for (size_t i = 0; i < b.bufs.size(); ++i) {
+        if ((int)b.bufs[i].d.kind != (int)RAD_BUF_TRANSIENT) continue;
+        const rad_buf h = (rad_buf)(i + 1);
+        bool used = false;
+        for (const auto& o : b.ops)
+            if (in(o.reads, h) || in(o.writes, h)) { used = true; break; }
+        if (!used) dead.push_back(b.bufs[i].name);
+    }
+    std::sort(dead.begin(), dead.end());
+    return dead;
+}
+
+/* How many buffers of the plan carry this name. The builder refuses a duplicate, so the answer is
+ * 0 or 1: the count is how the Engram test says two layers share one trio instead of each
+ * declaring its own, and how the P-11b test says a plane is not in the plan at all. */
+int count_buf(const RadBuilder& b, const char* name) {
+    int n = 0;
+    for (const auto& r : b.bufs) n += r.name == name;
+    return n;
+}
+
+/* Whether some declared op reads or writes the buffer of this name: charged and used is a plane the
+ * step runs through, charged and unnamed is the arena this card is about. */
+bool named_by_op(const RadBuilder& b, const char* name) {
+    for (size_t i = 0; i < b.bufs.size(); ++i) {
+        if (b.bufs[i].name != name) continue;
+        const rad_buf h = (rad_buf)(i + 1);
+        for (const auto& o : b.ops)
+            if (in(o.reads, h) || in(o.writes, h)) return true;
+        return false;
+    }
+    return false;
+}
+
+/* The bytes the plan of this test charges for nothing: a plane the list allows must not grow into a
+ * wider one behind the same name, so the lint reads the bytes too. */
+int64_t dead_bytes(const RadBuilder& b) {
+    int64_t n = 0;
+    for (size_t i = 0; i < b.bufs.size(); ++i) {
+        const RadBufDecl& d = b.bufs[i].d;
+        if ((int)d.kind != (int)RAD_BUF_TRANSIENT) continue;
+        const rad_buf h = (rad_buf)(i + 1);
+        bool used = false;
+        for (const auto& o : b.ops)
+            if (in(o.reads, h) || in(o.writes, h)) { used = true; break; }
+        if (used) continue;
+        int64_t numel = 1;
+        for (uint32_t r = 0; r < d.rank; ++r) numel *= d.shape[r];
+        n += rad_dtype_bytes(d.dtype, numel);
+    }
+    return n;
+}
+
+/* The served u3's shape (the recipe of /models/hy4-flash-iqr-v4-u3.rad): the trunk's linears and both
+ * experts' under the rotated computed trellis, and the Engram table stored as E4M3 rows so its rows
+ * take no round trip. This is the plan the card-less dump of the served model was read from. */
+void served_u3_encs(RadBuilder* b) {
+    int8_trunk_encs(b);
+    const RadEncoding iqr = enc_trellis(RAD_U4, true);
+    for (auto& e : b->encs)
+        if (e.first == "ffn_gate_up_exps" || e.first == "ffn_down_exps" ||
+            e.first == "ffn_gate_up." || e.first == "ffn_down." ||
+            e.first == "ffn_gate_up_shexp" || e.first == "ffn_down_shexp" ||
+            e.first == "ffn_latent_in" || e.first == "ffn_latent_out")
+            e.second = iqr;
+    b->encs.insert(b->encs.begin(), { { "engram_table", rad_enc_affine(RAD_F8E4M3, RAD_F32, 1, 0) },
+                                      { "engram_mult", rad_enc_plain(RAD_I64) } });
+}
+
+}  // namespace
+
+TEST(no_transient_is_declared_that_no_op_reads) {
+    struct Plan {
+        const char* what;
+        void (*encs)(RadBuilder*);
+        int world;
+        /* The planes this plan leaves without a use, sorted, each with its reason in the comment
+         * above. The set is the same for every plan but the bf16 ones, where the MoE codes the arm
+         * does not need are not declared at all. */
+        const char* kept;
+        /* And their bytes, so a plane the list allows cannot quietly become a wider one. */
+        long long dead;
+    };
+    const Plan plans[] = {
+        { "bf16", bf16_encs, 1, "ix.stage ", 9216 },
+        { "int8 trunk", int8_trunk_encs, 1, "ix.stage ", 9216 },
+        { "int8 experts",
+          [](RadBuilder* b) { bf16_encs(b); b->encs[0].second = b->encs[1].second = enc_i8(true); },
+          1, "ix.stage moe.expert_ff.q moe.expert_ff.s moe.latent.q moe.latent.s ", 110592 },
+        { "iqr experts",
+          [](RadBuilder* b) {
+              bf16_encs(b);
+              b->encs[0].second = b->encs[1].second = enc_trellis(RAD_U4, true);
+          },
+          1, "ix.stage moe.expert_ff.q moe.expert_ff.s moe.latent.q moe.latent.s ", 110592 },
+        { "bf16, two ranks", bf16_encs, 2, "ix.stage ", 9216 },
+        /* The served recipe as the rig's dump was read (the Engram table at E4M3, so the round trip
+         * is off; the trunk's linears and the experts' under the rotated trellis). It pins the four
+         * MoE code planes of the dump's list. The product itself, `moe.expert_ff`, is not dead here:
+         * at this geometry the expert gate is not served the fused gated quantiser, so `silu_mul`
+         * still writes the plane and the down projection's quantiser reads it. On the rig it is --
+         * the dump names it, 48 MiB at TP2/2048 and 96 MiB at TP4/8192, the largest plane of the ten
+         * that stay; see notes/backlog/measurements/P-11b.md. */
+        { "the served u3", served_u3_encs, 1,
+          "ix.stage moe.expert_ff.q moe.expert_ff.s moe.latent.q moe.latent.s ", 110592 },
+    };
+    for (const Plan& p : plans) {
+        Declared d(p.encs, p.world);
+        REQUIRE_EQ(d.rc, RAD_OK);
+        steps_clean_at(d.b, 0, 1);   /* every step kind, each lint clean */
+        const int64_t bytes = dead_bytes(d.b);
+        fprintf(stderr, "plan %-16s dead %lld bytes: %s\n", p.what, (long long)bytes,
+                dead_join(unused_transients(d.b)).c_str());
+        CHECK_EQ(dead_join(unused_transients(d.b)), std::string(p.kept));
+        CHECK_EQ(bytes, (int64_t)p.dead);
+    }
+}
+
+/* P-11b. A product plane belongs to the gate that writes it, and the round trip belongs to the
+ * table it is taken from. Each of these planes was charged for the whole program from the wire,
+ * where the declare cannot see which form the layer takes; each is now declared where the form is
+ * settled, so a model that runs the other form reserves nothing for it. */
+TEST(the_product_planes_follow_the_gate_that_writes_them) {
+    /* The rotated int8 trunk with the fused gate: the shared arm's gate writes the codes it was
+     * asked for, so the model has no shared-expert product plane at all -- that is the plane this
+     * round takes away. The dense MLP's gate_up is not a rotated int8 weight in this container, so
+     * its pair is unfused, its plane is there, and `silu_mul` names it: charged and used, which is
+     * not the arena this card is about. */
+    {
+        Declared d(int8_trunk_encs, 1);
+        REQUIRE_EQ(d.rc, RAD_OK);
+        steps_clean_at(d.b, 0, 1);
+        CHECK_EQ(count_op(d.b, "gated_had_quant_i8g") > 0, true);
+        CHECK_EQ(count_buf(d.b, "moe.shared_ff"), 0);
+        CHECK_EQ(count_buf(d.b, "dense_ff"), 1);
+        CHECK(named_by_op(d.b, "dense_ff"));
+    }
+    /* The switch off: the pair is back, the first MoE layer declares its plane into the model's slot
+     * for every later one -- one buffer for the model's two MoE layers, not one a layer -- and the
+     * activation op names it. */
+    setenv("RADIANCE_HY4_FUSED_QUANT", "0", 1);
+    Declared unfused(int8_trunk_encs, 1);
+    unsetenv("RADIANCE_HY4_FUSED_QUANT");
+    REQUIRE_EQ(unfused.rc, RAD_OK);
+    steps_clean_at(unfused.b, 0, 1);
+    CHECK_EQ(count_buf(unfused.b, "dense_ff"), 1);
+    CHECK(named_by_op(unfused.b, "dense_ff"));
+    CHECK_EQ(count_buf(unfused.b, "moe.shared_ff"), 1);
+    CHECK(named_by_op(unfused.b, "moe.shared_ff"));
+    CHECK_EQ(count_op(unfused.b, "silu_mul") > 0, true);
+    /* Both are named, so neither is what the plan charges for nothing. */
+    CHECK_EQ(dead_join(unused_transients(unfused.b)), std::string("ix.stage "));
+}
+
+/* P-11b. The Engram round trip's three planes follow the trip: the served recipe stores the table
+ * as E4M3 rows under a scale a row, which is what the model reads, so the trip is not taken and the
+ * plan carries none of them; a bf16 table with `engram_fp8_embedding` takes it, and the two Engram
+ * layers of this model share one trio -- the handles are carried to the later layer on the wire. */
+TEST(the_engram_round_trip_declares_its_planes_only_when_it_is_taken) {
+    /* The table as the u3 ships it: fp8_e4m3*f32[1x*] (data/recipes/hy4-flash-bf16-f32.recipe). */
+    Declared e4m3([](RadBuilder* b) {
+        bf16_encs(b);
+        b->encs.insert(b->encs.begin(),
+                       { { "engram_table", rad_enc_affine(RAD_F8E4M3, RAD_F32, 1, 0) },
+                         { "engram_mult", rad_enc_plain(RAD_I64) } });
+    }, 1, 0, false, 128, 0, 0, 0, two_engram_layers);
+    REQUIRE_EQ(e4m3.rc, RAD_OK);
+    steps_clean_at(e4m3.b, 0, 1);
+    /* two_engram_layers puts the Engram at blk.0 and blk.2: the scale view is what says the trip
+     * really was not taken. */
+    REQUIRE(find_w(e4m3.b, "blk.0.engram_table.scale") != nullptr);
+    for (const char* n : { "eg.rows.q", "eg.rows.s", "eg.rows.rt" })
+        CHECK_EQ(count_buf(e4m3.b, n), 0);
+
+    /* The bf16 table as shipped: the round trip runs, so the trio is in the plan once, named by the
+     * quantiser and the dequant that write and read it. */
+    Declared bf16(bf16_encs, 1, 0, false, 128, 0, 0, 0, two_engram_layers);
+    REQUIRE_EQ(bf16.rc, RAD_OK);
+    steps_clean_at(bf16.b, 0, 1);
+    REQUIRE_EQ(count_op(bf16.b, "quant_act_fp8") > 0, true);
+    for (const char* n : { "eg.rows.q", "eg.rows.s", "eg.rows.rt" }) {
+        CHECK_EQ(count_buf(bf16.b, n), 1);
+        CHECK(named_by_op(bf16.b, n));
+    }
+}
+
+/* P-11b, the guard itself and not only the arch that leans on it. `GateQuantFP8::declare` picks a
+ * form, and every form that names the bf16 plane -- `relu2`, any clamp, the bf16 line, the rotated
+ * chain -- demands it; what this change permits is one case, the gated quantiser that writes the
+ * codes and nothing else. The first round's review could see the hunk and nothing else, so both
+ * halves are asserted here: a caller that asked for the product and handed no plane is refused as it
+ * was before the change, and the codes-only caller is accepted and its row names two buffers, so no
+ * launch can write buffer 0. */
+TEST(a_gate_that_asks_for_the_product_without_a_plane_is_refused) {
+    RadBuilder b;
+    hyv4flash::Geom g;
+    g.max_tok = 64;
+    const rad_buf gate_up = hyv4flash::decl_b(&b, "t.gate_up", RAD_BF16, { 64, 256 });
+    const rad_buf q       = hyv4flash::decl_b(&b, "t.q", RAD_F8E4M3, { 64, 128 });
+    const rad_buf s       = hyv4flash::decl_b(&b, "t.s", RAD_F32,    { 64, 1 });
+    const rad_buf x       = hyv4flash::decl_b(&b, "t.x", RAD_BF16,   { 64, 128 });
+    REQUIRE(gate_up && q && s && x);
+
+    hyv4flash::ActFP8 codes_only;   /* the codes pair, no bf16 plane: what an arch that declares none hands */
+    codes_only.q = q;
+    codes_only.s = s;
+
+    hyv4flash::GateQuantFP8 asked;
+    CHECK_EQ(asked.declare(&b, g, gate_up, codes_only, 128, "silu", 0, /*bf16_out=*/true),
+             RAD_E_INVAL);
+    CHECK_EQ(asked.want_x, true);
+    REQUIRE(!b.ops.empty());
+    CHECK_EQ((int)b.ops.back().writes.size(), 0);   /* refused before it named an operand */
+
+    hyv4flash::ActFP8 with_plane = codes_only;
+    with_plane.x = x;
+    hyv4flash::GateQuantFP8 full;
+    CHECK_OK(full.declare(&b, g, gate_up, with_plane, 128, "silu", 0, /*bf16_out=*/true));
+    REQUIRE(!b.ops.empty());
+    CHECK_EQ((int)b.ops.back().writes.size(), 3);
+    CHECK(in(b.ops.back().writes, x));
+    CHECK(in(b.ops.back().writes, q));
+
+    hyv4flash::GateQuantFP8 folded;
+    CHECK_OK(folded.declare(&b, g, gate_up, codes_only, 128, "silu", 0, /*bf16_out=*/false));
+    CHECK_EQ(folded.want_x, false);
+    REQUIRE(!b.ops.empty());
+    CHECK_EQ(b.ops.back().op, std::string("gated_quant_fp8"));
+    CHECK_EQ((int)b.ops.back().writes.size(), 2);
+    for (const rad_buf h : b.ops.back().writes) CHECK(h != 0);
 }

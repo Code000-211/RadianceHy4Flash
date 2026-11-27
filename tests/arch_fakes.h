@@ -204,6 +204,13 @@ struct RadCtx {
     std::vector<StageRec> stages_next;
     /* The ops this fake's step dispatches to the host (rad_op_domain); every other op is device. */
     std::vector<rad_op>   host_ops;
+    /* rad_expert_w2: the control block every routed layer is handed for a pass of `w2_min_rows`
+     * rows and up; null (the default) is a core with RADIANCE_W2=0. `w2_asked` counts the calls. */
+    void*                 w2 = nullptr;
+    int64_t               w2_min_rows = 0;
+    int                   w2_asked = 0;
+    /* rad_expert_w2_tail: the issue index each call came in front of. */
+    std::vector<size_t>   w2_tails;
 };
 
 /* -------------------------------------------------------------------- the declare-side ABI */
@@ -645,6 +652,17 @@ extern "C" int rad_expert_prefetch(RadCtx* c, const RadPrefetchNext* next, rad_b
 }
 extern "C" int rad_expert_prefetch_mark(RadCtx* c) { (void)c; return RAD_OK; }
 extern "C" int rad_expert_prefetch_step(RadCtx* c, int layer) { (void)c; (void)layer; return RAD_OK; }
+extern "C" void rad_expert_w2_tail(RadCtx* c) {
+    if (c) c->w2_tails.push_back(c->issues.size());
+}
+/* W2 (abi/rad_w2.h): off unless the test set RadCtx::w2. */
+extern "C" void* rad_expert_w2(RadCtx* c, int layer, const rad_weight* first, int64_t n_place,
+                               int64_t rows) {
+    (void)layer;
+    if (!c) return nullptr;
+    ++c->w2_asked;
+    return c->w2 && first && n_place > 0 && rows >= c->w2_min_rows ? c->w2 : nullptr;
+}
 /* Never dereferenced: a plugin passes these through to rad_route_report or offsets one into a raw
  * operand. Each handle gets its own 2^36-byte window above any user-space address, tagged by
  * kind in the top bits, so the step lint can map a raw operand inside a buffer back to that buffer
@@ -1407,6 +1425,32 @@ std::vector<const RadCtx*> view(const std::vector<std::unique_ptr<RadCtx>>& v) {
     std::vector<const RadCtx*> p;
     for (const auto& c : v) p.push_back(c.get());
     return p;
+}
+
+/* Ctx::lane1_ rule 3 (abi/rad_runtime.h): every buffer an issue on the second lane reads or
+ * writes is named to rad_buf_concurrent, or lives the whole program anyway (PERSIST, DERIVED, no
+ * declared use). The planner packs transients from one linear order, so an unnamed transient the
+ * second lane touches may share bytes with one lane 0 uses at the same time (#282). One finding a
+ * buffer, by name. */
+std::vector<std::string> lane1_unnamed(const RadBuilder& b, const std::vector<const RadCtx*>& passes) {
+    const std::vector<Live> L = liveness(b);
+    const std::set<rad_buf> conc(b.concurrent.begin(), b.concurrent.end());
+    std::set<rad_buf> seen;
+    std::vector<std::string> bad;
+    for (const RadCtx* c : passes)
+        for (const RecIssue& is : c->issues) {
+            if (is.lane != 1) continue;
+            for (const RadOperand& od : is.opd) {
+                if (od.kind != RAD_OPK_BUF || od.handle == 0 || od.handle > b.bufs.size()) continue;
+                const rad_buf h = od.handle;
+                if (!L[h].transient || !L[h].planned || conc.count(h) || !seen.insert(h).second)
+                    continue;
+                const RecOp* o = b.op_of(is.op);
+                bad.push_back("'" + b.bufs[h - 1].name + "' is touched on lane 1 (" +
+                              (o ? o->op : std::string("?")) + ") and not named concurrent");
+            }
+        }
+    return bad;
 }
 
 /* The lint as a check: every finding is printed, and the step passes only with none. */

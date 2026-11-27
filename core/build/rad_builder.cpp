@@ -2709,6 +2709,10 @@ void Builder::finish_buffer_liveness() {
             b.first_def = 0;
             b.last_use  = last_op;
             b.runs.assign(1, BufRun{ 0, last_op });
+            /* Of the three reasons above, only `first[i] < 0` means nothing in the declared list
+             * names the buffer at all; the other two are live on purpose. Naming the difference is
+             * what lets --debug-graph account for the bytes (BufferInfo::no_op_use). */
+            b.no_op_use = b.decl.kind == RAD_BUF_TRANSIENT && first[i] < 0;
             continue;
         }
         /* A concurrent buffer under a declared window (rad_lane1_window_begin): live across the

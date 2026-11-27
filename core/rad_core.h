@@ -276,6 +276,12 @@ struct BufferInfo {
     bool        full_write = false;
     int64_t     arena_offset = -1;
     void*       ptr = nullptr;
+    /* A transient no op of the declared list names as an operand: the plan charges it for the whole
+     * program (see Builder::finish_buffer_liveness), and no issued step can read or write it, so
+     * those bytes are arena that nothing uses. Recorded because the builder rewrites first_def and
+     * last_use to the whole program's range, which leaves no other way to tell the two reasons for
+     * a whole-program life apart. */
+    bool        no_op_use = false;
 };
 
 struct OpInfo {

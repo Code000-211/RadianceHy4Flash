@@ -1148,6 +1148,8 @@ static const RadOperandSpec oMoeGemmQ[] = {
     { "w_odd_scale",   RAD_OPD_WTAB, 0 },
     { "y",             RAD_OPD_OUT,  0 },
     { "split",         RAD_OPD_IN,   1 },
+    { "w2",            RAD_OPD_INOUT, 1 },
+    { "w2_tail",       RAD_OPD_INOUT, 1 },
 };
 /* The same GEMM over four classes by expert number mod 4: `w`/`w_scale` hold class 0 at [N, K],
  * `w_q`/`w_q_scale` class q at [N_q, K_q], expert e at entry e / 4 of class e % 4. Four ranks
@@ -1175,6 +1177,8 @@ static const RadOperandSpec oMoeGemmQMod4[] = {
     { "w_3_scale",     RAD_OPD_WTAB, 0 },
     { "y",             RAD_OPD_OUT,  0 },
     { "split",         RAD_OPD_IN,   1 },
+    { "w2",            RAD_OPD_INOUT, 1 },
+    { "w2_tail",       RAD_OPD_INOUT, 1 },
 };
 static const RadParamSpec pMoeGather[] = {
     P_INT("M"), P_INT("n"), P_INT("top_k"), P_STR("dtype"),
@@ -2014,7 +2018,9 @@ static const RadOperandSpec oRouterSigmoidScatter[] = {
     { "ids", RAD_OPD_OUT, 0 },          { "weights", RAD_OPD_OUT, 0 },
     { "sorted_tok", RAD_OPD_OUT, 0 },   { "expert_offset", RAD_OPD_OUT, 0 },
     { "expert_count", RAD_OPD_OUT, 0 }, { "gate", RAD_OPD_OUT, 1 },
-    { "inverse", RAD_OPD_OUT, 1 }
+    { "inverse", RAD_OPD_OUT, 1 },
+    /* The layer's W2 control block (abi/rad_w2.h): present, the launch ends with the plan. */
+    { "w2", RAD_OPD_INOUT, 1 }
 };
 /* `logit_softcap`'s, matching ref's `pMnCap` (spec §2.3). `cap` must be > 0; the op refuses a
  * non-positive cap (a division by zero in every lane). */

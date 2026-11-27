@@ -22,6 +22,7 @@
 #include "residency.h"
 #include "stager.h"
 #include "wtab.h"
+#include "rad_w2.h"
 #include "device/device.h"
 
 #include <atomic>
@@ -42,6 +43,8 @@ class Registry;
 struct HookReload;
 struct XpState;
 struct XpLayer;
+struct W2State;
+struct W2Config;
 
 typedef void (*ArchStepFn)(RadCtx*, const RadBatch*);
 
@@ -356,6 +359,16 @@ public:
      * Called with the compute stream at each routed layer's mark, also where the prefetch is off. */
     void set_pace_hook(std::function<int(RadStream)> f) { pace_hook_ = std::move(f); }
     bool xp_on() const { return xp_ != nullptr; }
+    /* ---------------------------------------------------- "Weg 2": resident experts first, the
+     * misses' whole units copied under them and run in a tail (w2.h, abi/rad_w2.h). w2_open at
+     * bringup where the switch is on; off, w2_layer returns null and no block issues the form. */
+    void  w2_open(const W2Config& cfg, const uint64_t* lo, const uint64_t* hi, const uint64_t* stride, int n);
+    void  w2_close();
+    void* w2_layer(int layer, const rad_weight* first, int64_t n_place, int64_t rows);
+    void  w2_tail();
+    bool  w2_on() const { return w2_ != nullptr; }
+    bool  w2_stats(RadW2Stats* out);
+    uint64_t w2_epoch() const;
     /* Drain, do not sample. `next_histogram` returns the oldest bank holding a landed histogram
      * for a step in (`after_step`, `before_step`), or -1. A caller loops on it with the step it
      * last credited, so it sees every histogram in order. The readers below take that bank; they
@@ -602,6 +615,7 @@ private:
         std::vector<TapeHost>  host;
         std::vector<std::pair<int, RadRouting>> route;
         std::vector<TapeXp> xp;
+        bool     w2 = false;    /* carries W2 launches: a play wakes the serving thread (w2_kick) */
         /* What the recording added to the Ctx's counters, and the bookkeeping it ended on. */
         int64_t  issues = 0, ar_calls = 0, ar_bytes = 0, stream_waits = 0, host_syncs = 0;
         bool     touch_pending[2] = {};
@@ -749,6 +763,11 @@ private:
 
     /* The expert prefetch's state (xp_state.h), null while it is off. */
     std::unique_ptr<XpState> xp_;
+    /* W2's state (w2_state.h), null while it is off. */
+    std::unique_ptr<W2State> w2_;
+    void w2_free(W2State& x);
+    void w2_serve(W2State& x);
+    void w2_kick();
     std::function<int(RadStream)> pace_hook_;
     void xp_free(XpState& x);
     void xp_serve(XpState& x);

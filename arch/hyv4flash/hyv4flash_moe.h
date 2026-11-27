@@ -44,7 +44,8 @@ struct GatedMlp {
     int declare(RadBuilder* b, Names& nm, const Geom& g, const Shape& s, int l, const char* gu_name,
                 const char* dn_name, const char* mp, int64_t ff_w, rad_buf x, rad_buf y,
                 rad_buf gu_buf, rad_buf ff_buf, const Lin* feed = nullptr,
-                const ActFP8* in_codes = nullptr) {
+                const ActFP8* in_codes = nullptr, rad_buf* ff_slot = nullptr,
+                const char* ff_name = "dense_ff") {
         gu = gu_buf;
         ff = ActFP8{};
         ff.x = ff_buf;
@@ -82,6 +83,18 @@ struct GatedMlp {
                 ff.x = ff_buf;
                 act = GateQuantFP8{};
             }
+        }
+        /* The product plane (P-11b): only the unfused pair reads or writes it, so it is declared
+         * here, where the form is settled, and once for the model -- `ff_slot` is the model's, and
+         * the first layer that needs the plane declares it for every later one. Both gated MLPs of
+         * the model work this way: the dense one (`dense_ff`) and the shared expert of a MoE layer
+         * (`moe.shared_ff`), which is a second width and so a second slot. A model that folds every
+         * gate of a width charges the arena nothing for it, which is the point: charged for the
+         * whole program, the plane sat in the fixed region and cost its size at every step size. */
+        if (!gfuse && ff_slot && !*ff_slot) {
+            *ff_slot = decl_b(b, nm.f("%s", ff_name), RAD_BF16, { g.max_tok, ff_w });
+            if (!*ff_slot) return RAD_E_INVAL;
+            ff.x = *ff_slot;
         }
         if (!gfuse) RAD_ARCH_TRY(act.declare(b, g, gu, ff, ff_w, "silu"));
         /* The fold: gate_up, the gate and the codes of the product in one epilogue (the rule every
@@ -201,7 +214,7 @@ struct MoeWire {
     ActFP8 sum{};
     rad_buf routed = 0;    /* [T, n] latent_out's output, then routed + shared */
     rad_buf sgu = 0;       /* [T, 2 * ff_shared] */
-    rad_buf sff = 0;       /* [T, ff_shared] */
+    rad_buf sff = 0;       /* [T, ff_shared]; 0 while every shared arm folds (GatedMlp::declare) */
     rad_buf sout = 0;      /* [T, n] */
     MoeFP8::Wire moe{};
     /* The routed arm's activation codes, by the experts' format (Ffn::arm): none for bf16
@@ -220,7 +233,10 @@ struct MoeWire {
         lat.x = bf("moe.latent", { T, L });
         routed = bf("moe.routed", { T, s.n_embd });
         sgu = bf("moe.shared_gate_up", { T, 2 * s.n_ff_shared_r });
-        sff = bf("moe.shared_ff", { T, s.n_ff_shared_r });
+        /* `sff` -- the shared expert's product plane -- is not declared here (P-11b): only an
+         * unfused shared arm reads or writes it, so GatedMlp::declare takes the slot and declares
+         * it at the first layer that needs it. Declared on the wire it was charged for the whole
+         * program, and the fixed region carried it at every step size. */
         sout = bf("moe.shared_out", { T, s.n_embd });
         auto& w = moe;
         w.logits = decl_b(b, nm.f("moe.router_logits"), RAD_F32, { T, s.n_expert });
@@ -249,25 +265,35 @@ struct MoeWire {
             Geom gq = g;
             gq.w_bf16 = false;
             const bool i8 = arm == kArmI8;
+            /* The latent's E4M3 pair stays for every quantised arm: MoeFP8::declare refuses a wire
+             * whose latent carries no codes (P-11b checked whether it is arena nothing reads -- it
+             * is, and the block still asks for it). */
             RAD_ARCH_TRY(lat.declare_qs(b, nm, gq, nm.f("moe.latent"), L));
             RAD_ARCH_TRY(w.hr.declare_qs(b, nm, gq, nm.f("moe.latent_rot"), L, 0, i8, !i8));
             w.hr.q8_fed = w.hr.q8_rot = i8;
+            /* P-11b tried to drop this E4M3 pair for an int8 arm: the fused SwiGLU writes the
+             * rotated int8 pair the down projection reads, so no op of the declared plan names it,
+             * and the plan dump counts it as arena. It stays: MoeFP8's own rule asks for it
+             * (`down_codebook_fp8` / `down_supported`, arch/common/rad_block_moe_fp8.h), which also
+             * carries the mixed recipe of an IQR gate_up behind a w6 down. Same finding as the
+             * latent's pair a few lines above -- the block is asked, the plan is not. */
             RAD_ARCH_TRY(w.eff.declare_qs(b, nm, gq, nm.f("moe.expert_ff"), F, T * k, i8, true));
             w.eff.q8_fed = w.eff.q8_rot = i8;
         }
-        if (!(lat.x && routed && sgu && sff && sout && w.logits && w.ids && w.ew && w.eoff &&
-              w.ecnt && w.sorted && w.egu && w.eff.x && w.edn))
+        if (!(lat.x && routed && sgu && sout && w.logits && w.ids && w.ew && w.eoff && w.ecnt &&
+              w.sorted && w.egu && w.eff.x && w.edn))
             return RAD_E_INVAL;
         /* A layer writes these from one end to the other before reading them, so their bytes are
          * free between layers (P-11). `ecnt` is PERSIST (the routing table). The activation codes
-         * are declared only for a quantised arm; they follow the plane they code. Left out:
-         * `moe.latent` (the shared and the routed branch both write it), `moe.expert_weights`,
+         * are declared only for a quantised arm; they follow the plane they code. `moe.shared_ff`
+         * is declared by GatedMlp::declare and marked where Ffn::declare hands it the slot. Left
+         * out: `moe.latent` (the shared and the routed branch both write it), `moe.expert_weights`,
          * `moe.expert_sorted` and `moe.expert_slot` (written piecewise by the router's own ops, so
          * a run of theirs cannot be shown to write what it reads). `moe.expert_ids`, the fold's
          * `gate_up` / `ff` / `down` planes: with the debug taps on, a snapshot copy of the ids is
          * issued after those planes were written and before the routing reads them, so with the
          * plan lending their bytes an out-of-order tap would read what the next layer wrote. */
-        RAD_ARCH_TRY(wire_full_write(b, { routed, sgu, sff, sout, w.logits }));
+        RAD_ARCH_TRY(wire_full_write(b, { routed, sgu, sout, w.logits }));
         if (lat.g8 > 0) RAD_ARCH_TRY(wire_full_write(b, { lat.q8, lat.s8 }));
         if (w.hr.g8 > 0) RAD_ARCH_TRY(wire_full_write(b, { w.hr.q8, w.hr.s8 }));
         if (w.eff.g8 > 0) RAD_ARCH_TRY(wire_full_write(b, { w.eff.q8, w.eff.s8 }));
@@ -401,10 +427,15 @@ struct Ffn {
         return code_form(b, wn);
     }
 
-    /* `in_codes` (G-3b): the rotated int8 codes of `x` the junction in front writes. */
+    /* `in_codes` (G-3b): the rotated int8 codes of `x` the junction in front writes.
+     * `shared_ff` is the model's slot for the shared expert's product plane, the same arrangement as
+     * `dense_ff`: this Ffn is one layer's and copies the wire each layer, so the slot cannot live on
+     * its own copy -- it is the model's, and the first layer whose shared arm is unfused declares
+     * the plane into it for every later one (P-11b). */
     int declare(RadBuilder* b, Names& nm, const Shape& s, const Geom& geom, int l, rad_buf x,
-                rad_buf y, const MoeWire& wire, rad_buf dense_gu, rad_buf dense_ff,
-                rad_buf dense_out, MoeFP8::Src* src, const ActFP8* in_codes = nullptr) {
+                rad_buf y, const MoeWire& wire, rad_buf dense_gu, rad_buf* dense_ff,
+                rad_buf dense_out, MoeFP8::Src* src, const ActFP8* in_codes = nullptr,
+                rad_buf* shared_ff = nullptr) {
         g = geom;
         layer = l;
         n_embd = s.n_embd;
@@ -425,7 +456,7 @@ struct Ffn {
             mo = dense_out;
             RAD_ARCH_TRY(mlp.declare(b, nm, g, s, l, nm.f("blk.%d.ffn_gate_up", l),
                                      nm.f("blk.%d.ffn_down", l), mp, s.n_ff_r, xf, mo, dense_gu,
-                                     dense_ff));
+                                     dense_ff ? *dense_ff : 0, nullptr, nullptr, dense_ff));
             sum = mo;
             post_src = nm.ckpt("%s.post_fc2_norm.weight", mp);
         } else {
@@ -486,7 +517,10 @@ struct Ffn {
             RAD_ARCH_TRY(shared.declare(b, nm, g, s, l, nm.f("blk.%d.ffn_gate_up_shexp", l),
                                         nm.f("blk.%d.ffn_down_shexp", l),
                                         nm.ckpt("%s.shared_experts", mp), s.n_ff_shared_r, xf,
-                                        w.sout, w.sgu, w.sff, &lat_in, in_codes));
+                                        w.sout, w.sgu, shared_ff ? *shared_ff : 0, &lat_in, in_codes,
+                                        shared_ff, "moe.shared_ff"));
+            /* The shared product plane, once declared, is written whole before it is read (P-11). */
+            if (shared_ff) RAD_ARCH_TRY(wire_full_write(b, { *shared_ff }));
             /* Issued inside MoeFP8's pass, ahead of their declared place behind latent_out, the
              * arm's buffers are excluded from sharing (SideOps' rule). It reads x's codes (or x),
              * which nothing in the routed span writes, and writes only its own buffers. */

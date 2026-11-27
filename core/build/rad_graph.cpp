@@ -192,14 +192,18 @@ std::string dump_graph_str(const Program& p, const std::vector<std::string>* err
     s += "\n";
 
     /* ---------------------------------------------------------------- the buffer plan */
-    int64_t sum = 0, peak = 0, unknown = 0, persist = 0;
+    int64_t sum = 0, peak = 0, unknown = 0, persist = 0, unknown_bytes = 0;
     const int32_t last_op = (int32_t)p.ops.size() - 1;
+    std::vector<const BufferInfo*> unused;
     for (size_t i = 1; i < p.buffers.size(); ++i) {
         const BufferInfo& b = p.buffers[i];
         if (b.decl.domain == RAD_DOMAIN_HOST) continue;
         if (b.decl.kind == RAD_BUF_TRANSIENT) {
             sum += b.bytes;
-            if (b.first_def <= 0 && b.last_use >= last_op) ++unknown;
+            /* The plan charges a transient that no op names for the whole program. Read off the
+             * builder's record, not off the range: a PERSIST plane, a second-lane buffer and a
+             * genuinely whole-program activation all read [0, last_op] the same way. */
+            if (b.no_op_use) { ++unknown; unknown_bytes += b.bytes; unused.push_back(&b); }
         } else {
             persist += b.bytes;
         }
@@ -229,10 +233,18 @@ std::string dump_graph_str(const Program& p, const std::vector<std::string>* err
     if (p.host_arena_bytes)
         s += fmt("  host arena  %12s   (its own offset space and its own base pointer)\n",
                  humanb(p.host_arena_bytes).c_str());
-    if (unknown)
-        s += fmt("  %lld transient buffer(s) had no declared use and are assumed live for the "
+    if (unknown) {
+        s += fmt("  %lld transient buffer(s), %s, had no declared use and are assumed live for the "
                  "whole program -- that is the arena's waste, and it goes away when ops name "
-                 "their buffer operands\n", (long long)unknown);
+                 "their buffer operands\n",
+                 (long long)unknown, humanb(unknown_bytes).c_str());
+        /* Named, because the number alone says nothing about which declare to take away. */
+        std::sort(unused.begin(), unused.end(),
+                  [](const BufferInfo* a, const BufferInfo* b) { return a->bytes > b->bytes; });
+        for (const BufferInfo* b : unused)
+            s += fmt("    %-32s %12s  no op of the declared list names it\n",
+                     b->name.c_str(), humanb(b->bytes).c_str());
+    }
 
     std::vector<const BufferInfo*> big;
     for (size_t i = 1; i < p.buffers.size(); ++i) big.push_back(&p.buffers[i]);
