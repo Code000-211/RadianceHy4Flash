@@ -23,6 +23,7 @@
 #include "rad_plugin.h"
 #include "r4d_plugin.h"
 #include "r4d_common.h"
+#include "r4d_fp8_lm.h"
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -30,6 +31,7 @@
 #include <cstring>
 #include <random>
 #include <string>
+#include <tuple>
 #include <vector>
 
 extern const char* emu_last_kernel;
@@ -301,6 +303,133 @@ int main(int argc, char** argv) {
         run(r4d_rad_cast_rowtopk, xb.data(), RAD_BF16, 8, 64, 8, 8, -1, &o, scratch);
         ++cases;
         if (o.rc == 0) { ++fails; std::printf("FAIL cast_row_topk took a bf16 plane\n"); }
+    }
+
+    /* ---- logits_topk (K-21): the head's matvec, the f32 -> bf16 rounding `cast` makes and
+     * row_topk's stage 1 in one launch, against the pair it replaces -- logits_gemm_i8 over the
+     * same operands and cast_row_topk over the f32 plane it wrote -- byte for byte on idx, val and
+     * the pair plane. The rounding is the same f32_to_bf16 of the same accumulator (the fused
+     * kernel keeps rows_dot_mt's own order), and the selection is exact: a block's slice of a row
+     * cannot hold more than kTopkRc = 8 of the row's top 8, and stage 2 ranks the blocks' 8s with
+     * row_topk's own chain, so ties break by the lower id exactly as there. */
+    {
+        const int E = 1024;         /* a block scale's 128 columns; a multiple of 1024, so the
+                                     * stored head row takes no 16-byte pad (r4d_fp8_lm.h) */
+        const int w_ld = (int)r4d_fp8::lm_row_bytes(E);
+        const int Vmax = 4096;
+        std::vector<unsigned char> wbuf((size_t)Vmax * w_ld + 16, 0);
+        unsigned char* const w = wbuf.data() + ((16 - ((uintptr_t)wbuf.data() & 15)) & 15);
+        std::vector<unsigned char> sbuf;
+        int bad = 0, neg = 0, nc = 0;
+        for (int V : { Vmax, 1032, 64, 8 })
+        for (int M : { 1, 2 })
+        for (int kind : { 4, 5 })                 /* ordinary, then every value alike (ties) */
+        for (int R : { 8, 1 })
+        for (int sharded = 0; sharded < 2; ++sharded) {
+            if (V < 64 && (M != 1 || kind != 4 || R != 8)) continue;    /* bound the emulator */
+            const int off = sharded ? (V == Vmax ? 3 * (V / 4) : V) : -1;
+            /* The head: int8 codes, one bf16 scale a 128 columns. kind 5 makes every column of a
+             * block alike, so the tie rule alone decides. */
+            for (int v = 0; v < V; ++v) {
+                unsigned char* const row = w + (size_t)v * w_ld;
+                for (int c = 0; c < E; ++c)
+                    row[c] = (unsigned char)(kind == 5 ? 3 : (int)(g() % 255) - 127);
+                for (int c = 0; c < E / 128; ++c) {
+                    const uint16_t s = cast_bf16(std::ldexp(1.0f, -7) * (float)(1 + (kind == 5 ? 0 :
+                                                    (int)(g() % 3))));
+                    std::memcpy(row + E + 2 * c, &s, 2);
+                }
+            }
+            std::vector<uint16_t> xb((size_t)M * E);
+            for (int m = 0; m < M; ++m) {
+                std::vector<float> xr(E);
+                fill_row(g, xr.data(), E, kind == 5 ? 4 : kind);
+                for (int c = 0; c < E; ++c) xb[(size_t)m * E + c] = cast_bf16(xr[c]);
+            }
+            /* The reference: the head into an f32 plane, then cast_row_topk over that plane. */
+            std::vector<float> y((size_t)M * V, 0.f);
+            Out rf, fu;
+            {
+                RadTensor t[3] = { ten(xb.data(), RAD_BF16, { M, E }),
+                                   ten(w, RAD_I8, { V, E }), ten(y.data(), RAD_F32, { M, V }) };
+                RadParam p[4]{ { "M", RAD_P_INT, M }, { "n_vocab", RAD_P_INT, V },
+                               { "n_embd", RAD_P_INT, E } };
+                p[3].key = "dtype"; p[3].kind = RAD_P_STR; p[3].sval = "bf16";
+                RadArgs a{};
+                a.t = t; a.n_t = 3; a.p = p; a.n_p = 4;
+                if (r4d_rad_logits_gemm_i8(&a, nullptr) != 0) { ++bad; std::printf("head failed\n"); }
+            }
+            run(r4d_rad_cast_rowtopk, y.data(), RAD_F32, M, V, R, 8, off, &rf, sbuf);
+            /* The fused op: the same head and outputs in one launch. */
+            {
+                fu.idx.assign((size_t)M * R, 12345);
+                fu.val.assign((size_t)M * R, 777.f);
+                fu.pairs.assign((size_t)M * R * 2, 555.f);
+                RadTensor t[5] = { ten(xb.data(), RAD_BF16, { M, E }),
+                                   ten(w, RAD_I8, { V, E }),
+                                   ten(fu.idx.data(), RAD_I32, { M, R }),
+                                   ten(fu.val.data(), RAD_F32, { M, R }),
+                                   ten(fu.pairs.data(), RAD_F32, { M, R, 2 }) };
+                RadParam p[6]{};
+                int np = 0;
+                p[np++] = { "M", RAD_P_INT, M };
+                p[np++] = { "R", RAD_P_INT, R };
+                p[np++] = { "n_vocab", RAD_P_INT, V };
+                p[np++] = { "n_embd", RAD_P_INT, E };
+                p[np].key = "dtype"; p[np].kind = RAD_P_STR; p[np++].sval = "bf16";
+                if (off >= 0) p[np++] = { "vocab_off", RAD_P_INT, off };
+                RadArgs a{};
+                a.t = t; a.n_t = off >= 0 ? 5 : 4; a.p = p; a.n_p = np;
+                const int64_t need = r4d_rad_logits_topk_scratch(&a);
+                if (need <= 0) { ++bad; std::printf("FAIL logits_topk scratch %lld\n",
+                                                    (long long)need); }
+                else {
+                    sbuf.assign((size_t)need, 0xA5);
+                    a.scratch = sbuf.data(); a.scratch_bytes = need;
+                    fu.rc = r4d_rad_logits_topk_i8(&a, nullptr);
+                    fu.kern = emu_last_kernel ? emu_last_kernel : "";
+                    ++nc;
+                    if (!same(rf, fu, off >= 0) ||
+                        fu.kern.find("mvm_topk") == std::string::npos) {
+                        ++bad;
+                        std::printf("FAIL logits_topk M=%d V=%d R=%d off=%d (rc %d/%d, %s)\n", M,
+                                    V, R, off, rf.rc, fu.rc, fu.kern.c_str());
+                    }
+                    /* A second run on the same outputs: the arrival counters were left zero. */
+                    std::fill(fu.idx.begin(), fu.idx.end(), 0);
+                    std::fill(fu.val.begin(), fu.val.end(), 0.f);
+                    std::fill(fu.pairs.begin(), fu.pairs.end(), 0.f);
+                    fu.rc = r4d_rad_logits_topk_i8(&a, nullptr);
+                    if (!same(rf, fu, off >= 0)) {
+                        ++bad;
+                        std::printf("FAIL logits_topk repeat M=%d V=%d R=%d off=%d\n", M, V, R, off);
+                    }
+                }
+            }
+        }
+        cases += nc;
+        if (bad || nc == 0) { ++fails; std::printf("FAIL logits_topk: %d bad of %d\n", bad, nc); }
+        /* The refusals: R beyond a block's eight, and an M above the matvec band. */
+        {
+            std::vector<uint16_t> xb((size_t)3 * E, 0);
+            std::vector<int32_t> ib((size_t)3 * 16, 0);
+            std::vector<float> vb((size_t)3 * 16, 0.f);
+            for (auto c : { std::make_tuple(2, 9), std::make_tuple(2, 16), std::make_tuple(3, 8) }) {
+                const int M = std::get<0>(c), R = std::get<1>(c);
+                RadTensor t[4] = { ten(xb.data(), RAD_BF16, { M, E }), ten(w, RAD_I8, { 8, E }),
+                                   ten(ib.data(), RAD_I32, { M, R }),
+                                   ten(vb.data(), RAD_F32, { M, R }) };
+                RadParam p[5]{ { "M", RAD_P_INT, M }, { "R", RAD_P_INT, R },
+                               { "n_vocab", RAD_P_INT, 8 }, { "n_embd", RAD_P_INT, E } };
+                p[4].key = "dtype"; p[4].kind = RAD_P_STR; p[4].sval = "bf16";
+                RadArgs a{};
+                a.t = t; a.n_t = 4; a.p = p; a.n_p = 5;
+                a.scratch = sbuf.data(); a.scratch_bytes = (int64_t)sbuf.size();
+                if (r4d_rad_logits_topk_i8(&a, nullptr) == 0) ++neg;
+            }
+            ++cases;
+            if (neg) { ++fails; std::printf("FAIL logits_topk took %d out-of-band case(s)\n", neg); }
+        }
     }
 #endif
 

@@ -659,6 +659,10 @@ int r4d_rad_gemm_i8a8_m16  (const RadArgs*, RadStream);
 int64_t r4d_rad_gemm_i8a8_m16_scratch(const RadArgs*);
 int r4d_rad_logits_gemm_i8(const RadArgs*, RadStream);
 int r4d_rad_logits_gemm_iqr(const RadArgs*, RadStream);
+/* `logits_topk`: the head's matvec with row_topk's ranking in its epilogue (K-21,
+ * r4d_gemm_fp8a16_nt_m1.hip) -- no f32 plane, no `cast`, no stage 1. */
+int r4d_rad_logits_topk_i8(const RadArgs*, RadStream);
+int64_t r4d_rad_logits_topk_scratch(const RadArgs*);
 /* `logits_gemm_vocab`: the head as width classes of the vocabulary's rows (r4d_logits_vocab.hip). */
 int r4d_rad_logits_gemm_vocab(const RadArgs*, RadStream);
 int64_t r4d_rad_logits_gemm_vocab_scratch(const RadArgs*);
@@ -1033,6 +1037,7 @@ int r4d_shape_rope           (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_kv_store       (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_kv_store_streamed (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_logits_gemm    (const RadParam*, int, int operand, RadOpdDesc*);
+int r4d_shape_logits_topk    (const RadParam*, int, int operand, RadOpdDesc*);
 
 int r4d_shape_sample_penalties (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_sample_dry       (const RadParam*, int, int operand, RadOpdDesc*);

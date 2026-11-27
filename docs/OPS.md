@@ -2200,6 +2200,7 @@ The VAEs' convolutions are `conv3d_ndhwc` with `tpad` and the audio VAE's `conv2
 | `row_topk_merge` | `M` `R` `world_size` `dtype` | `gathered` → `idx`, `val` |
 | `pair_argmax` | `M`(range) `n` `dtype` | `pairs` → `idx`, `val`? |
 | `logit_rerank` | `M`(range) `R` `n_vocab` `n_embd` `vocab_off`/opt `dtype` | `x`, `head`w, `idx_in` → `idx`, `val`, `pairs`? |
+| `logits_topk` | `M`(range) `R` `n_vocab` `n_embd` `vocab_off`/opt `dtype` | `x`, `lm_head`w → `idx`, `val`, `pairs`? |
 
 **`row_topk` and `row_topk_merge`** are a pair for a vocab-sharded head, whose logits cover only its
 own slice. `vocab_off` shifts the reported columns into global ids, and `pairs` writes the same R
@@ -2218,6 +2219,20 @@ with the implementation's own NaN rule), and the top-R is taken over the rounded
 what `val` reports. Its outputs are the pair's bytes; what goes is the cast's launch and its bf16
 plane. A draft head whose logits GEMM writes f32 takes it where a library serves it and the pair
 otherwise.
+
+**`logits_topk`** (K-21) is `logits_gemm` and `cast_row_topk` as one op for a draft round's head: the
+matvec's blocks keep the top-R of the vocabulary slice each covers, hand stage 2 the candidates, and
+the block that arrives last for a row ranks them with `row_topk`'s own chain. `x` is the bf16
+activation, `lm_head` the head in `logits_gemm_i8`'s stored form (int8 codes with a bf16 scale a 128
+columns), and the outputs are `cast_row_topk`'s -- `idx`, `val` and the optional `pairs` -- with
+its `vocab_off` and tie rule. What goes is the 242 KB a row f32 logits plane, the `cast` and stage
+1's launch over that plane. It is exact, not an approximation: a block's slice of a row cannot hold
+more than its eight candidates of the row's top eight, and stage 2 ranks their union with the same
+key, so the outputs are the pair's bytes; a slot a block could not fill carries the same -inf key
+`row_topk` pads with. It serves the matvec band (`M <= 2`, where `logits_gemm` runs its matvec), `R
+<= 8` and the int8 head -- an E4M3 head would be a second row on a layout family this build does not
+have; a drafter keeps the head and the pair above that, or with a tap of the f32 plane. `x`
+alone is the head's input, so a rank's slice is `n_vocab` columns from `vocab_off`.
 
 **`pair_argmax`** is the merge at R = 1, for a vocab-sharded draft head that wants each position's
 winner: `idx` gets the id of the largest value among a row's `n` gathered pairs, ties to the lower

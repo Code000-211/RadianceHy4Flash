@@ -32,6 +32,9 @@
 #include "r4d_fp8_wmma.h"
 #include "r4d_chain.h"
 #include "r4d_iqr.h"
+#include "r4d_common.h"
+#include "r4d_keyed.h"
+#include "r4d_topk.h"
 
 #include <algorithm>
 
@@ -456,6 +459,133 @@ __global__ __launch_bounds__(kDenseThreads) void mvm_kernel(
     const uint16_t* __restrict__ X, uint32_t a_ld, OT* __restrict__ out, uint32_t c_ld,
     uint32_t rows, uint32_t cols, uint32_t w_ld, uint32_t sc_cols, uint32_t m_real) {
     mvm_body<MT, SROW, OT, RB, I8, TB>(W, S, X, a_ld, out, c_ld, rows, cols, w_ld, sc_cols, m_real);
+}
+
+/* ---------------------------------------------- the head with its ranking in the epilogue (K-21)
+ *
+ * One draft round ran this matvec, wrote its f32 logits plane, cast it to bf16 and had row_topk's
+ * stage 1 rank it: 242 KB a row of plane written and read back at TP2's 62080 columns. logits_topk
+ * is the same matvec -- rows_dot_mt, the same lanes, the same launch geometry, so the same f32
+ * accumulators bit for bit -- with the ranking in its epilogue: a block keeps the top-RC of each
+ * token row over the columns it covered, hands stage 2 its candidates, and the block that arrives
+ * last for a row runs stage 2 (r4d_topk.h's function, the one row_topk's own stage 2 calls) over
+ * the row's candidates. No plane, no cast, no stage 1.
+ *
+ * The rounding is the chain's: a candidate's value is f32_to_bf16(acc) -- what `cast` writes -- and
+ * the key is r4d_topk.h's, so the order, the tie rule and the padding are stage 1's. RC = 8 = the
+ * drafter's R makes the candidate set exact for every input: a block's slice can hold at most R of
+ * the row's top-R, so its own top-R contains all of them (stage 1's risk with RC < R does not
+ * exist here). A block that is not full leaves fewer, and its empty slots are the zero key stage
+ * 1's tail also leaves.
+ *
+ * Coverage is mvm_kernel's: block b, wave w, pass i own the columns b*kDenseWaves + w + i*step, so
+ * the block's list is its slice of the plane and the union over blocks is the row. Only the grid is
+ * the launcher's choice and coarser than the matvec's (fewer blocks, more passes a wave), because
+ * the plane the candidates land in is kTopkRc keys a block: `cap` is the passes a wave makes, and
+ * kDenseWaves * cap <= kTopkCap slots a row keeps the block's list in the static LDS.
+ */
+constexpr uint32_t kTopkRc = 8;    // candidates a block hands stage 2 per row (the drafter's R)
+constexpr uint32_t kTopkCap = 64;  // slots one row of a block may fill
+
+template <uint32_t MT>
+__global__ __launch_bounds__(kDenseThreads) void mvm_topk_kernel(
+    const uint8_t* __restrict__ W, const uint16_t* __restrict__ S,
+    const uint16_t* __restrict__ X, uint32_t a_ld, unsigned long long* __restrict__ P,
+    unsigned* __restrict__ ctr, float* __restrict__ OV, int* __restrict__ OI,
+    float* __restrict__ OP, uint32_t rows, uint32_t cols, uint32_t w_ld, uint32_t sc_cols,
+    uint32_t m_real, uint32_t cap, int off, int R) {
+    const int tid = threadIdx.x;
+    const int lane = tid & (kWave - 1);
+    const int wave = tid / kWave;
+    __shared__ unsigned long long cand[MT * kTopkCap];  // the block's slice, a row a range
+    __shared__ unsigned long long win[kDenseWaves * kTopkRc];  // stage 2's first level
+    __shared__ unsigned last_mask;
+    for (uint32_t i = (uint32_t)tid; i < MT * kTopkCap; i += kDenseThreads) cand[i] = 0ull;
+    __syncthreads();
+
+    const uint32_t step = gridDim.x * kDenseWaves;      // RB = 1, as at this height in mvm_body
+    uint32_t pass = 0;
+    for (uint32_t r0 = (uint32_t)blockIdx.x * kDenseWaves + (uint32_t)wave; r0 < rows;
+         r0 += step, ++pass) {
+        float acc[MT];
+        rows_dot_mt<MT, 1, true, true, 0>(W, S, X, a_ld, r0, rows, cols, w_ld, sc_cols, m_real,
+                                         lane, acc);
+        // The column this (row, wave, pass) holds, as the key stage 1 would make of the plane's
+        // entry: the cast's rounding of the accumulator, and the column as the tie-break.
+        if (lane == 0) {
+#pragma unroll
+            for (uint32_t m = 0; m < MT; ++m)
+                if (m < m_real)
+                    cand[m * kTopkCap + wave + kDenseWaves * pass] =
+                        tk_key(f32_to_bf16(acc[m]), r0);
+        }
+    }
+    __syncthreads();
+
+    // A wave a row: the block's top-RC of the columns it covered.
+    if ((uint32_t)wave < MT && (uint32_t)wave < m_real) {
+        const uint32_t m = (uint32_t)wave;
+        unsigned long long t[kTopkRc];
+#pragma unroll
+        for (uint32_t q = 0; q < kTopkRc; ++q) t[q] = 0ull;
+        for (uint32_t s = (uint32_t)lane; s < cap; s += kWave)
+            tk_insert<kTopkRc>(t, cand[m * kTopkCap + s]);
+        unsigned long long* const p = P + ((size_t)m * gridDim.x + blockIdx.x) * kTopkRc;
+#pragma unroll
+        for (uint32_t q = 0; q < kTopkRc; ++q) {
+            const unsigned long long w = tk_round<kTopkRc>(t);
+            if (lane == 0) p[q] = w;
+        }
+        // This wave's stores before this block's arrival, and the barrier before it orders them
+        // with tid 0's counter (see r4d_rowtopk_bf16.hip's fused stage 1).
+        __threadfence();
+    }
+    __syncthreads();
+
+    // One arrival a (block, row); the block that takes the row's last ticket runs stage 2 for it.
+    if (tid == 0) {
+        unsigned mask = 0;
+        for (uint32_t m = 0; m < MT; ++m) {
+            if (m >= m_real) break;
+            const unsigned t = __hip_atomic_fetch_add(ctr + m, 1u, __ATOMIC_ACQ_REL,
+                                                      __HIP_MEMORY_SCOPE_AGENT);
+            if (t + 1u == (unsigned)gridDim.x) mask |= 1u << m;
+        }
+        last_mask = mask;
+    }
+    __syncthreads();
+    if (!last_mask) return;
+
+    // Stage 2 over the row's gridDim.x * RC candidates, in two levels: the eight waves take a slice
+    // each, then one wave ranks their 8 * RC winners. Exact for R <= RC (a slice's top-RC holds all
+    // of the answer that falls in it, and so does the second level).
+    const uint32_t n = (uint32_t)gridDim.x * kTopkRc;
+    const uint32_t len = (n + kDenseWaves - 1u) / kDenseWaves;
+    for (uint32_t m = 0; m < MT; ++m) {
+        if (!(last_mask & (1u << m))) continue;
+        if (tid == 0) ctr[m] = 0u;            // zero for the next launch (launches never overlap)
+        __threadfence();                      // the other blocks' candidates
+        const unsigned long long* const p = P + (size_t)m * n;
+        const uint32_t c0 = (uint32_t)wave * len;
+        const uint32_t c1 = (c0 + len < n) ? (c0 + len) : n;
+        unsigned long long t[kTopkRc];
+#pragma unroll
+        for (uint32_t q = 0; q < kTopkRc; ++q) t[q] = 0ull;
+        for (uint32_t s = c0 + (uint32_t)lane; s < c1; s += kWave) tk_insert<kTopkRc>(t, p[s]);
+#pragma unroll
+        for (uint32_t q = 0; q < kTopkRc; ++q) {
+            const unsigned long long w = tk_round<kTopkRc>(t);
+            if (lane == 0) win[wave * kTopkRc + q] = w;
+        }
+        __syncthreads();
+        /* `win` holds one row's candidates, so the row's own outputs are passed in and the row
+         * index to stage 2 is 0: it would index both the plane and the outputs by it. */
+        if (wave == 0)
+            r4d_rowtopk_stage2_row<kTopkRc>(win, OV + (size_t)m * R, OI + (size_t)m * R,
+                                           OP ? OP + (size_t)m * R * 2 : nullptr, off, R,
+                                           (int)(kDenseWaves * kTopkRc), 0, lane);
+        __syncthreads();
+    }
 }
 
 // The same matvec as a chained form, for a head at M <= 2 (the row resolves with `chain` there:
@@ -993,7 +1123,7 @@ static int rad_logits_gemm_8(const RadArgs* a, RadStream s, bool i8) {
     const RadTensor* y = r4d_opt(a, LG_Y);
     if (!x || !w || !y) return R4D_NO(RAD_E_INVAL);
     if (x->dtype != RAD_BF16) return R4D_NO(RAD_E_DTYPE);
-    if (w->dtype != (i8 ? RAD_I8 : RAD_F8E4M3)) return R4D_NO(RAD_E_DTYPE);
+    if (w->dtype != RAD_I8) return R4D_NO(RAD_E_DTYPE);
     if (y->dtype != RAD_F32) return R4D_NO(RAD_E_DTYPE);
     if (!r4d_contig(w)) return R4D_NO(RAD_E_STRIDE);
 
@@ -1065,3 +1195,124 @@ extern "C" int r4d_rad_logits_gemm_iqr(const RadArgs* a, RadStream s) {
 // The shared operand reader is r4d_fp8_args.h; see libr4d/r4d_args.h.
 /* ================================================================== the fp8 GEMMs */
 
+/* ------------------------------------------------------------------ logits_topk
+
+ The head's matvec with row_topk's ranking in its epilogue (mvm_topk_kernel above): logits_gemm_i8's
+ operands and checks for the head, and cast_row_topk's outputs, padding and pair plane, in one
+ launch. A drafter swaps the head, its `cast` and stage 1 for this row.
+
+ The candidates go to this row's scratch -- RC keys a block a row, the plane row_topk's stage 1
+ would have written, shorter -- and the arrival counters to a keyed device block (r4d_keyed.h) that
+ is zero at entry and left zero. A launch that cannot get a block fails instead of ranking over a
+ stale counter. */
+enum { LT_X = 0, LT_W, LT_IDX, LT_VAL, LT_PAIRS };
+
+/* The grid: fewer blocks than the matvec's own count, because what the fused epilogue pays for is
+ * the candidate plane, and that is kTopkRc keys a block a row. A block takes at most kTopkCap
+ * columns (kDenseWaves waves a pass, so at most kTopkCap / kDenseWaves = 8 passes and the static
+ * LDS holds its slice), never more blocks than the columns have waves, and 256 blocks at least so a
+ * short vocabulary still fills the card. At the model's 62080-column head that is 970 blocks and
+ * 8 * 970 = 7760 keys a row (62 KB) against the 62080 f32 logits (242 KB) it replaces. */
+static long long logits_topk_blocks(long long rows) {
+    const long long most = (rows + kDenseWaves - 1) / kDenseWaves;
+    long long nch = (rows + kTopkCap - 1) / kTopkCap;
+    if (nch < 256) nch = 256;
+    if (nch > most) nch = most;
+    return nch < 1 ? 1 : nch;
+}
+
+/* The reader the scratch sizer (at declare, with no tensors) and the launch share. */
+static int logits_topk_params(const RadArgs* a, const RadTensor** x, const RadTensor** w,
+                              const RadTensor** idx, const RadTensor** val, long long* M,
+                              long long* n_vocab, long long* n_embd, long long* R) {
+    *x = r4d_opt(a, LT_X);
+    *w = r4d_opt(a, LT_W);
+    *idx = r4d_opt(a, LT_IDX);
+    *val = r4d_opt(a, LT_VAL);
+    if (*x) {
+        if ((*x)->rank != 2) return R4D_NO(RAD_E_SHAPE);
+        *M = (*x)->shape[0];
+        *n_embd = (*x)->shape[1];
+    } else {
+        *M = r4d_geti_or(a, "M", 0);
+        *n_embd = r4d_geti_or(a, "n_embd", 0);
+    }
+    *n_vocab = r4d_geti_or(a, "n_vocab", 0);
+    *R = r4d_geti_or(a, "R", 0);
+    if (*M < 1 || *M > 2) return R4D_NO(RAD_E_SHAPE);       /* the matvec band, see the kernel */
+    if (*n_vocab < 1 || *n_embd < 1) return R4D_NO(RAD_E_SHAPE);
+    if (*n_embd % (long long)kBlock) return R4D_NO(RAD_E_SHAPE);
+    if (*R < 1 || *R > (long long)kTopkRc) return R4D_NO(RAD_E_SHAPE);
+    return RAD_OK;
+}
+
+extern "C" int64_t r4d_rad_logits_topk_scratch(const RadArgs* a) {
+    const RadTensor *x, *w, *idx, *val;
+    long long M, n_vocab, n_embd, R;
+    const int rc = logits_topk_params(a, &x, &w, &idx, &val, &M, &n_vocab, &n_embd, &R);
+    if (rc != RAD_OK) return rc;
+    return M * logits_topk_blocks(n_vocab) * (int64_t)kTopkRc *
+           (int64_t)sizeof(unsigned long long);
+}
+
+static int logits_topk_launch(const RadArgs* a, RadStream s) {
+    const RadTensor *x, *w, *idx, *val;
+    long long M, n_vocab, n_embd, R;
+    const int rc = logits_topk_params(a, &x, &w, &idx, &val, &M, &n_vocab, &n_embd, &R);
+    if (rc != RAD_OK) return rc;
+    if (!x || !w || !idx || !val) return R4D_NO(RAD_E_INVAL);
+    if (x->dtype != RAD_BF16) return R4D_NO(RAD_E_DTYPE);
+    if (w->dtype != RAD_I8) return R4D_NO(RAD_E_DTYPE);
+    if (idx->dtype != RAD_I32 || val->dtype != RAD_F32) return R4D_NO(RAD_E_DTYPE);
+    if (!r4d_contig(w) || !r4d_contig(idx) || !r4d_contig(val)) return R4D_NO(RAD_E_STRIDE);
+    /* The head's declared [n_vocab][n_embd] and the row's stored width, as logits_gemm_8 checks
+     * them: the plane is wider than its declaration. */
+    if (w->rank != 2 || w->shape[0] != n_vocab || w->shape[1] != n_embd) return R4D_NO(RAD_E_SHAPE);
+    if (r4d_numel(idx) < M * R || r4d_numel(val) < M * R) return R4D_NO(RAD_E_SHAPE);
+    const long long stride = r4d_fp8::lm_row_bytes(n_embd);
+    if (stride % 16 || !r4d_aligned(w->data, 16)) return R4D_NO(RAD_E_ALIGN);
+    long long Mx = 0;
+    const long long x_ld = r4d_rows_pitch(x, n_embd, &Mx);
+    if (x_ld < 0) return R4D_NO(RAD_E_STRIDE);
+    if (Mx != M) return R4D_NO(RAD_E_SHAPE);
+    if (!r4d_aligned(x->data, 16)) return R4D_NO(RAD_E_ALIGN);
+
+    const RadTensor* pairs = r4d_opt(a, LT_PAIRS);
+    const long long off = r4d_geti_or(a, "vocab_off", 0);
+    if (off < 0) return R4D_NO(RAD_E_SHAPE);
+    if (pairs) {
+        if (pairs->dtype != RAD_F32 || !r4d_contig(pairs)) return R4D_NO(RAD_E_STRIDE);
+        if (r4d_numel(pairs) < M * R * 2) return R4D_NO(RAD_E_SHAPE);
+    }
+
+    const uint32_t rows = (uint32_t)n_vocab, cols = (uint32_t)n_embd;
+    const uint32_t nch = (uint32_t)logits_topk_blocks((long long)rows);
+    const uint32_t step = nch * kDenseWaves;
+    const uint32_t slots = kDenseWaves * ((rows + step - 1u) / step);
+    if (slots > kTopkCap) return R4D_NO(RAD_E_SHAPE);       /* the sizer's grid rules it out */
+    const int64_t need = (int64_t)M * nch * (int64_t)kTopkRc *
+                         (int64_t)sizeof(unsigned long long);
+    if (!a->scratch || a->scratch_bytes < need) return R4D_NO(RAD_E_SCRATCH);
+
+    unsigned* const ctr =
+        r4d::keyed_block(r4d::Keyed::LogitsTopk, (const void*)s, (const void*)val, 32u);
+    if (!ctr) return R4D_NO(RAD_E_DEVICE);
+
+    unsigned long long* const plane = (unsigned long long*)a->scratch;
+    const int voff = (int)off, r = (int)R;
+#define R4D_LTK(MTV)                                                                            \
+    hipLaunchKernelGGL((mvm_topk_kernel<MTV>), dim3(nch), dim3(kDenseThreads), 0,                \
+                       (hipStream_t)s, (const uint8_t*)r4d_addr(w), (const uint16_t*)nullptr,    \
+                       (const uint16_t*)r4d_addr(x), (uint32_t)x_ld, plane, ctr,                 \
+                       (float*)r4d_addr(val), (int*)r4d_addr(idx),                               \
+                       (float*)(size_t)r4d_addr(pairs), rows, cols, (uint32_t)stride, 0u,        \
+                       (uint32_t)M, slots, voff, r)
+    if (M == 1) R4D_LTK(1u); else R4D_LTK(2u);
+#undef R4D_LTK
+    return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
+}
+
+/* The op's one row: the int8 head, logits_gemm_i8's plane and checks. */
+extern "C" int r4d_rad_logits_topk_i8(const RadArgs* a, RadStream s) {
+    return logits_topk_launch(a, s);
+}
