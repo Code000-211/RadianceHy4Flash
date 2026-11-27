@@ -631,6 +631,31 @@ void check_sink_sc(std::mt19937& rng) {
     check_stable("sc 64 w0", p, true, 64);
     check_verify("sc 64 w0", p, 64);
     check_paged_vs_sel("sc 64 w0", p, 64);
+    /* Past the merge's first batch: merge_sink folds a launch's slots in batches of the default
+     * law's count (20, kMaxSplitsFull), and the switched law has up to 40, so the second batch is
+     * the one carrying slots 20..39. A range of more than 1280 tokens puts a visible key in slot 20
+     * and past it (at 1400, slots 0..21 hold keys, 22..39 are empty), and one of more than 2560 in
+     * the tail slot that takes the rest of the range past the law's table (at 2700, slot 39 holds
+     * [2496, 2700), so both its halves are visible). Both are checked against the f64 reference and
+     * against the selection form, in the split form (merge_sink) and, for the rows of the launch,
+     * in the fused one. */
+    for (int ctx : { 1400, 2700 }) {
+        const std::string tag = "sc 64 w0 at " + std::to_string(ctx) + " tokens";
+        Problem l;
+        make_paged(l, { 1 }, { ctx }, 8, 4, 0, true, rng);
+        const std::vector<double> w = ref_paged(l);
+        for (int stable : { 1, 0 }) {
+            std::vector<uint16_t> o;
+            const int rc = launch(l, false, 0, o, { .stable = stable, .sc = 64 });
+            double e = 0;
+            const bool ok = rc == RAD_OK && close_to(o, w, e);
+            std::snprintf(buf, sizeof buf, "max_abs %.2e", e);
+            report(tag + " stable " + std::to_string(stable) +
+                       ": inside the f64 reference's bound",
+                   ok, buf);
+        }
+        check_paged_vs_sel(tag, l, 64);
+    }
     /* The scratch: twice the slots of the same range at window 0, and 32 of them in the selection
      * form over blocks x block_size 2048 (where the default law has 16). */
     report("sc 64 w0: the scratch is twice the default's (40 slots in place of 20)",
