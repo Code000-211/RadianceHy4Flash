@@ -414,17 +414,17 @@ A worker without access to the lanes can still do a card, and measures it as far
    review starts, the comment forms and the rounds are in `AGENTS.md`.
 5. The review checks the code and the measurement file: the rows are the ones §2 asks for, before and after come from
    one machine, the raw lines carry the numbers. The merge also needs a measurement the server accepted for the head:
-   a `## Measurement` comment on the issue by a registered measurer who is not the PR's author, or a run of the test
-   lane, or the owner's `no-measurement` label. When only the measurement is missing, the issue gets
-   `ready-for-testing` (§6.1).
+   the measurement file of step 3, once the review approved the head that carries it (anyone may measure, the
+   author included); or a `## Measurement` comment on the issue by anyone but the PR's author (§6.1); or the owner's
+   `no-measurement` label. When only the measurement is missing, the issue gets `ready-for-testing` (§6.1).
 
 ### 6.1 Testing a `ready-for-testing` issue
 
-Anyone on the measurers list with a free GPU can measure a change that waits on `ready-for-testing`, without writing
-code: check out the PR's head and its merge base (`git merge-base origin/<base> <head>`), measure both as step 3 says,
+Anyone with a free GPU (there is no measurers list) can measure someone else's change that waits on
+`ready-for-testing`, without writing code: check out the PR's head and its merge base (`git merge-base origin/<base> <head>`), measure both as step 3 says,
 and post the result on the issue in the form of `.github/moebius/measurement.md`. The server checks the form and the
 commits and starts the next review round by itself. The test lane `r9700` (the local pair) also measures approved
-changes, at kernel level only (`rad-kbench`); end-to-end rows still come from a measurer.
+changes, at kernel level only (`rad-kbench`), when it runs; end-to-end rows still come from a person's measurement.
 
 Items whose whole value is a measurement (marked "lane required" in their issue) need a lane from the start. Lossy items
 keep §3.
