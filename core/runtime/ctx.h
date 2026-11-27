@@ -354,10 +354,16 @@ public:
     int  xp_predict(const RadPrefetchNext* next, rad_buf h, int64_t r0, int64_t rows, int64_t n_embd);
     int  xp_mark();
     int  xp_step(int layer);
-    /* The mover's pacing at the same mark (Mover::pace_mark, expert streaming X1 b): set at
+    /* The mover's pacing at its own mark (Mover::pace_mark, expert streaming X1 b, M-06): set at
      * bringup, before any pass is recorded, so recorded passes carry the mark as a host step.
-     * Called with the compute stream at each routed layer's mark, also where the prefetch is off. */
+     * Issued with the compute stream at the end of a layer, behind its second (post-FFN) junction,
+     * so the share it sends rides behind the next layer's first dispatch and crosses the link
+     * under that layer's attention rather than under a routed GEMM. A no-op where pacing is off. */
+    int  pace_mark();
     void set_pace_hook(std::function<int(RadStream)> f) { pace_hook_ = std::move(f); }
+    /* Whether a layer has marked its own end (pace_mark): the prefetch's mark then leaves the
+     * pacing to it, so a layer sends one share, not two. */
+    bool pace_marked() const { return pace_marked_; }
     bool xp_on() const { return xp_ != nullptr; }
     /* ---------------------------------------------------- "Weg 2": resident experts first, the
      * misses' whole units copied under them and run in a tail (w2.h, abi/rad_w2.h). w2_open at
@@ -584,7 +590,7 @@ private:
      * differing dispatch. */
     enum TapeKind : uint8_t { kTapePlay = 0, kTapeTable = 1, kTapeHost = 2, kTapeRoute = 3,
                               kTapeXp = 4, kTapeXpMark = 5, kTapeXpStep = 6,
-                              kTapeKvStage = 7, kTapeKvStageAfter = 8 };
+                              kTapeKvStage = 7, kTapeKvStageAfter = 8, kTapePaceMark = 9 };
     /* A prefetch call (Ctx::xp_predict), run again where the pass made it. */
     struct TapeXp {
         RadPrefetchNext next{};
@@ -769,6 +775,7 @@ private:
     void w2_serve(W2State& x);
     void w2_kick();
     std::function<int(RadStream)> pace_hook_;
+    bool pace_marked_ = false;
     void xp_free(XpState& x);
     void xp_serve(XpState& x);
     void xp_judge(XpState& x);
@@ -776,6 +783,7 @@ private:
     int  xp_predict_run(const RadPrefetchNext& next, rad_buf h, int64_t r0, int64_t rows, int64_t n_embd);
     int  xp_mark_run();
     int  xp_step_run(int layer);
+    int  pace_mark_run();
 
     int       rank_       = 0;
     int       slot_       = 0;

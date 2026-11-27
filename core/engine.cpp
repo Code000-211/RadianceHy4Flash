@@ -1210,9 +1210,11 @@ void Engine::rank_loop(int index) {
                 if (XsTally* xs = xstats_->tally(index)) xs->issued(*b);
             /* Expert streaming X1: a promotion whose copy has landed is published before the pass
              * is played, so this pass reads it from VRAM (not the next one); the paced copies the
-             * last dispatch held are spread over this pass's routed layers. */
-            if (what != kIssueSampler && b->draft_pass == 0 && r.heat.enabled()) {
-                if (xs_early_publish_) (void)r.mover.publish_landed(&r.heat);
+             * last dispatch held are spread over this pass's routed layers. A draft pass paces too
+             * (M-06): its layers are PCIe-free, so the copies a drafter's step held cross the link
+             * under it instead of waiting for the trunk pass. */
+            if (what != kIssueSampler && r.heat.enabled()) {
+                if (xs_early_publish_ && b->draft_pass == 0) (void)r.mover.publish_landed(&r.heat);
                 if (r.mover.pacing()) r.mover.pace_begin(r.ctx.n_route_layers());
             }
             int s = what == kIssueSampler ? RAD_OK : r.ctx.run_step(b);

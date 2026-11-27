@@ -2613,6 +2613,73 @@ TEST(a_program_with_a_calibration_tap_records_no_passes) {
     CHECK(!f.ctx.records_passes());
 }
 
+/* The paced promotions' mark (expert streaming X1 b, M-06): the mover's hook is called with the
+ * compute stream from the arch's rad_expert_pace_mark at the end of a layer. It is host work the
+ * tape names, so when a pass is issued again -- an audit, or a play -- the hook runs at the same
+ * points it ran the first time; that only holds if a pass paces from its own start, so the latch
+ * below resets every pass. A null context is refused, no hook (pacing off) is no work at all, and
+ * with no arch mark the prefetch's mark keeps the older position (X1 b, behind the routed down
+ * GEMMs). */
+TEST(the_pace_mark_runs_the_movers_hook_with_the_compute_stream) {
+    Fixture f;
+    rad_buf x = f.add_buffer("x", RAD_BF16, 64, 4, 0);
+    rad_op op = loose_op(f);
+    int marks = 0;
+    RadStream seen = nullptr;
+    f.ctx.set_pace_hook([&](RadStream cs) {
+        ++marks;
+        seen = cs;
+        return RAD_OK;
+    });
+    CHECK_OK(f.start(nullptr, false, /*record=*/true));
+    f.batch.phase = RAD_PHASE_DECODE;
+    CHECK_EQ(rad_expert_pace_mark(nullptr), RAD_E_INVAL);
+
+    /* A pass with no arch mark, and its own key: the prefetch's mark paces, and nothing latches. */
+    CHECK_OK(f.step(2, 0, [&](Ctx& c) { CHECK_OK(c.xp_mark()); }));
+    CHECK_EQ(marks, 1);
+    CHECK(!f.ctx.pace_marked());
+
+    /* A pass of the arch kind: the prefetch's mark paces up to the first layer end, the layer's
+     * own marks pace from then on, and the prefetch's mark stays out of the way after it -- one
+     * share a layer, not two. `before` re-read each pass is the reset: a pass paces from its own
+     * start, so the prefetch's mark paces here again. */
+    auto arch_pass = [&](int step) {
+        const int before = marks;
+        CHECK_OK(f.step(1, step, [&](Ctx& c) {
+            const RadOperand o[1] = { RAD_B(x) };
+            CHECK_OK(c.issue(op, o, 1, RAD_N_BATCH));
+            CHECK(!f.ctx.pace_marked());
+            CHECK_OK(c.xp_mark());              /* paces: no layer end has marked yet */
+            CHECK_EQ(marks, before + 1);
+            CHECK(!f.ctx.pace_marked());
+            CHECK_OK(rad_expert_pace_mark((RadCtx*)&c));
+            CHECK_EQ(marks, before + 2);
+            CHECK(f.ctx.pace_marked());
+            CHECK_OK(rad_expert_pace_mark((RadCtx*)&c));   /* the next layer's */
+            CHECK_EQ(marks, before + 3);
+            CHECK_OK(c.xp_mark());              /* latched: no second share this layer */
+            CHECK_EQ(marks, before + 3);
+        }));
+        CHECK_OK(rad_stream_sync(f.ctx.stream()));
+        CHECK_EQ(marks, before + 3);            /* live or audited: three a pass */
+        CHECK(seen == f.ctx.stream());
+    };
+    arch_pass(1);
+
+    /* The second sighting of a pass is audited: issued live and compared with its recording. The
+     * marks must fall where they fell, which they only do if the latch resets per pass -- a
+     * sticky one records no prefetch mark on the second pass and the audit refuses it
+     * (RAD_E_STATE). */
+    arch_pass(2);
+
+    /* With no hook (pacing off) the mark is no work at all. */
+    const int before = marks;
+    f.ctx.set_pace_hook(nullptr);
+    CHECK_OK(f.step(3, 3, [&](Ctx& c) { CHECK_OK(c.pace_mark()); }));
+    CHECK_EQ(marks, before);
+}
+
 /* ================================================================== the pass key */
 /* A recorded pass is replayed while its key holds, so the key must change with every batch field
  * and runtime state a pass's shape or arguments read, and must not change with the step number

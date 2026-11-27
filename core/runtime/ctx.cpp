@@ -1412,6 +1412,11 @@ int Ctx::play_pass(PassTape& t) {
             rc = xp_ || pace_hook_ ? xp_mark_run() : RAD_OK;
             lane_ = l0;
             break;
+        case kTapePaceMark:
+            lane_ = st.lane;
+            rc = pace_mark_run();
+            lane_ = l0;
+            break;
         case kTapeXpStep:
             lane_ = st.lane;
             rc = xp_ ? xp_step_run(st.a) : RAD_OK;
@@ -1445,6 +1450,10 @@ int Ctx::play_pass(PassTape& t) {
 int Ctx::run_pass(const RadBatch* b) {
     const auto bump = [](std::atomic<int64_t>& c) { c.fetch_add(1, std::memory_order_relaxed); };
     scratch_cur_[0] = scratch_cur_[1] = 0;
+    /* A pass paces from its own start: the first mark of a pass is the layer end's, whenever the
+     * pass begins, so two passes of one key record the same marks and an audit of either agrees
+     * (runtime/xprefetch.cpp, M-06). */
+    pace_marked_ = false;
     /* A pass the stager armed for is issued live: see runtime/stager.h. */
     if (!tape_on_ || staging_) { bump(pc_unkeyed_); arch_step_(this, b); return RAD_OK; }
     const uint64_t key = pass_key(b);

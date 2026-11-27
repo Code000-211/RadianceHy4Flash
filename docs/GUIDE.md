@@ -4836,8 +4836,12 @@ or 1024 heat steps of its own demotion (nested: every `readmit_16` is also in th
 `heat_steps` is that step count, the unit of the windows. A high `readmit_128 / promotions` means the
 heat guards ping-pong units. `early_published`, `paced_units`, `paced_marks` and `paced_late` describe
 expert streaming (a promotion published before the next pass; promotion copies spread over a pass's
-routed layers, `RADIANCE_XS_PACE`: -1 spread, N per layer, 0 off; default spread without a drafter,
-off with one; `RADIANCE_XS_EARLY_PUBLISH=0` restores the old order). The heat engine's parameters can be
+layers, `RADIANCE_XS_PACE`: -1 spread, N a layer, 0 off; default spread without a drafter, off with
+one; `RADIANCE_XS_EARLY_PUBLISH=0` restores the old order). A share rides behind the layer's post-FFN
+junction, so the copies cross the link under the next layer's attention, which reads no expert
+(M-06), and no share carries more than `RADIANCE_XS_PACE_BYTES` bytes (default 4,050,000: 150 us of
+the lane's 27 GB/s uplink, about what one to three expert units weigh; a draft pass marks its draft
+layers' ends too; 0 leaves the count alone). The heat engine's parameters can be
 set for A/B runs with `RADIANCE_HEAT_DECAY`, `_HYSTERESIS`, `_MIN_GAIN`, `_CREDIT_CAP` and `_MOVES`;
 the startup log says what is in force. `RADIANCE_ROUTE_TRACE=<file>` records rank 0's routing for
 `rad-heat-replay`, whose `--layer-min N` replays the trace with every layer held at N resident units
