@@ -1805,8 +1805,8 @@ const char* q4_vals[] = {
     "4", "4", "320", "8",
     "silu", "2048", "4", "128",
     "4",
-    "linear_attention linear_attention linear_attention full_attention "
-    "linear_attention linear_attention linear_attention full_attention",
+    ("linear_attention linear_attention linear_attention full_attention "
+     "linear_attention linear_attention linear_attention full_attention"),
     "4", "128",
     "16", "48", "128", "128",
     "640", "1", "3", "20000000",
@@ -6826,8 +6826,8 @@ const char* k_g4moe_vals[] = {
     "2816", "16", "8", "256", "512",
     "2", "true", "262144", "2112",
     "1e-06", "1024", "30.0", "gelu_pytorch_tanh",
-    "[\"sliding_attention\", \"sliding_attention\", \"sliding_attention\", \"sliding_attention\", "
-    "\"sliding_attention\", \"full_attention\"]",
+    ("[\"sliding_attention\", \"sliding_attention\", \"sliding_attention\", \"sliding_attention\", "
+     "\"sliding_attention\", \"full_attention\"]"),
     "10000.0", "default",
     "1000000.0", "proportional",
     "0.25", "true", "128",
