@@ -569,7 +569,9 @@ private:
      * dispatch a block carries them, ahead of everything that reads a table, instead of one
      * dispatch at each op that finds its tables stale. A staged pass keeps the per-op path above:
      * its stager publishes mid-pass (stager.h, before_op). An entry whose transfer has not landed
-     * yet also keeps it, so its stream wait stays where the op that reads it can carry it. */
+     * yet also keeps it, so its stream wait stays where the op that reads it can carry it. The
+     * patches go out on lane 0; a pass that patched orders lane 1 behind them with one join, so an
+     * op on either lane that reads a table sees it patched (wtab_patch_pass). */
     int  wtab_patch_pass();
     /* Resolves entry `e` of `t` into `*out`, or fails the step naming the entry when the load phase
      * bound it no pointer. The first issue of a table (table_refresh) and the patch of its moved

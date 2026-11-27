@@ -505,6 +505,7 @@ int Ctx::wtab_flush() {
 /* Every table's queued entries, patched at the head of a pass: one dispatch a block, ahead of
  * everything the pass reads. See ctx.h. */
 int Ctx::wtab_patch_pass() {
+    const int64_t patches_before = n_wtab_patches_;
     const bool wt_time = g_dbg_issue && rank() == 0;   /* one thread accumulates */
     const auto t_wt0 = wt_time ? std::chrono::steady_clock::now()
                                : std::chrono::steady_clock::time_point{};
@@ -552,6 +553,22 @@ int Ctx::wtab_patch_pass() {
      * pend again, for that op's own table_refresh). */
     int rc = RAD_OK;
     if (wtab_acc_.n > 0) rc = wtab_flush();
+    /* The patches went out on lane 0, and an op on lane 1 reads its table there. Before this, a
+     * table was refreshed at the op, on the op's lane; a plugin that interleaves the lanes joins
+     * lane 0 into lane 1 itself ahead of its lane-1 work (rad_arch.h, rad_block's pipe_on1), and
+     * one that does not would read the array the patch is still writing. So a pass that patched
+     * orders lane 1 behind the patch, once: no patch, no join, and a lane built later starts
+     * behind lane 0 anyway (lane_init). */
+    if (rc >= 0 && lane1_ && n_wtab_patches_ != patches_before) {
+        rc = lane_join(0, 1);
+        if (rc < 0) {
+            step_fail_ = fmt("the second lane could not be ordered behind the pass's weight table "
+                             "patches: %s",
+                             rad_strerror(rc));
+            RAD_ERR("%s", step_fail_.c_str());
+            return rc;
+        }
+    }
     if (wt_time) {
         g_wtab_us += std::chrono::duration<double, std::micro>(
                          std::chrono::steady_clock::now() - t_wt0).count();
