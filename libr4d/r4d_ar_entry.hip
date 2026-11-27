@@ -1590,7 +1590,8 @@ static int rad_ar_add_rmsnorm(const RadArgs* a, RadStream s) {
     if (ap < 0 || xp < 0 || yp < 0) return RAD_E_STRIDE;
     if (ap != K) return RAD_E_STRIDE;
 
-    const long long mode = r4d_geti_or(a, "mode", 1);
+    long long mode = 0;
+    if (!r4d_geti(a, "mode", &mode)) return RAD_E_INVAL;   /* schema: required */
     if (mode != 0 && mode != 1) return RAD_E_INVAL;
     const float eps  = (float)r4d_getf(a, "eps", 1e-6);
     const float wadd = (float)r4d_getf(a, "wadd", 0.0);

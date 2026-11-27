@@ -7,7 +7,8 @@
  *   mode 1   all_reduce (exact) -> add -> rmsnorm:   x += a;          y = rmsnorm(x)
  *
  * Reference: the unfused chain, in libr4d's per-element arithmetic -- the standalone exact
- * all-reduce's fold (an f32 sum of the two bf16 values rounded once), add_bf16's word
+ * all-reduce's fold (an f32 sum of the two bf16 values rounded once through the kernel's `ar_bf16`,
+ * bf16_hi_rne_nan: a NaN stays NaN, quieted; everything else rounds to nearest even), add_bf16's word
  * (bf16(f32(x) + f32(a))), and rmsnorm_bf16's norm (the sum of squares in kR4dSumLanes' partition,
  * a butterfly a wave then the waves from zero, rsqrtf(ss/n + eps), bf16(f32(v) * s * g) -- the
  * same helpers tests/r4d_emu/test_norm.cpp uses). The fused kernel must match it bit for bit:
@@ -38,6 +39,16 @@
 #include <vector>
 
 static std::mt19937 rng(97);
+
+/* The all-reduce's fold rounds as the kernel's `ar_bf16` does (bf16_hi_rne_nan): a NaN stays NaN,
+ * quieted to 0x7FC0, and everything else rounds to nearest even. ref_host's f2b is the store
+ * rounding the add and the norm use; the two differ only on NaN, which this keeps exact. */
+static uint16_t f2b_ar(float f) {
+    uint32_t u;
+    std::memcpy(&u, &f, sizeof u);
+    const uint32_t r = u + 0x7fffu + ((u >> 16) & 1u), q = u | 0x400000u;
+    return (uint16_t)((f != f ? q : r) >> 16);
+}
 
 /* rmsnorm_bf16's sum of squares: 256 lanes strided over the row, a butterfly a wave, the waves in
  * order (tests/r4d_emu/test_norm.cpp's block_factor, the same partition). */
@@ -96,7 +107,7 @@ static int run_case(const Case& c) {
         const size_t o = (size_t)m * n;
         std::vector<float> v((size_t)n);
         for (int i = 0; i < n; ++i) {
-            ca[o + (size_t)i] = f2b(b2f(a0[o + (size_t)i]) + b2f(peer[o + (size_t)i]));
+            ca[o + (size_t)i] = f2b_ar(b2f(a0[o + (size_t)i]) + b2f(peer[o + (size_t)i]));
             v[(size_t)i] = b2f(ca[o + (size_t)i]);
         }
         if (c.mode == 0) {
