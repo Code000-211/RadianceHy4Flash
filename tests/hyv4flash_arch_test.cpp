@@ -3987,6 +3987,89 @@ TEST(the_pass_head_enters_every_stream_in_one_hc_enter) {
     CHECK_EQ(compared, 1);
 }
 
+static void one_stream(MetaKV& k) { k.set("hc_mult", "1"); }
+static void nine_streams(MetaKV& k) { k.set("hc_mult", "9"); }
+static void sixteen_streams(MetaKV& k) { k.set("hc_mult", "16"); }
+
+/* K-28: the stream counts `hc_enter` does not admit -- a one-stream checkpoint, or one with more
+ * than eight -- keep the per-stream copies the pass head made before it: one 2-D `cast` of the
+ * embedding row, declared once and issued once a stream, and no `hc_enter` beside it. What the
+ * copies leave in the streams is hc identical copies of the embedding row, as before. */
+TEST(a_pass_head_outside_hc_enters_range_copies_each_stream) {
+    struct Case { void (*set)(MetaKV&); int64_t hc; };
+    const Case cases[] = { { one_stream, 1 }, { nine_streams, 9 }, { sixteen_streams, 16 } };
+    for (const Case& g : cases) {
+        Declared d(bf16_encs, 1, 0, false, 128, 0, 0, 0, g.set);
+        REQUIRE_EQ(d.rc, RAD_OK);
+        const RecBuf* se = find_b(d.b, "streams");
+        const RecBuf* xe = find_b(d.b, "embed");
+        REQUIRE(se != nullptr);
+        REQUIRE(xe != nullptr);
+        const int64_t E = xe->d.shape[1];
+        CHECK_EQ(se->d.shape[1] / E, g.hc);
+        const rad_buf streams = buf_named(d.b, "streams"), embed = buf_named(d.b, "embed");
+        REQUIRE(streams != 0);
+        REQUIRE(embed != 0);
+
+        /* Declared: the one wide copy of the embedding, no hc_enter. */
+        int enters = 0, decl_copies = 0;
+        for (const RecOp& o : d.b.ops) {
+            enters += o.op == "hc_enter";
+            if (o.op != "cast" || pstr(&o, "from") != pstr(&o, "to")) continue;
+            bool reads = false, writes = false;
+            for (rad_buf r : o.reads) reads = reads || r == embed;
+            for (rad_buf w : o.writes) writes = writes || w == streams;
+            decl_copies += reads && writes;
+        }
+        CHECK_EQ(enters, 0);
+        CHECK_EQ(decl_copies, 1);
+
+        auto k = kit(d.b, { 1, 1, 1 }, {}, 0);
+        k->b.positions_h = k->pos.data();
+        const int64_t T = (int64_t)k->b.n_tok;   /* the rows this step carries */
+        auto v = run_passes(d.b, hyv4flash::step, { k.get() }, 0, 1);
+        CHECK_PASSES(d.b, v);
+        REQUIRE(!v.empty());
+        const RadCtx& c = *v[0];
+        CHECK_EQ(count_issued(d.b, c, "hc_enter"), 0);
+
+        /* Issued: hc copies of that one op, one per stream. */
+        int copies = 0;
+        size_t last = 0;
+        bool seen = false;
+        for (size_t i = 0; i < c.issues.size(); ++i) {
+            const RecIssue& is = c.issues[i];
+            const RecOp* o = d.b.op_of(is.op);
+            if (!o || o->op != "cast" || pstr(o, "from") != pstr(o, "to")) continue;
+            bool reads = false, writes = false;
+            for (const RadOperand& od : is.opd) {
+                if (od.kind != RAD_OPK_BUF && od.kind != RAD_OPK_WEIGHT) continue;
+                if (od.handle == embed) reads = true;
+                if (od.handle == streams) writes = true;
+            }
+            if (!reads || !writes) continue;
+            ++copies;
+            last = i;
+            seen = true;
+        }
+        CHECK_EQ(copies, g.hc);
+        REQUIRE(seen);
+
+        /* Replayed: past the last copy the streams are hc copies of the embedding, row for row. */
+        Replay rp(d.b);
+        for (size_t i = 0; i <= last; ++i) rp.issue(c.issues[i]);
+        const std::vector<uint64_t> x = rp.rows_of(embed, T), h = rp.rows_of(streams, T);
+        REQUIRE_EQ(x.size(), (size_t)T * (size_t)E);
+        REQUIRE_EQ(h.size(), (size_t)T * (size_t)(g.hc * E));
+        int diff = 0;
+        for (int64_t r = 0; r < T; ++r)
+            for (int64_t s = 0; s < g.hc; ++s)
+                for (int64_t i = 0; i < E; ++i)
+                    diff += h[(size_t)(r * g.hc * E + s * E + i)] != x[(size_t)(r * E + i)];
+        CHECK_EQ(diff, 0);
+    }
+}
+
 /* D-02: at every stream count the server runs (1, 2, 8, 16) and every depth to the configured one,
  * full block and short, greedy and coupled, each chain round's corrected state is the header's
  *
