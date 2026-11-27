@@ -193,6 +193,10 @@ struct Model {
     Hyper hc_head{};
     std::vector<Layer> layers;
     std::vector<Engram> engrams;
+    /* M-18b: the layers behind the first register here (EngramWire::pf), so the first Engram
+     * layer's step can issue their step-start prefetch. Holds pointers into `engrams`, which is
+     * sized before any declare and never resized again. */
+    std::vector<Engram*> eg_pf;
     Tap t_embed{}, t_hc_head{}, t_final{};
     bool force_absorbed = false;
     Calib calib{};   /* --calib-dir: the trunk's Hessians (hyv4flash_calib.h) */
@@ -760,6 +764,7 @@ static int buffers(RadBuilder* b, Model& m) {
         m.dense_out = bf("dense_out", { T, E });
         if (!m.dense_gu || !m.dense_out) return RAD_E_INVAL;
     }
+    m.ew.pf = &m.eg_pf;   /* M-18b: the step-start prefetch registry (Engram::declare) */
     if (!s.engram_layers.empty()) RAD_ARCH_TRY(m.ew.declare(b, nm, s, g));
     return RAD_OK;
 }

@@ -513,6 +513,125 @@ TEST(the_engram_layers_share_one_window) {
     CHECK_EQ(n_adv, 2);         /* the window moves on once a layout, not once a layer */
 }
 
+/* M-18b: the step-start prefetch. A disk-placed Engram layer's row reads (~3 ms a layer at decode)
+ * must not serialize in front of the layers that wait for them: the first Engram layer's step
+ * hashes each later disk-placed layer's ids into that layer's own planes and issues a gather whose
+ * ahead operand names those ids themselves -- the host gather's prefetch signal (avx_ngram.cpp's
+ * prefetch mode: hand the ids to the reader thread, read nothing). The layer's own ids and gather
+ * follow at its position, unchanged: the step's outputs are the parent's byte for byte, only the
+ * cache's timing moves. A device-placed table declares the planes and issues nothing. */
+TEST(the_later_engram_layers_prefetch_at_the_step_start) {
+    Declared d(bf16_encs, 1, 0, false, 128, 0, 0, 0, two_engram_layers);
+    REQUIRE_EQ(d.rc, RAD_OK);
+    const RadBuilder& b = d.b;
+    /* The second of the two layers declares its own planes and the two ops that fill them; the
+     * first, which opens the step, declares none. */
+    const RecBuf* pf_ids = find_b(b, "eg.pf_ids.2");
+    const RecBuf* pf_mask = find_b(b, "eg.pf_mask.2");
+    const RecBuf* pf_rows = find_b(b, "eg.pf_rows.2");
+    REQUIRE(pf_ids != nullptr);
+    REQUIRE(pf_mask != nullptr);
+    REQUIRE(pf_rows != nullptr);
+    CHECK(find_b(b, "eg.pf_ids.0") == nullptr);
+    CHECK_EQ(count_op(b, "engram_ids"), 5);        /* two layouts a layer and the second's early hash */
+    CHECK_EQ(count_op(b, "embed_lookup_q"), 3);    /* a gather a layer and the second's prefetch */
+    /* The prefetch ops are declared last (after the layer's own vocabulary), so they are the last
+     * `engram_ids` op and the last `embed_lookup_q` op. */
+    std::vector<rad_op> ids_ops, gathers;
+    for (size_t i = 0; i < b.ops.size(); ++i) {
+        if (b.ops[i].op == "engram_ids") ids_ops.push_back((rad_op)(i + 1));
+        if (b.ops[i].op == "embed_lookup_q") gathers.push_back((rad_op)(i + 1));
+    }
+    REQUIRE_EQ((int)ids_ops.size(), 5);
+    REQUIRE_EQ((int)gathers.size(), 3);
+    const rad_op pf_ids_op = ids_ops.back(), pf_gather = gathers.back();
+    auto k = kit(b, { 1 }, { 12 }, 0);
+    k->b.positions_h = k->pos.data();
+    const int64_t T = k->b.n_tok;
+    const rad_buf pf_h = (rad_buf)(pf_ids - b.bufs.data() + 1);
+    const rad_buf pm_h = (rad_buf)(pf_mask - b.bufs.data() + 1);
+    const rad_buf pr_h = (rad_buf)(pf_rows - b.bufs.data() + 1);
+    /* A device-placed table: the step is the parent's, nothing hashed or read early. */
+    {
+        RadCtx c{ .b = &d.b, .batch = &k->b };
+        hyv4flash::step(&c, &k->b);
+        CHECK(c.step_fail.empty());
+        CHECK_LINT(b, &c);
+        CHECK_EQ(count_issued(b, c, "engram_ids"), 4);
+        CHECK_EQ(count_issued(b, c, "embed_lookup_q"), 2);
+    }
+    /* A host-placed (disk) table. */
+    {
+        RadCtx c{ .b = &d.b, .batch = &k->b };
+        for (rad_op h : gathers) c.host_ops.push_back(h);
+        hyv4flash::step(&c, &k->b);
+        CHECK(c.step_fail.empty());
+        CHECK_LINT(b, &c);
+        CHECK_EQ(count_issued(b, c, "engram_ids"), 6);
+        CHECK_EQ(count_issued(b, c, "embed_lookup_q"), 3);
+        int pf_hash = 0, first_pf = -1, i = 0;
+        for (const RecIssue& is : c.issues) {
+            if (is.op == pf_ids_op) {
+                ++pf_hash;
+                if (first_pf < 0) first_pf = i;
+                CHECK_EQ((int)pint(b.op_of(is.op), "advance"), 0);   /* the window is not moved */
+                /* The step's own tokens, no ahead tail; the ids land in this layer's plane. */
+                CHECK_EQ(is.opd[0].rows, T);
+                CHECK_EQ(is.opd.back().kind, (uint8_t)RAD_OPK_BUF);
+                CHECK_EQ((int64_t)is.opd.back().handle, (int64_t)pm_h);      /* pf_mask */
+                CHECK_EQ((int64_t)is.opd[is.opd.size() - 2].handle, (int64_t)pf_h);   /* pf_ids */
+                std::string mult;
+                for (const RadOperand& od : is.opd)
+                    if (od.kind == RAD_OPK_WEIGHT && od.handle > 0 &&
+                        (size_t)od.handle <= b.weights.size()) {
+                        const std::string& n = b.weights[(size_t)od.handle - 1].name;
+                        if (n.size() > 4 && n.compare(n.size() - 4, 4, "mult") == 0) mult = n;
+                    }
+                CHECK(mult == "blk.2.engram_mult");   /* the SECOND layer's table */
+            }
+            ++i;
+        }
+        CHECK_EQ(pf_hash, 2);   /* both layouts, as the step's own ids are */
+        /* The prefetch gather: its ahead operand names its own ids (the alias is the signal), its
+         * output is the plane nothing reads, and it rides the step's start -- before the second
+         * layer's own gather. */
+        int ng = 0;
+        const RecIssue* pfg = nullptr;
+        int own2 = -1, pfg_at = -1;
+        for (i = 0, ng = 0; i < (int)c.issues.size(); ++i) {
+            const RecIssue& is = c.issues[(size_t)i];
+            if (b.ops[(size_t)is.op - 1].op != "embed_lookup_q") continue;
+            if (is.op == pf_gather) { pfg = &is; pfg_at = i; }
+            else if (is.op == gathers[1]) own2 = i;   /* declared second: layer 2's own gather */
+            ++ng;
+        }
+        REQUIRE(pfg != nullptr);
+        CHECK_EQ(ng, 3);
+        CHECK_EQ((int64_t)pfg->opd[0].handle, (int64_t)pf_h);          /* ids */
+        CHECK_EQ((int64_t)pfg->opd.back().handle, (int64_t)pf_h);      /* ahead: the same plane */
+        CHECK_EQ(pfg->opd.back().rows, T);
+        bool saw_rows = false;
+        for (const RadOperand& od : pfg->opd)
+            saw_rows = saw_rows || (od.kind == (uint8_t)RAD_OPK_BUF &&
+                                    (int64_t)od.handle == (int64_t)pr_h);
+        CHECK(saw_rows);                                               /* out: pf_rows */
+        CHECK(first_pf >= 0 && first_pf < pfg_at);                     /* hash before the read */
+        CHECK(pfg_at < own2);   /* the step's start, ahead of the layer this read belongs to */
+    }
+    /* The A/B arm: RADIANCE_HY4_ENGRAM_PREFETCH=0 leaves the sync-hybrid step of the parent. */
+    {
+        setenv("RADIANCE_HY4_ENGRAM_PREFETCH", "0", 1);
+        RadCtx c{ .b = &d.b, .batch = &k->b };
+        for (rad_op h : gathers) c.host_ops.push_back(h);
+        hyv4flash::step(&c, &k->b);
+        CHECK(c.step_fail.empty());
+        CHECK_LINT(b, &c);
+        CHECK_EQ(count_issued(b, c, "engram_ids"), 4);
+        CHECK_EQ(count_issued(b, c, "embed_lookup_q"), 2);
+        unsetenv("RADIANCE_HY4_ENGRAM_PREFETCH");
+    }
+}
+
 TEST(last_layer_keeps_cache_writers_at_chunk_height_and_queries_at_output_height) {
     RadBuilder b;
     bf16_encs(&b);

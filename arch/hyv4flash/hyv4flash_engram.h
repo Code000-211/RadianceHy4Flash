@@ -36,6 +36,14 @@ inline bool ahead_forced() {
     return e && *e && std::strcmp(e, "0") != 0;
 }
 
+/* RADIANCE_HY4_ENGRAM_PREFETCH=0: no step-start prefetch of the disk-placed layers' rows (the
+ * sync-hybrid A/B arm; M-18b). Unset or any other value: a disk-placed layer's ids are hashed and
+ * its row reads handed to the host reader at the step's start, by the first Engram layer's step. */
+inline bool prefetch_off() {
+    const char* e = std::getenv("RADIANCE_HY4_ENGRAM_PREFETCH");
+    return e && *e && std::strcmp(e, "0") == 0;
+}
+
 inline double engram_eps() {
     const char* e = std::getenv("RADIANCE_HY4_ENGRAM_EPS");
     if (!e || !*e || !std::strcmp(e, "f32")) return 1.1920928955078125e-07;
@@ -47,6 +55,8 @@ inline double engram_eps() {
                     "positive number; using f32 (1.19e-7)\n", e);
     return 1.1920928955078125e-07;
 }
+
+struct Engram;
 
 /* The planes every Engram layer shares.
  *
@@ -79,6 +89,10 @@ struct EngramWire {
     rad_buf val = 0;      /* [T, n] */
     rad_buf before = 0;   /* [T, hc * n] the streams before the add (the engram_out tap) */
     rad_buf m1 = 0;       /* [T, hc * n] -1, the tap's subtraction */
+    /* M-18b: every Engram layer after the first registers itself here at declare (ascending), so
+     * the first one's step can hash their ids and hand their row reads to the host reader at the
+     * step's start (Engram::issue_pf). The vector lives as long as the program (Model::eg_pf). */
+    std::vector<Engram*>* pf = nullptr;
     int declare(RadBuilder* b, Names& nm, const Shape& s, const Geom& g) {
         const int64_t T = g.max_tok, H = s.engram_heads, HD = s.engram_head_dim, W = H * HD;
         ids = decl_b(b, nm.f("eg.ids"), RAD_I32, { T, H }, RAD_BUF_TRANSIENT, RAD_DOMAIN_HOST);
@@ -127,6 +141,15 @@ struct Engram {
     rad_op op_ids = 0, op_ids_dec = 0, op_gather = 0, op_quant = 0, op_dequant = 0, op_norm = 0;
     rad_op op_key = 0, op_val = 0, op_gate = 0;
     rad_op op_tap_copy = 0, op_tap_m1 = 0, op_tap_mul = 0, op_tap_add = 0;
+    /* M-18b: the step-start prefetch, declared for every layer behind the first (EngramWire::pf):
+     * this layer's own ids planes (the wire's are shared a layer, so a layer hashed at the step's
+     * start cannot use them) and the two ops that fill them -- `engram_ids` with `advance` 0, and
+     * an `embed_lookup_q` whose ahead operand names its own ids: the host gather's prefetch
+     * signal. The rows it reads land in the reader's cache, so `pf_rows` is an output nothing
+     * reads (a host gather without the prefetch mode fills it and the layer's own gather still
+     * hits the cache -- correct, just not early). */
+    rad_op op_ids_pf = 0, op_gather_pf = 0;
+    rad_buf pf_ids = 0, pf_mask = 0, pf_rows = 0;
     Tap t_out{}, t_ids{};
 
     /* Joins `n` per-stream (or per-head) checkpoint tensors `<prefix><i><suffix>` along dim 0,
@@ -341,6 +364,48 @@ struct Engram {
         HY4_NEED(op_key && op_val, "gemm_nt_bias");
         HY4_NEED(op_gate, "engram_gate");
 
+        /* M-18b: the step-start prefetch (EngramWire::pf, Engram::issue_pf). Declared for every
+         * layer behind the first whatever its placement -- the resolve comes after the declare,
+         * and the ids' cost is 64 bytes a token against the rows' 3 KiB. The early ids op is the
+         * layer's own `engram_ids` with `advance` 0: the window every layer hashes is the one the
+         * step opened with, and only the last Engram layer's own issue commits it (P-06), so an
+         * early hash must not move it. The prefetch gather names its ids as its ahead list: that
+         * alias is the host kernel's signal to hand the rows to its reader thread and read
+         * nothing here (avx_ngram.cpp's prefetch mode). */
+        if (wire.pf && l != hist_layer) {
+            /* PERSIST, not TRANSIENT: these planes are written and read at the step's start,
+             * which is not where their ops are declared, so their declared lifetimes say nothing
+             * about when their bytes are live -- the packer could alias them with a per-layer
+             * host transient whose async device writer overlaps the host prefetch's read.
+             * Sharing nothing costs ~75 MB of host arena at max_tok and removes the class. */
+            pf_ids = decl_b(b, nm.f("eg.pf_ids.%d", l), RAD_I32, { T, H }, RAD_BUF_PERSIST,
+                            RAD_DOMAIN_HOST);
+            pf_mask = decl_b(b, nm.f("eg.pf_mask.%d", l), RAD_I32, { T }, RAD_BUF_PERSIST,
+                             RAD_DOMAIN_HOST);
+            pf_rows = decl_b(b, nm.f("eg.pf_rows.%d", l), RAD_BF16, { T, W }, RAD_BUF_PERSIST,
+                             RAD_DOMAIN_HOST);
+            if (!pf_ids || !pf_mask || !pf_rows) return RAD_E_INVAL;
+            const RadParam ps_pf[] = { RAD_RANGE("M", 1, T), RAD_INT("heads", H),
+                                       RAD_INT("ngram", s.engram_ngram),
+                                       RAD_INT("pad", s.engram_pad),
+                                       RAD_INT("map_size", s.engram_map),
+                                       RAD_INT("image", s.image_token),
+                                       RAD_INT("video", s.video_token), RAD_INT("advance", 0) };
+            const rad_weight ws_pf[4] = { map, mult, vsz, off };
+            /* One op serves both layouts (the kernel branches on `num_accepted`); the prefill
+             * form's `ahead_ids` is not bound -- the early hash reads no following prompt. */
+            op_ids_pf = rw(b, rad_decl_op(b, "engram_ids", ps_pf, 8, ws_pf, 4), {},
+                           { pf_ids, pf_mask });
+            HY4_NEED(op_ids_pf, "engram_ids (the step-start prefetch)");
+            const rad_weight wg_pf[2] = { table, table_scale };
+            const RadParam pg_pf[] = { RAD_RANGE("M", 1, T * H), RAD_INT("n_embd", HD),
+                                       RAD_INT("n_vocab", rows), RAD_STR("dtype", "bf16") };
+            op_gather_pf = rw(b, rad_decl_op(b, "embed_lookup_q", pg_pf, 4, wg_pf,
+                                             table_bf16 ? 1 : 2), { pf_ids, pf_ids }, { pf_rows });
+            HY4_NEED(op_gather_pf, "embed_lookup_q (the step-start prefetch)");
+            wire.pf->push_back(this);
+        }
+
         /* engram_out: the residual the add made, the streams after it less a copy before it. */
         if (taps_on()) {
             RAD_ARCH_TRY(t_out.declare(b, nm, T, "engram_out", l, RAD_BF16, s.hc * E, w.before));
@@ -439,7 +504,57 @@ struct Engram {
             RAD_ISSUE_N(c, op_tap_mul, T, brows(w.before, T), brows(w.m1, T), brows(w.before, T));
             RAD_ISSUE_N(c, op_tap_add, T, brows(h, T), brows(w.before, T), brows(t_out.buf, T));
         }
+        /* M-18b: this is the step's start for the layers behind this one -- their tokens are the
+         * step's own, so hash their ids now and hand their row reads to the host reader. A
+         * disk-placed layer's read (the card's ~3/6/9 ms a layer at decode) then runs behind the
+         * layers in front of it instead of in front of the layer it belongs to, and that layer's
+         * own gather finds the rows claimed or ready. Only the first Engram layer issues for the
+         * rest (the ascending order means it is the first to run); only for host-placed tables
+         * (a device gather reads rows over the link and needs no reader); and nothing here
+         * changes a buffer the step's own ops read, so the outputs are untouched. */
+        if (w.pf && layer == hist_layer && !prefetch_off())
+            for (Engram* e : *w.pf)
+                if (rad_op_domain(c, e->op_gather) == RAD_DOMAIN_HOST) e->issue_pf(c, batch);
         return true;
+    }
+
+    /* M-18b: this layer's ids and their row reads, issued at the step's start by the first Engram
+     * layer's step. The window is the one the step opened with (`advance` 0 -- the last layer's
+     * own issue still commits it), the ids land in this layer's own planes, and the gather issue
+     * names them as its ahead list: the host gather that knows the row cache (libavx's prefetch
+     * mode) hands them to its reader thread and reads nothing; one that does not reads the rows
+     * into pf_rows, which nothing reads, and the layer's own gather behind this one hits the
+     * cache either way. Both layouts ride the same op (the kernel branches on `num_accepted`);
+     * the early hash reads no following prompt, so no `ahead_ids` operand. */
+    void issue_pf(RadCtx* c, const RadBatch* batch) const {
+        const int64_t T = batch->n_tok, S = batch->n_seq, H = s.engram_heads;
+        const RadKVGroupBatch* hb = kv_batch(batch, hist);
+        const int32_t* sidx = hb ? hb->state_index : nullptr;
+        const int64_t pitch = hb && hb->state_index_pitch > 0 ? hb->state_index_pitch : 1;
+        if (!sidx || hashless) return;   /* step() refuses those by name */
+        int64_t D = 0, DT = 0;
+        batch_split(batch, &D, &DT);
+        const int64_t P = S - D;
+        const RadOperand tok = praw(batch->token_ids, RAD_I32, T);
+        const RadOperand pos = praw(batch->positions, RAD_I32, T);
+        if (D > 0) {
+            RadOperand sd = praw2(sidx, RAD_I32, D, pitch);
+            sd.cols = 1;
+            RAD_ISSUE_N(c, op_ids_pf, T, tok, kv_cache(hist, hist_layer),
+                        praw(batch->cu_seqlens, RAD_I32, D + 1), pos, RAD_W(map), RAD_W(mult),
+                        RAD_W(vsz), RAD_W(off), praw(batch->num_accepted, RAD_I32, D), sd,
+                        brows(pf_ids, T), brows(pf_mask, T));
+        }
+        if (P > 0) {
+            RadOperand sp = praw2(sidx + D * pitch, RAD_I32, P, pitch);
+            sp.cols = 1;
+            RAD_ISSUE_N(c, op_ids_pf, T, tok, kv_cache(hist, hist_layer),
+                        praw(batch->cu_seqlens + D, RAD_I32, P + 1), pos, RAD_W(map), RAD_W(mult),
+                        RAD_W(vsz), RAD_W(off), RAD_NONE, sp, brows(pf_ids, T), brows(pf_mask, T));
+        }
+        RAD_ISSUE_N(c, op_gather_pf, T * H, brows(pf_ids, T), RAD_W(table),
+                    table_bf16 ? RAD_NONE : RAD_W(table_scale), brows(pf_rows, T),
+                    brows(pf_ids, T));
     }
 };
 
