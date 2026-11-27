@@ -887,6 +887,88 @@ TEST(a_decode_only_step_folds_the_query_rotary_into_the_sinks) {
     CHECK_EQ(mixed.bare, 3);
 }
 
+/* F-16, LOSSY and opt-in: RADIANCE_HY4_SINK_SC=64 puts the sinks' super-chunk at window 0 and in
+ * the selection form at 64 tokens in place of the law's 128. The switch is the sink's alone: with
+ * it every sink op carries `sink_sc` 64 (one parameter, once), and no other op gains, loses or
+ * changes a parameter; unset, or any other value, leaves every op as it was. */
+TEST(the_sink_super_chunk_switch_is_the_sinks_alone) {
+    /* op name, then every parameter as `key=value` (the integer form, which is what sink_sc is). */
+    auto snapshot = [](const RadBuilder& b) {
+        std::vector<std::string> s;
+        for (const auto& o : b.ops) {
+            std::string line = o.op;
+            for (const auto& p : o.p)
+                line += " " + p.key + "=" + std::to_string(p.ival) + "/" +
+                        std::to_string(p.dval) + "/" + p.sval;
+            s.push_back(line);
+        }
+        return s;
+    };
+    auto sinks = [](const RadBuilder& b, int& paged, int& sel) {
+        std::vector<const RecOp*> v;
+        for (const auto& o : b.ops) {
+            if (o.op == "mla_attn_paged_sink") ++paged;
+            else if (o.op == "mla_attn_sel_sink") ++sel;
+            else continue;
+            v.push_back(&o);
+        }
+        return v;
+    };
+    unsetenv("RADIANCE_HY4_SINK_SC");
+    Declared off;
+    REQUIRE_EQ(off.rc, RAD_OK);
+    int paged_off = 0, sel_off = 0;
+    const auto sinks_off = sinks(off.b, paged_off, sel_off);
+    /* The model's sinks: the sparse layers through the selection form, the sliding ones through the
+     * paged instance, plus the verify's instances. */
+    CHECK(paged_off > 0);
+    CHECK(sel_off > 0);
+    for (const RecOp* o : sinks_off) CHECK(param(o, "sink_sc") == nullptr);
+    const std::vector<std::string> before = snapshot(off.b);
+
+    setenv("RADIANCE_HY4_SINK_SC", "64", 1);
+    Declared on;
+    unsetenv("RADIANCE_HY4_SINK_SC");
+    REQUIRE_EQ(on.rc, RAD_OK);
+    int paged_on = 0, sel_on = 0;
+    const auto sinks_on = sinks(on.b, paged_on, sel_on);
+    CHECK_EQ(paged_on, paged_off);
+    CHECK_EQ(sel_on, sel_off);
+    for (const RecOp* o : sinks_on) {
+        int n = 0;
+        for (const auto& p : o->p) n += p.key == "sink_sc";
+        CHECK_EQ(n, 1);
+        const RecParam* p = param(o, "sink_sc");
+        REQUIRE(p != nullptr);
+        CHECK_EQ(p->ival, 64);
+    }
+    /* Every op, in the declaration's order, and every parameter of it, save the one parameter this
+     * switch adds to the sinks: the switch moves nothing else. */
+    const std::vector<std::string> after = snapshot(on.b);
+    REQUIRE_EQ(after.size(), before.size());
+    for (size_t i = 0; i < after.size(); ++i) {
+        std::string want = before[i];
+        bool is_sink = false;
+        for (const RecOp* o : sinks_off) is_sink = is_sink || o == &off.b.ops[i];
+        if (!is_sink) {
+            CHECK(after[i] == want);
+            continue;
+        }
+        /* the same op, with `sink_sc=64/0/` appended to the parameters it had */
+        CHECK_EQ(after[i], want + " sink_sc=64/0.000000/");
+    }
+    /* Another value, and an empty one: the law, with no parameter at all. */
+    for (const char* v : { "0", "128", "64 ", "" }) {
+        setenv("RADIANCE_HY4_SINK_SC", v, 1);
+        Declared d;
+        unsetenv("RADIANCE_HY4_SINK_SC");
+        REQUIRE_EQ(d.rc, RAD_OK);
+        int paged = 0, sel = 0;
+        for (const RecOp* o : sinks(d.b, paged, sel)) CHECK(param(o, "sink_sc") == nullptr);
+        CHECK(snapshot(d.b) == before);
+    }
+}
+
 /* #74 review, point 1: the tail's capacity counts the three rotary planes exactly when the
  * derivation writes them, which is when the step carries rope_pos: the core hands it to a program
  * that declares an encoder (batch.cpp, mm_on_). Served tower: an encoder, five planes; declared

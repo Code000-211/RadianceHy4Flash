@@ -3449,6 +3449,19 @@ ihc_pre (hc_head), rmsnorm (output_norm), gather_rows, logits_gemm
   plain `rmsnorm_ihc_junction`) unless `RADIANCE_HY4_JUNCTION_TP4=1`; `RADIANCE_HY4_JUNCTION=0`
   keeps the unfused chain everywhere. By-value kernel-argument structs of the wide all-reduce
   family are padding-free (a recorded pass's audit compares argument bytes).
+- **The sinks' super-chunk** (F-16, LOSSY and opt-in). `mla_attn_paged_sink` at window 0 and
+  `mla_attn_sel_sink` cut the row's range into slots of 128 tokens (`kShiftFull`), each walked in
+  16-token chunks, so a decode row's time is the longest slot's chunks. `RADIANCE_HY4_SINK_SC=64`
+  passes `sink_sc` 64 to every sink op, which cuts that super-chunk to 64 tokens: 40 slots over the
+  law's 2560-token table in place of 20, and twice the partials' scratch (126 MB a card at 32 heads
+  and 48 rows at TP1, half that at TP2; on when the switch is). Every boundary of the 128-token law
+  is one of the 64-token law's, so the switched law still is the law -- the paged form at window 0
+  equals the selection form, a row's bytes are its own, the fused and split forms agree, the launch
+  stays inside the f64 reference's bound -- and what it moves is the fold's order: the output's last
+  bits (32 of 24 576 values in the emulator, 1.2e-4 at most). A window's own super-chunk is 64
+  either way and does not move. Off by default; the KL it costs is
+  `notes/backlog/lossy/F-16.md`'s. Any value but 64 is refused by the sink (`RAD_E_UNSUPPORTED`)
+  rather than run as one of the two laws.
 - **Arena levels and the prefill stager.** The probe sets `shape_probe_ok`, and a sizing declare
   (`RadBuildCtx::shape_probe`) fills a thread-local model of its own, so the core declares again at
   256 and 1024 rows (4x steps below the chunk), lends the arena above a level to the expert slab

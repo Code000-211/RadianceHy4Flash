@@ -445,6 +445,9 @@ struct Attn {
                     ps.push_back(RAD_STR("rope_mode", "gptj"));
                 }
             }
+            /* F-16, opt-in: 64-token super-chunks at window 0 and in the selection form when
+             * RADIANCE_HY4_SINK_SC names them (unset: the law's 128, and no parameter at all). */
+            if (const int64_t sc = sink_sc()) ps.push_back(RAD_INT("sink_sc", sc));
             return ps;
         };
         auto paged_op = [&](int64_t rows, int stable, std::initializer_list<rad_buf> in) {

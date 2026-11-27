@@ -378,6 +378,17 @@ inline bool router_fuse_on() {
     return !(e && *e && std::strcmp(e, "0") == 0);
 }
 
+/* F-16, LOSSY and opt-in: the sinks' super-chunk at window 0 and in the selection form is 128 tokens
+ * in the law (libr4d/r4d_mla_sink.hip); RADIANCE_HY4_SINK_SC=64 cuts it to 64 there, which halves
+ * the chunks the longest slot of a decode row walks and doubles the slots of the same range -- and
+ * so the partials' scratch. It meets every boundary the 128-token law meets, so what it moves is the
+ * fold's order, the output's last bits. The KL it costs is notes/backlog/lossy/F-16.md's. Any other
+ * value, or none, is the law. A window's own super-chunk is 64 either way. */
+inline int64_t sink_sc() {
+    const char* e = std::getenv("RADIANCE_HY4_SINK_SC");
+    return e && std::strcmp(e, "64") == 0 ? 64 : 0;
+}
+
 /* The int8 codes a stored linear reads: none for a plain bf16 (or unknown) weight, else its K-wise
  * scale group and whether they are in the rotated (Hadamard) domain. */
 struct CodeForm {

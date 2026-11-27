@@ -817,7 +817,10 @@ struct Dfly {
                            { RAD_RANGE("M", 1, Md), RAD_INT("heads", H), RAD_INT("latent_dim", L),
                              RAD_INT("rope_dim", RO), RAD_INT("blocks", W),
                              RAD_INT("block_size", s.ix_pool), RAD_F64("scale", scale),
-                             RAD_STR("dtype", "bf16") },
+                             RAD_STR("dtype", "bf16"),
+                             /* F-16, opt-in: the drafter's sink takes the same super-chunk at
+                              * window 0 and in the selection form as the model's. */
+                             RAD_INT("sink_sc", sink_sc()) },
                            { d.sinks }, { q_lat, q_rope, d.tab, d.len }, { lat });
             d.op_expand = proj("expand", lat, ao);
             d.op_gmul = mk(b, "gate_mul",
