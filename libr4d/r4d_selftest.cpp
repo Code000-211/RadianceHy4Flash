@@ -36172,16 +36172,16 @@ static void hy4_mla_project_kv_case(const Plugin& pl) {
                 t.stride[0] = pitch;
                 return t;
             };
-            auto prm = [&](int64_t m, long long mb, long long chain, bool gate) {
+            auto prm = [&](int64_t m, long long mb, long long chain, bool gate, long long stage) {
                 std::vector<RadParam> ps = { PI("M", m), PI("heads", H), PI("k_dim", kd), PI("v_dim", vd),
                                              PI("latent_dim", L), PS("dtype", "bf16"), PI("mb", mb),
-                                             PI("chain", chain) };
+                                             PI("chain", chain), PI("stage", stage) };
                 if (!gate) ps.push_back(PS("mode", mode));
                 return ps;
             };
             /* y of rows [r0, r0 + m) through `r`, packed on the host */
             auto launch = [&](const RadKernelInfo* r, int64_t r0, int64_t m, long long mb, long long chain,
-                              bool pitched, bool gate) {
+                              bool pitched, bool gate, long long stage = 0) {
                 const int64_t xp = pitched ? XW + 3 : XW, wp = pitched ? L + 3 : L,
                               gp = pitched ? GW + 3 : GW, ypt = pitched ? YW + 3 : YW;
                 uint16_t* y = (uint16_t*)dalloc((size_t)(m * ypt + 8) * 2) + (pitched ? 1 : 0);
@@ -36189,7 +36189,7 @@ static void hy4_mla_project_kv_case(const Plugin& pl) {
                                               T2(pitched ? pw : dw, WR, L, wp) };
                 if (gate) ts.push_back(T2((pitched ? pg : dg) + r0 * gp, m, GW, gp));
                 ts.push_back(T2(y, m, YW, ypt));
-                std::vector<RadParam> ps = prm(m, mb, chain, gate);
+                std::vector<RadParam> ps = prm(m, mb, chain, gate, stage);
                 run_case(r, ts, ps);
                 std::vector<uint16_t> o((size_t)(m * YW)), rowb((size_t)ypt);
                 for (int64_t i = 0; i < m; ++i) {
@@ -36207,18 +36207,19 @@ static void hy4_mla_project_kv_case(const Plugin& pl) {
             std::string where;
             for (const long long chain : { 0, 1 })
                 for (const long long mb : { 0, 1, 2, 4, 8 })
-                    for (const int64_t m : { M, (int64_t)9 }) {
-                        const auto o = launch(row, 0, m, mb, chain, false, false);
-                        if (!std::equal(o.begin(), o.end(), alone.begin())) {
-                            same = false;
-                            where = fmt("M %lld mb %lld chain %lld", (long long)m, mb, chain);
+                    for (const long long stage : { 0, 1 })   /* K-50: the staged expansion (0) and kvp_body's (1) */
+                        for (const int64_t m : { M, (int64_t)9 }) {
+                            const auto o = launch(row, 0, m, mb, chain, false, false, stage);
+                            if (!std::equal(o.begin(), o.end(), alone.begin())) {
+                                same = false;
+                                where = fmt("M %lld mb %lld chain %lld stage %lld", (long long)m, mb, chain, stage);
+                            }
                         }
-                    }
             const auto tail = launch(row, 5, M - 5, 0, 0, false, false);
             if (!std::equal(tail.begin(), tail.end(), alone.begin() + 5 * YW)) { same = false; where = "rows 5.."; }
             const auto pit = launch(row, 0, M, 0, 0, true, false);
             if (pit != alone) { same = false; where = "pitched"; }
-            ok(fmt("mla_project_kv %s heads %lld: a token's bytes do not depend on M, mb, the chained form or "
+            ok(fmt("mla_project_kv %s heads %lld: a token's bytes do not depend on M, mb, stage, the chained form or "
                    "the operand layout", mode, (long long)H).c_str(), same, where);
             if (ab) continue;
             /* the fused gate against gate_mul over the expansion */
@@ -36234,11 +36235,15 @@ static void hy4_mla_project_kv_case(const Plugin& pl) {
             bool fsame = true;
             for (const long long chain : { 0, 1 })
                 for (const long long mb : { 0, 1, 4, 8 })
-                    for (const bool pitched : { false, true }) {
-                        if (pitched && (chain || mb)) continue;
-                        const auto o = launch(fused, 0, M, mb, chain, pitched, true);
-                        if (o != want) { fsame = false; where = fmt("mb %lld chain %lld%s", mb, chain, pitched ? " pitched" : ""); }
-                    }
+                    for (const long long stage : { 0, 1 })
+                        for (const bool pitched : { false, true }) {
+                            if (pitched && (chain || mb || stage)) continue;
+                            const auto o = launch(fused, 0, M, mb, chain, pitched, true, stage);
+                            if (o != want) {
+                                fsame = false;
+                                where = fmt("mb %lld chain %lld stage %lld%s", mb, chain, stage, pitched ? " pitched" : "");
+                            }
+                        }
             const auto o9 = launch(fused, 0, 9, 0, 1, false, true);
             if (!std::equal(o9.begin(), o9.end(), want.begin())) { fsame = false; where = "M 9 chained"; }
             ok(fmt("mla_expand_gate heads %lld == mla_project_kv expand + gate_mul, bit for bit", (long long)H).c_str(),

@@ -703,7 +703,8 @@ extern "C" int r4d_fuse_qkv_norm_rope_kv_store(const RadParam* p, int n_p, uint6
 
 /* ==========================================================================================
  * mla_expand_gate -- mla_project_kv's expand, then gate_mul over its output.
- * (row: mla_expand_gate_bf16; kernel: libr4d/r4d_mla_kv_bf16.hip, kv_project_wmma with GATE)
+ * (row: mla_expand_gate_bf16; kernel: libr4d/r4d_mla_kv_bf16.hip, kv_project_wmma with GATE, or
+ *  kv_expand_staged with GATE at four token tiles, aligned, unchained, `stage` not 1)
  *
  * Operands: [0] x  [1] w  [2] g  [3] y
  *

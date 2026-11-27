@@ -6736,8 +6736,13 @@ static const RadConstraint cLogitsVocab[] = { C_DIV("n_embd", 256), C_IN("dtype"
  * computes every output element with the same WMMAs in the same order (a token's bytes depend on
  * its own row only), so the axis moves time, not bits (tests/r4d_emu/test_mla_kv.cpp walks it). */
 static const int64_t kMlaKvMb[] = { 0, 1, 2, 4, 8 };
+/* stage (expand only, K-50): 0 = the workgroup that takes four token tiles on the aligned unchained
+ * form stages their latent block in LDS once for four column tiles; 1 = every workgroup loads it
+ * itself (the A/B arm). Bit-neutral like mb. */
+static const int64_t kMlaKvStage[] = { 0, 1 };
 static const RadTunable tMlaKv[] = {
   { "mb", kMlaKvMb, NELEM(kMlaKvMb), 0, "16-token tiles a wave shares each kv_b fragment over; 0 = by M (1 up to 16 rows, 4 past them)" },
+  { "stage", kMlaKvStage, NELEM(kMlaKvStage), 0, "expand at four token tiles: 0 = stage the tokens' latent block in LDS once for four column tiles, 1 = each workgroup loads it itself" },
 };
 
 /* The prefetch's workgroups. It runs beside a collective or a latency-bound kernel and should fill
