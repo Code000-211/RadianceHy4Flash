@@ -2730,10 +2730,11 @@ constexpr long long kPrefillCols = 128;
  *      decode form      804    900    1006   1113   1541   2224
  *      prefill form     826    900     981   1053   1247   1413
  *
- * So the band is T <= 1.5 * n_expert (768 rows here). Decode is at most
+ * So the band is T <= 1.5 * n_expert (768 rows here; rad_w2_in_band, which W2 reads too). Decode is at most
  * `max_num_seqs * (1 + n_spec) * top_k` (320 rows at eight sequences, depth 3, top 10). */
 static inline bool r4d_moe_decode_band(long long T, long long n_expert) {
-    return 2 * T <= 3 * n_expert;
+    /* abi/rad_w2.h holds the rule, because W2 takes its form only inside the band (issue #324) */
+    return rad_w2_in_band(T, n_expert) != 0;
 }
 /* Row limit, per weight format, for staging two 128-wide K blocks per pass (FK 256) in the decode
  * form of the token-operand projection (gate_up). Only formats that already fold scale groups
