@@ -153,6 +153,9 @@ its exact all-reduce and the norm the next layer reads -- on the step's second l
 other piece's expert GEMMs. It needs a step of exactly one checkpoint interval, which is why the
 batch is two intervals wide and the span runs them as two steps; pieces under 1024 rows are not
 cut (`RADIANCE_HY4_PIPE_ROWS` moves that floor, `RADIANCE_HY4_PIPE_LANE` the lane).
+`RADIANCE_HY4_PIPE_ATTN=1` (with the pipeline) cuts the attention core into the same two pieces,
+so piece 0's attention junction rides the second lane beside piece 1's attention instead of
+waiting; the output is the same bytes (`notes/backlog/measurements/P-17.md`).
 
 Measured at these settings on four R9700 (32 GB each, 210 W a card), a 10948-token prompt, three
 warm runs a config:

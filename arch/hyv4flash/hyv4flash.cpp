@@ -134,6 +134,21 @@ inline void pipe_issue(RadCtx* c, const std::function<void()>& fn) {
 inline void pipe_join(RadCtx* c) {
     if (pipe_lane()) pipe_wait1(c);
 }
+/* P-17: RADIANCE_HY4_PIPE_ATTN=1 runs the attention core in the pipeline's pieces as well
+ * (Attn::core_piece), so piece 0's attention junction rides lane 1 beside piece 1's attention instead
+ * of running exposed. Off unless set; it needs the pipeline (RADIANCE_HY4_PIPE=1). */
+inline bool pipe_attn_on() {
+    const char* e = std::getenv("RADIANCE_HY4_PIPE_ATTN");   /* read once a step */
+    return e && *e && e[0] == '1';
+}
+/* The cut's rows are one sequence's consecutive positions (the bounds below take n0 from them). */
+inline bool pipe_positions_run(const RadBatch* batch, int64_t T) {
+    const int32_t* ph = batch->positions_h;
+    if (!ph || !batch->positions || T < 2) return false;
+    for (int64_t i = 1; i < T; ++i)
+        if (ph[i] != ph[0] + i) return false;
+    return true;
+}
 /* One line per process when the pipeline first runs, so a log says which prefill shape took it. */
 inline bool& pipe_said() {
     static bool said = false;
@@ -215,6 +230,11 @@ struct Model {
      * half (the junction's narrow reduction exists, the buffers are concurrent); the step adds the
      * per-batch half. */
     bool pipe_on = false;
+    /* P-17 (RADIANCE_HY4_PIPE_ATTN): the attention core in the pipeline's two pieces too, so piece
+     * 0's junction rides lane 1 beside piece 1's attention. The bounds plane and its two launches,
+     * issued once a step (pipe_cut). */
+    PieceCut cut{};
+    rad_op op_cut_fill = 0, op_cut_sub = 0;
 };
 static std::unique_ptr<Model> models[MAX_SLOTS];
 /* Where a sizing declare goes (RadBuildCtx::shape_probe): the engine declares again at smaller step
@@ -741,7 +761,18 @@ static int buffers(RadBuilder* b, Model& m) {
         (s.is_sliding[(size_t)l] ? any_sliding : any_sparse) = true;
         (s.is_moe[(size_t)l] ? any_moe : any_dense) = true;
     }
-    m.cu_prefill = decl_b(b, nm.f("cu_prefill"), RAD_I32, { g.max_seqs + 1 });
+    /* P-17: with RADIANCE_HY4_PIPE_ATTN at more than one rank, the attention pieces' bounds
+     * (PieceCut) are eight more ints behind the rebased bounds: every attention launch that reads a
+     * piece's bounds reads w.cu_p already, so the plane's planned life covers them, and no other
+     * buffer is added (a PERSIST one moved every activation of the arena by its alignment and cost
+     * the switch-off path its speed). */
+    const bool cut_on = g.world > 1 && pipe_attn_on();
+    m.cu_prefill = decl_b(b, nm.f("cu_prefill"), RAD_I32,
+                          { g.max_seqs + 1 + (cut_on ? PieceCut::kSlots : 0) });
+    if (cut_on) {
+        m.cut.buf = m.cu_prefill;
+        m.cut.base = g.max_seqs + 1;
+    }
     if (!m.cu_prefill) return RAD_E_INVAL;
     if (any_sparse)
         RAD_ARCH_TRY(m.aw_sparse.declare(b, nm, s, s.sparse_r, T, m.cu_prefill, "sparse"));
@@ -1138,6 +1169,16 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     /* P-04: one rebase a step for every layer's prefill attention, declared where step() issues it. */
     m.op_rebase = mk(b, "sub_i32", { RAD_RANGE("M", 1, g.max_seqs + 1) }, {}, {}, { m.cu_prefill });
     HY4_NEED(m.op_rebase, "sub_i32");
+    /* P-17: the two launches that write the pieces' bounds (buffers() put them behind the rebased
+     * bounds), declared where step() issues them, with the switch only, so the sizing declare is the
+     * same with the pipeline on and off. A library without the rows leaves the attention whole. */
+    if (m.cut.buf) {
+        m.op_cut_fill = optional_op(b, mk(b, "fill", { RAD_RANGE("M", 1, 1), RAD_INT("n", PieceCut::kSlots),
+                                                      RAD_STR("dtype", "i32") },
+                                          {}, {}, { m.cu_prefill }));
+        m.op_cut_sub = optional_op(b, mk(b, "sub_i32", { RAD_RANGE("M", 1, 1) }, {}, { m.cu_prefill },
+                                         { m.cu_prefill }));
+    }
     RAD_ARCH_TRY(m.t_embed.declare(b, nm, T, "embed", -1, RAD_BF16, E, m.x0));
 
     if (!s.engram_layers.empty()) {
@@ -1216,6 +1257,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
      * heads split) and pools the whole indexer keys, so the host tier keeps each paged group once
      * a slot (WP16.0c). The sliding window's latent is the same rows. The indexer's raw-key tail
      * (LINEAR) and the Engram history (CONV) travel in the checkpoint store and stay per rank. */
+    m.cut.groups[0] = m.kv_sparse;
+    m.cut.groups[1] = m.kv_sliding;
     if (m.kv_sparse) RAD_ARCH_TRY(rad_kv_group_replicated(b, m.kv_sparse));
     if (m.kv_sliding) RAD_ARCH_TRY(rad_kv_group_replicated(b, m.kv_sliding));
     if (m.kv_index) RAD_ARCH_TRY(rad_kv_group_replicated(b, m.kv_index));
@@ -1412,6 +1455,28 @@ static void step(RadCtx* c, const RadBatch* batch) {
                     brows(m.cu_prefill, p.P + 1));
     }
 
+    /* P-17: the attention pieces' bounds (PieceCut), once a step on a step the pipeline cuts, all on
+     * lane 0 ahead of the layers: zeros, n0 = positions[n0] - positions[0] (the cut lies inside one
+     * sequence's consecutive positions), n1 = T - n0 from the rebased bounds, and per cache group its
+     * seqused less n1. Device values, because one program serves every step height. */
+    PieceCut cut = m.cut;
+    const bool attn_pieces = pipe && pipe_attn_on() && m.op_cut_fill && m.op_cut_sub && cut.buf &&
+                             p.D == 0 && p.P == 1 && p.T == T && pipe_positions_run(batch, T);
+    if (attn_pieces) {
+        cut.n0 = n0;
+        cut.n1 = n1;
+        auto slot = [&](int64_t k) { return brow_slice(cut.buf, cut.base + k, 1, 1); };
+        RAD_ISSUE_N(c, m.op_cut_fill, 1, brow_slice(cut.buf, cut.base, PieceCut::kSlots, 1));
+        RAD_ISSUE_N(c, m.op_cut_sub, 1, praw(batch->positions + n0, RAD_I32, 1),
+                    praw(batch->positions, RAD_I32, 1), slot(1));
+        RAD_ISSUE_N(c, m.op_cut_sub, 1, brow_slice(m.cu_prefill, 1, 1, 1), slot(1), slot(3));
+        for (int k = 0; k < 2; ++k) {
+            const auto* kb = cut.groups[k] ? kv_batch(batch, cut.groups[k]) : nullptr;
+            if (kb && kb->seqused)
+                RAD_ISSUE_N(c, m.op_cut_sub, 1, praw(kb->seqused, RAD_I32, 1), slot(3), slot(4 + k));
+        }
+    }
+
     /* A junction (WP16.2) runs the chain from a block's reduction to the next block's input norm
      * in one launch; the taps behind it read what the chain would have left. */
     RadBatch compact{};
@@ -1483,9 +1548,27 @@ static void step(RadCtx* c, const RadBatch* batch) {
         if (!l.sliding) m.df.snap_step(c, (int)i, m.iw, lp.select, rows, direct);
         const bool jm = (bool)l.j_mid;
         const bool je = (bool)l.j_end;
-        l.attn.core(c, batch, lp, direct ? so.sel : m.iw.sel, m.iw.len,
-                    direct ? so.nsel : m.iw.nsel, jm, queries, rows,
-                    direct ? so.first : 0, direct ? so.first : 0);
+        /* P-17: core(0), then piece 0's junction on lane 1 beside core(1); the pipeline below joins
+         * it before piece 1's junction and piece 0's arms (which read what it wrote). */
+        const bool split = attn_pieces && pipe && jm && je && !rows.ids &&
+                           l.attn.piece_ok(batch, lp, rows, cut);
+        if (split) {
+            const rad_buf sel = direct ? so.sel : m.iw.sel;
+            const int64_t sel0 = direct ? so.first : 0;
+            l.attn.core_piece(c, batch, lp, sel, m.iw.len, cut, 0, sel0);
+            pipe_issue(c, [&] { l.j_mid.step(c, 0, n0, pipe_lane()); });
+            l.attn.core_piece(c, batch, lp, sel, m.iw.len, cut, 1, sel0);
+            static bool said = false;
+            if (!said) {
+                said = true;
+                fprintf(stderr, "hyv4flash: pipelined prefill, attention in pieces (%lld + %lld rows)\n",
+                        (long long)n0, (long long)n1);
+            }
+        } else {
+            l.attn.core(c, batch, lp, direct ? so.sel : m.iw.sel, m.iw.len,
+                        direct ? so.nsel : m.iw.nsel, jm, queries, rows,
+                        direct ? so.first : 0, direct ? so.first : 0);
+        }
         if (rows.ids)
             rows.spans([&](int64_t src, int64_t dst, int64_t n) {
                 move_rows(c, m.pack_h, m.tr.h, s.hc * E, src, dst, n);
@@ -1529,7 +1612,7 @@ static void step(RadCtx* c, const RadBatch* batch) {
                 fprintf(stderr, "hyv4flash: pipelined prefill, %lld + %lld rows\n", (long long)n0,
                         (long long)n1);
             }
-            pipe_issue(c, [&] { l.j_mid.step(c, 0, n0, pipe_lane()); });
+            if (!split) pipe_issue(c, [&] { l.j_mid.step(c, 0, n0, pipe_lane()); });
             pipe_join(c);
             pipe_issue(c, [&] { l.j_mid.step(c, n0, n1, pipe_lane()); });
             l.ffn.body(c, rows.n, 0, n0);

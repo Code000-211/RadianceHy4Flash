@@ -2928,6 +2928,156 @@ TEST(the_pipelined_prefill_pieces_are_the_whole_steps_junctions) {
     g3_fusions = g3;
 }
 
+/* P-17 (#301): the attention core in the pipeline's two pieces (RADIANCE_HY4_PIPE_ATTN=1), run
+ * card-less at 128 rows cut 64 + 64, fresh (the sliding layer's dense form, the sparse layers'
+ * selection) and behind a 96-token cached prefix (the paged form), at two and four ranks:
+ *  - with the switch the declare is the same with the pipeline on and off, op for op (sizing), and
+ *    without it the bounds and their two launches are not declared at all;
+ *  - every attention launch of the step is a 64-row piece on lane 0, and lane 1 runs exactly what it
+ *    runs without the split (only junction pieces);
+ *  - each piece's bounds, replayed from the step's own integer launches (IntReplay), put its first
+ *    query at its own position: the paged form's `used - qlen` at positions[r0], the dense form's
+ *    `n - m` at key r0 over keys from row 0, the selection form's tables at row r0;
+ *  - no two issues the lanes may run at once touch the same elements with one writing (lane_races),
+ *    with the split and without; every buffer lane 1 touches is named (lane1_unnamed); lint clean;
+ *  - with the switch off the attention runs whole, as before. */
+TEST(the_attention_pieces_bound_each_piece_at_its_own_rows) {
+    const bool g3 = g3_fusions;
+    g3_fusions = true;
+    setenv("RADIANCE_HY4_PIPE_MIN", "64", 1);
+    setenv("RADIANCE_HY4_PIPE_ROWS", "64", 1);
+    auto declare = [](RadBuilder& b, MetaKV& mk, int world, bool pipe) {
+        if (pipe) setenv("RADIANCE_HY4_PIPE", "1", 1);
+        else unsetenv("RADIANCE_HY4_PIPE");
+        setenv("RADIANCE_HY4_PIPE_ATTN", "1", 1);   /* the bounds plane is declared with the switch */
+        pipe_i8_encs(&b);
+        RadBuildCtx ctx = build_ctx(0, world);
+        G3Env g3env;
+        const int rc = hyv4flash::declare(&b, mk.meta(), &ctx);
+        unsetenv("RADIANCE_HY4_PIPE");
+        unsetenv("RADIANCE_HY4_PIPE_ATTN");
+        return rc;
+    };
+    /* the rebased bounds plane's extent: the pieces' eight bounds ride behind its entries */
+    auto cu_rows = [](const RadBuilder& b) {
+        for (const RecBuf& r : b.bufs)
+            if (r.name.size() >= 10 && r.name.compare(r.name.size() - 10, 10, "cu_prefill") == 0)
+                return r.d.shape[0];
+        return (int64_t)0;
+    };
+    auto is_attn = [](const RecOp* o) {
+        return o && (o->op == "mla_attn_paged_sink" || o->op == "mla_attn_sel_sink" ||
+                     o->op == "attn_kv_sink");
+    };
+    auto pitch_of = [](const RadBuilder& b, rad_buf h) {
+        const RadBufDecl& d = b.bufs[h - 1].d;
+        int64_t p = 1;
+        for (uint32_t k = 1; k < d.rank; ++k) p *= d.shape[k];
+        return p;
+    };
+    auto lane1_ops = [](const RadCtx& c) {
+        std::vector<std::pair<rad_op, int64_t>> v;
+        for (const RecIssue& is : c.issues)
+            if (is.lane == 1) v.emplace_back(is.op, is.n);
+        return v;
+    };
+    for (int world : { 2, 4 })
+        for (int32_t prefix : { 0, 96 }) {
+            MetaKV mk = mini_meta(true, 128, 256);
+            RadBuilder whole, piped;
+            REQUIRE_EQ(declare(whole, mk, world, false), RAD_OK);
+            REQUIRE_EQ(declare(piped, mk, world, true), RAD_OK);
+            REQUIRE_EQ(whole.ops.size(), piped.ops.size());
+            REQUIRE_EQ(whole.bufs.size(), piped.bufs.size());
+            REQUIRE(cu_rows(piped) > 8);
+            auto run = [&](bool split) {
+                if (split) setenv("RADIANCE_HY4_PIPE_ATTN", "1", 1);
+                else unsetenv("RADIANCE_HY4_PIPE_ATTN");
+                auto k = kit(piped, {}, { 128 }, prefix);
+                k->b.positions_h = k->pos.data();
+                auto v = run_passes(piped, hyv4flash::step, { k.get() }, 0, world);
+                unsetenv("RADIANCE_HY4_PIPE_ATTN");
+                return std::make_pair(std::move(k), std::move(v));
+            };
+            auto off = run(false);
+            auto on = run(true);
+            CHECK_PASSES(piped, off.second);
+            CHECK_PASSES(piped, on.second);
+            const RadCtx& c0 = *off.second[0];
+            const RadCtx& c1 = *on.second[0];
+            const Kit& kt = *on.first;
+            /* the attention launches: whole without the switch, 64-row pieces on lane 0 with it */
+            int whole_attn = 0, pieces = 0, wrong = 0;
+            for (const RecIssue& is : c0.issues)
+                if (is_attn(piped.op_of(is.op))) whole_attn += is.n == 128;
+            CHECK(whole_attn > 0);
+            IntReplay rep;
+            rep.run(piped, c1, c1.issues.size());
+            std::map<rad_op, int64_t> sel_base;
+            for (const RecIssue& is : c1.issues) {
+                const RecOp* o = piped.op_of(is.op);
+                if (!is_attn(o)) continue;
+                if (is.n != 64 || is.lane != 0) {
+                    ++wrong;
+                    continue;
+                }
+                ++pieces;
+                const RadOperand& out = is.opd.back();
+                const int64_t r0 = out.offset / pitch_of(piped, out.handle);
+                CHECK(r0 == 0 || r0 == 64);
+                const RadOperand& q = is.opd[0];
+                CHECK_EQ(q.offset / pitch_of(piped, q.handle), r0);
+                if (o->op == "mla_attn_paged_sink") {
+                    const int64_t qlen = rep.at(piped, is.opd[5], 1) - rep.at(piped, is.opd[5], 0);
+                    const int64_t first = rep.at(piped, is.opd[4], 0) - qlen;
+                    CHECK_EQ(qlen, (int64_t)64);
+                    if (first != kt.pos[(size_t)r0])
+                        fprintf(stderr, "    world %d prefix %d: paged piece at row %lld sees position %lld, "
+                                "not %d\n", world, prefix, (long long)r0, (long long)first, kt.pos[(size_t)r0]);
+                    CHECK_EQ(first, (int64_t)kt.pos[(size_t)r0]);
+                } else if (o->op == "attn_kv_sink") {
+                    const int64_t m = rep.at(piped, is.opd[3], 1) - rep.at(piped, is.opd[3], 0);
+                    const int64_t nk = rep.at(piped, is.opd[4], 1) - rep.at(piped, is.opd[4], 0);
+                    CHECK_EQ(prefix, 0);
+                    CHECK_EQ(m, (int64_t)64);
+                    CHECK_EQ(nk - m, r0);
+                    CHECK_EQ(is.opd[1].offset, (int64_t)0);
+                    CHECK(is.opd[1].rows >= nk);
+                } else {
+                    /* the selection's tables at the piece's rows: `len` a row each, `sel` at its
+                     * window's base (P-09) plus r0 rows */
+                    CHECK_EQ(is.opd[4].offset, r0);
+                    const int64_t K = pitch_of(piped, is.opd[3].handle);
+                    if (!r0) sel_base[is.op] = is.opd[3].offset;
+                    else CHECK_EQ(is.opd[3].offset, sel_base[is.op] + r0 * K);
+                }
+            }
+            CHECK_EQ(wrong, 0);
+            CHECK_EQ(pieces, 2 * whole_attn);
+            CHECK(lane1_ops(c1) == lane1_ops(c0));
+            CHECK(!lane1_ops(c1).empty());
+            CHECK_EQ(report_lint(lane_races(piped, view(off.second))), (size_t)0);
+            CHECK_EQ(report_lint(lane_races(piped, view(on.second))), (size_t)0);
+            CHECK_EQ(report_lint(lane1_unnamed(piped, view(on.second))), (size_t)0);
+            /* last: a declare replaces the model the step runs */
+            {
+                RadBuilder plain;
+                setenv("RADIANCE_HY4_PIPE", "1", 1);
+                pipe_i8_encs(&plain);
+                RadBuildCtx ctx = build_ctx(0, world);
+                G3Env g3env;
+                REQUIRE_EQ(hyv4flash::declare(&plain, mk.meta(), &ctx), RAD_OK);
+                unsetenv("RADIANCE_HY4_PIPE");
+                CHECK_EQ(cu_rows(plain) + 8, cu_rows(piped));
+                CHECK_EQ(plain.bufs.size(), piped.bufs.size());
+                CHECK_EQ(plain.ops.size() + 2, piped.ops.size());
+            }
+        }
+    unsetenv("RADIANCE_HY4_PIPE_MIN");
+    unsetenv("RADIANCE_HY4_PIPE_ROWS");
+    g3_fusions = g3;
+}
+
 /* The Engram table as E4M3 rows under a bf16 or an f32 scale a row (hy4-flash-bf16.recipe,
  * hy4-flash-bf16-f32.recipe): the scale view at the stored dtype, no runtime round trip. */
 TEST(the_engram_table_takes_a_bf16_or_an_f32_row_scale) {
