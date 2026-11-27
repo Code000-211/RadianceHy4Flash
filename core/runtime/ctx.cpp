@@ -1530,10 +1530,21 @@ int Ctx::run_step(const RadBatch* b) {
     step_status_ = RAD_OK;
     step_fail_.clear();
     prof_n_      = 0;
+    /* A pass the stager armed for is issued live under a stager that publishes mid-pass
+     * (runtime/stager.h, before_op), so its tables keep the per-op path (issue.cpp,
+     * table_refresh). Every other pass has all of the step's residency changes already, the sync
+     * above -- the mover publishes landed promotions before the pass -- and patches them in one
+     * dispatch a block at its head, ahead of everything the pass reads (ctx.h, wtab_patch_pass). */
+    if (!staging_) {
+        const int wp = wtab_patch_pass();
+        if (wp < 0) step_status_ = wp;
+    }
     kvstream_enter(this, b);
-    {
+    /* A table that could not be patched leaves a stale pointer for the pass to read: the step is
+     * lost, so it is not issued. */
+    if (step_status_ >= 0) {
         const int rc = run_pass(b);
-        if (rc < 0 && step_status_ >= 0) step_status_ = rc;
+        if (rc < 0) step_status_ = rc;
     }
 
     /* Always join lane 1 back into lane 0 before the step ends: the engine syncs only the

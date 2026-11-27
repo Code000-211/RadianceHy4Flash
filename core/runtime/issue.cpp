@@ -155,7 +155,7 @@ static inline bool byte_delta(int bits, int64_t elems, int64_t* out) {
     return true;
 }
 
-void* Ctx::resolve_weight(rad_weight w) {
+void* Ctx::resolve_weight(rad_weight w, bool defer_in_flight, bool* in_flight) {
     /* The template carries WeightInfo::ptr, refreshed between steps after a move. In the
      * all-in-VRAM case that is the answer. */
     void* p = w_tmpl_[w].data;
@@ -164,6 +164,10 @@ void* Ctx::resolve_weight(rad_weight w) {
     const WeightSlot* s = residency_->lookup(w);       /* never blocks -- residency.h */
     if (s) {
         p = s->ptr;
+        if (defer_in_flight && s->ready) {
+            if (in_flight) *in_flight = true;
+            return p;
+        }
         /* Wait once per generation and lane, not per issue; a stream wait orders everything
          * issued after it on that stream, and nothing on the other lane. Sound because the mover
          * bumps `generation` per transfer (residency.h). */
@@ -370,6 +374,38 @@ int Ctx::resolve_weight_table(rad_op h, int operand, rad_weight first, int64_t n
     return weight_table_tensor(h, operand, t, w_tmpl_[first], out);
 }
 
+/* Resolves one queued entry of `t` and, when the pointer the residency table gives differs from
+ * the one the device array holds, appends the write to `pt` (runtime/wtab.h), dispatching it when
+ * the block fills. Both callers patch only what moved: table_refresh for the entries the op that
+ * reads the table needs, wtab_patch_pass for every table ahead of a pass that has no stager. */
+int Ctx::wtab_entry(WeightTable& t, int64_t e, rad_op h, int operand, WtabPatch& pt,
+                    int64_t* walked, bool defer_in_flight, bool* in_flight) {
+    const rad_weight w = (rad_weight)(t.first + e);
+    bool in_flight_here = false;
+    void* p = resolve_weight(w, defer_in_flight, &in_flight_here);
+    if (in_flight_here) {
+        if (in_flight) *in_flight = true;
+        return RAD_OK;
+    }
+    if (!p)
+        return abort_step_msg(h, RAD_E_STATE,
+                              fmt("weight '%s' (entry %lld of operand %d's table) has no "
+                                  "pointer at issue: the load phase never bound it and no "
+                                  "residency table claims it",
+                                  program_->weights[w].name.c_str(), (long long)e, operand));
+    ++*walked;
+    if (t.cur[(size_t)e] == p) return RAD_OK;
+    t.cur[(size_t)e] = p;
+    pt.dst[pt.n] = static_cast<void**>(t.dev) + e;
+    pt.val[pt.n] = p;
+    if (++pt.n == (uint32_t)kWtabPatch) {
+        RAD_TRY(wtab_patch(pt, cur_stream()));
+        ++n_wtab_patches_;
+        pt.n = 0;
+    }
+    return RAD_OK;
+}
+
 int Ctx::table_refresh(rad_op h, int operand, WeightTable& t) {
     const RadTensor& e0 = w_tmpl_[t.first];
     const bool wt_time = g_dbg_issue && rank() == 0;   /* one thread accumulates */
@@ -427,21 +463,7 @@ int Ctx::table_refresh(rad_op h, int operand, WeightTable& t) {
          * when there is one (wtab_flush), else a dispatch of this table's own. */
         WtabPatch own;
         WtabPatch& pt = wtab_gather_ ? wtab_acc_ : own;
-        auto one = [&](int64_t e) -> int {
-            void* p = nullptr;
-            RAD_TRY(resolve(e, &p));
-            ++walked;
-            if (t.cur[(size_t)e] == p) return RAD_OK;
-            t.cur[(size_t)e] = p;
-            pt.dst[pt.n] = static_cast<void**>(t.dev) + e;
-            pt.val[pt.n] = p;
-            if (++pt.n == (uint32_t)kWtabPatch) {
-                RAD_TRY(wtab_patch(pt, cur_stream()));
-                ++n_wtab_patches_;
-                pt.n = 0;
-            }
-            return RAD_OK;
-        };
+        auto one = [&](int64_t e) -> int { return wtab_entry(t, e, h, operand, pt, &walked); };
         if (t.full) {
             for (int64_t e = 0; e < t.n; ++e) RAD_TRY(one(e));
         } else {
@@ -472,6 +494,70 @@ int Ctx::wtab_flush() {
     ++n_wtab_patches_;
     const int rc = wtab_patch(wtab_acc_, cur_stream());
     wtab_acc_.n = 0;
+    return rc;
+}
+
+/* Every table's queued entries, patched at the head of a pass: one dispatch a block, ahead of
+ * everything the pass reads. See ctx.h. */
+int Ctx::wtab_patch_pass() {
+    const bool wt_time = g_dbg_issue && rank() == 0;   /* one thread accumulates */
+    const auto t_wt0 = wt_time ? std::chrono::steady_clock::now()
+                               : std::chrono::steady_clock::time_point{};
+    int64_t walked = 0;
+    std::vector<int32_t> stay;            /* entries whose copy is still in flight */
+    wtab_gather_ = true;                  /* wtab_entry fills wtab_acc_ and dispatches a block */
+    for (WeightTable& t : wtabs_) {
+        /* An unchecked table is uploaded whole at its first issue (table_refresh), and one with
+         * nothing queued has nothing to write. */
+        if (!t.checked || (!t.full && t.pend.empty())) continue;
+        const rad_op h       = (rad_op)(t.key >> 32);
+        const int    operand = (int)(uint32_t)t.key;
+        /* An entry whose copy is still in flight keeps the per-op path: `ready` is the event the
+         * compute stream must wait on, and its wait is worth no less at the head than at the op
+         * -- but for a copy still going, it is a stall the pass's first ops did not have before.
+         * It goes back into `pend` for the op that reads the table (Residency::begin_transfer). */
+        int rc = RAD_OK;
+        stay.clear();
+        const int64_t n = t.full ? t.n : (int64_t)t.pend.size();
+        for (int64_t i = 0; i < n; ++i) {
+            const int64_t e = t.full ? i : (int64_t)t.pend[(size_t)i];
+            bool in_flight = false;
+            rc = wtab_entry(t, e, h, operand, wtab_acc_, &walked, /*defer_in_flight=*/true,
+                            &in_flight);
+            if (rc < 0) break;
+            if (in_flight) stay.push_back((int32_t)e);
+        }
+        if (rc < 0) {
+            /* A table that could not be patched leaves a stale pointer for the pass to read, so
+             * the step is lost. What the walk gathered still goes out (ctx.h, wtab_acc_). */
+            wtab_gather_ = false;
+            (void)wtab_flush();
+            return step_status_ < 0
+                       ? rc
+                       : abort_step_msg(h, rc,
+                                        fmt("operand %d: the weight table could not be patched "
+                                            "at the head of the pass", operand));
+        }
+        t.full = false;
+        t.pend.swap(stay);
+    }
+    wtab_gather_ = false;
+    /* The walk dispatches each block as it fills; the last one it did not fill waits in wtab_acc_
+     * for this flush (an entry handed back to its op is not part of it: `stay` is in the table's
+     * pend again, for that op's own table_refresh). */
+    int rc = RAD_OK;
+    if (wtab_acc_.n > 0) rc = wtab_flush();
+    if (wt_time) {
+        g_wtab_us += std::chrono::duration<double, std::micro>(
+                         std::chrono::steady_clock::now() - t_wt0).count();
+        g_wtab_e  += walked;
+    }
+    if (rc < 0 && step_status_ >= 0) {
+        step_fail_ = fmt("the weight tables could not be patched at the head of the pass: %s",
+                         rad_strerror(rc));
+        RAD_ERR("%s", step_fail_.c_str());
+        return rc;
+    }
     return rc;
 }
 
