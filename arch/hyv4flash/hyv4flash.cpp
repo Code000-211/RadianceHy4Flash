@@ -751,9 +751,14 @@ static int buffers(RadBuilder* b, Model& m) {
     if (any_moe) RAD_ARCH_TRY(m.mw.declare(b, nm, s, g, m.arm));
     if (any_dense) {
         m.dense_gu = bf("dense_gate_up", { T, 2 * s.n_ff_r });
-        m.dense_ff = bf("dense_ff", { T, s.n_ff_r });
+        /* P-11b: the product plane is declared nowhere here. Where the gate writes the codes
+         * itself (GatedMlp::gfuse) no op writes or reads a bf16 product, and a plane in the model's
+         * wire is arena held for the whole program; GatedMlp::declare declares it into `dense_ff`
+         * once, for every layer, the first time a layer takes the unfused pair. The shared expert's
+         * plane of a MoE layer (`m.mw.sff`) works the same way and gets its slot passed the same
+         * way -- both are the model's, because a plane in a wire is charged for the whole program. */
         m.dense_out = bf("dense_out", { T, E });
-        if (!m.dense_gu || !m.dense_ff || !m.dense_out) return RAD_E_INVAL;
+        if (!m.dense_gu || !m.dense_out) return RAD_E_INVAL;
     }
     if (!s.engram_layers.empty()) RAD_ARCH_TRY(m.ew.declare(b, nm, s, g));
     return RAD_OK;
@@ -889,8 +894,8 @@ static int trunk_layer(RadBuilder* b, Model& m, int l, MoeFP8::Src* msrc,
     RAD_ARCH_TRY(lay.j_mid.declare(b, s, g, T, m.tr, lay.attn.w.o, 0, lay.attn.post_gain,
                                    &lay.hc_ffn, lay.ffn_gain, m.tr.xn, 0, lay.attn.op_ar, jq));
     RAD_ARCH_TRY(lay.t_ffn_in.declare(b, nm, T, "ffn_in_norm", l, RAD_BF16, E, m.tr.xn));
-    RAD_ARCH_TRY(lay.ffn.declare(b, nm, s, g, l, m.tr.xn, m.tr.y, m.mw, m.dense_gu, m.dense_ff,
-                                 m.dense_out, msrc, lay.j_mid.codes_if()));
+    RAD_ARCH_TRY(lay.ffn.declare(b, nm, s, g, l, m.tr.xn, m.tr.y, m.mw, m.dense_gu, &m.dense_ff,
+                                 m.dense_out, msrc, lay.j_mid.codes_if(), &m.mw.sff));
     RAD_ARCH_TRY(lay.hc_ffn.declare_post(b, s, T, m.tr.h, m.tr.post, m.tr.y));
     /* An Engram opens the next layer: the junction stops behind the write (tail 0). */
     for (int e : s.engram_layers)

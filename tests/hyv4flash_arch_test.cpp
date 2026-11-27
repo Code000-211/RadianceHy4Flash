@@ -4863,3 +4863,272 @@ TEST(g3_junctions_write_the_codes_their_readers_take) {
     /* every junction that writes codes removes the quantiser behind it */
     CHECK(had_on < count_op(off.b, "had_quant_act_i8g"));
 }
+
+/* P-11b. The buffer plan charges a transient the whole program when no op of the declared list
+ * names it (core/build/rad_bufplan.cpp; `radiance --debug-graph` prints the ones it counts, with
+ * the bytes), so each of them is arena the engine holds and never reads. The merge base's plan
+ * charged fifteen of them at TP2/2048; five are gone with this change -- the dense MLP's bf16
+ * product plane and the shared expert's, both declared now by the first layer that takes the
+ * unfused pair, and the Engram round trip's three, declared now by the first layer whose table is
+ * bf16 -- and the list below is what is left, a reason each, so a new plane no op names fails this
+ * test by its name.
+ *   moe.expert_ff.q / .s -- the routed arm's E4M3 product codes. An int8 arm's fused SwiGLU writes
+ *       the rotated int8 pair the down projection reads, so no op names them; MoeFP8's own rule
+ *       does ask for them (down_codebook_fp8 / down_supported,
+ *       arch/common/rad_block_moe_fp8.h), the mixed IQR-gate_up-behind-a-w6-down recipe with them.
+ *   moe.expert_ff -- the routed arm's bf16 product. The rig's dump names it (48 MiB at TP2/2048, 96
+ *       at TP4/8192): there the fused gated quantiser serves the expert gate and nothing reads the
+ *       plane. No plan of this fixture reaches that form -- at this geometry `silu_mul` is still
+ *       declared for the arm -- so the product is in none of the lists below. It stays in the arena
+ *       either way: MoeFP8::declare refuses a wire without it (the two tests of
+ *       quantised_experts_are_served_clamped), which is why this PR hands over the planes the arch
+ *       can place and not this one.
+ *   moe.latent.q / .s -- the same for the latent linear: the gather's output is read as the rotated
+ *       int8 pair, and MoeFP8::declare refuses a wire whose latent carries no codes at all.
+ *   ix.stage -- the indexer stages a closing group's raw keys through it, and the step issues that
+ *       path only where the library does not serve the fused key side (qsa_work_pool_tail).
+ * The sampler's four candidate planes are arena for the whole program for the same reason, but the
+ * sampler declares its ops with no operand lists at all (core/sample/sampler.cpp), so this builder
+ * never sees them; making the plan name them is a core change. */
+namespace {
+
+std::string dead_join(const std::vector<std::string>& v) {
+    std::string s;
+    for (const std::string& n : v) s += n + " ";
+    return s;
+}
+
+/* The plan's own rule: a transient no op of the declared list reads or writes. */
+std::vector<std::string> unused_transients(const RadBuilder& b) {
+    std::vector<std::string> dead;
+    for (size_t i = 0; i < b.bufs.size(); ++i) {
+        if ((int)b.bufs[i].d.kind != (int)RAD_BUF_TRANSIENT) continue;
+        const rad_buf h = (rad_buf)(i + 1);
+        bool used = false;
+        for (const auto& o : b.ops)
+            if (in(o.reads, h) || in(o.writes, h)) { used = true; break; }
+        if (!used) dead.push_back(b.bufs[i].name);
+    }
+    std::sort(dead.begin(), dead.end());
+    return dead;
+}
+
+/* How many buffers of the plan carry this name. The builder refuses a duplicate, so the answer is
+ * 0 or 1: the count is how the Engram test says two layers share one trio instead of each
+ * declaring its own, and how the P-11b test says a plane is not in the plan at all. */
+int count_buf(const RadBuilder& b, const char* name) {
+    int n = 0;
+    for (const auto& r : b.bufs) n += r.name == name;
+    return n;
+}
+
+/* Whether some declared op reads or writes the buffer of this name: charged and used is a plane the
+ * step runs through, charged and unnamed is the arena this card is about. */
+bool named_by_op(const RadBuilder& b, const char* name) {
+    for (size_t i = 0; i < b.bufs.size(); ++i) {
+        if (b.bufs[i].name != name) continue;
+        const rad_buf h = (rad_buf)(i + 1);
+        for (const auto& o : b.ops)
+            if (in(o.reads, h) || in(o.writes, h)) return true;
+        return false;
+    }
+    return false;
+}
+
+/* The bytes the plan of this test charges for nothing: a plane the list allows must not grow into a
+ * wider one behind the same name, so the lint reads the bytes too. */
+int64_t dead_bytes(const RadBuilder& b) {
+    int64_t n = 0;
+    for (size_t i = 0; i < b.bufs.size(); ++i) {
+        const RadBufDecl& d = b.bufs[i].d;
+        if ((int)d.kind != (int)RAD_BUF_TRANSIENT) continue;
+        const rad_buf h = (rad_buf)(i + 1);
+        bool used = false;
+        for (const auto& o : b.ops)
+            if (in(o.reads, h) || in(o.writes, h)) { used = true; break; }
+        if (used) continue;
+        int64_t numel = 1;
+        for (uint32_t r = 0; r < d.rank; ++r) numel *= d.shape[r];
+        n += rad_dtype_bytes(d.dtype, numel);
+    }
+    return n;
+}
+
+/* The served u3's shape (the recipe of /models/hy4-flash-iqr-v4-u3.rad): the trunk's linears and both
+ * experts' under the rotated computed trellis, and the Engram table stored as E4M3 rows so its rows
+ * take no round trip. This is the plan the card-less dump of the served model was read from. */
+void served_u3_encs(RadBuilder* b) {
+    int8_trunk_encs(b);
+    const RadEncoding iqr = enc_trellis(RAD_U4, true);
+    for (auto& e : b->encs)
+        if (e.first == "ffn_gate_up_exps" || e.first == "ffn_down_exps" ||
+            e.first == "ffn_gate_up." || e.first == "ffn_down." ||
+            e.first == "ffn_gate_up_shexp" || e.first == "ffn_down_shexp" ||
+            e.first == "ffn_latent_in" || e.first == "ffn_latent_out")
+            e.second = iqr;
+    b->encs.insert(b->encs.begin(), { { "engram_table", rad_enc_affine(RAD_F8E4M3, RAD_F32, 1, 0) },
+                                      { "engram_mult", rad_enc_plain(RAD_I64) } });
+}
+
+}  // namespace
+
+TEST(no_transient_is_declared_that_no_op_reads) {
+    struct Plan {
+        const char* what;
+        void (*encs)(RadBuilder*);
+        int world;
+        /* The planes this plan leaves without a use, sorted, each with its reason in the comment
+         * above. The set is the same for every plan but the bf16 ones, where the MoE codes the arm
+         * does not need are not declared at all. */
+        const char* kept;
+        /* And their bytes, so a plane the list allows cannot quietly become a wider one. */
+        long long dead;
+    };
+    const Plan plans[] = {
+        { "bf16", bf16_encs, 1, "ix.stage ", 9216 },
+        { "int8 trunk", int8_trunk_encs, 1, "ix.stage ", 9216 },
+        { "int8 experts",
+          [](RadBuilder* b) { bf16_encs(b); b->encs[0].second = b->encs[1].second = enc_i8(true); },
+          1, "ix.stage moe.expert_ff.q moe.expert_ff.s moe.latent.q moe.latent.s ", 110592 },
+        { "iqr experts",
+          [](RadBuilder* b) {
+              bf16_encs(b);
+              b->encs[0].second = b->encs[1].second = enc_trellis(RAD_U4, true);
+          },
+          1, "ix.stage moe.expert_ff.q moe.expert_ff.s moe.latent.q moe.latent.s ", 110592 },
+        { "bf16, two ranks", bf16_encs, 2, "ix.stage ", 9216 },
+        /* The served recipe as the rig's dump was read (the Engram table at E4M3, so the round trip
+         * is off; the trunk's linears and the experts' under the rotated trellis). It pins the four
+         * MoE code planes of the dump's list. The product itself, `moe.expert_ff`, is not dead here:
+         * at this geometry the expert gate is not served the fused gated quantiser, so `silu_mul`
+         * still writes the plane and the down projection's quantiser reads it. On the rig it is --
+         * the dump names it, 48 MiB at TP2/2048 and 96 MiB at TP4/8192, the largest plane of the ten
+         * that stay; see notes/backlog/measurements/P-11b.md. */
+        { "the served u3", served_u3_encs, 1,
+          "ix.stage moe.expert_ff.q moe.expert_ff.s moe.latent.q moe.latent.s ", 110592 },
+    };
+    for (const Plan& p : plans) {
+        Declared d(p.encs, p.world);
+        REQUIRE_EQ(d.rc, RAD_OK);
+        steps_clean_at(d.b, 0, 1);   /* every step kind, each lint clean */
+        const int64_t bytes = dead_bytes(d.b);
+        fprintf(stderr, "plan %-16s dead %lld bytes: %s\n", p.what, (long long)bytes,
+                dead_join(unused_transients(d.b)).c_str());
+        CHECK_EQ(dead_join(unused_transients(d.b)), std::string(p.kept));
+        CHECK_EQ(bytes, (int64_t)p.dead);
+    }
+}
+
+/* P-11b. A product plane belongs to the gate that writes it, and the round trip belongs to the
+ * table it is taken from. Each of these planes was charged for the whole program from the wire,
+ * where the declare cannot see which form the layer takes; each is now declared where the form is
+ * settled, so a model that runs the other form reserves nothing for it. */
+TEST(the_product_planes_follow_the_gate_that_writes_them) {
+    /* The rotated int8 trunk with the fused gate: the shared arm's gate writes the codes it was
+     * asked for, so the model has no shared-expert product plane at all -- that is the plane this
+     * round takes away. The dense MLP's gate_up is not a rotated int8 weight in this container, so
+     * its pair is unfused, its plane is there, and `silu_mul` names it: charged and used, which is
+     * not the arena this card is about. */
+    {
+        Declared d(int8_trunk_encs, 1);
+        REQUIRE_EQ(d.rc, RAD_OK);
+        steps_clean_at(d.b, 0, 1);
+        CHECK_EQ(count_op(d.b, "gated_had_quant_i8g") > 0, true);
+        CHECK_EQ(count_buf(d.b, "moe.shared_ff"), 0);
+        CHECK_EQ(count_buf(d.b, "dense_ff"), 1);
+        CHECK(named_by_op(d.b, "dense_ff"));
+    }
+    /* The switch off: the pair is back, the first MoE layer declares its plane into the model's slot
+     * for every later one -- one buffer for the model's two MoE layers, not one a layer -- and the
+     * activation op names it. */
+    setenv("RADIANCE_HY4_FUSED_QUANT", "0", 1);
+    Declared unfused(int8_trunk_encs, 1);
+    unsetenv("RADIANCE_HY4_FUSED_QUANT");
+    REQUIRE_EQ(unfused.rc, RAD_OK);
+    steps_clean_at(unfused.b, 0, 1);
+    CHECK_EQ(count_buf(unfused.b, "dense_ff"), 1);
+    CHECK(named_by_op(unfused.b, "dense_ff"));
+    CHECK_EQ(count_buf(unfused.b, "moe.shared_ff"), 1);
+    CHECK(named_by_op(unfused.b, "moe.shared_ff"));
+    CHECK_EQ(count_op(unfused.b, "silu_mul") > 0, true);
+    /* Both are named, so neither is what the plan charges for nothing. */
+    CHECK_EQ(dead_join(unused_transients(unfused.b)), std::string("ix.stage "));
+}
+
+/* P-11b. The Engram round trip's three planes follow the trip: the served recipe stores the table
+ * as E4M3 rows under a scale a row, which is what the model reads, so the trip is not taken and the
+ * plan carries none of them; a bf16 table with `engram_fp8_embedding` takes it, and the two Engram
+ * layers of this model share one trio -- the handles are carried to the later layer on the wire. */
+TEST(the_engram_round_trip_declares_its_planes_only_when_it_is_taken) {
+    /* The table as the u3 ships it: fp8_e4m3*f32[1x*] (data/recipes/hy4-flash-bf16-f32.recipe). */
+    Declared e4m3([](RadBuilder* b) {
+        bf16_encs(b);
+        b->encs.insert(b->encs.begin(),
+                       { { "engram_table", rad_enc_affine(RAD_F8E4M3, RAD_F32, 1, 0) },
+                         { "engram_mult", rad_enc_plain(RAD_I64) } });
+    }, 1, 0, false, 128, 0, 0, 0, two_engram_layers);
+    REQUIRE_EQ(e4m3.rc, RAD_OK);
+    steps_clean_at(e4m3.b, 0, 1);
+    /* two_engram_layers puts the Engram at blk.0 and blk.2: the scale view is what says the trip
+     * really was not taken. */
+    REQUIRE(find_w(e4m3.b, "blk.0.engram_table.scale") != nullptr);
+    for (const char* n : { "eg.rows.q", "eg.rows.s", "eg.rows.rt" })
+        CHECK_EQ(count_buf(e4m3.b, n), 0);
+
+    /* The bf16 table as shipped: the round trip runs, so the trio is in the plan once, named by the
+     * quantiser and the dequant that write and read it. */
+    Declared bf16(bf16_encs, 1, 0, false, 128, 0, 0, 0, two_engram_layers);
+    REQUIRE_EQ(bf16.rc, RAD_OK);
+    steps_clean_at(bf16.b, 0, 1);
+    REQUIRE_EQ(count_op(bf16.b, "quant_act_fp8") > 0, true);
+    for (const char* n : { "eg.rows.q", "eg.rows.s", "eg.rows.rt" }) {
+        CHECK_EQ(count_buf(bf16.b, n), 1);
+        CHECK(named_by_op(bf16.b, n));
+    }
+}
+
+/* P-11b, the guard itself and not only the arch that leans on it. `GateQuantFP8::declare` picks a
+ * form, and every form that names the bf16 plane -- `relu2`, any clamp, the bf16 line, the rotated
+ * chain -- demands it; what this change permits is one case, the gated quantiser that writes the
+ * codes and nothing else. The first round's review could see the hunk and nothing else, so both
+ * halves are asserted here: a caller that asked for the product and handed no plane is refused as it
+ * was before the change, and the codes-only caller is accepted and its row names two buffers, so no
+ * launch can write buffer 0. */
+TEST(a_gate_that_asks_for_the_product_without_a_plane_is_refused) {
+    RadBuilder b;
+    hyv4flash::Geom g;
+    g.max_tok = 64;
+    const rad_buf gate_up = hyv4flash::decl_b(&b, "t.gate_up", RAD_BF16, { 64, 256 });
+    const rad_buf q       = hyv4flash::decl_b(&b, "t.q", RAD_F8E4M3, { 64, 128 });
+    const rad_buf s       = hyv4flash::decl_b(&b, "t.s", RAD_F32,    { 64, 1 });
+    const rad_buf x       = hyv4flash::decl_b(&b, "t.x", RAD_BF16,   { 64, 128 });
+    REQUIRE(gate_up && q && s && x);
+
+    hyv4flash::ActFP8 codes_only;   /* the codes pair, no bf16 plane: what an arch that declares none hands */
+    codes_only.q = q;
+    codes_only.s = s;
+
+    hyv4flash::GateQuantFP8 asked;
+    CHECK_EQ(asked.declare(&b, g, gate_up, codes_only, 128, "silu", 0, /*bf16_out=*/true),
+             RAD_E_INVAL);
+    CHECK_EQ(asked.want_x, true);
+    REQUIRE(!b.ops.empty());
+    CHECK_EQ((int)b.ops.back().writes.size(), 0);   /* refused before it named an operand */
+
+    hyv4flash::ActFP8 with_plane = codes_only;
+    with_plane.x = x;
+    hyv4flash::GateQuantFP8 full;
+    CHECK_OK(full.declare(&b, g, gate_up, with_plane, 128, "silu", 0, /*bf16_out=*/true));
+    REQUIRE(!b.ops.empty());
+    CHECK_EQ((int)b.ops.back().writes.size(), 3);
+    CHECK(in(b.ops.back().writes, x));
+    CHECK(in(b.ops.back().writes, q));
+
+    hyv4flash::GateQuantFP8 folded;
+    CHECK_OK(folded.declare(&b, g, gate_up, codes_only, 128, "silu", 0, /*bf16_out=*/false));
+    CHECK_EQ(folded.want_x, false);
+    REQUIRE(!b.ops.empty());
+    CHECK_EQ(b.ops.back().op, std::string("gated_quant_fp8"));
+    CHECK_EQ((int)b.ops.back().writes.size(), 2);
+    for (const rad_buf h : b.ops.back().writes) CHECK(h != 0);
+}
