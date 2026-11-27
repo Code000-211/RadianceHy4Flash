@@ -387,4 +387,251 @@ TEST(a_shared_table_is_filled_once_and_pinned_by_the_next_engine) {
     CHECK_EQ(rad::TableFillTestAccess::join(engine), RAD_OK);
 }
 
+/* --ngram-placement-layers through resolve_table_placement, where a named tier is tested on its
+ * own bytes (engine_bringup.cpp): the ram layer whose memory fits resolves ram under a global
+ * disk, a vram layer is refused when no kernel gathers the table on a card and again when the
+ * card cannot hold it, a disk layer is refused when no kernel gathers it on the host, and
+ * ngram_on_card_bytes_ counts every table that ends up beside the other weights: a global vram
+ * table whole, and a vram layer's bytes under a global that keeps the rest off the card. */
+TEST(the_resolver_honours_and_refuses_the_per_layer_placement_asks) {
+    const int64_t MiB = (int64_t)1 << 20;
+    const int64_t ngram = 10 * MiB;
+    const std::map<int, int64_t> layer_bytes = {{2, 2 * MiB}, {5, 3 * MiB}};
+    auto room_facts = [] {
+        rad::VramFacts f{};
+        f.capacity   = 16LL << 30;   /* a card with room: the trial's own facts (mem_test) */
+        f.free       = f.capacity;
+        f.arena      = 64LL << 20;
+        f.kv_ceiling = 300LL << 20;
+        return std::vector<rad::VramFacts>{ f };
+    };
+    const std::vector<int64_t> no_emb;
+    const std::vector<rad::WeightFootprint> no_wfs;
+
+    /* A ram layer under a global disk, the copy pinned for a card kernel (RLIMIT_MEMLOCK does
+     * not count a driver's userptr mapping): the lockable check admits the layer's bytes, the
+     * layer resolves ram, the layers the spec left out keep the global disk, and no byte of
+     * the table sits beside the other weights. */
+    {
+        rad::Config config;
+        config.ngram_placement = rad::TablePlacement::Disk;
+        config.ngram_layer_asked = {{2, rad::TablePlacement::Ram}};
+        rad::Engine engine(config);
+        rad::EngineScope owner(engine.owner(), "resolve-ram-layer");
+        const int rc = rad::TableResolveTestAccess::resolve(
+            engine, room_facts(), no_emb, no_wfs, 0, ngram, true, true, 0, layer_bytes);
+        REQUIRE_EQ(rc, RAD_OK);
+        const rad::Config& c = rad::TableResolveTestAccess::cfg(engine);
+        CHECK(c.ngram_effective(2) == rad::TablePlacement::Ram);
+        CHECK(c.ngram_effective(5) == rad::TablePlacement::Disk);   /* unasked: the global */
+        CHECK(c.ngram_resolved == rad::TablePlacement::Disk);
+        CHECK_EQ(rad::TableResolveTestAccess::on_card(engine), (int64_t)0);
+    }
+
+    /* A vram layer with no card kernel: refused before any fit test, as a named tier is. */
+    {
+        rad::Config config;
+        config.ngram_placement = rad::TablePlacement::Disk;
+        config.ngram_layer_asked = {{2, rad::TablePlacement::Vram}};
+        rad::Engine engine(config);
+        rad::EngineScope owner(engine.owner(), "resolve-vram-layer-no-kernel");
+        const int rc = rad::TableResolveTestAccess::resolve(
+            engine, room_facts(), no_emb, no_wfs, 0, ngram, false, true, 0, layer_bytes);
+        CHECK_EQ(rc, (int)RAD_E_INVAL);
+    }
+
+    /* A vram layer the card cannot hold -- the KV floor of one --max-model-len sequence leaves
+     * nothing for it: refused, and the server would stop on this status. */
+    {
+        rad::Config config;
+        config.ngram_placement = rad::TablePlacement::Disk;
+        config.ngram_layer_asked = {{2, rad::TablePlacement::Vram}};
+        rad::Engine engine(config);
+        rad::EngineScope owner(engine.owner(), "resolve-vram-layer-misfit");
+        const int rc = rad::TableResolveTestAccess::resolve(
+            engine, room_facts(), no_emb, no_wfs, (int64_t)1 << 40, ngram, true, true, 0,
+            layer_bytes);
+        CHECK_EQ(rc, (int)RAD_E_NOMEM);
+    }
+
+    /* A disk layer with no host gatherer: the container has no reader, refused. (The global
+     * ram ask resolves first -- a pinned copy, which the memory admits -- so the refusal here
+     * is the layer's own.) */
+    {
+        rad::Config config;
+        config.ngram_placement = rad::TablePlacement::Ram;
+        config.ngram_layer_asked = {{2, rad::TablePlacement::Disk}};
+        rad::Engine engine(config);
+        rad::EngineScope owner(engine.owner(), "resolve-disk-layer-no-host-kernel");
+        const int rc = rad::TableResolveTestAccess::resolve(
+            engine, room_facts(), no_emb, no_wfs, 0, ngram, true, false, 0, layer_bytes);
+        CHECK_EQ(rc, (int)RAD_E_INVAL);
+    }
+
+    /* The card's bytes, global: a vram table counts whole. */
+    {
+        rad::Config config;
+        config.ngram_placement = rad::TablePlacement::Vram;
+        rad::Engine engine(config);
+        rad::EngineScope owner(engine.owner(), "resolve-vram-global");
+        const int rc = rad::TableResolveTestAccess::resolve(
+            engine, room_facts(), no_emb, no_wfs, 0, ngram, true, true, 0, layer_bytes);
+        REQUIRE_EQ(rc, RAD_OK);
+        CHECK(rad::TableResolveTestAccess::cfg(engine).ngram_resolved ==
+              rad::TablePlacement::Vram);
+        CHECK_EQ(rad::TableResolveTestAccess::on_card(engine), ngram);
+    }
+
+    /* The card's bytes, layered: a vram layer adds its own bytes under a global disk that
+     * keeps the rest of the table off the card. */
+    {
+        rad::Config config;
+        config.ngram_placement = rad::TablePlacement::Disk;
+        config.ngram_layer_asked = {{2, rad::TablePlacement::Vram}};
+        rad::Engine engine(config);
+        rad::EngineScope owner(engine.owner(), "resolve-vram-layer-accounting");
+        const int rc = rad::TableResolveTestAccess::resolve(
+            engine, room_facts(), no_emb, no_wfs, 0, ngram, true, true, 0, layer_bytes);
+        REQUIRE_EQ(rc, RAD_OK);
+        const rad::Config& c = rad::TableResolveTestAccess::cfg(engine);
+        CHECK(c.ngram_effective(2) == rad::TablePlacement::Vram);
+        CHECK(c.ngram_resolved == rad::TablePlacement::Disk);
+        CHECK_EQ(rad::TableResolveTestAccess::on_card(engine), (int64_t)2 * MiB);
+    }
+
+    /* Last, because a machine whose limits refuse it skips the rest: the same ram ask with a
+     * host gather, where the copy is locked and RLIMIT_MEMLOCK counts it. A pass resolves the
+     * layer exactly as the pinned case did; a refusal is the machine's setting, not a defect. */
+    {
+        rad::Config config;
+        config.ngram_placement = rad::TablePlacement::Disk;
+        config.ngram_layer_asked = {{2, rad::TablePlacement::Ram}};
+        rad::Engine engine(config);
+        rad::EngineScope owner(engine.owner(), "resolve-ram-layer-locked");
+        const int rc = rad::TableResolveTestAccess::resolve(
+            engine, room_facts(), no_emb, no_wfs, 0, ngram, false, true, 0, layer_bytes);
+        if (rc == RAD_E_NOMEM)
+            SKIP("the machine cannot lock the layer's table (RLIMIT_MEMLOCK/MemAvailable)");
+        REQUIRE_EQ(rc, RAD_OK);
+        CHECK(rad::TableResolveTestAccess::cfg(engine).ngram_effective(2) ==
+              rad::TablePlacement::Ram);
+    }
+}
+
+/* The per-layer ram=DIR / disk=DIR directories are the resolver's answer and the load's
+ * operand: resolve fills Config's ngram_share_dir_for/ngram_disk_dir_for per layer, and
+ * load_weights hands exactly those to copy_table and table_file_map (engine_bringup.cpp).
+ * Driven here through the same access with a two-layer spec under a global disk: the disk
+ * layer's table becomes its own file under its directory, filled from the container and
+ * mapped for the host gather; the ram layer's directory waits for the pinned copy only a
+ * card's backend can make, which is the next test. */
+TEST(the_per_layer_dirs_are_the_ones_the_resolver_hands_the_load) {
+    TempContainer tmp{radtest::tmp_path("table-fill-layers.rad")};
+    /* Both asked tables at the share minimum, the size the load copies rather than reads in
+     * place; c is the unasked table, which takes the global disk and no directory. */
+    const int64_t nc = 64ll << 10, na = rad::kTableShareMin, nb = rad::kTableShareMin;
+    Tables t;
+    REQUIRE(write_tables(tmp.path, nc, na, nb, &t));
+    REQUIRE_EQ(t.open(), 0);
+
+    const std::string ram_dir  = radtest::tmp_path("ngram-layer-ram");
+    const std::string disk_dir = radtest::tmp_path("ngram-layer-disk");
+    REQUIRE(::mkdir(ram_dir.c_str(), 0777) == 0);    /* empty DIRs are the spec's own */
+    REQUIRE(::mkdir(disk_dir.c_str(), 0777) == 0);
+
+    rad::Config config;
+    config.ngram_placement = rad::TablePlacement::Disk;
+    config.ngram_layer_asked = {{1, rad::TablePlacement::Ram}, {2, rad::TablePlacement::Disk}};
+    config.ngram_layer_share_dir[1] = ram_dir;
+    config.ngram_layer_disk_dir[2]  = disk_dir;
+    rad::Engine engine(config);
+    rad::EngineScope owner(engine.owner(), "table-fill-layers-test");
+    rad::TableFillTestAccess::hold(engine, std::move(t.file));
+
+    rad::VramFacts f{};
+    f.capacity = 16LL << 30; f.free = f.capacity; f.arena = 64LL << 20; f.kv_ceiling = 300LL << 20;
+    const int rc = rad::TableResolveTestAccess::resolve(
+        engine, { f }, {}, {}, 0, nc + na + nb, true, true, 0, {{1, na}, {2, nb}});
+    REQUIRE_EQ(rc, RAD_OK);
+    const rad::Config& c = rad::TableResolveTestAccess::cfg(engine);
+    CHECK(c.ngram_effective(1) == rad::TablePlacement::Ram);
+    CHECK(c.ngram_share_dir_for(1) == ram_dir);
+    CHECK(c.ngram_effective(2) == rad::TablePlacement::Disk);
+    CHECK(c.ngram_disk_dir_for(2) == disk_dir);
+    CHECK(c.ngram_effective(0) == rad::TablePlacement::Disk);   /* unasked: the global */
+    CHECK(c.ngram_share_dir_for(0).empty());                    /* no directory of its own */
+    CHECK(c.ngram_disk_dir_for(0).empty());
+
+    /* disk=DIR through the access, with the directory the resolver named for THIS layer: the
+     * table's own file under it, filled from the container and mapped -- the gather reads the
+     * file's bytes, not the container's range. */
+    void* m = nullptr;
+    std::string why;
+    const int fm = rad::TableFillTestAccess::file_map(engine, t.src[2], t.n[2], t.off[2], &m,
+                                                      &why, c.ngram_disk_dir_for(2));
+    REQUIRE_EQ(fm, RAD_OK);
+    CHECK(m != nullptr && m != (const void*)t.src[2]);
+    CHECK(same_as(m, t.want[2].data(), t.n[2]));
+    CHECK_EQ(rad::TableFillTestAccess::files(engine), size_t(1));
+    const std::string id2 = rad::table_share_id(tmp.path, t.off[2], t.n[2]);
+    REQUIRE(!id2.empty());
+    CHECK(::access((disk_dir + "/ngram-" + id2 + ".bin").c_str(), F_OK) == 0);
+    /* The ram layer's directory holds nothing yet: its copy is the one a card's backend pins
+     * in place -- the next test's subject -- and the disk layer's file landed in its own
+     * directory, not the ram layer's. */
+    CHECK(!share_file_exists(ram_dir, rad::table_share_id(tmp.path, t.off[1], t.n[1])));
+    CHECK(::access((ram_dir + "/ngram-" + id2 + ".bin").c_str(), F_OK) != 0);
+}
+
+/* The ram layer's directory under the same spec: copy_table, handed the resolver's
+ * ngram_share_dir_for(layer), fills the shared file THERE -- a table the card pins in place,
+ * which only a card's backend can map. The join publishes it, and the bytes are the
+ * container's. */
+TEST(the_per_layer_ram_dir_holds_the_shared_file_the_card_pins) {
+    if (rad::device_is_host())
+        SKIP("the shared placement pins a file in place, which the host backend cannot do");
+    TempContainer tmp{radtest::tmp_path("table-fill-layers-ram.rad")};
+    const int64_t nc = 64ll << 10, na = rad::kTableShareMin, nb = rad::kTableShareMin;
+    Tables t;
+    REQUIRE(write_tables(tmp.path, nc, na, nb, &t));
+    REQUIRE_EQ(t.open(), 0);
+    const std::string ram_dir = radtest::tmp_path("ngram-layer-ram2");
+    REQUIRE(::mkdir(ram_dir.c_str(), 0777) == 0);
+
+    rad::Config config;
+    config.ngram_placement = rad::TablePlacement::Disk;
+    config.ngram_layer_asked = {{1, rad::TablePlacement::Ram}};
+    config.ngram_layer_share_dir[1] = ram_dir;
+    rad::Engine engine(config);
+    rad::EngineScope owner(engine.owner(), "table-fill-layers-ram-test");
+    rad::TableFillTestAccess::hold(engine, std::move(t.file));
+
+    rad::VramFacts f{};
+    f.capacity = 16LL << 30; f.free = f.capacity; f.arena = 64LL << 20; f.kv_ceiling = 300LL << 20;
+    REQUIRE_EQ(rad::TableResolveTestAccess::resolve(
+                   engine, { f }, {}, {}, 0, nc + na, true, true, 0, {{1, na}}),
+               RAD_OK);
+    const rad::Config& c = rad::TableResolveTestAccess::cfg(engine);
+    CHECK(c.ngram_effective(1) == rad::TablePlacement::Ram);
+    CHECK(c.ngram_share_dir_for(1) == ram_dir);
+
+    void* out = nullptr;
+    std::string why;
+    const int rc = rad::TableFillTestAccess::copy(engine, t.src[1], t.n[1], t.off[1], true, &out,
+                                                  &why, c.ngram_share_dir_for(1));
+    /* A card whose locked-memory limit is under the table is the machine's setting, not a
+     * defect. */
+    if (rc == RAD_E_NOMEM && why.find("locking piece") != std::string::npos)
+        SKIP("%s", why.c_str());
+    REQUIRE_EQ(rc, RAD_OK);
+    const std::string id1 = rad::table_share_id(tmp.path, t.off[1], t.n[1]);
+    REQUIRE(!id1.empty());
+    CHECK(share_file_exists(ram_dir, id1));
+    CHECK_EQ(rad::TableFillTestAccess::join(engine), RAD_OK);
+    CHECK_EQ(rad::TableFillTestAccess::shared(engine), size_t(1));
+    CHECK(out != nullptr && out != (const void*)t.src[1]);
+    CHECK(same_as(out, t.want[1].data(), t.n[1]));
+}
+
 RAD_TEST_MAIN()
+

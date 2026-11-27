@@ -511,15 +511,17 @@ struct Engram {
          * own gather behind this one finds the rows claimed or ready. Only the first Engram layer
          * issues for the rest (the ascending order means it is the first to run); only with
          * RADIANCE_HY4_ENGRAM_PREFETCH=1 (off by default: no prefetch work is issued at all);
-         * only for the layers --ngram-placement-layers named (rad_ngram_layer_named) -- today's
-         * global all-disk placement and a global ram's host-gathered locked copy keep the
-         * synchronous path, where this issue's gather would read the rows into pf_rows twice;
-         * and only where that layer's gather dispatches to the host (a device gather reads rows
-         * over the link and needs no reader). Nothing here changes a buffer the step's own ops
-         * read, so the outputs are untouched. */
+         * only for the layers whose RESOLVED placement is disk (rad_ngram_layer_resolved -- the
+         * per-layer Config::ngram_effective view, not the flag's text): naming is not placement.
+         * A layer named ram whose locked copy is host-gathered passes the domain test below and
+         * would take a second full gather into pf_rows every step, so only a table a drive reads
+         * prefetches; a global ram says the same for every layer it did not name. And only where
+         * that layer's gather dispatches to the host (a device gather reads rows over the link
+         * and needs no reader). Nothing here changes a buffer the step's own ops read, so the
+         * outputs are untouched. */
         if (w.pf && layer == hist_layer && prefetch_on())
             for (Engram* e : *w.pf)
-                if (rad_ngram_layer_named(e->layer) == 1 &&
+                if (rad_ngram_layer_resolved(e->layer) == RAD_TABLE_PLACE_DISK &&
                     rad_op_domain(c, e->op_gather) == RAD_DOMAIN_HOST)
                     e->issue_pf(c, batch);
         return true;
@@ -559,6 +561,15 @@ struct Engram {
                         praw(batch->cu_seqlens + D, RAD_I32, P + 1), pos, RAD_W(map), RAD_W(mult),
                         RAD_W(vsz), RAD_W(off), RAD_NONE, sp, brows(pf_ids, T), brows(pf_mask, T));
         }
+        /* The unit the alias matches in, stated in the open. This issue's ahead operand is
+         * brows(pf_ids, T): the [T, heads] plane -- T rows of H ids, numel T*H. libavx counts
+         * both sides of the test in that unit: rows_form sets M = numel(out)/n_embd = T*H
+         * gathered rows (libavx/avx_gemm.cpp:1357) and n_ahead = numel(ahd) = T*H offered ids
+         * (libavx/avx_gemm.cpp:1369), and the prefetch alias is `q.ahead == q.ids &&
+         * q.n_ahead == q.M` (libavx/avx_ngram.cpp:1282) -- n_ahead == M EXACTLY, both T*H. A
+         * token-counted operand (n_ahead = T) would not match and the gather would read its own
+         * rows; avx_check's prefetch case pins that boundary (n_ahead = M/2 and M+1 both refuse:
+         * libavx/avx_check_rows.cpp, row_prefetch_case). */
         RAD_ISSUE_N(c, op_gather_pf, T * H, brows(pf_ids, T), RAD_W(table),
                     table_bf16 ? RAD_NONE : RAD_W(table_scale), brows(pf_rows, T),
                     brows(pf_ids, T));

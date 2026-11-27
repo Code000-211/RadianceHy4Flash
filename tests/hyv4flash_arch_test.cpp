@@ -551,11 +551,11 @@ TEST(the_later_engram_layers_prefetch_at_the_step_start) {
     const rad_buf pf_h = (rad_buf)(pf_ids - b.bufs.data() + 1);
     const rad_buf pm_h = (rad_buf)(pf_mask - b.bufs.data() + 1);
     const rad_buf pr_h = (rad_buf)(pf_rows - b.bufs.data() + 1);
-    /* The prefetch is off by default and gated on the per-layer knob: every case below says
-     * which way RADIANCE_HY4_ENGRAM_PREFETCH and rad_ngram_layer_named stand. */
-    const int named2 = 2;
+    /* The prefetch is off by default and gated on the RESOLVED placement: every case below
+     * says which way RADIANCE_HY4_ENGRAM_PREFETCH and rad_ngram_layer_resolved stand. Layer 2
+     * is the one with prefetch planes; the fake's unset default is Config's own: global disk. */
     setenv("RADIANCE_HY4_ENGRAM_PREFETCH", "1", 1);
-    radtest_set_ngram_layers(&named2, 1);
+    radtest_set_ngram_resolved(2, RAD_TABLE_PLACE_DISK);
     /* A device-placed table: the step is the parent's, nothing hashed or read early. */
     {
         RadCtx c{ .b = &d.b, .batch = &k->b };
@@ -623,10 +623,12 @@ TEST(the_later_engram_layers_prefetch_at_the_step_start) {
         CHECK(first_pf >= 0 && first_pf < pfg_at);                     /* hash before the read */
         CHECK(pfg_at < own2);   /* the step's start, ahead of the layer this read belongs to */
     }
-    /* The gate on the knob: PREFETCH=1 but the layer NOT named by --ngram-placement-layers --
-     * today's global all-disk step, the parent's byte for byte, no second gather into pf_rows. */
+    /* The gate is placement, not naming. A layer NAMED 2=ram whose locked copy is host-gathered
+     * passes the domain test and would take a second full gather into pf_rows every step: the
+     * resolved view refuses it, and the step is the parent's byte for byte -- zero prefetch
+     * work issued for the named-ram layer. */
     {
-        radtest_set_ngram_layers(nullptr, 0);
+        radtest_set_ngram_resolved(2, RAD_TABLE_PLACE_RAM);
         RadCtx c{ .b = &d.b, .batch = &k->b };
         for (rad_op h : gathers) c.host_ops.push_back(h);
         hyv4flash::step(&c, &k->b);
@@ -634,7 +636,34 @@ TEST(the_later_engram_layers_prefetch_at_the_step_start) {
         CHECK_LINT(b, &c);
         CHECK_EQ(count_issued(b, c, "engram_ids"), 4);
         CHECK_EQ(count_issued(b, c, "embed_lookup_q"), 2);
-        radtest_set_ngram_layers(&named2, 1);
+        radtest_set_ngram_resolved(2, RAD_TABLE_PLACE_DISK);
+    }
+    /* A global ram placement says the same for the layer no spec named: the resolved view is
+     * ram for it too, and the host gather of its locked copy prefetches nothing. */
+    {
+        radtest_set_ngram_resolved(2, -1);              /* layer 2 unnamed */
+        radtest_set_ngram_resolved(-1, RAD_TABLE_PLACE_RAM);
+        RadCtx c{ .b = &d.b, .batch = &k->b };
+        for (rad_op h : gathers) c.host_ops.push_back(h);
+        hyv4flash::step(&c, &k->b);
+        CHECK(c.step_fail.empty());
+        CHECK_LINT(b, &c);
+        CHECK_EQ(count_issued(b, c, "engram_ids"), 4);
+        CHECK_EQ(count_issued(b, c, "embed_lookup_q"), 2);
+    }
+    /* And the other way: the global all-disk step (nothing named at all) IS a disk placement --
+     * the gate reads the placement, so the unnamed layer prefetches exactly as a named-disk
+     * one does. */
+    {
+        radtest_set_ngram_resolved(-1, -1);             /* back to the Config default: disk */
+        RadCtx c{ .b = &d.b, .batch = &k->b };
+        for (rad_op h : gathers) c.host_ops.push_back(h);
+        hyv4flash::step(&c, &k->b);
+        CHECK(c.step_fail.empty());
+        CHECK_LINT(b, &c);
+        CHECK_EQ(count_issued(b, c, "engram_ids"), 6);
+        CHECK_EQ(count_issued(b, c, "embed_lookup_q"), 3);
+        radtest_set_ngram_resolved(2, RAD_TABLE_PLACE_DISK);
     }
     /* Off by default: PREFETCH unset leaves the parent's step whatever the knob says. */
     {
@@ -660,7 +689,8 @@ TEST(the_later_engram_layers_prefetch_at_the_step_start) {
         CHECK_EQ(count_issued(b, c, "embed_lookup_q"), 2);
     }
     unsetenv("RADIANCE_HY4_ENGRAM_PREFETCH");
-    radtest_set_ngram_layers(nullptr, 0);
+    radtest_set_ngram_resolved(2, -1);    /* the fake back to Config default: global disk */
+    radtest_set_ngram_resolved(-1, -1);
 }
 
 TEST(last_layer_keeps_cache_writers_at_chunk_height_and_queries_at_output_height) {

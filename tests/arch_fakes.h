@@ -27,6 +27,7 @@
 #include <cstring>
 #include <functional>
 #include <map>
+#include <map>
 #include <memory>
 #include <set>
 #include <string>
@@ -569,19 +570,24 @@ extern "C" int rad_op_domain(RadCtx* c, rad_op op) {
         if (h == op) return RAD_DOMAIN_HOST;
     return RAD_DOMAIN_DEVICE;
 }
-/* The layers --ngram-placement-layers named, as the test sets them (rad_ngram_layer_named,
- * abi/rad_runtime.h): the real one records the parse; the fake records what a case asks for. */
-inline std::vector<int>& fake_ngram_layers() {
-    static std::vector<int> v;
-    return v;
+/* The resolved placements as the test sets them (rad_ngram_layer_resolved, abi/rad_runtime.h):
+ * the real one snapshots Engine::resolve_table_placement's Config::ngram_effective view; the
+ * fake answers from here. layer -1 is the global placement; with nothing set the fake answers
+ * Config's own default, global disk. placement < 0 erases the entry. */
+inline std::map<int, int>& fake_ngram_resolved() {
+    static std::map<int, int> m;
+    return m;
 }
-extern "C" void radtest_set_ngram_layers(const int* layers, int n) {
-    fake_ngram_layers().assign(layers, layers + (n > 0 ? n : 0));
+extern "C" void radtest_set_ngram_resolved(int layer, int placement) {
+    if (placement < 0) fake_ngram_resolved().erase(layer);
+    else fake_ngram_resolved()[layer] = placement;
 }
-extern "C" int rad_ngram_layer_named(int layer) {
-    for (int l : fake_ngram_layers())
-        if (l == layer) return 1;
-    return 0;
+extern "C" int rad_ngram_layer_resolved(int layer) {
+    auto& m = fake_ngram_resolved();
+    const auto it = m.find(layer);
+    if (it != m.end()) return it->second;
+    const auto g = m.find(-1);
+    return g != m.end() ? g->second : RAD_TABLE_PLACE_DISK;
 }
 /* The second lane, recorded: each issue's lane, and each join's position among the issues. */
 extern "C" int rad_lane(RadCtx* c, int lane) {

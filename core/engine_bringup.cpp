@@ -853,6 +853,7 @@ int Engine::resolve_table_placement(const std::vector<VramFacts>& facts,
         }
     }
     cfg_.ngram_resolved = ng;
+    config_note_ngram_resolved(-1, ng);   /* the arch prefetch gate reads the resolved view */
     ngram_on_card_bytes_ = ng == TablePlacement::Vram ? ngram_bytes : 0;
 
     /* The asked layers, tested on their own bytes: a named tier that cannot be honoured stops
@@ -892,6 +893,7 @@ int Engine::resolve_table_placement(const std::vector<VramFacts>& facts,
         }
         for (const auto& [l, p] : cfg_.ngram_layer_asked) {
             cfg_.ngram_layer_resolved[l] = p;
+            config_note_ngram_resolved(l, p);
             const auto b = ngram_layer_bytes.find(l);
             if (b == ngram_layer_bytes.end()) {
                 RAD_WARN("--ngram-placement-layers: layer %d is named, but this model has no "

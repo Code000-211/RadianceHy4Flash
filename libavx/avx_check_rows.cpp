@@ -559,9 +559,10 @@ bool row_ahead_case(const Lib& lib, const std::string& dir, bool verbose) {
  * n_ahead equals M, the gather hands the rows to the reader thread and reads nothing here — the
  * hyv4flash step-start Engram read rides on that. What this checks, on a table file of its own
  * (a fresh cache, so the rows read are counted exactly):
- *   - the alias matches only in the unit the plugin passes: M = T*H rows and n_ahead = T*H rows
- *     (brows(pf_ids, T) over a [T, heads] plane). n_ahead = M/2, as a token-counted offer would
- *     be, must NOT match: the call gathers its rows itself and fills out.
+ *   - the alias matches only in the unit the plugin passes, and only EXACTLY: M = T*H rows and
+ *     n_ahead = T*H rows (brows(pf_ids, T) over a [T, heads] plane). n_ahead = M/2, as a
+ *     token-counted offer would be, must NOT match, and neither may n_ahead = M+1 -- one row
+ *     off: both calls gather their rows themselves and fill out.
  *   - the matching call returns without reading: out keeps its fill value, and the reader thread
  *     reads exactly those rows; the layer's own gather behind it (ahead gone) finds them in the
  *     cache and reads nothing more.
@@ -623,8 +624,8 @@ bool row_prefetch_case(const Lib& lib, const std::string& dir_in, bool verbose) 
         if (!ok) { ++fails; std::printf("  FAIL %s: %s\n", what, name); }
         else if (verbose) std::printf("  %s: %s\n", what, name);
     };
-    /* One call: rows gathered, ahead aliases ids when `alias` (n_ahead = M), else n_ahead = M/2
-     * (a token-counted offer) or no ahead operand at all (`ahead_none`). */
+    /* One call: rows gathered, ahead aliases ids when `alias` (n_ahead = M; 2: M/2, a
+     * token-counted offer; 3: M+1, one row off) or no ahead operand at all (`ahead_none`). */
     auto call = [&](std::vector<int32_t>& ids, int64_t M, void* out, int64_t out_n,
                    int alias, int ahead_none) {
         std::vector<RadTensor> ts = {
@@ -632,8 +633,9 @@ bool row_prefetch_case(const Lib& lib, const std::string& dir_in, bool verbose) 
             tensor(const_cast<uint8_t*>(tab), RAD_F8E4M3, {V, n}),
             tensor(&sc, RAD_BF16, {1}),
             tensor(out, RAD_BF16, {M, n}),
-            ahead_none ? tensor(nullptr, RAD_I32, {0})
-                       : tensor(ids.data(), RAD_I32, {alias == 2 ? M / 2 : M}) };
+            ahead_none
+                ? tensor(nullptr, RAD_I32, {0})
+                : tensor(ids.data(), RAD_I32, {alias == 2 ? M / 2 : (alias == 3 ? M + 1 : M)}) };
         RadParam ps[3] = {};
         ps[0].key = "M";      ps[0].kind = RAD_P_INT; ps[0].ival = M;
         ps[1].key = "n_embd"; ps[1].kind = RAD_P_INT; ps[1].ival = n;
@@ -669,6 +671,22 @@ bool row_prefetch_case(const Lib& lib, const std::string& dir_in, bool verbose) 
         check(read == (uint64_t)M, "n_ahead=M/2 gathers its own rows (the alias needs n_ahead=M,"
                                    " both counted in rows: M = T*H, brows(pf_ids, T) = T*H ids)");
         check(rows_exact(ids, M, out.data()), "n_ahead=M/2 output is the file's rows");
+    }
+    /* 1b. The exact boundary: the alias points at the ids and n_ahead is off by ONE row
+     * (M+1), which is still not M — the alias needs the equality exactly, and the call is
+     * again the ordinary gather. */
+    {
+        const int64_t M = 256;
+        std::vector<int32_t> ids((size_t)(M + 1));   /* one more than M: numel(ahead) = M+1 */
+        for (int64_t m = 0; m <= M; ++m) ids[(size_t)m] = (int32_t)(512 + m);
+        std::vector<uint16_t> out((size_t)(M * n), 0xdead);
+        const uint64_t before = reads();
+        const int rc = call(ids, M, out.data(), M, 3, 0);
+        const uint64_t read = reads() - before;
+        check(rc == RAD_OK, "n_ahead=M+1 call returns RAD_OK");
+        check(read == (uint64_t)M, "n_ahead=M+1 gathers its own rows (the alias needs"
+                                   " n_ahead == M exactly)");
+        check(rows_exact(ids, M, out.data()), "n_ahead=M+1 output is the file's rows");
     }
     /* 2. The alias: n_ahead = M over the same pointer — the reader gets the rows, this call reads
      *    nothing, and the layer's own gather behind it finds the cache full. */

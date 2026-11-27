@@ -25,6 +25,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <map>
 #include <set>
 #include <sstream>
 #include <sys/stat.h>
@@ -578,13 +579,26 @@ static bool parse_table_placement(const char* v, TablePlacement* out) {
     return true;
 }
 
-/* The Engram layers --ngram-placement-layers has named in this process (every parse of the flag
- * or its env adds to it). rad_ngram_layer_named answers from it; the step-start Engram prefetch
- * gates on it (abi/rad_runtime.h, hyv4flash_engram.h). */
-static std::set<int> g_ngram_layers_named;
+/* The placements Engine::resolve_table_placement confirmed for this process: the global one
+ * (layer -1) and the per-layer ones. rad_ngram_layer_resolved answers from it -- the snapshot of
+ * Config::ngram_effective the arch plugins read (abi/rad_runtime.h, hyv4flash_engram.h) -- and
+ * starts at Config's own default (global disk), so an answer exists before any resolve. One
+ * server per process, as the flag's parse recorder was: the last resolve wins. */
+static std::map<int, int> g_ngram_resolved;
 
-extern "C" int rad_ngram_layer_named(int layer) {
-    return g_ngram_layers_named.count(layer) ? 1 : 0;
+/* (Already inside namespace rad.) The resolve records through this; the snapshot answers the
+ * abi/rad_runtime.h accessor below. */
+void config_note_ngram_resolved(int layer, TablePlacement p) {
+    g_ngram_resolved[layer] = static_cast<int>(p);
+}
+
+extern "C" int rad_ngram_layer_resolved(int layer) {
+    const auto it = g_ngram_resolved.find(layer);
+    if (it != g_ngram_resolved.end()) return it->second;
+    const auto g = g_ngram_resolved.find(-1);   /* the global resolved placement */
+    return g != g_ngram_resolved.end()
+               ? g->second
+               : static_cast<int>(rad::TablePlacement::Disk);
 }
 
 /* --ngram-placement-layers / RADIANCE_NGRAM_PLACEMENT_LAYERS: the comma list of L=WHERE parsed
@@ -640,7 +654,6 @@ static bool parse_ngram_layers(const char* spec, Config* c) {
             RAD_ERR("--ngram-placement-layers: layer %d is named twice", l);
             return false;
         }
-        g_ngram_layers_named.insert(l);   /* what rad_ngram_layer_named answers (abi/rad_runtime.h) */
         if (!share_dir.empty()) c->ngram_layer_share_dir[l] = share_dir;
         if (!disk_dir.empty()) c->ngram_layer_disk_dir[l] = disk_dir;
         if (comma == std::string::npos) break;

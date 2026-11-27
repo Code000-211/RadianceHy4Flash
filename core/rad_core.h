@@ -137,6 +137,10 @@ enum class Tier { VRAM = 0, HostPinned = 1, HostPageable = 2, SSD = 3, Mapped = 
  *          embedding takes Ram or Vram. */
 enum class TablePlacement { Auto = 0, Vram = 1, Ram = 2, Disk = 3 };
 const char* table_placement_name(TablePlacement p);
+/* Record a confirmed placement for rad_ngram_layer_resolved (abi/rad_runtime.h): layer < 0 is
+ * the global one. Engine::resolve_table_placement calls it as it fills ngram_resolved and
+ * ngram_layer_resolved (core/config.cpp holds the snapshot). */
+void config_note_ngram_resolved(int layer, TablePlacement p);
 /* --draft-window: how many drafts a step verifies per sequence (core/sched/draft.h).
  *   Fixed     every sequence drafts --num-speculative-tokens.
  *   Adaptive  that is the ceiling; head depth per step and each sequence's stop follow measured
