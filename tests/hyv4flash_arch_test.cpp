@@ -213,6 +213,26 @@ std::vector<const RecOp*> sink_ops(const RadBuilder& b, int* paged = nullptr, in
     return v;
 }
 
+/* F-16's switch (`sink_sc`): the declaration `on`, switched, against `off`, the same declaration
+ * with the switch unset, whose sink ops `sinks` names. Every op, in the declaration's order, and
+ * every parameter of it, is the one it had, save the one `sink_sc=64/0.000000/` the switch appends
+ * to each of those sinks: the switch moves nothing else. */
+void the_sink_sc_switch_moves_the_sinks_alone(const RadBuilder& off,
+                                              const std::vector<const RecOp*>& sinks,
+                                              const RadBuilder& on) {
+    const std::vector<std::string> before = ops_snapshot(off), after = ops_snapshot(on);
+    REQUIRE_EQ(after.size(), before.size());
+    for (size_t i = 0; i < after.size(); ++i) {
+        bool is_sink = false;
+        for (const RecOp* o : sinks) is_sink = is_sink || o == &off.ops[i];
+        if (!is_sink) {
+            CHECK(after[i] == before[i]);
+            continue;
+        }
+        CHECK_EQ(after[i], before[i] + " sink_sc=64/0.000000/");
+    }
+}
+
 }  // namespace
 
 /* WP16.0c / WP16.1a: the whole-on-every-rank paged groups are declared replicated at every world
@@ -953,19 +973,7 @@ TEST(the_sink_super_chunk_switch_is_the_sinks_alone) {
     }
     /* Every op, in the declaration's order, and every parameter of it, save the one parameter this
      * switch adds to the sinks: the switch moves nothing else. */
-    const std::vector<std::string> after = ops_snapshot(on.b);
-    REQUIRE_EQ(after.size(), before.size());
-    for (size_t i = 0; i < after.size(); ++i) {
-        std::string want = before[i];
-        bool is_sink = false;
-        for (const RecOp* o : sinks_off) is_sink = is_sink || o == &off.b.ops[i];
-        if (!is_sink) {
-            CHECK(after[i] == want);
-            continue;
-        }
-        /* the same op, with `sink_sc=64/0/` appended to the parameters it had */
-        CHECK_EQ(after[i], want + " sink_sc=64/0.000000/");
-    }
+    the_sink_sc_switch_moves_the_sinks_alone(off.b, sinks_off, on.b);
     /* Another value, and an empty one: the law, with no parameter at all. */
     for (const char* v : { "0", "128", "64 ", "" }) {
         setenv("RADIANCE_HY4_SINK_SC", v, 1);
@@ -3367,15 +3375,7 @@ TEST(the_drafters_sink_takes_the_super_chunk_only_when_the_switch_names_it) {
 
     /* Every op and every parameter of the drafter's step, in order, save the one parameter this
      * switch adds to the sinks: the drafter's declaration moves nothing else. */
-    const std::vector<const RecOp*> sinks_off = sink_ops(off.b);
-    const std::vector<std::string> after = ops_snapshot(on.b);
-    REQUIRE_EQ(after.size(), before.size());
-    for (size_t i = 0; i < after.size(); ++i) {
-        bool is_sink = false;
-        for (const RecOp* o : sinks_off) is_sink = is_sink || o == &off.b.ops[i];
-        if (!is_sink) CHECK(after[i] == before[i]);
-        else CHECK_EQ(after[i], before[i] + " sink_sc=64/0.000000/");
-    }
+    the_sink_sc_switch_moves_the_sinks_alone(off.b, sink_ops(off.b), on.b);
     /* Another value, and an empty one: the law, and the drafter's sink with no parameter at all. */
     for (const char* v : { "0", "128", "" }) {
         setenv("RADIANCE_HY4_SINK_SC", v, 1);
