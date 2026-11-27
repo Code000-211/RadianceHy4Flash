@@ -239,14 +239,14 @@ static const RadParamSpec pMlaProjectKv[] = { P_INT("M"), P_INT("heads"), P_INT(
 static const RadParamSpec pMlaAttnPagedSink[] = { P_INT("M"), P_INT("heads"), P_INT("latent_dim"),
     P_INT("rope_dim"), P_INT("block_size"), P_INT("window"), P_F64("scale"), P_STR("dtype"),
     P_INTO("stable"), P_F64O("rope_theta"), P_F64O("rope_scale"), P_STRO("rope_mode"),
-    P_STRO("rope_sections") };
+    P_STRO("rope_sections"), P_INTO("sink_sc") };
 static const RadOperandSpec oMlaAttnPagedSink[] = { OPD("q"), OPD("q_rope"), OPD("kv"),
     OPD("block_table"), OPD("seqused"), OPD("cu_seqlens"), WGT("sinks"), OUT("out"),
     OPD_O("rope_pos") };
 static const RadParamSpec pMlaAttnSelSink[] = { P_INT("M"), P_INT("heads"), P_INT("latent_dim"),
     P_INT("rope_dim"), P_INT("blocks"), P_INT("block_size"), P_F64("scale"), P_STR("dtype"),
     P_INTO("stable"), P_F64O("rope_theta"), P_F64O("rope_scale"), P_STRO("rope_mode"),
-    P_STRO("rope_sections") };
+    P_STRO("rope_sections"), P_INTO("sink_sc") };
 static const RadOperandSpec oMlaAttnSelSink[] = { OPD("q"), OPD("q_rope"), OPD("kv"), OPD("bt"),
     OPD("length"), WGT("sinks"), OUT("out"), OPD_O("rope_pos") };
 static const RadParamSpec pMlaKvSplit[] = { P_INT("M"), P_INT("heads"), P_INT("k_dim"),
@@ -1495,7 +1495,10 @@ static const RadOpSchema kSchemas[] = {
   "this launch (the operand is this launch's rows, a view of a whole step's array): with it "
   "the fragment is turned here from q_rope's raw columns (`rope_theta`, `rope_scale`, "
   "`rope_mode` gptj or imrope_gptj, `rope_sections`), so the rows need no `rope` launch; "
-  "without it q_rope arrives rotated." },
+  "without it q_rope arrives rotated. `sink_sc` (optional, default 0) 64 cuts the super-chunk of "
+  "window 0 and of the selection form to 64 tokens in place of 128 (F-16's opt-in: more slots, half "
+  "the chunks a slot walks, the fold's order and so the last bits move); 0 is the law. A window's "
+  "own super-chunk is 64 either way." },
 { "mla_attn_sel_sink", ARR(pMlaAttnSelSink), ARR(oMlaAttnSelSink),
   "mla_attn's per-query page table and visible length with a rotary part and a sink: tokens "
   "[0, length[r]) of table row bt[r]. The score, the sink and `stable` are "

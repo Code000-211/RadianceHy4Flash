@@ -21,12 +21,13 @@
  * The stable law (WP16 perf.md 3.4.1, anchored at the row's first visible key): a row's range
  * [lo, hi) is cut into slots of 64 tokens with a window and of 128 at window 0 and in the selection
  * form, slot j = [lo + SC j, lo + SC (j + 1)), each walked in 16-token chunks from its start. The
- * law has sink_law() slots (8 at a window of 512, kMaxSplits at window 0 and in the selection form),
- * the last one taking whatever lies past it. At window 0 and in the selection form lo is 0, so the
- * grid is absolute there. (perf.md's absolute grid for a window -- slots at multiples of 64 of the
- * sequence -- was built and measured: on the card under the engine a verify row then did not give
- * the decode row's bytes, although the emulator and r4d_selftest found the launch row-exact; the
- * lo-anchored grid does, and is the old split's at a full window. See notes/wp16s.md.)
+ * law has sink_law() slots (8 at a window of 512, kMaxSplitsFull at window 0 and in the selection
+ * form, kMaxSplits where the op's `sink_sc` names 64 there), the last one taking whatever lies past
+ * it. At window 0 and in the selection form lo is 0, so the grid is absolute there. (perf.md's
+ * absolute grid for a window -- slots at multiples of 64 of the sequence -- was built and measured:
+ * on the card under the engine a verify row then did not give the decode row's bytes, although the
+ * emulator and r4d_selftest found the launch row-exact; the lo-anchored grid does, and is the old
+ * split's at a full window. See notes/wp16s.md.)
  * The slots holding a visible key fold in ascending order
  * (the first copied, each later one acc * exp(acc_m - m') + part * exp(part_m - m')), then the sink
  * joins once. So a row's bytes are a function of its own operands, the cache it sees and the op's
@@ -34,6 +35,15 @@
  * table's width bounds them) or the number of streams. A verify of k + 1 rows of any number of
  * streams gives the single-row decode at each position bit for bit, and the paged form at window 0
  * equals the selection form over a table listing the same pages in order (both anchor at 0).
+ *
+ * The super-chunk at window 0 and in the selection form is the op's own parameter (`sink_sc`): 128
+ * unless the launch names 64, F-16's opt-in. 64 halves the chunks the longest slot walks -- what a
+ * decode row's time is -- and so doubles the slots of the same range (40 in place of 20, and the
+ * scratch with them). It meets every boundary the 128-token law meets, so what it moves is the
+ * fold's order, the output's last bits, and nothing else; the law holds, so a row's bytes stay its
+ * own and the paged form at window 0 still equals the selection form. A window's own super-chunk is
+ * not this parameter's: it stays 64. Off unless an op asks for it (the plugin's
+ * RADIANCE_HY4_SINK_SC=64).
  *
  * Two forms run the law. The split form (up to the form's row cap: kRowsWindow / kRowsFull for
  * `stable 0`, kRowsStableWindow / kRowsStableFull for `stable 1`): a workgroup a slot, the partial
@@ -70,8 +80,21 @@ constexpr int kPitch = W + 8;
 constexpr int kPieces = 16 * W / 8; /* 16-byte pieces of a 16-token chunk */
 /* Super-chunks: 64 tokens with a window, 128 at window 0 and in the selection form. A lone
  * workgroup takes about 1.8 us a 16-token chunk (gfx1201), so a decode row's time is the chunks of
- * one super-chunk; more of them cost the partials' write and merge. The merge holds kMaxSplits. */
-constexpr int kShiftWindow = 6, kShiftFull = 7, kMaxSplits = 20;
+ * one super-chunk; more of them cost the partials' write and merge.
+ *
+ * F-16's opt-in halves the super-chunk at window 0 and in the selection form (kShiftFullTight, the
+ * op's `sink_sc` 64): the same range then has twice the slots (kMaxSplits, and twice the scratch)
+ * and each walks half the chunks, which is what a decode row's time is. Off unless the op asks for
+ * it: the law's own super-chunk there is kShiftFull's 128, and a window's stays kShiftWindow's 64
+ * either way. The merge reads a launch's slots in batches of the default law's count, so the array
+ * it holds is the one it has always held instead of a widest law's 40 spilling. */
+constexpr int kShiftWindow = 6, kShiftFull = 7;
+/* The law's table: the range its slots cover without a tail of their own (20 x 128 or 40 x 64); a
+ * longer range's last slot takes the rest. */
+constexpr int kLawTable = 20 * (1 << kShiftFull);
+constexpr int kShiftFullTight = 6, kSinkScTight = 1 << kShiftFullTight;
+constexpr int kMaxSplits = kLawTable >> kShiftFullTight, kMaxSplitsFull = kLawTable >> kShiftFull;
+static_assert(kMaxSplits == 2 * kMaxSplitsFull, "the widest law is two merge batches");
 /* The most rows a `stable 0` launch splits; past them the workgroups fill the card unsplit, which
  * is then also faster (measured: the window at 16 rows 79 us split against 68 unsplit, the
  * selection at 64 rows 362 against 269).
@@ -105,6 +128,8 @@ struct SinkMeta {
     int rope, plane, mode, n_sec, s0, s1, s2;
     float scale, rscale;
 };
+/* The 20 here is the struct's ints (the doubles, then pos and theta, then them), not the law's
+ * slots: the merge's arrays are kMaxSplitsFull's. */
 static_assert(sizeof(SinkMeta) == 12 * 8 + 8 + 8 + 20 * 4 + 2 * 4, "SinkMeta is a kernel argument "
               "by value and carries no padding");
 
@@ -524,42 +549,48 @@ __device__ __forceinline__ void mla_sink_rows_body(
     }
 }
 
-/* A workgroup a (row, head), thread t holding columns 4t..4t+3: every slot's maximum and partial
- * loaded at once (no serial dependency between the loads), then the slots with a visible key folded
- * in ascending order (sink_fold, the fused form's rule) and the sink once. An empty slot (den 0)
- * wrote only its maximum and denominator; its values are not read. */
+/* A workgroup a (row, head), thread t holding columns 4t..4t+3: a batch of slots' maximum and
+ * partial loaded at once (no serial dependency between the loads), then the slots with a visible key
+ * folded in ascending order (sink_fold, the fused form's rule) and the sink once. An empty slot
+ * (den 0) wrote only its maximum and denominator; its values are not read. A batch is the default
+ * law's slot count (kMaxSplitsFull), so a launch of that law is one pass -- the load-then-fold it
+ * has always done -- and the widest law's 40 slots are two: the folds' order and their arithmetic
+ * are the same either way. */
 __device__ __forceinline__ void merge_sink_body(const float* scratch, const float* sinks,
                                                 uint16_t* out, SinkMeta m) {
     const int t = threadIdx.x, head = blockIdx.y, r = blockIdx.x;
     const float* src = scratch + ((long)r * m.heads + head) * m.splits * PART;
-    float part_max[kMaxSplits], part_den[kMaxSplits];
-    float4 part[kMaxSplits];
-#pragma unroll
-    for (int s = 0; s < kMaxSplits; ++s)
-        if (s < m.splits) {
-            part_max[s] = src[s * PART + D];
-            part_den[s] = src[s * PART + D + 1];
-            part[s] = part_den[s] > 0 ? *(const float4*)(src + s * PART + 4 * t)
-                                      : make_float4(0, 0, 0, 0);
-        }
     float4 value = make_float4(0, 0, 0, 0);
     float acc_m = -INFINITY, den = 0;
+    for (int base = 0; base < m.splits; base += kMaxSplitsFull) {
+        const int n = min(kMaxSplitsFull, m.splits - base);
+        float part_max[kMaxSplitsFull], part_den[kMaxSplitsFull];
+        float4 part[kMaxSplitsFull];
 #pragma unroll
-    for (int s = 0; s < kMaxSplits; ++s) {
-        if (!(s < m.splits && part_den[s] > 0)) continue;
-        if (!(den > 0)) {
-            acc_m = part_max[s];
-            den = part_den[s];
-            value = part[s];
-            continue;
+        for (int s = 0; s < kMaxSplitsFull; ++s)
+            if (s < n) {
+                const float* p = src + (base + s) * PART;
+                part_max[s] = p[D];
+                part_den[s] = p[D + 1];
+                part[s] = part_den[s] > 0 ? *(const float4*)(p + 4 * t) : make_float4(0, 0, 0, 0);
+            }
+#pragma unroll
+        for (int s = 0; s < kMaxSplitsFull; ++s) {
+            if (!(s < n && part_den[s] > 0)) continue;
+            if (!(den > 0)) {
+                acc_m = part_max[s];
+                den = part_den[s];
+                value = part[s];
+                continue;
+            }
+            const SinkFold f = sink_fold(acc_m, part_max[s]);
+            den = fmaf(part_den[s], f.b, den * f.a);
+            acc_m = f.m;
+            value.x = fmaf(part[s].x, f.b, value.x * f.a);
+            value.y = fmaf(part[s].y, f.b, value.y * f.a);
+            value.z = fmaf(part[s].z, f.b, value.z * f.a);
+            value.w = fmaf(part[s].w, f.b, value.w * f.a);
         }
-        const SinkFold f = sink_fold(acc_m, part_max[s]);
-        den = fmaf(part_den[s], f.b, den * f.a);
-        acc_m = f.m;
-        value.x = fmaf(part[s].x, f.b, value.x * f.a);
-        value.y = fmaf(part[s].y, f.b, value.y * f.a);
-        value.z = fmaf(part[s].z, f.b, value.z * f.a);
-        value.w = fmaf(part[s].w, f.b, value.w * f.a);
     }
     const float inv = sink_inv(acc_m, den, sinks[(long)head * m.ss]);
     uint16_t* const o = out + (long)r * m.orr + (long)head * m.oh + 4 * t;
@@ -603,20 +634,26 @@ __global__ __launch_bounds__(128) void merge_sink(const float* scratch, const fl
     if (CH::on) r4d_chain_done();
 }
 
-int sink_shift(bool sel, long window) { return !sel && window > 0 ? kShiftWindow : kShiftFull; }
+/* An op's super-chunk: 64 with a window, 128 at window 0 and in the selection form (64 there too
+ * where the op's `sink_sc` names it: F-16's opt-in). A function of the op, the window and that
+ * parameter alone, so a paged launch at window 0 and a selection launch cut the same range the same
+ * way. */
+int sink_shift(bool sel, long window, long sc) {
+    return !sel && window > 0 ? kShiftWindow : (sc == kSinkScTight ? kShiftFullTight : kShiftFull);
+}
 /* The law's slots: a window's range in super-chunks, window / SC rounded up (8 at 512), at most
- * kMaxSplits; kMaxSplits at window 0 and in the selection form. A function of the op and the
- * window alone. */
-int sink_law(bool sel, long window) {
-    if (sel || window <= 0) return kMaxSplits;
-    const long sc = 1L << kShiftWindow;
-    return (int)std::min<long>(kMaxSplits, (window + sc - 1) / sc);
+ * kMaxSplitsFull; at window 0 and in the selection form the table in super-chunks (kMaxSplitsFull,
+ * or kMaxSplits at the 64-token one). A function of the op, the window and `sink_sc` alone. */
+int sink_law(bool sel, long window, long sc) {
+    if (sel || window <= 0) return kLawTable >> sink_shift(sel, window, sc);
+    const long wsc = 1L << kShiftWindow;
+    return (int)std::min<long>(kMaxSplitsFull, (window + wsc - 1) / wsc);
 }
 /* The slots a launch needs: no visible token lies at or past the table's capacity, so a slot past
  * it is empty in every row. Moves no bits (empty slots are skipped). */
-int sink_slots(bool sel, long window, long cap) {
-    const long need = cap < 1 ? 1 : ((cap - 1) >> sink_shift(sel, window)) + 1;
-    return (int)std::min<long>(sink_law(sel, window), need);
+int sink_slots(bool sel, long window, long cap, long sc) {
+    const long need = cap < 1 ? 1 : ((cap - 1) >> sink_shift(sel, window, sc)) + 1;
+    return (int)std::min<long>(sink_law(sel, window, sc), need);
 }
 /* The most rows the launch splits: the form's cap, `stable 1` past `stable 0`'s. Moves no bits (both
  * forms run the law). */
@@ -657,7 +694,11 @@ int sink_body(const RadArgs* a, RadStream stream) {
     const long heads = r4d_geti_or(a, "heads", 0), bs = r4d_geti_or(a, "block_size", 0),
                window = SEL ? 0 : r4d_geti_or(a, "window", 0);
     const float scale = (float)r4d_getf(a, "scale", 0);
-    const long stable = r4d_geti_or(a, "stable", 0);
+    /* F-16's opt-in (`sink_sc`): the super-chunk at window 0 and in the selection form, 64 tokens in
+     * place of the law's 128; absent or 0 is the law, and a window's own super-chunk is not this
+     * parameter's. */
+    const long stable = r4d_geti_or(a, "stable", 0), sc = r4d_geti_or(a, "sink_sc", 0);
+    if (sc != 0 && sc != kSinkScTight) return RAD_E_UNSUPPORTED;
     heads_view(q, heads, D);
     heads_view(qr, heads, RD);
     heads_view(o, heads, D);
@@ -728,7 +769,7 @@ int sink_body(const RadArgs* a, RadStream stream) {
             return RAD_E_SHAPE;
     }
     const int form = g_sink_form;
-    const int law = sink_law(SEL, window);
+    const int law = sink_law(SEL, window, sc);
     /* The split form up to the row cap (a workgroup a slot, merge_sink); past it, or where the
      * scratch holds no partials, `stable 1` runs the fused form (the same bytes: a workgroup walks
      * the row's slots and folds them as the merge does, an accumulator a row in the scratch) and
@@ -738,7 +779,8 @@ int sink_body(const RadArgs* a, RadStream stream) {
      * always the law's count, because its table is the batch's block table, whose pitch can differ
      * between a recorded pass and its replay (a launch sized at a narrower table would drop the
      * keys of a later, longer context). */
-    int splits = SEL ? sink_slots(true, 0, bt.shape[1] * bs) : sink_law(false, window), fused = 0;
+    int splits = SEL ? sink_slots(true, 0, bt.shape[1] * bs, sc) : sink_law(false, window, sc),
+        fused = 0;
     if (splits > 1) {
         const int64_t have = a->scratch ? a->scratch_bytes : 0;
         const bool split_fits = have >= rows * heads * splits * PART * 4,
@@ -805,7 +847,7 @@ int sink_body(const RadArgs* a, RadStream stream) {
                       (int)kv.shape[0],
                       splits,
                       law,
-                      sink_shift(SEL, window),
+                      sink_shift(SEL, window, sc),
                       fused,
                       (int)window,
                       SEL ? 0 : (int)r4d_geti_or(a, "row0", 0),
@@ -860,12 +902,14 @@ int sink_body(const RadArgs* a, RadStream stream) {
 int64_t sink_scratch(const RadArgs* a, bool sel) {
     const long heads = r4d_geti_or(a, "heads", 0), rows = r4d_geti_or(a, "M", kRowsFull),
                window = sel ? 0 : r4d_geti_or(a, "window", 0), stable = r4d_geti_or(a, "stable", 0),
-               blocks = sel ? r4d_geti_or(a, "blocks", 0) : 0, bs = r4d_geti_or(a, "block_size", 0);
+               blocks = sel ? r4d_geti_or(a, "blocks", 0) : 0, bs = r4d_geti_or(a, "block_size", 0),
+               sc = r4d_geti_or(a, "sink_sc", 0);
     if (heads < 1 || heads > 64 || rows < 1 || rows > 65535 || window < 0 || stable < 0 ||
         stable > 1)
         return RAD_E_SHAPE;
-    const int slots = sel && blocks > 0 && bs > 0 ? sink_slots(true, 0, blocks * bs)
-                                                  : sink_law(sel, window);
+    if (sc != 0 && sc != kSinkScTight) return RAD_E_UNSUPPORTED;
+    const int slots = sel && blocks > 0 && bs > 0 ? sink_slots(true, 0, blocks * bs, sc)
+                                                  : sink_law(sel, window, sc);
     if (slots <= 1) return 0;
     const long cap = std::min(rows, sink_rows_cap(sel, window, stable != 0));
     /* stable 1: the split form's partials up to the cap, the fused form's accumulator past it */
@@ -883,7 +927,8 @@ extern "C" int r4d_rad_mla_attn_sel_sink(const RadArgs* a, RadStream stream) {
  * 48 rows at 32 heads, 24.2 MiB); 20 slots at window 0 and 32 heads 1.32 MiB (stable 0: 32 rows,
  * 42.3 MiB; stable 1: 48 rows, 60.4 MiB); the selection at blocks x block_size 2048 has 16 slots
  * (1.06 MiB a row at 32 heads: stable 1 48 rows, 48.4 MiB; 24.2 MiB at the 16 heads a rank has at
- * TP2). */
+ * TP2). `sink_sc` 64 (F-16's opt-in) doubles the slots at window 0 and in the selection (40, and 32
+ * at the 2048-token selection), and so the partials' scratch with them. */
 extern "C" int64_t r4d_rad_mla_attn_paged_sink_scratch(const RadArgs* a) {
     return sink_scratch(a, false);
 }
