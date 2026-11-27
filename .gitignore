@@ -9,5 +9,8 @@ __pycache__/
 
 /runs/
 
+# the RDNA4 ISA suite a kernel card clones to lint its kernels (a review tool, not source)
+/.radisa/
+
 # per-user tool state (gh, etc.) must never be committed
 .local/
