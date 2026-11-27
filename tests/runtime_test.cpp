@@ -824,6 +824,47 @@ TEST(a_table_whose_copy_is_in_flight_is_patched_at_the_op_that_reads_it) {
     two_tables_one_pass(nullptr, 2, true);
 }
 
+/* An entry the load phase bound no pointer (the placement left it nowhere, which is not a copy
+ * still going) is a load-phase bug, and the head walk names it: the step fails, and the pass is
+ * not issued against an array that still holds the entry's old pointer. The per-op path reports
+ * the same entry in the same words, from the one resolve both walk through (wtab_resolve). */
+TEST(a_table_entry_with_no_pointer_fails_the_step_at_the_pass_head) {
+    constexpr int kE = kPassTabE;
+    static uint16_t home[kE][8];
+    Fixture f;
+    std::vector<rad_weight> w;
+    for (int e = 0; e < kE; ++e)
+        w.push_back(f.add_weight(("np.e" + std::to_string(e)).c_str(), RAD_BF16, 8, 4, home[e]));
+    rad_buf x = f.add_buffer("x", RAD_BF16, 64, 4, 0);
+    rad_buf y = f.add_buffer("y", RAD_BF16, 64, 8, 1024);
+    rad_op  op = f.add_op("patch_pass_np", "M", { 8192 }, { k_tab_a }, { "tab_a" },
+                          &g_moe_schema, w);
+    f.P.ops[op].weight_opd.assign((size_t)kE, 1);
+
+    TableResidency res;
+    res.slot.assign(f.P.weights.size(), rad::WeightSlot{});
+    for (int e = 0; e < kE; ++e) res.slot[(size_t)w[(size_t)e]].ptr = home[e];
+    CHECK_OK(f.start(&res));
+
+    auto issue = [&](int step_no) {
+        g_rec.clear();
+        return f.step(4, step_no, [&](Ctx& c) {
+            RadOperand a[3] = { RAD_B(x), RAD_WTAB(w[0], kE), RAD_B(y) };
+            CHECK_OK(c.issue(op, a, 3, RAD_N_BATCH));
+        });
+    };
+    /* The first issue uploads the table whole: nothing queued, nothing to name. */
+    CHECK_OK(issue(0));
+    CHECK_EQ(f.ctx.wtab_patches(), (int64_t)0);
+
+    /* The mover takes entry 1 and lands nothing: no pointer at issue. */
+    res.move(w[1], nullptr);
+    CHECK(issue(1) < 0);
+    CHECK(g_rec.empty());                   /* no launch against the stale array */
+    CHECK(std::strstr(f.ctx.step_error(), "weight 'np.e1'") != nullptr);
+    CHECK(std::strstr(f.ctx.step_error(), "has no pointer at issue") != nullptr);
+}
+
 /* A pass with an op on each lane, both reading one table: the head patch goes out on lane 0, and
  * a pass that patched joins lane 1 behind it, so the op on lane 1 reads the moved entries too
  * (before this a table was patched at the op, on the op's own lane). The first step builds lane 1
