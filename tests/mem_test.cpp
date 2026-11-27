@@ -763,6 +763,45 @@ TEST(queue_scratch_flat_bound_is_five_mib_a_cu_and_zero_for_no_card) {
     CHECK_EQ(queue_scratch_flat_bytes(96), (int64_t)96 * (5LL << 20));
 }
 
+/* M-09 review: the backend selection in rad_dev_resident_scratch_bytes. A host or unified device
+ * charges nothing; a backend that cannot answer for the device -- a stub backend, or a device id it
+ * does not know, which is the same answer from this side -- keeps the flat bound, labelled as such.
+ * Card-less: the fallback is reached through the device id, not through a missing card. */
+TEST(queue_scratch_backend_selection_flats_a_backend_without_metadata) {
+    RadDeviceProps host_props{};
+    host_props.device_id = 0;
+    host_props.n_cu = 96;
+    host_props.warp_size = 64;
+    host_props.is_host_backend = 1;
+    const RadQueueScratch host = rad_dev_resident_scratch_bytes(&host_props);
+    CHECK_EQ(host.bytes, 0);
+    CHECK(!host.metadata);
+    CHECK_EQ(host.largest_private, 0u);
+
+    RadDeviceProps unified_props{};
+    unified_props.device_id = 0;
+    unified_props.n_cu = 96;
+    unified_props.warp_size = 64;
+    unified_props.unified = 1;
+    const RadQueueScratch unified = rad_dev_resident_scratch_bytes(&unified_props);
+    CHECK_EQ(unified.bytes, 0);
+    CHECK(!unified.metadata);
+
+    RadDeviceProps stub_props{};
+    stub_props.device_id = -1;
+    stub_props.n_cu = 96;
+    stub_props.warp_size = 64;
+    const RadQueueScratch stub = rad_dev_resident_scratch_bytes(&stub_props);
+    CHECK_EQ(stub.bytes, queue_scratch_flat_bytes(96));
+    CHECK(!stub.metadata);
+    CHECK_EQ(stub.largest_private, 0u);
+    CHECK_EQ(stub.declared, 0);
+    CHECK_EQ(stub.total, 0);
+    CHECK_EQ(stub.kernel, std::string());
+
+    CHECK_EQ(rad_dev_resident_scratch_bytes(nullptr).bytes, 0);
+}
+
 TEST(the_queue_scratch_receipt_names_which_answer_it_shows) {
     auto report = [](bool metadata, int64_t bytes, int plan, int kernels, uint32_t priv,
                      const char* kernel) {

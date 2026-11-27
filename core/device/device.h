@@ -200,13 +200,13 @@ namespace rad {
 
 /* The queue scratch this card will keep for a plan that loads the modules registered so far: the
  * heaviest private_segment_fixed_size among the kernels those code objects describe, through
- * queue_scratch_bytes(), plus `extra_mib_per_cu` MiB a CU when a deployment sets
- * the kernels' own metadata. A module loads whole at its first kernel, so every kernel of it is
- * one the program can launch: `declared` counts the ones with a private segment, `total` every
- * kernel the code objects describe, and `kernel` names the heaviest. `metadata` is false when the
- * backend could not read code objects and the flat n_cu * 5 MiB bound stands (the receipt says
- * which). 0 on the host backend and on unified memory. Charged to the VRAM budget beside the
- * hardware queues. (M-09) */
+ * queue_scratch_bytes() -- one wave a CU, once a card. There is no deployment knob: the item asks
+ * for the metadata charge, so the metadata is the charge. A module loads whole at its first kernel,
+ * so every kernel of it is one the program can launch: `declared` counts the ones with a private
+ * segment, `total` every kernel the code objects describe, and `kernel` names the heaviest.
+ * `metadata` is false when the backend could not read code objects and the flat n_cu * 5 MiB bound
+ * stands (the receipt says which). 0 on the host backend and on unified memory. Charged to the VRAM
+ * budget beside the hardware queues. (M-09) */
 struct RadQueueScratch {
     int64_t     bytes = 0;
     uint32_t    largest_private = 0;   /* bytes, the heaviest private_segment_fixed_size */
