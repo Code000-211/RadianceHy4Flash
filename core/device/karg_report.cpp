@@ -11,29 +11,6 @@ namespace rad {
 namespace aql {
 namespace {
 
-const char* hidden_name(Hidden h) {
-    switch (h) {
-    case Hidden::None:          return nullptr;
-    case Hidden::Pad:           return "hidden padding";
-    case Hidden::BlockCountX:   return "hidden block_count_x";
-    case Hidden::BlockCountY:   return "hidden block_count_y";
-    case Hidden::BlockCountZ:   return "hidden block_count_z";
-    case Hidden::GroupSizeX:    return "hidden group_size_x";
-    case Hidden::GroupSizeY:    return "hidden group_size_y";
-    case Hidden::GroupSizeZ:    return "hidden group_size_z";
-    case Hidden::RemainderX:    return "hidden remainder_x";
-    case Hidden::RemainderY:    return "hidden remainder_y";
-    case Hidden::RemainderZ:    return "hidden remainder_z";
-    case Hidden::GlobalOffsetX: return "hidden global_offset_x";
-    case Hidden::GlobalOffsetY: return "hidden global_offset_y";
-    case Hidden::GlobalOffsetZ: return "hidden global_offset_z";
-    case Hidden::GridDims:      return "hidden grid_dims";
-    case Hidden::DynamicLds:    return "hidden dynamic_lds";
-    case Hidden::Unsupported:   return "hidden unsupported";
-    }
-    return "hidden";
-}
-
 uint64_t load(const unsigned char* p, uint32_t n) {
     uint64_t v = 0;
     std::memcpy(&v, p, n < 8 ? n : 8);
@@ -61,10 +38,14 @@ std::vector<std::string> karg_lines(const KargSlot& slot,
                               slot.kernarg_size, i, a.offset));
             break;
         }
-        const char* hname = hidden_name(a.hidden);
         std::string head;
-        if (hname) {
-            head = fmt("%s (%u bytes at +%u)", hname, a.size, a.offset);
+        if (a.hidden != Hidden::None) {
+            /* The metadata's own spelling of an implicit argument (`hidden_block_count_x`): the
+             * reader keeps it in `KernelArg::kind` and `hidden_kind` maps it to the enum, so
+             * reading it here is what keeps the report and the refusal message from drifting
+             * into two spellings of one slot. */
+            head = fmt("%s (%u bytes at +%u)", a.kind.empty() ? "hidden" : a.kind.c_str(), a.size,
+                       a.offset);
         } else {
             const std::string name = a.name.empty() ? fmt("%zu", i) : a.name;
             head = fmt("argument %s (%s, %u bytes at +%u)", name.c_str(),
@@ -85,9 +66,19 @@ std::vector<std::string> karg_lines(const KargSlot& slot,
     }
 
     /* The chained-launch record: the kernel reads it at RAD_CHAIN_KARG_OFF and waits for that
-     * counter if and only if the record's magic and check hold (libr4d/r4d_chain.h). Printing it,
-     * with the counter's location, tells a chained launch that waited from an unchained one. */
+     * counter if and only if the record's magic and check hold (libr4d/r4d_chain.h). Only the
+     * chained form of a kernel reads it, and the backend writes the record for exactly those
+     * launches (`if (k->chained) chain_record(...)`), so that is the only case in which the bytes
+     * there are this launch's. A plain kernel's slot still holds whatever record an earlier
+     * chained launch in it left: saying the launch waited would be a claim about a launch that
+     * never read the slot at all. */
     if ((uint64_t)RAD_CHAIN_KARG_OFF + RAD_CHAIN_REC_BYTES <= slot.bytes) {
+        if (!slot.chained) {
+            out.push_back(fmt("chain record at +%d: not read, this launch is the plain form of its "
+                              "kernel; what stands there belongs to an earlier launch in this slot",
+                              (int)RAD_CHAIN_KARG_OFF));
+            return out;
+        }
         const unsigned char* p = slot.base + RAD_CHAIN_KARG_OFF;
         const uint64_t magic = load(p, 8), target = load(p + 8, 8);
         const uint64_t ctr = load(p + 16, 8), check = load(p + 24, 8);

@@ -536,6 +536,7 @@ std::unordered_map<uint64_t, std::string> g_names;
  * so the dump names each operand and each size instead of guessing at pointer-shaped words. */
 struct KargLayout {
     uint32_t kernarg_size = 0;
+    bool chained = false;          /* the code object is the chained form: it reads the record */
     std::vector<KernelArg> args;
 };
 std::unordered_map<uint64_t, KargLayout> g_klayout;
@@ -603,7 +604,7 @@ KernelRec* resolve(Func* fn, int ord) {
     {
         std::lock_guard<std::mutex> nl(g_names_mu);
         g_names[k->object] = k->name;
-        g_klayout[k->object] = KargLayout{k->kernarg_size, meta->args};
+        g_klayout[k->object] = KargLayout{k->kernarg_size, k->chained, meta->args};
     }
     KernelRec* out = k.release();
     fn->rec[ord].store(out, std::memory_order_release);
@@ -1041,7 +1042,7 @@ void report_running(int card) {
          * with the location it lies in, a value as the number it is. The slot's bytes past the
          * launch's segment belong to whatever used the slot before, and are not printed. */
         const std::vector<std::string> lines =
-            karg_lines(KargSlot{slot, kKargSlot, lay.kernarg_size, &lay.args},
+            karg_lines(KargSlot{slot, kKargSlot, lay.kernarg_size, lay.chained, &lay.args},
                        [](uintptr_t a) { return where_is(a); });
         if (!lines.empty()) {
             for (const std::string& l : lines) RAD_ERR("  %s", l.c_str());

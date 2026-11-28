@@ -45,14 +45,20 @@ std::vector<KernelArg> i8_kpar_layout() {
         a.name = vals[i];
         v.push_back(a);
     }
+    /* An implicit argument carries the metadata's own spelling in `kind` (`.value_kind`) and the
+     * enum `hidden_kind` reads it to (aql_code.cpp); the report prints `kind`, so one name for one
+     * slot stands in the report and in the refusal message. */
     const Hidden hid[8] = {Hidden::BlockCountX, Hidden::BlockCountY, Hidden::BlockCountZ,
                            Hidden::GroupSizeX,  Hidden::GroupSizeY,  Hidden::GroupSizeZ,
                            Hidden::GridDims,    Hidden::DynamicLds};
+    const char* hkind[8] = {"hidden_block_count_x", "hidden_block_count_y", "hidden_block_count_z",
+                            "hidden_group_size_x",  "hidden_group_size_y",  "hidden_group_size_z",
+                            "hidden_grid_dims",     "hidden_dynamic_lds_size"};
     for (int i = 0; i < 8; ++i) {
         KernelArg a;
         a.offset = (uint32_t)(64 + 4 * i);
         a.size = 4;
-        a.kind = "by_value";
+        a.kind = hkind[i];
         a.hidden = hid[i];
         v.push_back(a);
     }
@@ -113,8 +119,8 @@ const std::string* find_line(const std::vector<std::string>& lines, const char* 
 }
 
 std::vector<std::string> lines_of(const std::vector<unsigned char>& slot, uint32_t kernarg_size,
-                                  const std::vector<KernelArg>& layout) {
-    return karg_lines(KargSlot{slot.data(), (uint32_t)slot.size(), kernarg_size, &layout},
+                                  const std::vector<KernelArg>& layout, bool chained = true) {
+    return karg_lines(KargSlot{slot.data(), (uint32_t)slot.size(), kernarg_size, chained, &layout},
                       fake_where);
 }
 
@@ -145,9 +151,9 @@ TEST(arguments_are_named_and_typed) {
     CHECK(find_line(lines, "argument M (by_value, 4 bytes at +48) = 6") != nullptr);
     CHECK(find_line(lines, "argument a_ld (by_value, 4 bytes at +52) = 4096") != nullptr);
     CHECK(find_line(lines, "argument sa_ld (by_value, 4 bytes at +56) = 16") != nullptr);
-    CHECK(find_line(lines, "hidden block_count_x (4 bytes at +64) = 192") != nullptr);
-    CHECK(find_line(lines, "hidden group_size_x (4 bytes at +76) = 128") != nullptr);
-    CHECK(find_line(lines, "hidden dynamic_lds (4 bytes at +92) = 0") != nullptr);
+    CHECK(find_line(lines, "hidden_block_count_x (4 bytes at +64) = 192") != nullptr);
+    CHECK(find_line(lines, "hidden_group_size_x (4 bytes at +76) = 128") != nullptr);
+    CHECK(find_line(lines, "hidden_dynamic_lds_size (4 bytes at +92) = 0") != nullptr);
 
     /* Not one line is the slot's leftovers: the segment ends at +96 and the rest is 0xa5. */
     for (const std::string& l : lines) {
@@ -195,6 +201,24 @@ TEST(chain_record_is_printed) {
     CHECK(bad_rec->find("did not wait") != std::string::npos);
 }
 
+/* The record is a chained launch's, and only a chained launch's: the backend writes it in
+ * `if (k->chained) chain_record(...)` and the plain form of a kernel never reads the slot. A slot a
+ * plain launch reused still holds the record an earlier chained launch left there, and reading it
+ * as this launch's would say "this launch waited for that counter" about a kernel that does not
+ * look at the slot at all. */
+TEST(chain_record_is_not_claimed_for_a_plain_launch) {
+    const std::vector<KernelArg> layout = i8_kpar_layout();
+    std::vector<unsigned char> slot = hy4_slot();
+    put_record(slot, 4711, kCtr);  /* a valid record from an earlier launch in this slot */
+    const std::vector<std::string> lines = lines_of(slot, 96, layout, false);
+    const std::string* rec = find_line(lines, "chain record at +");
+    REQUIRE(rec != nullptr);
+    CHECK(rec->find("not read") != std::string::npos);
+    CHECK(rec->find("waited") == std::string::npos);
+    CHECK(rec->find("target 4711") == std::string::npos);
+    CHECK(rec->find("belongs to an earlier launch") != std::string::npos);
+}
+
 /* A segment shorter than the metadata's parameters: what follows is another launch's, and the
  * report says so instead of printing it as arguments. */
 TEST(past_the_segment_is_not_printed) {
@@ -220,11 +244,12 @@ TEST(past_the_slot_is_reported) {
  * caller keeps its old dump. */
 TEST(no_layout_means_no_lines) {
     std::vector<unsigned char> slot = hy4_slot();
-    CHECK(karg_lines(KargSlot{slot.data(), (uint32_t)slot.size(), 96, nullptr}, fake_where)
+    CHECK(karg_lines(KargSlot{slot.data(), (uint32_t)slot.size(), 96, true, nullptr}, fake_where)
               .empty());
     const std::vector<KernelArg> empty;
-    CHECK(karg_lines(KargSlot{slot.data(), (uint32_t)slot.size(), 96, &empty}, fake_where).empty());
-    CHECK(karg_lines(KargSlot{nullptr, 0, 96, &empty}, fake_where).empty());
+    CHECK(karg_lines(KargSlot{slot.data(), (uint32_t)slot.size(), 96, true, &empty}, fake_where)
+              .empty());
+    CHECK(karg_lines(KargSlot{nullptr, 0, 96, true, &empty}, fake_where).empty());
 }
 
 }  /* namespace */

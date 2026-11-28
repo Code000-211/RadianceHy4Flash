@@ -35,13 +35,15 @@ struct KargSlot {
     const unsigned char*          base = nullptr;
     uint32_t                      bytes = 0;        /* readable bytes at `base` (one slot) */
     uint32_t                      kernarg_size = 0; /* this launch's segment */
+    bool                          chained = false;  /* the code object reads the record at +992 */
     const std::vector<KernelArg>* args = nullptr;   /* the code object's layout, in order */
 };
 
-/* The lines for that launch: one per parameter of the segment, then the chain record's line when
- * the slot holds a valid record. `where` locates an address (the dump's own lookup: a pageable
- * chunk, a live range, a pinned piece, "in no range ..."). Empty when there is no layout to print,
- * in which case the caller prints the slot's pointer-shaped words as it did before. */
+/* The lines for that launch: one per parameter of the segment, then the record's line (this launch
+ * waited on it, it was not chained, or no record is valid). `where` locates an address (the dump's
+ * own lookup: a pageable chunk, a live range, a pinned piece, "in no range ..."). Empty when there
+ * is no layout to print, in which case the caller prints the slot's pointer-shaped words as it did
+ * before. */
 std::vector<std::string> karg_lines(const KargSlot& slot,
                                     const std::function<std::string(uintptr_t)>& where);
 
