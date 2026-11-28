@@ -2797,6 +2797,9 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
         RAD_ERR("serve: start() has not run, or stopped at --debug-graph");
         return RAD_E_STATE;
     }
+    /* The run's own refusals, now that the pools are allocated (#337, #272): a pool the weights are
+     * read from that mlock could not lock against swap faults mid-request instead of stalling. */
+    if (const int refused = check_run_configuration(); refused < 0) return refused;
     embedding_ = ranks_[0]->program.pooled_buf != RAD_NULL_HANDLE;
     const bool audio_gen = ranks_[0]->program.is_audio_generator();
     const bool video_gen = ranks_[0]->program.is_video_generator();

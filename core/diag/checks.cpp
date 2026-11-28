@@ -309,19 +309,39 @@ void check_memory(const Facts& f, const RunFacts& r, std::vector<Finding>* out) 
 }
 
 /* #272: pinned host memory whose mlock was refused. The cards map it without pinning a page, so
- * reclaim may swap it out, and every swap-out evicts all of the process's queues on every card. */
+ * reclaim may swap it out, and every swap-out evicts all of the process's queues on every card.
+ *
+ * When a rank reads weights from the host tiers it is worse than a stall: a kernel reading a weight
+ * from a page that is no longer mapped faults, and the server stops mid-request -- issue #337's
+ * faulting kernel is the routed expert GEMM, whose weights cross from the host. That is a
+ * configuration startup refuses (incompatible_run below) instead of serving. */
 void check_pinned_unlocked(const Facts& f, const RunFacts& r, std::vector<Finding>* out) {
     if (r.pinned_unlocked_bytes <= 0) return;
     const int64_t lim = f.host.memlock_soft;
-    add(out, Finding::Warn, "pinned-unlocked",
-        fmt("%s of the pinned host memory is not locked against swap (RLIMIT_MEMLOCK %s)",
-            humanb(r.pinned_unlocked_bytes).c_str(),
-            lim == -2 ? "unlimited" : lim < 0 ? "unknown" : humanb(lim).c_str()),
+    const bool weights = r.host_weight_bytes > 0;
+    std::string what = fmt("%s of the pinned host memory is not locked against swap (RLIMIT_MEMLOCK "
+                           "%s)",
+                           humanb(r.pinned_unlocked_bytes).c_str(),
+                           lim == -2 ? "unlimited" : lim < 0 ? "unknown" : humanb(lim).c_str());
+    std::string why =
         "the cards map those pages without pinning them, so under memory pressure the kernel may "
         "swap them out; each swap-out evicts every queue of this process on every card until "
-        "the pages are read back in, and all cards stop together for that long",
+        "the pages are read back in, and all cards stop together for that long";
+    std::string fix =
         "Docker: --ulimit memlock=-1; systemd: LimitMEMLOCK=infinity; otherwise memlock in "
-        "/etc/security/limits.conf");
+        "/etc/security/limits.conf";
+    if (weights) {
+        what += fmt(", and a rank reads %s of weights from host memory every step, which the cards "
+                    "map the same way",
+                    humanb(r.host_weight_bytes).c_str());
+        why += ". A weight read from a page that is not mapped faults instead of stalling: #337's "
+               "faulting kernel is the routed expert GEMM that reads these weights, and the "
+               "server stopped mid-request on it";
+        fix += "; or keep the weights out of that pool (--host-pool-mib 0) and give them VRAM "
+               "instead (a shorter --max-model-len, fewer --max-num-seqs, --kv-cache-dtype i8, or "
+               "more cards, --tp)";
+    }
+    add(out, weights ? Finding::Incompatible : Finding::Warn, "pinned-unlocked", what, why, fix);
 }
 
 void check_memlock(const Facts& f, const RunFacts& r, std::vector<Finding>* out) {
@@ -427,6 +447,18 @@ std::vector<Finding> incompatible(const Facts& f) {
     check_cwsr(f, &out);
     std::stable_sort(out.begin(), out.end(),
                      [](const Finding& a, const Finding& b) { return a.level > b.level; });
+    return out;
+}
+
+std::vector<Finding> incompatible_run(const Facts& f, const RunFacts& r) {
+    std::vector<Finding> out;
+    const std::vector<Finding> machine = incompatible(f);
+    for (const Finding& x : check(f, r)) {
+        if (x.level != Finding::Incompatible) continue;
+        bool named = false;   /* check() opens with incompatible()'s, which startup already refused */
+        for (const Finding& m : machine) named = named || m.id == x.id;
+        if (!named) out.push_back(x);
+    }
     return out;
 }
 

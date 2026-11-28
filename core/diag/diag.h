@@ -207,6 +207,11 @@ std::vector<Finding> check(const Facts& f, const RunFacts& r);
  * anything: the serving cards (rank >= 0) and their host. check() includes them. */
 std::vector<Finding> incompatible(const Facts& f);
 
+/* The incompatible findings only the run's own facts can name, known once the pools are allocated:
+ * startup stops on them too, after the load and before it serves. check() includes them; the
+ * machine's own (incompatible()) are not repeated here, since startup refused them already. */
+std::vector<Finding> incompatible_run(const Facts& f, const RunFacts& r);
+
 /* The box --proceed-with-incompatible-configuration puts at the top of the log and the startup
  * report, one log line an element. */
 std::vector<std::string> unsupported_banner();
