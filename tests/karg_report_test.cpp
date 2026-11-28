@@ -33,6 +33,7 @@ std::vector<KernelArg> i8_kpar_layout() {
         a.offset = (uint32_t)(8 * i);
         a.size = 8;
         a.kind = "global_buffer";
+        a.address = aql::kind_is_address(a.kind);   /* what code_object_kernels fills */
         a.name = ptrs[i];
         v.push_back(a);
     }
@@ -42,6 +43,7 @@ std::vector<KernelArg> i8_kpar_layout() {
         a.offset = (uint32_t)(40 + 4 * i);
         a.size = 4;
         a.kind = "by_value";
+        a.address = aql::kind_is_address(a.kind);
         a.name = vals[i];
         v.push_back(a);
     }
@@ -60,6 +62,7 @@ std::vector<KernelArg> i8_kpar_layout() {
         a.size = 4;
         a.kind = hkind[i];
         a.hidden = hid[i];
+        a.address = aql::kind_is_address(a.kind);
         v.push_back(a);
     }
     return v;
@@ -227,17 +230,29 @@ TEST(an_eight_byte_value_is_not_an_address) {
     std::vector<KernelArg> layout;
     KernelArg n;
     n.offset = 0; n.size = 8; n.kind = "by_value"; n.name = "n";
+    n.address = aql::kind_is_address(n.kind);
     layout.push_back(n);
     KernelArg go;
     go.offset = 8; go.size = 8; go.kind = "hidden_global_offset_x";
     go.hidden = Hidden::GlobalOffsetX;
+    go.address = aql::kind_is_address(go.kind);
     layout.push_back(go);
     KernelArg p;
     p.offset = 16; p.size = 8; p.kind = "global_buffer"; p.name = "p";
+    p.address = aql::kind_is_address(p.kind);
     layout.push_back(p);
     KernelArg k;
     k.offset = 24; k.size = 4; k.kind = "by_value"; k.name = "k";
+    k.address = aql::kind_is_address(k.kind);
     layout.push_back(k);
+
+    /* And the table itself: the pointer kinds, and nothing else. */
+    CHECK(aql::kind_is_address("global_buffer"));
+    CHECK(aql::kind_is_address("dynamic_shared_pointer"));
+    CHECK(!aql::kind_is_address("by_value"));
+    CHECK(!aql::kind_is_address("hidden_global_offset_x"));
+    CHECK(!aql::kind_is_address("ext_image"));
+    CHECK(!aql::kind_is_address(""));
 
     std::vector<unsigned char> slot(1024, 0xa5);
     put64(slot, 0, 0x7ca037295800ull);  /* a count that happens to look like an address */

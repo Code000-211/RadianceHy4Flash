@@ -17,19 +17,13 @@ uint64_t load(const unsigned char* p, uint32_t n) {
     return v;
 }
 
-/* Whether a parameter's bytes are an address or a number, from the metadata's value_kind. Size
- * cannot answer it: a `uint64_t *` and a `uint64_t` are both eight bytes, and so is
- * hidden_global_offset_x, which the backend writes as the value it is (aql.cpp). A kind the
- * metadata does not name (empty, or one added after this) is printed as the number it may be:
- * a number shown as "in no range this process holds" is the line this report exists to remove. */
+/* Whether a parameter's bytes are an address or a number. The metadata reader decides it once, from
+ * the value_kind, into `KernelArg::address` (aql_code.cpp: kind_is_address); the report reads that
+ * flag instead of spelling the kinds a second time, where the two lists could drift apart. A number
+ * shown as "in no range this process holds" is the line this report exists to remove, so a kind
+ * nobody named is printed as the number it may be. */
 bool is_address(const KernelArg& a) {
-    if (a.hidden != Hidden::None) {
-        /* The implicit arguments this backend accepts carry a count or an offset, never an address
-         * (`hidden_kind`, aql_code.cpp), and the rest refuse their kernel before it is launched. */
-        return false;
-    }
-    return a.kind == "global_buffer" || a.kind == "dynamic_shared_pointer" ||
-           a.kind == "sampler" || a.kind == "image" || a.kind == "pipe" || a.kind == "queue";
+    return a.address;
 }
 
 }  /* namespace */

@@ -240,8 +240,19 @@ Hidden hidden_kind(const std::string& k) {
     for (const auto& t : kTab) if (k == t.n) return t.h;
     return Hidden::Unsupported;
 }
-
 }  // namespace
+
+/* Whether a parameter's bytes are an address or a number, from the metadata's value_kind. The
+ * kinds the ABI names as pointers; anything else (by_value, ext types, a kind added after this) is
+ * printed as the number it may be, because a number shown as "in no range this process holds" is
+ * the line issue #337's report exists to remove. */
+bool kind_is_address(const std::string& k) {
+    static const char* const kAddress[] = { "global_buffer", "dynamic_shared_pointer", "sampler",
+                                            "image", "pipe", "queue" };
+    for (const char* n : kAddress)
+        if (k == n) return true;
+    return false;
+}
 
 /* ------------------------------------------------------------------ the metadata note */
 
@@ -309,6 +320,9 @@ bool code_object_kernels(const void* elf, size_t size, std::vector<KernelMeta>* 
                         if (const MP* v = a.get(".value_kind")) ka.kind   = v->str();
                         if (const MP* v = a.get(".name"))       ka.name   = v->str();
                         ka.hidden = hidden_kind(ka.kind);
+                        /* An implicit argument carries a count or an offset, never an address
+                         * (`hidden_kind` above); the report reads this one flag. */
+                        ka.address = ka.hidden == Hidden::None && kind_is_address(ka.kind);
                         m.args.push_back(std::move(ka));
                     }
                 }

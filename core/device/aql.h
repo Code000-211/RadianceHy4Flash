@@ -31,10 +31,20 @@ enum class Hidden : uint8_t {
     Unsupported,    /* anything else: a kernel that wants it is refused by name */
 };
 
+/* Whether a metadata value_kind names a pointer. `code_object_kernels` fills KernelArg::address from
+ * it once, and the fault report reads that flag; this is the one table of the kinds that are
+ * addresses (aql_code.cpp), so a kind added on one side is not missing on the other. */
+bool kind_is_address(const std::string& kind);
+
 struct KernelArg {
     uint32_t offset = 0;
     uint32_t size   = 0;
     Hidden   hidden = Hidden::None;
+    /* Its bytes are an address, decided once from the metadata's value_kind (kind_is_address,
+     * aql_code.cpp) so that the fault report and the refusal message read one table, not two. Size
+     * cannot answer it: a `uint64_t *` and a `uint64_t` are both eight bytes, and so is
+     * hidden_global_offset_x, which the backend writes as the value it is. */
+    bool     address = false;
     std::string kind;              /* the metadata's value_kind, for the refusal message */
     std::string name;              /* the metadata's parameter name, for the fault report */
 };
