@@ -397,6 +397,22 @@ public:
     /* Releases the cache's reference on a marked block, or a reservation's on any other. */
     void release_block(int32_t group, int32_t block);
     int32_t block_refcount(int32_t group, int32_t block) const;
+    /* Compaction (M-15b): moves the cache's reference on `src`, a block only the cache holds
+     * (marked, refcount one), to the lowest free block below it, and returns that block in
+     * `*dst`, now marked and at refcount one. `src` keeps a plain reservation (unmarked, refcount
+     * one): its bytes are the copy's source, so it must stay out of the free list -- and so out
+     * of the loan's reach -- until the copy has landed. The caller issues the copy of every layer
+     * of `src` into `*dst` on each rank, points the cache entry at `*dst`, and release_block(src)
+     * once the copy is done.
+     *
+     * Lendable groups only: the compaction exists to lower the held top the loan stops at.
+     * RAD_E_STATE when something else holds `src` (a sequence reads it, or the cache does not);
+     * RAD_E_FULL when no free block lies below `src`, or taking one would leave fewer free than
+     * the buffer. It never recalls the loan: a block taken back from the slab to move another
+     * down would give the slab nothing. Rank 0 only. */
+    int  relocate_cached_block(int32_t group, int32_t src, int32_t* dst);
+    /* Blocks relocate_cached_block has moved in a group since configure(). */
+    int64_t relocated_blocks(int32_t group) const;
     /* Blocks only the cache holds: marked, at refcount one. This is what an eviction would free.
      * Maintained at every refcount change because it is read under the scheduler's lock, where a
      * walk of the cache would stall the step. */
@@ -522,6 +538,7 @@ public:
         int64_t live          = 0;
         int64_t spare_tokens  = 0;
         int64_t loan_tokens   = 0;
+        int64_t compacted     = 0;   /* relocated_blocks(group): blocks a compaction moved down */
     };
     SpareSplit spare_split() const;
 
@@ -800,6 +817,7 @@ private:
      * marked. `cache_only_` is, per group, how many marked blocks are at a count of one. */
     std::vector<std::vector<uint8_t>> cached_;
     std::vector<int64_t>              cache_only_;
+    std::vector<int64_t>              relocated_;     /* per group: relocate_cached_block moves */
     std::vector<std::vector<int32_t>> free_states_;   /* per group */
     std::unordered_map<uint64_t, Seq> seqs_;
     std::vector<BlockCopy> pending_;

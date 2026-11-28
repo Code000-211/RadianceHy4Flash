@@ -17,6 +17,7 @@
 #include "mem/pcstore.h"
 #include "device/device.h"
 #include "plugin/registry.h"
+#include "runtime/kvmove.h"
 #include "runtime/tierexec.h"
 #include "sched/mem_iface.h"
 #include "engine_priv.h"           /* pcache_page_in_request */
@@ -5296,6 +5297,274 @@ TEST(cached_context_that_fills_its_part_of_the_pool_stays_and_the_blocks_far_abo
     CHECK_EQ(x.f.pc.drop_clean(goal), 0);           /* which keeps every block */
     CHECK_EQ(x.f.pc.resident(), 200ll);
     CHECK_EQ(x.f.pc.lookup(dense, {}).n_attn_tokens, 16 * 200);
+}
+
+/* ================================================================== compaction (M-15b) */
+
+/* The move one block makes: the cache's reference goes to the lowest free block below it, and the
+ * source stays reserved, out of the free list and the loan's reach, until the caller has copied
+ * it. Only a block the cache alone holds moves, never past the buffer, never by recalling. */
+TEST(a_cached_block_moves_to_the_lowest_hole_and_its_source_waits_for_the_copy) {
+    Lender e;
+    CHECK_OK(e.build());
+    const int64_t all = e.kv.total_blocks(G_FULL);
+    std::vector<int32_t> got;
+    for (int64_t i = 0; i < all / 2; ++i) {
+        int32_t b = -1;
+        CHECK_OK(e.kv.reserve_block(G_FULL, &b));
+        e.kv.cache_reserved_block(G_FULL, b);
+        got.push_back(b);
+    }
+    REQUIRE(got.size() >= 8);
+    CHECK_EQ(got[0], 0);
+    /* Two holes at the bottom, as an eviction leaves them. */
+    e.kv.release_block(G_FULL, got[0]);
+    e.kv.release_block(G_FULL, got[1]);
+    const int64_t held = e.kv.held_blocks(G_FULL);
+    const int64_t only = e.kv.cache_only_blocks(G_FULL);
+    const int64_t top  = e.kv.held_top_blocks(G_FULL);
+    const int32_t hi   = got.back();
+
+    int32_t dst = -1;
+    CHECK_OK(e.kv.relocate_cached_block(G_FULL, hi, &dst));
+    CHECK_EQ(dst, got[0]);                                /* the lowest hole */
+    CHECK_EQ(e.kv.block_refcount(G_FULL, dst), 1);
+    CHECK_EQ(e.kv.block_refcount(G_FULL, hi), 1);         /* reserved until the copy lands */
+    CHECK_EQ(e.kv.held_blocks(G_FULL), held + 1);
+    CHECK_EQ(e.kv.cache_only_blocks(G_FULL), only);       /* one cache-only block for another */
+    CHECK_EQ(e.kv.held_top_blocks(G_FULL), top);          /* the source still holds the top */
+    CHECK_EQ(e.kv.relocated_blocks(G_FULL), 1);
+    CHECK_EQ(e.kv.spare_split().compacted, 1);
+    /* The source is the cache's no longer: a second move of it is refused. */
+    int32_t again = -1;
+    CHECK_EQ(e.kv.relocate_cached_block(G_FULL, hi, &again), RAD_E_STATE);
+    CHECK_EQ(again, -1);
+
+    /* A block a sequence also holds stays where its table names it. */
+    const int32_t shared = got[got.size() - 2];
+    CHECK_OK(e.kv.retain_block(G_FULL, shared));
+    CHECK_EQ(e.kv.relocate_cached_block(G_FULL, shared, &again), RAD_E_STATE);
+
+    /* The second hole goes to the next block down; then nothing free lies below the rest. */
+    CHECK_OK(e.kv.relocate_cached_block(G_FULL, got[got.size() - 3], &dst));
+    CHECK_EQ(dst, got[1]);
+    const int64_t free_now = e.kv.free_blocks(G_FULL);
+    CHECK_EQ(e.kv.relocate_cached_block(G_FULL, got[4], &again), RAD_E_FULL);
+    CHECK_EQ(e.kv.free_blocks(G_FULL), free_now);         /* it took nothing */
+    CHECK_EQ(e.kv.block_refcount(G_FULL, got[4]), 1);
+
+    /* The copy has landed: the sources go back and the top comes down. */
+    e.kv.release_block(G_FULL, hi);
+    e.kv.release_block(G_FULL, got[got.size() - 3]);
+    CHECK(e.kv.held_top_blocks(G_FULL) <= top);
+    CHECK_EQ(e.kv.held_blocks(G_FULL), held);             /* two holes filled, two freed */
+}
+
+TEST(a_compaction_move_keeps_the_buffer_and_never_recalls_the_loan) {
+    Lender e;
+    CHECK_OK(e.build());
+    /* Lend everything but the buffer, then hold two blocks and free the lower one. */
+    CHECK_OK(e.kv.set_loan(e.kv.spare_tokens()));
+    const int64_t loan = e.kv.loan_tokens();
+    REQUIRE(loan > 0);
+    int32_t a = -1, b = -1;
+    CHECK_OK(e.kv.reserve_block(G_FULL, &a));
+    CHECK_OK(e.kv.reserve_block(G_FULL, &b));
+    e.kv.cache_reserved_block(G_FULL, a);
+    e.kv.cache_reserved_block(G_FULL, b);
+    e.kv.release_block(G_FULL, a);
+    REQUIRE(e.kv.free_blocks(G_FULL) <= e.kv.spare_split().buffer_blocks);
+    int32_t dst = -1;
+    CHECK_EQ(e.kv.relocate_cached_block(G_FULL, b, &dst), RAD_E_FULL);
+    CHECK_EQ(e.kv.loan_tokens(), loan);
+    CHECK_EQ(e.kv.block_refcount(G_FULL, b), 1);
+    CHECK_EQ(e.kv.relocated_blocks(G_FULL), 0);
+}
+
+/* The pool M-15 measured on iks-A, in miniature: a conversation published low, a second above
+ * it, the first evicted. The holes it leaves are under the second, where no loan reaches. A pass
+ * moves the second down into them, keeps every one of its hits, and once the sources go back
+ * the loan reaches what the first held. */
+TEST(the_highest_cache_only_entries_move_down_into_the_holes_and_keep_their_hits) {
+    Fixture f;
+    CHECK_OK(f.build(/*with_linear=*/false, 0));
+    REQUIRE_EQ(f.pc.cached_groups().size(), (size_t)1);
+    const auto older = tok_run(1000, 16 * 100 + 16);
+    publish(f, 1, older, 16 * 100);
+    f.kv.free_sequence(1);
+    const auto newer = tok_run(5000, 16 * 100 + 16);
+    publish(f, 2, newer, 16 * 100);
+    f.kv.free_sequence(2);
+    std::vector<std::vector<int32_t>> before;
+    CHECK_EQ(f.pc.lookup(newer, {}, &before).n_attn_tokens, 16 * 100);
+    REQUIRE_EQ(before[0].size(), (size_t)100);
+    CHECK(*std::min_element(before[0].begin(), before[0].end()) >= 100);
+
+    CHECK_EQ(f.pc.evict_lru(100), 100);                 /* the older one, oldest first */
+    CHECK_EQ(f.pc.resident(), 100);
+    const KVManager::SpareSplit frag = f.kv.spare_split();
+    CHECK(frag.held_top - frag.held >= 100);
+    const int64_t spare0 = f.kv.spare_tokens();
+
+    std::vector<PrefixCache::Move> mv;
+    CHECK_EQ(f.pc.plan_compaction(1 << 20, &mv), 100);
+    REQUIRE_EQ(mv.size(), (size_t)100);
+    std::set<int32_t> dsts;
+    for (const PrefixCache::Move& m : mv) {
+        CHECK_EQ(m.group, (int32_t)G_FULL);
+        CHECK(m.dst < m.src);
+        CHECK(m.dst < 100);
+        dsts.insert(m.dst);
+    }
+    CHECK_EQ(dsts.size(), (size_t)100);
+    /* Ascending sources took ascending holes, so the pass is one run. */
+    for (size_t i = 1; i < mv.size(); ++i)
+        CHECK(mv[i].src > mv[i - 1].src && mv[i].dst > mv[i - 1].dst);
+    CHECK_EQ(f.pc.stats().compacted, 100);
+    CHECK_EQ(f.pc.stats().evictions, 100);              /* the move lost nothing */
+
+    /* Every hit now hands out the new ids. */
+    std::vector<std::vector<int32_t>> after;
+    CHECK_EQ(f.pc.lookup(newer, {}, &after).n_attn_tokens, 16 * 100);
+    CHECK(std::set<int32_t>(after[0].begin(), after[0].end()) == dsts);
+    /* Until the copies land the sources hold the top, so the loan reaches no further. */
+    CHECK_EQ(f.kv.held_top_blocks(G_FULL), frag.held_top);
+    CHECK_EQ(f.kv.spare_tokens(), spare0);
+
+    for (const PrefixCache::Move& m : mv) f.kv.release_block(m.group, m.src);
+    CHECK(f.kv.held_top_blocks(G_FULL) < frag.held_top);
+    CHECK(f.kv.held_top_blocks(G_FULL) - f.kv.held_blocks(G_FULL) <
+          frag.held_top - frag.held);
+    CHECK(f.kv.spare_tokens() > spare0);
+    CHECK_EQ(f.kv.held_blocks(G_FULL), 100);
+    /* Dense now: the next pass finds nothing to move. */
+    std::vector<PrefixCache::Move> none;
+    CHECK_EQ(f.pc.plan_compaction(1 << 20, &none), 0);
+    /* And an adopt of the moved prefix gets the new blocks. */
+    CHECK_OK(f.kv.add_sequence(3));
+    CHECK_OK(f.kv.adopt(3, G_FULL, after[0], 16 * 100));
+    CHECK(f.kv.block_table(3, G_FULL) == after[0]);
+}
+
+/* A pass is bounded, and takes the highest blocks first: what it moves is what lowers the top. */
+TEST(a_compaction_pass_moves_at_most_its_budget_from_the_top) {
+    Fixture f;
+    CHECK_OK(f.build(/*with_linear=*/false, 0));
+    const auto older = tok_run(1000, 16 * 40 + 16);
+    publish(f, 1, older, 16 * 40);
+    f.kv.free_sequence(1);
+    const auto newer = tok_run(5000, 16 * 40 + 16);
+    publish(f, 2, newer, 16 * 40);
+    f.kv.free_sequence(2);
+    std::vector<std::vector<int32_t>> bo;
+    (void)f.pc.lookup(newer, {}, &bo);
+    const int32_t top = *std::max_element(bo[0].begin(), bo[0].end());
+    CHECK_EQ(f.pc.evict_lru(40), 40);
+    std::vector<PrefixCache::Move> mv;
+    CHECK_EQ(f.pc.plan_compaction(8, &mv), 8);
+    int32_t lo_src = INT32_MAX;
+    for (const PrefixCache::Move& m : mv) lo_src = std::min(lo_src, m.src);
+    CHECK_EQ(lo_src, top - 7);                          /* the eight highest */
+}
+
+/* What the pass may not touch: blocks a running sequence reads (its table names them), and a
+ * cache with the host tier on, where an entry above the holes is written back and dropped for
+ * the loan instead, and a write-back in flight reads the ids it was planned with. */
+TEST(a_compaction_moves_nothing_a_sequence_reads_or_a_host_tier_copies) {
+    {
+        Fixture f;
+        CHECK_OK(f.build(/*with_linear=*/false, 0));
+        const auto older = tok_run(1000, 16 * 20 + 16);
+        publish(f, 1, older, 16 * 20);
+        f.kv.free_sequence(1);
+        const auto newer = tok_run(5000, 16 * 20 + 16);
+        publish(f, 2, newer, 16 * 20);                  /* sequence 2 still reads it */
+        CHECK_EQ(f.pc.evict_lru(20), 20);
+        std::vector<PrefixCache::Move> mv;
+        CHECK_EQ(f.pc.plan_compaction(1 << 20, &mv), 0);
+        CHECK(mv.empty());
+        f.kv.free_sequence(2);
+        CHECK_EQ(f.pc.plan_compaction(1 << 20, &mv), 20);
+    }
+    {
+        Stragglers x;
+        CHECK_OK(x.build(/*slots=*/4, /*under=*/0));
+        const auto older = tok_run(1000, 16 * 20 + 16);
+        publish(x.f, 1, older, 16 * 20);
+        x.f.kv.free_sequence(1);
+        const auto newer = tok_run(5000, 16 * 20 + 16);
+        publish(x.f, 2, newer, 16 * 20);
+        x.f.kv.free_sequence(2);
+        CHECK_EQ(x.f.pc.evict_lru(20), 20);
+        std::vector<PrefixCache::Move> mv;
+        CHECK_EQ(x.f.pc.plan_compaction(1 << 20, &mv), 0);
+        CHECK_EQ(x.f.kv.relocated_blocks(G_FULL), 0);
+    }
+}
+
+/* A pass whose copies could not be issued: the moved entries are forgotten with their new blocks,
+ * and the sources stay the caller's to release. */
+TEST(a_compaction_that_could_not_copy_forgets_what_it_moved) {
+    Fixture f;
+    CHECK_OK(f.build(/*with_linear=*/false, 0));
+    const auto older = tok_run(1000, 16 * 10 + 16);
+    publish(f, 1, older, 16 * 10);
+    f.kv.free_sequence(1);
+    const auto newer = tok_run(5000, 16 * 10 + 16);
+    publish(f, 2, newer, 16 * 10);
+    f.kv.free_sequence(2);
+    CHECK_EQ(f.pc.evict_lru(10), 10);
+    std::vector<PrefixCache::Move> mv;
+    CHECK_EQ(f.pc.plan_compaction(1 << 20, &mv), 10);
+    CHECK_EQ(f.pc.forget_moved(mv), 10);
+    CHECK_EQ(f.pc.resident(), 0);
+    CHECK_EQ(f.pc.lookup(newer, {}).n_attn_tokens, 0);
+    CHECK_EQ(f.kv.held_blocks(G_FULL), 10);             /* only the reserved sources */
+    for (const PrefixCache::Move& m : mv) f.kv.release_block(m.group, m.src);
+    CHECK_EQ(f.kv.held_blocks(G_FULL), 0);
+    CHECK_EQ(f.kv.pool_bytes_used(G_FULL), 0);
+}
+
+/* The device side: every layer's fragment of a source lands at its destination, nothing else in
+ * the pool changes, and neighbours on both sides go as one copy. */
+TEST(a_compaction_copy_moves_every_layer_of_a_block_and_coalesces_runs) {
+    Lender e;
+    CHECK_OK(e.build());
+    const KVGroupPlan* p = e.kv.plan(G_FULL);
+    REQUIRE(p && p->base && p->n_layers >= 2);
+    const int64_t frag = p->layer_bytes_per_block(), stride = p->layer_stride();
+    const int64_t span = p->n_layers * stride;
+    unsigned char* base = static_cast<unsigned char*>(p->base);
+    for (int64_t l = 0; l < p->n_layers; ++l)
+        for (int64_t b = 0; b < p->pool_blocks(); ++b)
+            std::memset(base + l * stride + b * frag, (int)((b * 7 + l * 13) & 0xff), (size_t)frag);
+    std::vector<unsigned char> was(base, base + span);
+
+    const std::vector<BlockCopy> copies = {
+        { G_FULL, 12, 2 }, { G_FULL, 10, 0 }, { G_FULL, 11, 1 },   /* one run, out of order */
+        { G_FULL, 30, 5 },
+    };
+    RadStream st = nullptr;
+    REQUIRE_EQ(rad_stream_create(&st, 0), RAD_OK);
+    CHECK_EQ(issue_block_copies(e.kv, copies, st), 2);
+    CHECK_OK(rad_stream_sync(st));
+    rad_stream_destroy(st);
+
+    std::map<int64_t, int64_t> moved = { { 0, 10 }, { 1, 11 }, { 2, 12 }, { 5, 30 } };
+    int64_t wrong = 0;
+    for (int64_t l = 0; l < p->n_layers; ++l)
+        for (int64_t b = 0; b < p->pool_blocks(); ++b) {
+            auto it = moved.find(b);
+            const int64_t from = it == moved.end() ? b : it->second;
+            wrong += std::memcmp(base + l * stride + b * frag,
+                                 was.data() + l * stride + from * frag, (size_t)frag) != 0;
+        }
+    CHECK_EQ(wrong, 0);
+    /* An id past the pool is refused before anything is issued for it. */
+    REQUIRE_EQ(rad_stream_create(&st, 0), RAD_OK);
+    CHECK_EQ(issue_block_copies(e.kv, { { G_FULL, (int32_t)p->pool_blocks(), 0 } }, st),
+             (int64_t)RAD_E_INVAL);
+    rad_stream_destroy(st);
 }
 
 TEST(a_recomputed_shared_prefix_keeps_its_original_host_copy_and_snapshot) {

@@ -506,6 +506,7 @@ struct KVBinding final : IKVManager {
         o.live          = s.live;
         o.spare_tokens  = s.spare_tokens;
         o.loan_tokens   = s.loan_tokens;
+        o.compacted     = s.compacted;
         return o;
     }
     int64_t pool_bytes(int32_t g) const override      { return m->pool_bytes(g); }

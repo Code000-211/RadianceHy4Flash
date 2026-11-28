@@ -27,6 +27,7 @@ struct KvSpareSplit {
     int64_t live          = 0;
     int64_t spare_tokens  = 0;
     int64_t loan_tokens   = 0;
+    int64_t compacted     = 0;   /* blocks of the group a compaction moved down (M-15b) */
 };
 
 struct SchedMetrics {

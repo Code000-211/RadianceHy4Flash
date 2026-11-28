@@ -924,6 +924,90 @@ int64_t PrefixCache::drop_stragglers(int64_t loan_goal, bool recheck) {
     return n;
 }
 
+/* Compaction (M-15b, see prefix.h). One walk of the resident list collects every block at or
+ * above its group's dense floor that only the cache holds, and the pass takes the highest
+ * `max_blocks` of them, so it lowers the held top as far as its budget reaches. They are moved
+ * lowest first: the free list hands out its lowest id, so ascending sources get ascending
+ * destinations and a run of neighbours stays a run on both sides, one copy for the engine
+ * (Engine::compact_issue) instead of one a block. */
+int64_t PrefixCache::plan_compaction(int64_t max_blocks, std::vector<Move>* out) {
+    if (!enabled_ || !kv_ || !out || max_blocks <= 0) return 0;
+    if (tiers_ && tiers_->host_on()) return 0;
+    const size_t ng = entry_groups_.size();
+    std::vector<int64_t> floor_b(ng, INT64_MAX);
+    bool any = false;
+    for (size_t k = 0; k < ng; ++k) {
+        const int32_t g = entry_groups_[k];
+        if (!kv_->lendable(g)) continue;
+        floor_b[k] = kv_->held_blocks(g);
+        any = any || kv_->held_top_blocks(g) > floor_b[k];
+    }
+    if (!any) return 0;
+
+    struct Cand { int32_t block; int32_t slot; Entry* e; const BlockHash* key; };
+    std::vector<Cand> cand;
+    for (const BlockHash& h : lru_) {
+        auto m = map_.find(h);
+        if (m == map_.end()) continue;
+        Entry& e = m->second;
+        for (size_t k = 0; k < ng && k < e.blocks.size(); ++k) {
+            const int32_t b = e.blocks[k];
+            if (b < 0 || (int64_t)b < floor_b[k]) continue;
+            if (kv_->block_refcount(entry_groups_[k], b) != 1) continue;
+            cand.push_back(Cand{ b, (int32_t)k, &e, &m->first });
+        }
+    }
+    if (cand.empty()) return 0;
+    if ((int64_t)cand.size() > max_blocks) {
+        std::nth_element(cand.begin(), cand.begin() + (max_blocks - 1), cand.end(),
+                         [](const Cand& a, const Cand& b) { return a.block > b.block; });
+        cand.resize((size_t)max_blocks);
+    }
+    std::sort(cand.begin(), cand.end(), [this](const Cand& a, const Cand& b) {
+        const int32_t ga = entry_groups_[(size_t)a.slot], gb = entry_groups_[(size_t)b.slot];
+        return ga != gb ? ga < gb : a.block < b.block;
+    });
+
+    int64_t n = 0;
+    for (const Cand& c : cand) {
+        const int32_t g = entry_groups_[(size_t)c.slot];
+        int32_t dst = -1;
+        /* RAD_E_FULL: no free block under this one (a higher one may still find one), or the
+         * free blocks are down to the buffer. Either way the block stays where it is. */
+        if (kv_->relocate_cached_block(g, c.block, &dst) != RAD_OK) continue;
+        c.e->blocks[(size_t)c.slot] = dst;
+        Move mv;
+        mv.key = *c.key;
+        mv.slot = c.slot;
+        mv.group = g;
+        mv.src = c.block;
+        mv.dst = dst;
+        out->push_back(mv);
+        ++n;
+    }
+    stats_.compacted += n;
+    return n;
+}
+
+int64_t PrefixCache::forget_moved(const std::vector<Move>& moves) {
+    int64_t n = 0;
+    for (const Move& mv : moves) {
+        auto it = map_.find(mv.key);
+        if (it == map_.end()) continue;
+        Entry& e = it->second;
+        if (e.in_lru) {
+            release_blocks(e);
+            lru_.erase(e.lru);
+            e.in_lru = false;
+        }
+        if (tiers_) tiers_->forget(mv.key);
+        map_.erase(it);
+        ++stats_.evictions;
+        ++n;
+    }
+    return n;
+}
+
 /* The KV manager tracks how many cache-held blocks are at refcount one. One group only: the paged
  * groups share a token axis and an entry is blocks_per_entry() blocks in each, so summing groups
  * would multiply the answer. Off-device entries hold no blocks and count for nothing. */

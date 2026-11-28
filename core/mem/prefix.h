@@ -377,6 +377,39 @@ public:
      * prefilled again if their conversation returns. Context that fills its part of the pool
      * stays: there the cache is worth more than the loan it holds back. */
     int64_t drop_clean(int64_t loan_goal = 0);
+
+    /* ---------------- compaction (M-15b) ----------------
+     *
+     * The loan reaches down only to the highest held block, so under eviction pressure the pool
+     * ends up with entries scattered high and free holes beneath them that nothing can lend
+     * (KVManager::SpareSplit, `held_top - held`). A compaction moves the highest entries' blocks
+     * down into the holes, keeping every entry: lossless, where drop_clean's stragglers trade
+     * cache hits for the loan.
+     *
+     * One move is one block of one entry: the cache's reference goes to a lower block
+     * (KVManager::relocate_cached_block) and the entry names it at once, so the next lookup hands
+     * out the new id. The caller must, before any step reads it, copy every layer of `src` into
+     * `dst` on each rank's compute stream (a lookup's adopt and the step that reads the block
+     * come after the copy on that stream), and release `src` (KVManager::release_block) once the
+     * copy has landed, not before: until then its bytes are the copy's source.
+     *
+     * Only blocks nothing but the cache holds move (a sequence reading one keeps its own table),
+     * only in lendable groups, highest first, at most `max_blocks`, down to the dense floor
+     * (held_blocks). Off with the host tier on: there an entry above the holes is written back
+     * and dropped for the loan (drop_clean), and a write-back in flight reads the entry's blocks
+     * by the ids it was planned with. Appends to `out`; returns how many moves it planned. */
+    struct Move {
+        BlockHash key;
+        int32_t   slot  = -1;    /* index into the entry's blocks (entry_groups() order) */
+        int32_t   group = -1;
+        int32_t   src   = -1;
+        int32_t   dst   = -1;
+    };
+    int64_t plan_compaction(int64_t max_blocks, std::vector<Move>* out);
+    /* A compaction whose copies could not be issued: the entries it moved are forgotten (their
+     * new blocks hold nothing yet) and their blocks released. The sources stay the caller's to
+     * release, as above. Returns how many entries went. */
+    int64_t forget_moved(const std::vector<Move>& moves);
     int64_t size() const { return (int64_t)map_.size(); }
     /* Entries holding blocks in the pool, as opposed to only a copy off the card. */
     int64_t resident() const { return (int64_t)lru_.size(); }
@@ -583,6 +616,8 @@ public:
         int64_t expired = 0, ckpt_expired = 0;
         /* Entries and snapshots a client released (release_session). */
         int64_t released = 0, ckpt_released = 0;
+        /* Blocks plan_compaction moved down (M-15b); nothing is lost by a move. */
+        int64_t compacted = 0;
     };
     const Stats& stats() const { return stats_; }
 

@@ -272,6 +272,7 @@ TEST(stats_says_where_the_kv_loan_stops_and_what_keeps_it_there) {
     d.sched.m.kv_loan.live          = 1048;
     d.sched.m.kv_loan.spare_tokens  = 0;
     d.sched.m.kv_loan.loan_tokens   = 512;
+    d.sched.m.kv_loan.compacted     = 321;
     const json s = d.get("/stats");
     REQUIRE(s.contains("kv_loan"));
     const json& l = s["kv_loan"];
@@ -284,6 +285,7 @@ TEST(stats_says_where_the_kv_loan_stops_and_what_keeps_it_there) {
     CHECK_EQ(l.value("live", (int64_t)0), (int64_t)1048);
     CHECK_EQ(l.value("spare_tokens", (int64_t)-1), (int64_t)0);
     CHECK_EQ(l.value("loan_tokens", (int64_t)0), (int64_t)512);
+    CHECK_EQ(l.value("compacted", (int64_t)0), (int64_t)321);   /* M-15b: blocks moved down */
 
     /* An engine whose manager cannot answer says nothing: absent, not a row of zeros that would
      * read as a pool with no room to lend. */
@@ -574,6 +576,7 @@ TEST(the_bridge_names_the_group_the_kv_loan_stops_in) {
     m.kv_spare.live          = 16;
     m.kv_spare.spare_tokens  = 99;
     m.kv_spare.loan_tokens   = 77;
+    m.kv_spare.compacted     = 55;
     const server::SchedMetrics o = bridge_metrics(m);
     CHECK_EQ(o.kv_loan.group, std::string("window"));
     CHECK_EQ(o.kv_loan.block_tokens, (int64_t)32);
@@ -584,6 +587,7 @@ TEST(the_bridge_names_the_group_the_kv_loan_stops_in) {
     CHECK_EQ(o.kv_loan.live, (int64_t)16);
     CHECK_EQ(o.kv_loan.spare_tokens, (int64_t)99);
     CHECK_EQ(o.kv_loan.loan_tokens, (int64_t)77);
+    CHECK_EQ(o.kv_loan.compacted, (int64_t)55);
 
     rad::SchedMetrics none;   /* group -1: no paged FULL group, or a follower */
     none.n_kv_groups = 2;
