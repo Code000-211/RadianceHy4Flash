@@ -631,6 +631,7 @@ TEST(heat_promotes_a_hot_pooled_expert) {
     HeatFixture hf;
     HeatEngine h;
     HeatParams hp;
+    hp.probation_slots = 0;   /* the LFU path on its own: 2Q admission has its own tests below */
     CHECK_OK(h.init(hf.plan, hp));
     CHECK(h.enabled());
 
@@ -665,6 +666,7 @@ TEST(heat_does_not_thrash_on_an_alternating_pattern) {
      * same pattern with guards removed is the control, since an engine that never proposes would
      * also score zero. */
     auto run = [](HeatParams hp) {
+        hp.probation_slots = 0;   /* the guards of the LFU path, without 2Q's admission filter */
         HeatFixture hf;
         HeatEngine h;
         h.init(hf.plan, hp);
@@ -731,6 +733,7 @@ TEST(heat_respects_the_move_budget) {
     HeatParams hp;
     hp.moves_per_step = 3;
     hp.min_gain = 0.5f;
+    hp.probation_slots = 0;   /* the budget of the LFU path; 2Q scales its own below */
     CHECK_OK(h.init(hf.plan, hp));
 
     /* Every pooled expert is hot, so the guards refuse nothing and only the move budget can bound
@@ -750,6 +753,234 @@ TEST(heat_respects_the_move_budget) {
             CHECK(sw[i].promote != sw[j].promote);
             CHECK(sw[i].demote != sw[j].demote);
         }
+}
+
+
+/* ================================================================== 2Q admission (X2)
+ *
+ * The four pooled experts here are HostPinned: their host copy stays put when they are admitted,
+ * which is what makes an admission and its expiry free address changes rather than copies.
+ */
+TEST(heat_admits_a_first_miss_into_a_lent_slot) {
+    HeatFixture hf;
+    HeatEngine h;
+    HeatParams hp;
+    CHECK_OK(h.init(hf.plan, hp));
+
+    const int32_t u = hf.unit_of_expert(6);
+    REQUIRE(u >= 0);
+    CHECK(h.tier(u) != Tier::VRAM);
+    CHECK(!h.probation(u));
+
+    /* One token routes to it: the first miss is the admission. */
+    const int32_t ids[1] = {6};
+    const int32_t counts[1] = {1};
+    h.observe_ids(0, ids, counts, 1);
+
+    std::vector<Swap> sw;
+    CHECK_OK(h.step(&sw));
+    CHECK_EQ((int)sw.size(), 1);
+    if (!sw.empty()) {
+        CHECK_EQ(sw[0].promote, u);
+        /* A free lent slot, not a resident's: the host copy never left, so no demotion is owed. */
+        CHECK_EQ(sw[0].demote, -1);
+        CHECK(sw[0].probation);
+    }
+    /* Proposed, not yet landed: the next step cannot admit it twice. */
+    CHECK(h.probation(u));
+    CHECK_EQ(h.stats().probation_admitted, (uint64_t)0);
+
+    /* The mover lands it: the slot is the unit's, the area counts it. */
+    h.set_tier(u, Tier::VRAM);
+    h.set_busy(u, false);
+    CHECK_EQ(h.stats().probation_admitted, (uint64_t)1);
+    CHECK_EQ(h.tier(u), Tier::VRAM);
+    CHECK(h.probation(u));
+}
+
+TEST(heat_promotes_a_probation_unit_on_its_second_use) {
+    HeatFixture hf;
+    HeatEngine h;
+    HeatParams hp;
+    CHECK_OK(h.init(hf.plan, hp));
+    const int32_t u = hf.unit_of_expert(6);
+    REQUIRE(u >= 0);
+
+    const int32_t ids[1] = {6};
+    const int32_t counts[1] = {1};
+    h.observe_ids(0, ids, counts, 1);
+    std::vector<Swap> sw;
+    CHECK_OK(h.step(&sw));
+    REQUIRE(!sw.empty());
+    h.set_tier(u, Tier::VRAM);
+    h.set_busy(u, false);
+    REQUIRE_EQ(h.stats().probation_admitted, (uint64_t)1);
+
+    /* A second use inside the window promotes it into the main set by an address change: no swap,
+     * no copy, the slot it landed in is its own. */
+    const uint64_t promotions = h.stats().promotions;
+    h.observe_ids(0, ids, counts, 1);
+    sw.clear();
+    CHECK_OK(h.step(&sw));
+    CHECK_EQ(h.stats().probation_promoted, (uint64_t)1);
+    CHECK(!h.probation(u));
+    CHECK_EQ(h.tier(u), Tier::VRAM);
+    CHECK_EQ((int)sw.size(), 0);
+    CHECK_EQ(h.stats().promotions, promotions);
+}
+
+TEST(heat_expires_an_unused_admission_for_free) {
+    HeatFixture hf;
+    HeatEngine h;
+    HeatParams hp;
+    hp.probation_steps = 2;
+    CHECK_OK(h.init(hf.plan, hp));
+    const int32_t u = hf.unit_of_expert(6);
+    REQUIRE(u >= 0);
+
+    const int32_t ids[1] = {6};
+    const int32_t counts[1] = {1};
+    h.observe_ids(0, ids, counts, 1);
+    std::vector<Swap> sw;
+    CHECK_OK(h.step(&sw));
+    REQUIRE(!sw.empty());
+    h.set_tier(u, Tier::VRAM);
+    h.set_busy(u, false);
+    REQUIRE_EQ(h.stats().probation_admitted, (uint64_t)1);
+
+    /* Two dispatches that do not route it: at the second, the window is over and it leaves by a
+     * demotion with no promotion -- the mover's copyless drop. */
+    const int32_t other[1] = {0};
+    const int32_t one[1] = {1};
+    int found = 0;
+    for (int d = 0; d < 2; ++d) {
+        h.observe_ids(0, other, one, 1);
+        sw.clear();
+        CHECK_OK(h.step(&sw));
+        for (const Swap& s : sw)
+            if (s.promote == -1 && s.demote == u) ++found;
+        for (const Swap& s : sw) h.abandon(s);
+        if (found) break;
+    }
+    CHECK_EQ(found, 1);
+    h.set_tier(u, Tier::HostPinned);
+    h.set_busy(u, false);
+    CHECK_EQ(h.stats().probation_expired, (uint64_t)1);
+    CHECK(!h.probation(u));
+    CHECK(h.tier(u) != Tier::VRAM);
+}
+
+TEST(heat_keeps_the_probation_area_to_its_size) {
+    HeatFixture hf;
+    HeatEngine h;
+    HeatParams hp;
+    hp.probation_slots = 1;
+    CHECK_OK(h.init(hf.plan, hp));
+
+    /* Two first misses, one slot in the area: the hotter is admitted, the other falls back to the
+     * LFU path (which pairs its copy with a resident's) and is no admission. */
+    const int32_t ids[2] = {6, 7};
+    const int32_t counts[2] = {5, 9};
+    h.observe_ids(0, ids, counts, 2);
+    std::vector<Swap> sw;
+    CHECK_OK(h.step(&sw));
+    const int32_t hotter = hf.unit_of_expert(7), colder = hf.unit_of_expert(6);
+    int admissions = 0;
+    for (const Swap& s : sw) {
+        if (!s.probation) continue;
+        ++admissions;
+        CHECK_EQ(s.promote, hotter);
+        CHECK_EQ(s.demote, -1);
+    }
+    CHECK_EQ(admissions, 1);
+    for (const Swap& s : sw)
+        if (s.promote == colder) CHECK(!s.probation);
+}
+
+TEST(heat_scales_the_move_budget_with_the_pass_width) {
+    HeatFixture hf;
+    const int32_t ids[4] = {4, 5, 6, 7};
+
+    auto admitted_by_one_step = [&](int rows_a_unit) {
+        HeatEngine h;
+        HeatParams hp;
+        hp.moves_per_step = 1;
+        hp.width_ref = 8;
+        hp.width_scale = 3;
+        hp.admit_rows_wide = 2;
+        CHECK_OK(h.init(hf.plan, hp));
+        /* Four experts routed by `rows_a_unit` rows each: 8 selections a layer is the width the
+         * budget of one move is sized for, 24 is three times it. */
+        const int32_t counts[4] = {rows_a_unit, rows_a_unit, rows_a_unit, rows_a_unit};
+        h.observe_ids(0, ids, counts, 4);
+        std::vector<Swap> sw;
+        CHECK_OK(h.step(&sw));
+        int n = 0;
+        for (const Swap& s : sw) n += s.probation ? 1 : 0;
+        return n;
+    };
+    CHECK_EQ(admitted_by_one_step(2), 1);   /* c8-shaped pass: one move a class */
+    CHECK_EQ(admitted_by_one_step(6), 3);   /* DFly2-shaped: the budget followed the width */
+}
+
+TEST(heat_asks_a_wide_pass_for_two_rows) {
+    HeatFixture hf;
+    HeatEngine h;
+    HeatParams hp;
+    hp.moves_per_step = 1;
+    hp.width_ref = 8;
+    hp.width_scale = 4;
+    hp.admit_rows_wide = 2;
+    CHECK_OK(h.init(hf.plan, hp));
+
+    /* A wide pass (17 selections a layer) where one expert is routed by a single row and two by
+     * eight: the single-row miss is refused, since its copy would compete with the pass's reads. */
+    const int32_t ids[3] = {4, 5, 6};
+    const int32_t counts[3] = {8, 8, 1};
+    h.observe_ids(0, ids, counts, 3);
+    std::vector<Swap> sw;
+    CHECK_OK(h.step(&sw));
+    int n = 0;
+    for (const Swap& s : sw) {
+        if (!s.probation) continue;
+        ++n;
+        CHECK(s.promote != hf.unit_of_expert(6));
+    }
+    CHECK_EQ(n, 2);
+}
+
+TEST(heat_does_not_offer_a_probation_unit_as_a_victim) {
+    HeatFixture hf;
+    HeatEngine h;
+    HeatParams hp;
+    CHECK_OK(h.init(hf.plan, hp));
+
+    /* Admit two pooled experts, then make a third hot enough for the LFU path to want a resident's
+     * slot: the coldest victim has to be a settled resident, never a unit of the area. */
+    const int32_t ids[2] = {6, 7};
+    const int32_t counts[2] = {1, 1};
+    h.observe_ids(0, ids, counts, 2);
+    std::vector<Swap> sw;
+    CHECK_OK(h.step(&sw));
+    for (const Swap& s : sw) {
+        h.set_tier(s.promote, Tier::VRAM);
+        h.set_busy(s.promote, false);
+    }
+    const int32_t a6 = hf.unit_of_expert(6), a7 = hf.unit_of_expert(7);
+    REQUIRE(h.probation(a6));
+    REQUIRE(h.probation(a7));
+
+    const int32_t hot[1] = {4};
+    const int32_t twenty[1] = {20};
+    h.observe_ids(0, hot, twenty, 1);
+    sw.clear();
+    CHECK_OK(h.step(&sw));
+    CHECK(!sw.empty());
+    for (const Swap& s : sw) {
+        CHECK_EQ(s.promote, hf.unit_of_expert(4));
+        CHECK(s.demote != a6);
+        CHECK(s.demote != a7);
+    }
 }
 
 namespace {
@@ -832,6 +1063,7 @@ TEST(heat_step_proposes_exactly_what_repeated_picks_would) {
         hp.moves_per_step = 1 + (int)rnd(8);
         hp.min_gain = (float)rnd(3);
         hp.hysteresis = 1.0f + 0.25f * (float)rnd(3);
+        hp.probation_slots = 0;   /* pick() is the LFU policy; 2Q proposals are extra swaps */
         HeatEngine h;
         CHECK_OK(h.init(plan, hp));
         if (!h.enabled()) return;
@@ -878,6 +1110,7 @@ TEST(heat_swaps_stay_inside_a_slab_class) {
         hp.moves_per_step = 1 + (int)rnd(8);
         hp.min_gain = (float)rnd(3);
         hp.hysteresis = 1.0f + 0.25f * (float)rnd(3);
+        hp.probation_slots = 0;   /* pick() is the LFU policy; 2Q proposals are extra swaps */
         HeatEngine h;
         CHECK_OK(h.init(plan, hp));
         if (!h.enabled()) return;
@@ -949,6 +1182,7 @@ TEST(heat_step_agrees_with_picks_over_a_run_of_dispatches) {
         hp.moves_per_step = 1 + (int)rnd(3);
         hp.min_gain = 1.0f + (float)rnd(4);
         hp.hysteresis = 1.0f + 0.25f * (float)rnd(4);
+        hp.probation_slots = 0;   /* repeated_picks is the LFU policy; 2Q proposals are extra swaps */
         HeatEngine h;
         CHECK_OK(h.init(plan, hp));
         if (!h.enabled()) return;
@@ -1019,6 +1253,7 @@ TEST(heat_credits_and_prices_every_layout_the_plan_can_have) {
 
     HeatParams hp;
     hp.moves_per_step = 3;
+    hp.probation_slots = 0;   /* repeated_picks is the LFU policy; 2Q proposals are extra swaps */
     HeatEngine h;
     CHECK_OK(h.init(plan, hp));
     CHECK(h.enabled());
@@ -1993,6 +2228,7 @@ TEST(mover_promotes_and_demotes_through_the_shadow_slots) {
     HeatFixture hf;
     HeatEngine h;
     HeatParams hp;
+    hp.probation_slots = 0;   /* the mover's pairing and quarantine; 2Q's admissions copy nothing */
     CHECK_OK(h.init(hf.plan, hp));
 
     Mover m;
@@ -2063,7 +2299,9 @@ TEST(mover_promotes_and_demotes_through_the_shadow_slots) {
 TEST(a_landed_promotion_is_published_before_the_next_pass) {
     HeatFixture hf;
     HeatEngine h;
-    CHECK_OK(h.init(hf.plan, HeatParams{}));
+    HeatParams hp;
+    hp.probation_slots = 0;   /* a paired promotion's publication, which 2Q never issues */
+    CHECK_OK(h.init(hf.plan, hp));
     Mover m;
     CHECK_OK(m.init(hf.f.prog, hf.plan, MoverConfig{}));
     RadStream compute = nullptr;
@@ -2110,7 +2348,9 @@ TEST(a_landed_promotion_is_published_before_the_next_pass) {
 TEST(paced_promotions_go_out_at_the_marks_and_land_the_pool_bytes) {
     HeatFixture hf;
     HeatEngine h;
-    CHECK_OK(h.init(hf.plan, HeatParams{}));
+    HeatParams hp;
+    hp.probation_slots = 0;   /* pacing of a paired promotion, which 2Q never issues */
+    CHECK_OK(h.init(hf.plan, hp));
     Mover m;
     MoverConfig mc;
     mc.pace_units = 1;
@@ -3691,7 +3931,9 @@ struct MirrorRig {
         RAD_TRY(pools.configure(c, /*vram_capacity=*/0, &rad_malloc_allocator(),
                                 &rad_malloc_allocator()));
         RAD_TRY(m.init(hf.f.prog, hf.plan, MoverConfig{}, &pools));
-        RAD_TRY(h.init(hf.plan, HeatParams{}));
+        HeatParams hp;                     /* the mirror's copies: a paired promotion, not 2Q */
+        hp.probation_slots = 0;
+        RAD_TRY(h.init(hf.plan, hp));
         RAD_TRY(rad_stream_create(&compute, 0));
         return m.bind_compute_stream(compute);
     }
@@ -4744,7 +4986,9 @@ struct TwoLayers {
         c.host_pool_mib = 64;
         PlannerInput in{&f.prog, &c, 0, 1, nullptr, 0};
         RAD_TRY(Planner(in).plan(&plan));
-        RAD_TRY(h.init(plan, HeatParams{}));
+        HeatParams hp;                     /* these pin pick()'s tie-breaks, so the LFU path alone */
+        hp.probation_slots = 0;
+        RAD_TRY(h.init(plan, hp));
         /* Residency as asked: the first `res` experts of each layer. */
         for (int32_t u = 0; u < (int32_t)plan.units.size(); ++u) {
             const MoveUnit& mu = plan.units[(size_t)u];
