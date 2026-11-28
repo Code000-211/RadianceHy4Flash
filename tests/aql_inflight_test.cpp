@@ -143,4 +143,27 @@ TEST(a_lagging_counter_only_adds_candidates) {
     CHECK(r.run(9, 12, 700, false).empty());
 }
 
+/* A fault address only names a range it can have come from (fault_ran_off, aql.cpp's
+ * fault_range_at). Run 2 of #337 faulted at 0xebbcff295000, which is above every 0x7c... range the
+ * process held by 108 TiB: the range below it is not its, and an operand pointing into that range
+ * must not be printed as the launch the fault address is past the end of. */
+TEST(a_fault_address_names_only_a_range_it_can_come_from) {
+    const uintptr_t base = 0x7ca0fb000000;
+    const int64_t bytes = 502 * 1024;             /* #298 backend's 502.69 KiB */
+    const uintptr_t end = base + (uintptr_t)bytes;
+    CHECK(fault_ran_off(base, bytes, base));               /* the first byte */
+    CHECK(fault_ran_off(base, bytes, end - 1));            /* the last */
+    CHECK(fault_ran_off(base, bytes, end));                /* the end itself is the smallest run-off */
+    CHECK(fault_ran_off(base, bytes, end + 4096));         /* one page past: a stride that ran off */
+    CHECK(fault_ran_off(base, bytes, end + (uintptr_t)bytes));   /* a whole range's length past: the bound */
+    CHECK(!fault_ran_off(base, bytes, end + (uintptr_t)bytes + 1));
+    CHECK(!fault_ran_off(base, bytes, (uintptr_t)0xebbcff295000ull));   /* #337's run 2 */
+    CHECK(!fault_ran_off(base, 0, base));                  /* an empty range explains nothing */
+    CHECK(!fault_ran_off(base, bytes, base - 1));          /* below it: the caller's lookup picks it */
+    /* A 24.37 GiB weight range: a run-off a few MiB past it is still its own. */
+    const int64_t w = (int64_t)24 * 1024 * 1024 * 1024;
+    CHECK(fault_ran_off(0x7cc1d6c36000ull, w, 0x7cc1d6c36000ull + (uintptr_t)w + 4096));
+    CHECK(!fault_ran_off(0x7cc1d6c36000ull, w, 0x7cc1d6c36000ull + 2 * (uintptr_t)w + 4096));
+}
+
 RAD_TEST_MAIN()

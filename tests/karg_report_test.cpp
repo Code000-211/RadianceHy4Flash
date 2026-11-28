@@ -302,10 +302,12 @@ TEST(past_the_slot_is_reported) {
     CHECK(find_line(lines, "argument M") == nullptr);
 }
 
-/* The parameter that points into the same live range the fault address is nearest to says so, and
- * no other line does: that parameter names the launch the fault address points at, which is the
- * question the ring's order cannot answer (#337). */
-TEST(the_parameter_nearest_the_fault_address_is_named) {
+/* The parameter that points into the range the fault address ran off the end of says so, and no
+ * other line does: that parameter names the launch the fault address points at, which is the
+ * question the ring's order cannot answer (#337). The range is aql.cpp's fault_range_at's answer --
+ * the one the address lies in, or the one just below it that it left by no more than that range's
+ * length -- so a fault address never matches a range that starts after it. */
+TEST(the_parameter_the_fault_address_ran_off_is_named) {
     const std::vector<KernelArg> layout = i8_kpar_layout();
     std::vector<unsigned char> slot = hy4_slot();
 
@@ -339,11 +341,12 @@ TEST(the_parameter_nearest_the_fault_address_is_named) {
     const std::string* wq = find_line(lines, "argument wq ");
     CHECK(wq && wq->find("this same range") == std::string::npos);
 
-    /* The fault address before the range's start, and inside it, are said as such. */
-    ks.fault = arena_lo - 0x10;
-    CHECK(find_line(karg_lines(ks, fake_where), "16 B before the start of this same range") !=
-          nullptr);
+    /* A fault address inside the range (not past it) is said as such. The range starts before any
+     * fault address fault_range_at gives it for, so there is no "before the start" line to print. */
     ks.fault = c;
+    CHECK(find_line(karg_lines(ks, fake_where), "the fault address is inside this same range") !=
+          nullptr);
+    ks.fault = arena_lo;
     CHECK(find_line(karg_lines(ks, fake_where), "the fault address is inside this same range") !=
           nullptr);
 

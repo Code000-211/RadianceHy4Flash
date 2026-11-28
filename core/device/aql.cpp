@@ -958,14 +958,16 @@ KargRange live_range_at(uintptr_t a) {
     return r;
 }
 
-/* The live range a fault address is nearest to: the one it lies in, else the one that ends just
- * before it (a read that ran off the end of a buffer is the ordinary case), else the one that
- * starts just after it. 0 when this process knows of none -- which is what #337's fault address
- * printed as, "in no range this process holds or recently freed". Called with g_alloc_mu held. */
+/* The live range a fault address ran off the end of: the one it lies in, or the one below it that
+ * it left by no more than that range's own length (aql_inflight.h's fault_ran_off says why the
+ * bound is there). 0 when no range explains the address -- #337's fault address was in no range
+ * this process held, and the range below it, 108 TiB down, was not its. Called with g_alloc_mu
+ * held. */
 uint64_t fault_range_at(uintptr_t a) {
     auto it = g_live.upper_bound(a);
-    if (it != g_live.begin()) return std::prev(it)->second.seq;
-    return it != g_live.end() ? it->second.seq : 0;
+    if (it == g_live.begin()) return 0;
+    const AllocRec& rec = std::prev(it)->second;
+    return fault_ran_off(rec.base, rec.bytes, a) ? rec.seq : 0;
 }
 
 /* Where address `a` lies: inside a live range, inside a freed one (newest first; a reallocated

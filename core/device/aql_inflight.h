@@ -72,6 +72,20 @@ std::vector<uint64_t> still_running(uint64_t rd, uint64_t wr, uint64_t size, uin
     return std::vector<uint64_t>(v.rbegin(), v.rend());
 }
 
+/* Whether the live range `bytes` long at `base` explains the fault address `a`: it holds `a`, or `a`
+ * has run off its end and has not gone further past that end than the range is long. The bound is
+ * the point. A read that runs off one buffer keeps within one allocation's length of it, so an
+ * address just above a range is that range's run-off; an address 108 TiB above every range the
+ * process holds is not evidence about any of them, and naming the range below it names a launch the
+ * fault address has nothing to do with (issue #337's run 2 faulted 108 TiB above every live range,
+ * and the report then said an operand was "108.63 TiB past the end of this same range"). */
+inline bool fault_ran_off(uintptr_t base, int64_t bytes, uintptr_t a) {
+    if (bytes <= 0 || a < base) return false;
+    const uintptr_t end = base + (uintptr_t)bytes;
+    if (a < end) return true;                                 /* inside it */
+    return (uint64_t)(a - end) <= (uint64_t)bytes;
+}
+
 /* One line for a candidate: whether it is chained and what it waits for, in the words the report
  * uses. `need` is that slot's chain_need, `counter` the completion counter as the card has it at
  * the call. */
