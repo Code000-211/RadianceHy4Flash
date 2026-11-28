@@ -16,6 +16,7 @@
 #include "build/startup.h"
 #include "build/rad_build.h"
 #include "device/device.h"
+#include "device/queue_scratch.h"
 #include "device/directio.h"
 #include "format/radfile.h"
 #include "format/rope_override.h"
@@ -2126,7 +2127,18 @@ int Engine::plan() {
             }
             RadDeviceProps props{};
             rad_dev_props(r->device, &props);
-            f.queue_scratch = rad_dev_resident_scratch_bytes(&props);
+            /* The queue scratch is the code objects', not a constant: the heaviest private
+             * segment the kernels this rank can launch declare, once per queue this plan opens
+             * (core/device/queue_scratch.h). */
+            {
+                const RadQueueScratch qs = rad_dev_resident_scratch_bytes(&props, f.n_queues);
+                f.queue_scratch    = qs.bytes;
+                f.scratch_private  = qs.largest_private;
+                f.scratch_kernels  = qs.declared;
+                f.scratch_plan     = qs.total;
+                f.scratch_metadata = qs.metadata;
+                f.scratch_kernel   = qs.kernel;
+            }
             f.capacity = props.vram_bytes;
             f.free     = props.vram_free;
             /* The two-queue probe left max(kept, 2) kept queues on the card, inside this reading,

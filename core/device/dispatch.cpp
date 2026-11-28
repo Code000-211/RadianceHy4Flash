@@ -8,6 +8,7 @@
  */
 #include "device.h"
 #include "directio.h"
+#include "queue_scratch.h"
 #include "../rad_internal.h"
 
 #include <algorithm>
@@ -910,6 +911,44 @@ int     dev_code_resident(int device, int64_t* bytes, int* modules) {
     return dev()->code_resident(device, bytes, modules);
 }
 
+/* The VRAM the runtime keeps as queue scratch on `p`'s card once kernels with a private segment
+ * (spill, or a local array: step_advance's) have been dispatched: the runtime hands each queue ONE
+ * scratch allocation at the first such dispatch and grows it when a later one asks for more, so the
+ * resident figure is the largest the plan can ask for, once per queue the plan opens. The kernels
+ * say how large: their code object's `private_segment_fixed_size` (kernel_scratch_max in aql.cpp),
+ * not a flat bound over every workload. A plan whose modules declare none charges nothing; one whose
+ * heaviest declares 18 KiB charges a wave of it on every CU, per queue (queue_scratch.h).
+ *
+ * The flat bound it replaces was 5 MiB a CU (the R9700 reports 32), 160 MiB a card. Two earlier
+ * runs measured the card holding +114 MiB after the first speculative step and +150 MiB with a
+ * larger segment; those are the recorded holds, not a multiple of this formula's per-queue figure
+ * (3 x 17.84 MiB = 53.5 MiB), so the floor is below them and DFly2's warm-up Verify is still owed
+ * before it can replace the bound as the general answer. The flat bound is held until then on a
+ * backend that cannot read code objects, and when code objects exist but none is registered at the
+ * plan; the receipt labels both cases. */
+RadQueueScratch rad_dev_resident_scratch_bytes(const RadDeviceProps* p, int n_queues) {
+    RadQueueScratch out;
+    if (!p || p->is_host_backend || p->unified) return out;
+    uint32_t largest = 0;
+    int declared = 0, total = 0;
+    std::string name;
+    int rc = RAD_E_UNSUPPORTED;
+    if (dev()->kernel_scratch_max)
+        rc = dev()->kernel_scratch_max(p->device_id, &largest, &declared, &total, &name);
+    /* Both metadata branches -- backend read code objects with none registered yet (total==0),
+     * and with a heaviest segment (total>0) -- and the no-metadata fallback are resolved by the
+     * pure helper, which the card-less tests drive directly (M-09 review). */
+    const ScratchCharge c = queue_scratch_resolve(rc, largest, declared, total, name,
+                                                  p->n_cu, p->warp_size, n_queues);
+    out.bytes          = c.bytes;
+    out.largest_private = c.largest_private;
+    out.declared        = c.declared;
+    out.total           = c.total;
+    out.metadata        = c.metadata;
+    out.kernel          = std::move(c.kernel);
+    return out;
+}
+
 }  /* namespace rad */
 
 extern "C" {
@@ -941,17 +980,6 @@ int  rad_event_sync(RadEvent e) {
     return dev()->event_sync(e);
 }
 void rad_dev_host_wrote(void)                     { dev()->host_wrote(); }
-
-/* The VRAM the runtime keeps as queue scratch on `p`'s card once kernels with a private segment
- * (spill, or a local array: step_advance's) have been dispatched: the runtime hands a queue
- * scratch memory at the first such dispatch, and the card showed +114 MiB after the first
- * speculative step and kept it, 150 MiB with a larger segment. Left out of the budget, it is
- * taken from the margin: serving ran with 27-65 MiB of a card free. 5 MiB a CU (the R9700 reports
- * 32), 160 MiB, over the measured. */
-extern "C" int64_t rad_dev_resident_scratch_bytes(const RadDeviceProps* p) {
-    if (!p || p->is_host_backend || p->unified) return 0;
-    return (int64_t)p->n_cu * (5LL * 1024 * 1024);
-}
 
 /* Whether launches chain, by engine: rad_dev_chain_infer on a thread of an engine (EngineScope)
  * records that engine's answer and rad_dev_chain_enabled on any of its threads reads it. A process

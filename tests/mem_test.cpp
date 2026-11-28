@@ -16,6 +16,7 @@
 #include "mem/kvtier.h"
 #include "mem/pcstore.h"
 #include "device/device.h"
+#include "device/queue_scratch.h"
 #include "plugin/registry.h"
 #include "runtime/tierexec.h"
 #include "sched/mem_iface.h"
@@ -718,6 +719,231 @@ TEST(resident_queue_scratch_is_charged_with_the_hardware_queues) {
     vram_budget_need({ f }, &need1, &want1);
     CHECK_EQ(need1 - need0, 160LL << 20);
     CHECK_EQ(want1 - want0, 160LL << 20);
+}
+
+/* M-09: the rule the charge rests on -- largest segment, not the sum over kernels -- and the
+ * one-wave floor that turns it into bytes. Both are pure, so both are checked without a card. */
+TEST(queue_scratch_scan_takes_the_largest_segment_not_the_sum) {
+    ScratchScan s;
+    queue_scratch_take(&s, "hyv4flash_dfly2_coupled_verify.kd", 18256);
+    queue_scratch_take(&s, "step_advance.kd", 4096);
+    queue_scratch_take(&s, "attn_dense.kd", 0);
+    CHECK_EQ(s.total, 3);
+    CHECK_EQ(s.declared, 2);
+    CHECK_EQ(s.largest, 18256u);
+    CHECK_EQ(s.kernel, std::string("hyv4flash_dfly2_coupled_verify"));
+
+    /* a heavier kernel later replaces both, and equal sizes keep the first name */
+    queue_scratch_take(&s, "spiller.kd", 32768);
+    queue_scratch_take(&s, "tie.kd", 32768);
+    CHECK_EQ(s.largest, 32768u);
+    CHECK_EQ(s.kernel, std::string("spiller"));
+    CHECK_EQ(s.total, 5);
+    CHECK_EQ(s.declared, 4);
+}
+
+TEST(queue_scratch_bytes_is_one_wave_a_cu) {
+    /* nothing declares a segment: no charge */
+    CHECK_EQ(queue_scratch_bytes(0, 96, 64), 0);
+    /* 18,256 B rounds to the 16 B ROCr alignment (1024 / 64 lanes), one wave a CU, 96 CUs */
+    const int64_t one_wave = queue_scratch_bytes(18256, 96, 64);
+    CHECK_EQ(one_wave, (int64_t)18256 * 64 * 96);
+    /* an odd lane count takes the alignment to 1 rather than dividing by zero */
+    CHECK_EQ(queue_scratch_bytes(18256, 8, 0), (int64_t)18256 * 1 * 8);
+    /* a card with no CUs charges nothing */
+    CHECK_EQ(queue_scratch_bytes(18256, 0, 64), 0);
+}
+
+/* M-09 review: the runtime holds a queue's scratch per queue, so the charge is the per-queue figure
+ * once per queue the plan opens. */
+TEST(queue_scratch_card_charge_is_per_queue) {
+    const int64_t one = queue_scratch_bytes(18256, 96, 64);
+    CHECK_EQ(queue_scratch_card_bytes(18256, 96, 64, 1), one);
+    CHECK_EQ(queue_scratch_card_bytes(18256, 96, 64, 3), 3 * one);
+    /* a plan with no queues charges one rather than zero */
+    CHECK_EQ(queue_scratch_card_bytes(18256, 96, 64, 0), one);
+    /* and nothing declared still charges nothing, however many queues */
+    CHECK_EQ(queue_scratch_card_bytes(0, 96, 64, 3), 0);
+}
+
+/* The fallback the review of #278 asked to see tested: a backend that cannot read code objects
+ * keeps the flat 5 MiB a CU bound, and the receipt says which answer it is showing. */
+TEST(queue_scratch_flat_bound_is_five_mib_a_cu_and_zero_for_no_card) {
+    CHECK_EQ(queue_scratch_flat_bytes(0), 0);
+    CHECK_EQ(queue_scratch_flat_bytes(-3), 0);
+    CHECK_EQ(queue_scratch_flat_bytes(32), (int64_t)32 * (5LL << 20));
+    CHECK_EQ(queue_scratch_flat_bytes(96), (int64_t)96 * (5LL << 20));
+}
+
+/* M-09 review: the backend selection in rad_dev_resident_scratch_bytes. A host or unified device
+ * charges nothing; a backend that cannot answer for the device -- a stub backend, or a device id it
+ * does not know, which is the same answer from this side -- keeps the flat bound, labelled as such.
+ * Card-less: the fallback is reached through the device id, not through a missing card. */
+TEST(queue_scratch_backend_selection_flats_a_backend_without_metadata) {
+    RadDeviceProps host_props{};
+    host_props.device_id = 0;
+    host_props.n_cu = 96;
+    host_props.warp_size = 64;
+    host_props.is_host_backend = 1;
+    const RadQueueScratch host = rad_dev_resident_scratch_bytes(&host_props, 1);
+    CHECK_EQ(host.bytes, 0);
+    CHECK(!host.metadata);
+    CHECK_EQ(host.largest_private, 0u);
+
+    RadDeviceProps unified_props{};
+    unified_props.device_id = 0;
+    unified_props.n_cu = 96;
+    unified_props.warp_size = 64;
+    unified_props.unified = 1;
+    const RadQueueScratch unified = rad_dev_resident_scratch_bytes(&unified_props, 1);
+    CHECK_EQ(unified.bytes, 0);
+    CHECK(!unified.metadata);
+
+    RadDeviceProps stub_props{};
+    stub_props.device_id = -1;
+    stub_props.n_cu = 96;
+    stub_props.warp_size = 64;
+    const RadQueueScratch stub = rad_dev_resident_scratch_bytes(&stub_props, 3);
+    CHECK_EQ(stub.bytes, queue_scratch_flat_bytes(96));
+    CHECK(!stub.metadata);
+    CHECK_EQ(stub.largest_private, 0u);
+    CHECK_EQ(stub.declared, 0);
+    CHECK_EQ(stub.total, 0);
+    CHECK_EQ(stub.kernel, std::string());
+
+    CHECK_EQ(rad_dev_resident_scratch_bytes(nullptr, 3).bytes, 0);
+}
+
+TEST(queue_scratch_resolve_drives_both_metadata_branches) {
+    /* Both metadata branches of rad_dev_resident_scratch_bytes now live in this pure helper, so a
+     * card-less test reaches them: the backend vtable cannot be swapped, but its read result -- rc
+     * plus the four scan outputs -- is the helper's argument. */
+    const char* name = "hyv4flash_dfly2_coupled_verify";
+
+    /* total==0: the backend read the code objects but none was registered at the plan. Hold the
+     * flat bound, keep metadata=true so the receipt names this case, and carry no kernel. */
+    const ScratchCharge noobj = queue_scratch_resolve(0, 0, 0, 0, "", 96, 64, 3);
+    CHECK(noobj.metadata);
+    CHECK_EQ(noobj.bytes, queue_scratch_flat_bytes(96));
+    CHECK_EQ(noobj.total, 0);
+    CHECK_EQ(noobj.declared, 0);
+    CHECK_EQ(noobj.largest_private, 0u);
+    CHECK_EQ(noobj.kernel, std::string());
+
+    /* total>0: the largest private segment, charged once per queue, with the kernel named. */
+    const ScratchCharge meta = queue_scratch_resolve(0, 18256, 2, 40, name, 96, 64, 3);
+    CHECK(meta.metadata);
+    CHECK_EQ(meta.bytes, queue_scratch_card_bytes(18256, 96, 64, 3));
+    CHECK_EQ(meta.total, 40);
+    CHECK_EQ(meta.declared, 2);
+    CHECK_EQ(meta.largest_private, 18256u);
+    CHECK_EQ(meta.kernel, std::string(name));
+
+    /* rc<0: the backend cannot read code objects -- the flat bound, metadata=false. */
+    const ScratchCharge flat = queue_scratch_resolve(RAD_E_UNSUPPORTED, 0, 0, 0, "", 96, 64, 3);
+    CHECK(!flat.metadata);
+    CHECK_EQ(flat.bytes, queue_scratch_flat_bytes(96));
+    CHECK_EQ(flat.largest_private, 0u);
+    CHECK_EQ(flat.kernel, std::string());
+}
+
+TEST(the_queue_scratch_receipt_names_which_answer_it_shows) {
+    /* Feed the receipt from the resolver's output, mapped into VramFacts exactly as
+     * engine_bringup.cpp does, so the test covers the real path from a backend read to its label
+     * rather than a hand-made tuple. */
+    auto report = [](const ScratchCharge& q) {
+        Config c = small_config();
+        c.vram_weights_mib = 0;
+        c.vram_kv_mib      = 0;
+        c.gpu_headroom_mib = 96;
+        VramFacts f{};
+        f.capacity    = 32LL << 30;
+        f.free        = f.capacity - (512LL << 20);
+        f.statics     = 2LL << 30;
+        f.experts     = 200LL << 30;
+        f.kv_ceiling  = 100LL << 30;
+        f.n_queues    = 2; f.queue_bytes = 33LL << 20;
+        f.queue_scratch    = q.bytes;
+        f.scratch_metadata = q.metadata;
+        f.scratch_plan     = q.total;
+        f.scratch_kernels  = q.declared;
+        f.scratch_private  = q.largest_private;
+        f.scratch_kernel   = q.kernel;
+        VramBudget b;
+        CHECK_OK(vram_budget_resolve(c, { f }, &b));
+        return b.report;
+    };
+    /* no code object registered yet: the real total==0 path from the resolver returns
+     * metadata=true with the flat bound held, so the receipt names that case, not claim the
+     * backend cannot read code objects. */
+    const std::string noobj = report(queue_scratch_resolve(0, 0, 0, 0, "", 96, 64, 3));
+    CHECK(noobj.find("no code object registered yet") != std::string::npos);
+    CHECK(noobj.find("flat") != std::string::npos);
+    CHECK(noobj.find("does not read code objects") == std::string::npos);
+    /* metadata, nothing declares a segment: total>0 with no private segment */
+    CHECK(report(queue_scratch_resolve(0, 0, 0, 12, "", 96, 64, 3)).find("none of the 12 kernels") != std::string::npos);
+    /* the flat bound: rc<0, the backend does not read code objects */
+    const std::string flat = report(queue_scratch_resolve(RAD_E_UNSUPPORTED, 0, 0, 0, "", 96, 64, 3));
+    CHECK(flat.find("the flat 5 MiB a CU bound") != std::string::npos);
+    CHECK(flat.find("does not read code objects") != std::string::npos);
+    /* metadata with a segment: the heaviest kernel is named */
+    const std::string meta = report(queue_scratch_resolve(0, 18256, 3, 40, "hyv4flash_dfly2_coupled_verify", 96, 64, 3));
+    CHECK(meta.find("hyv4flash_dfly2_coupled_verify") != std::string::npos);
+    CHECK(meta.find("3 of the 40 kernels") != std::string::npos);
+}
+
+
+/* The queue scratch is the plan's heaviest private segment once per queue, and 0 when nothing the
+ * plan launches declares one -- the answer the flat 5 MiB a CU never asked the kernels for. The
+ * heaviest segment any library here declares is 18,256 B (spechub's couple_verify_wide), so at a
+ * wave of 32 lanes on 64 CUs the charge is 18,272 * 32 * 64 = 37,421,056 B, against the 160 MiB
+ * the flat bound charged for every plan. */
+TEST(queue_scratch_is_charged_from_the_kernels_private_segments) {
+    CHECK_EQ(queue_scratch_align(32), 32u);
+    CHECK_EQ(queue_scratch_align(64), 16u);
+    CHECK_EQ(queue_scratch_align(1), 1024u);
+    CHECK_EQ(queue_scratch_align(0), 1u);              /* never a divide by zero */
+
+    CHECK_EQ(queue_scratch_bytes(0, 64, 32), 0);    /* no private segment: nothing resident */
+    CHECK_EQ(queue_scratch_bytes(44, 64, 32), 64LL * 32 * 64);   /* 44 -> 64, one wave a CU */
+    CHECK_EQ(queue_scratch_bytes(18256, 64, 32), 18272LL * 32 * 64);
+    CHECK_EQ(queue_scratch_bytes(18256, 0, 32), 0);
+
+    /* The receipt names what set it, so a lane reads the charge off the plan's own block. */
+    Config c = small_config();
+    c.vram_weights_mib = 0;
+    c.vram_kv_mib      = 0;
+    c.gpu_headroom_mib = 96;
+    VramFacts f{};
+    f.capacity = 32LL << 30;
+    f.free     = f.capacity - (512LL << 20);
+    f.arena    = 144LL << 20;
+    f.statics  = 2LL << 30;
+    f.experts  = 200LL << 30;
+    f.kv_ceiling = 100LL << 30;
+    f.n_queues = 2; f.queue_bytes = 33LL << 20;
+    f.queue_scratch    = queue_scratch_bytes(18256, 64, 32);
+    f.scratch_private  = 18256;
+    f.scratch_kernels  = 1;
+    f.scratch_plan     = 47;
+    f.scratch_metadata = true;
+    f.scratch_kernel   = "couple_verify_wide";
+    VramBudget b;
+    CHECK_OK(vram_budget_resolve(c, { f }, &b));
+    CHECK_EQ(b.queues, (66LL << 20) + f.queue_scratch);
+    CHECK_EQ(b.queue_scratch, f.queue_scratch);
+    CHECK(b.report.find("queue scratch") != std::string::npos);
+    CHECK(b.report.find("1 of the 47 kernels the code objects describe") != std::string::npos);
+    CHECK(b.report.find("18256 B (couple_verify_wide)") != std::string::npos);
+
+    /* A plan that declares none says that too, rather than looking like a missing term. */
+    VramFacts g = f;
+    g.queue_scratch = 0; g.scratch_private = 0; g.scratch_kernels = 0;
+    Config c2 = c;
+    VramBudget b2;
+    CHECK_OK(vram_budget_resolve(c2, { g }, &b2));
+    CHECK_EQ(b2.queues, 66LL << 20);
+    CHECK(b2.report.find("none of the 47 kernels the code objects describe declares a private segment") != std::string::npos);
 }
 
 /* What of "already held" is device code: the code objects resident on the card, each one loaded
@@ -9240,4 +9466,26 @@ TEST(a_streamed_op_exists_only_for_a_capable_architecture_and_a_ring) {
     CHECK(kvstream_op_gated(ctx, "kv_resolve"));
     CHECK(!kvstream_op_gated(ctx, "kv_store"));
     CHECK(!kvstream_op_gated(ctx, "attn_paged"));
+}
+
+/* The backend selection itself: a host backend or unified memory never asks the driver for code
+ * objects, so the charge is zero and the receipt must not claim metadata. (M-09) */
+TEST(queue_scratch_is_zero_on_the_host_backend_and_on_unified_memory) {
+    RadDeviceProps host{};
+    host.is_host_backend = true;
+    RadQueueScratch h = rad_dev_resident_scratch_bytes(&host, 1);
+    CHECK_EQ(h.bytes, 0);
+    CHECK_EQ(h.largest_private, 0u);
+    CHECK(!h.metadata);
+
+    RadDeviceProps uni{};
+    uni.unified = true;
+    RadQueueScratch u = rad_dev_resident_scratch_bytes(&uni, 1);
+    CHECK_EQ(u.bytes, 0);
+    CHECK(!u.metadata);
+
+    /* and a null props is the same answer, not a crash */
+    RadQueueScratch n = rad_dev_resident_scratch_bytes(nullptr, 1);
+    CHECK_EQ(n.bytes, 0);
+    CHECK(!n.metadata);
 }
