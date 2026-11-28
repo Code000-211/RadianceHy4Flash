@@ -92,12 +92,76 @@ class MClone(unittest.TestCase):
         self.assertEqual((c["m"], c["band"], [list(o["shape"]) for o in c["opd"]]), before)
 
 
+def a_wide_case():
+    """A recorded case of a row `wide_clone` widens, with an encoded operand to lose."""
+    if not FIXTURE.exists():
+        raise unittest.SkipTest("data/kernels_hy4.rkb is not in this tree")
+    for c in recipe.load(str(FIXTURE))["cases"]:
+        if c["op"] in recipe.WIDE and recipe.par(c, "n") and any(o["has_enc"] for o in c["opd"]):
+            return c
+    raise AssertionError("the fixture lost its encoded case of a wide row")
+
+
 class OtherClones(unittest.TestCase):
     def test_the_heads_clone_still_draws_plain_weights(self):
         c = a_heads_case()
         d = recipe.heads_clone(c, recipe.par(c, "heads") + 16, SALT)
         self.assertFalse(any(o["has_enc"] for o in d["opd"]))
         self.assertFalse(any("sel" in o or "enc" in o for o in d["opd"]))
+
+    def test_the_wide_clone_still_draws_plain_weights(self):
+        c = a_wide_case()
+        d = recipe.wide_clone(c, recipe.par(c, "n") + 1024, SALT)
+        self.assertFalse(any(o["has_enc"] for o in d["opd"]))
+        self.assertFalse(any("sel" in o or "enc" in o for o in d["opd"]))
+        self.assertEqual(recipe.par(d, "n"), recipe.par(c, "n") + 1024)
+
+
+class GemmQA(unittest.TestCase):
+    """`gemm_nt_q` at q_a's (N 1024, K 3072), M 2048 -- the Verify pair K-51 and audit F7.1 name."""
+
+    def base(self):
+        for c in recipe.load(str(FIXTURE))["cases"]:
+            if (c["op"] == "gemm_nt_q" and c["m"] == 512 and recipe.par(c, "N") == 3072
+                    and recipe.par(c, "K") == 1536):
+                return c
+        raise AssertionError("the fixture lost its N 3072 K 1536 gemm_nt_q case at M 512")
+
+    def test_the_clone_is_q_a_s_shape_and_the_others_are_left_alone(self):
+        base = self.base()
+        (d,) = recipe.t04e_gemm_q_a(str(FIXTURE))
+        self.assertEqual(d["op"], "gemm_nt_q")
+        self.assertEqual(d["m"], 2048)
+        self.assertEqual((recipe.par(d, "M"), recipe.par(d, "N"), recipe.par(d, "K")), (2048, 1024, 3072))
+        self.assertNotEqual(d["seed"], base["seed"])
+        self.assertIn("q_a", d["band"])
+        self.assertEqual(len(d["opd"]), len(base["opd"]))
+        encs = [o["has_enc"] for o in d["opd"]]
+        self.assertEqual(encs, [o["has_enc"] for o in base["opd"]])
+        self.assertTrue(any(encs))
+        for o, b in zip(d["opd"], base["opd"]):
+            self.assertEqual(o.get("enc"), b.get("enc"))
+            self.assertEqual(o["dtype"], b["dtype"])
+            self.assertEqual(o["role"], b["role"])
+            self.assertEqual(o["idx_max"], b["idx_max"])
+        shapes = [o["shape"] for o in d["opd"] if o["shape"]]
+        self.assertIn([2048, 3072], shapes)                 # the activation
+        self.assertIn([2048, 24], shapes)                   # its group scales
+        self.assertIn([1024, 3072], shapes)                 # the weight
+        self.assertIn([1024, 24], shapes)                   # the weight's group scales
+        self.assertIn([2048, 1024], shapes)                 # the output
+        # a kernel lays the selected planes out from their recorded extents: they move with the weight
+        sels = [o["sel"] for o in d["opd"] if o["has_enc"]]
+        self.assertEqual(sels, [[(0, 1024, 3072)], [(1, 1024, 24)]])
+
+    def test_the_committed_fixture_holds_a_case_at_q_a_s_shape(self):
+        if not FIXTURE.exists():
+            raise unittest.SkipTest("data/kernels_hy4.rkb is not in this tree")
+        hits = [c for c in recipe.load(str(FIXTURE))["cases"]
+                if (c["op"] == "gemm_nt_q" and c["m"] == 2048 and recipe.par(c, "N") == 1024
+                    and recipe.par(c, "K") == 3072)]
+        self.assertEqual(len(hits), 1, "the fixture lost the q_a-shaped gemm_nt_q case")
+        self.assertTrue(any(o["has_enc"] for o in hits[0]["opd"]))
 
 
 if __name__ == "__main__":

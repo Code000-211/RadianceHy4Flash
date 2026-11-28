@@ -387,7 +387,10 @@ def g3(out, src='data/kernels_hy4.rkb'):
 # indexer, the MLA absorb / sink / sel / expand, the MoE router and the lm_head. The M clone keeps the
 # encodings the container recorded with a case's operands -- it resizes the M rows and nothing else, so
 # the weights are still the container's, and a quantised row handed plain weights answers something
-# else than the reference (tests/kbench_recipe_test.py).
+# else than the reference (tests/kbench_recipe_test.py). The routed arm is not here because it is not in
+# this fixture at all: gpu-mini declares no expert arm, kernels_moe.rkb is Qwen's 256-expert geometry, and
+# a Hy4 case for `moe_gemm_q`'s rows needs a container that declares the routed arm (its u5-trellis expert
+# weights), not a clone. D-10's 47 % gate_up is a recording of its own.
 TRUNK = ('embed_lookup', 'cast', 'engram_norm', 'engram_gate', 'grid_embed_sf', 'iota', 'sub_i32',
          'ihc_pre', 'ihc_post', 'rmsnorm', 'rmsnorm_ihc_junction', 'gemm_nt_q', 'gemm_nt', 'gemm_nt_f32',
          'gemm_nt_bias', 'rope', 'rope_rows', 'kv_store', 'gate_mul', 'mla_kv_split', 'attn_kv_sink',
@@ -409,26 +412,35 @@ def t04a_sliding(src):
 
 def t04b_sel(src):
     """mla_attn_sel_sink: the 12 sparse layers at TP2 (16 heads a rank), M = 1 and 8, over the recorded
-    512-page cache. The table is a real `qsa_select` one when timed: `timing_input` draws a page table's
-    rows in block order (distinct, ascending), not one shuffled run over the whole operand."""
+    512-page cache. The table is a real `qsa_select` one when timed: `timing_input` draws this op's table
+    as each row's own distinct, ascending page ids (block order at M = 1, a sorted draw out of the page
+    range otherwise), not one shuffled run over the whole operand. Every other index table keeps its
+    permutation."""
     out, salt = [], 0xb04b0000
     for c in load(src)['cases']:
         if c['op'] != 'mla_attn_sel_sink' or par(c, 'heads') != 32 or c['m'] not in (1, 8): continue
         out.append(heads_clone(c, 16, salt)); salt += 1
     return out
 
+# The row axes that do not sit in shape[0], by op: `(operand, axis, ratio)`, and whether the operand's
+# index range follows the axis. A cu histogram is M + 1 long (the `flags & 4` rule in `t04_clone`), the
+# Engram grid's and the rope's position table are [components, M], and the indexer's pooling reads one
+# row per M * ratio -- one place for the rule instead of a branch per op.
+T04_ROW_AXIS = {'grid_embed_sf': (2, 1, False, False), 'rope': (1, 1, False, True),
+                'rope_rows': (1, 1, False, True), 'idx_pool_gated': (0, 0, True, False)}
+
 def t04_clone(c, M2, salt):
-    """`m_clone`, plus the row axes that do not sit in shape[0]: a cu histogram is M + 1 long, the Engram
-    grid's and the rope's position table are [components, M], and the indexer's pooling reads one row per
-    M * ratio. `m_clone` moves shape[0] and leaves the rest, which is the right clone only for a row whose
-    every operand has M first."""
+    """`m_clone`, plus the row axes that do not sit in shape[0] (`T04_ROW_AXIS`). `m_clone` moves shape[0]
+    and leaves the rest, which is the right clone only for a row whose every operand has M first."""
     d = m_clone(c, M2, salt)
     for o in d['opd']:
         if o['flags'] & 4 and o['shape'] and o['shape'][0] == c['m'] + 1: o['shape'][0] = M2 + 1
-    if c['op'] == 'grid_embed_sf': d['opd'][2]['shape'][1] = M2
-    elif c['op'] in ('rope', 'rope_rows'):
-        o = d['opd'][1]; o['shape'][1] = M2; o['idx_max'] = M2
-    elif c['op'] == 'idx_pool_gated': d['opd'][0]['shape'][0] = M2 * par(c, 'ratio')
+    rule = T04_ROW_AXIS.get(c['op'])
+    if rule is not None:
+        idx, axis, ratio, follows = rule
+        o = d['opd'][idx]
+        o['shape'][axis] = M2 * par(c, 'ratio') if ratio else M2
+        if follows: o['idx_max'] = o['shape'][axis]
     return d
 
 def t04c_verify(src):
@@ -447,7 +459,8 @@ def t04d_gemm_q(src):
     chunk's halves) at the trunk's two dense planes (K = 1536, the absorb's rank, and 8192, d_model): the
     recorded sweep stops at 512, so a chunk's GEMM is timed at a band no case reaches. The expert planes
     (K = 13824, 16384) keep their recorded sweep at the heights: a full-height expert GEMM is 150 GFLOP
-    of reference per case, and the card-less gate replays every case."""
+    of reference per case, and the card-less gate replays every case. q_a's own shape is `t04e` below:
+    every recorded case is N 3072, so the Verify pair's N 1024 / K 3072 had no case at any M."""
     fx, out, salt = load(src), [], 0xd04d0000
     for c in fx['cases']:
         if c['op'] != 'gemm_nt_q' or c['m'] != 512 or par(c, 'K') not in (1536, 8192): continue
@@ -455,8 +468,49 @@ def t04d_gemm_q(src):
             out.append(m_clone(c, M2, salt)); salt += 1
     return out
 
+def t04e_gemm_q_a(src):
+    """gemm_nt_q at q_a's shape (N 1024, K 3072), M 2048: the Verify pair K-51 and audit F7.1 name,
+    `(2048, 1024, 3072)` against `(2048, 3072, 8192)`, and no case had N 1024 or K 3072 at any M (every
+    recorded `gemm_nt_q` case is the trunk's N 3072 planes). Cloned from the K 1536 dense case with the
+    container's affine `fwht128` encoding kept: an encoding names the group and the transform, not the
+    extents, and 3072 is 24 groups of 128, so it still describes the 1024 x 3072 weight. The container
+    files the trunk's dense planes as i8a8h, so the case reaches the i8a8 rows at q_a's shape, not q_a's
+    own u5-trellis row (`gemm_iqr_tiled`), which no fixture holds (K-06, K-51)."""
+    N, K, M = 3072, 1536, 512
+    base = None
+    for c in load(src)['cases']:
+        if (c['op'] == 'gemm_nt_q' and c['m'] == M and par(c, 'N') == N and par(c, 'K') == K
+                and par(c, 'dtype') == 'i8a8h'):
+            base = c
+            break
+    if base is None:
+        raise SystemExit(f'no gemm_nt_q N {N} K {K} M {M} case to clone q_a from')
+    d = fresh(base, 0xe04e0000, keep_encodings=True)
+    # The one operand axis each shape is, by its exact extents: the weight and its group scales, the
+    # activation and its group scales, the output. A layout the container changed fails here loudly
+    # instead of cloning an operand by its position.
+    axes = {(M, K): (2048, 3072), (M, K // 128): (2048, 3072 // 128),
+            (N, K): (1024, 3072), (N, K // 128): (1024, 3072 // 128),
+            (M, N): (2048, 1024)}
+    for o in d['opd']:
+        if not o['shape']:
+            continue
+        if tuple(o['shape']) not in axes:
+            raise SystemExit(f'gemm_nt_q operand of shape {o["shape"]} is not one of q_a\'s axes')
+        o['shape'] = list(axes[tuple(o['shape'])])
+        if o['has_enc']:
+            # The selected planes' extents in their own elements move with the weight: a kernel reads
+            # them to lay the planes out, and a recorded extent that does not match the operand is a
+            # drop at rerecord ("its plane holds 4718592 elements and the reader wants 3145728").
+            o['sel'] = [(p, *axes[(e0, e1)]) for p, e0, e1 in o['sel']]
+    d['m'] = 2048
+    setp(d, 'M', 2048); setp(d, 'N', 1024); setp(d, 'K', 3072)
+    d['band'] = f"{base['band']} q_a M 2048"
+    return [d]
+
 def t04(out, src):
-    cases = (t04a_sliding(src) + t04b_sel(src) + t04c_verify(src) + t04d_gemm_q(src))
+    cases = (t04a_sliding(src) + t04b_sel(src) + t04c_verify(src) + t04d_gemm_q(src)
+             + t04e_gemm_q_a(src))
     fx = dict(version=6, samples=1024, source='hy4-flash TP2 shapes and c8 verify heights (T-04, D-10)',
               oracle='libref', recorded='2026-11-28', cases=cases)
     save(fx, out); print(len(cases), 'cases ->', out)
