@@ -19,6 +19,7 @@
 #include "kvstream/stage.h"
 #include "place/rtrace.h"
 #include "sample/accept.h"
+#include "sched/derive.h"
 #include "sched/scheduler.h"
 #include "server/adapters.h"
 #include "server/front.h"
@@ -1649,6 +1650,27 @@ int Engine::step_loop() {
         /* Buffer probe after the trunk step; drafters dump after their own passes. */
         dump_buffers(ranks_[0]->ctx, b->step);
 
+        if (cvec_.is_cast() && !cvec_views_.empty() && cvec_views_[0].cast_seq_route) {
+            auto routed = cvec_take_cast_route_slots();
+            if (!routed.empty()) {
+                const int64_t ms = cvec_views_[0].cast_max_slots;
+                std::vector<int32_t> h_routes((size_t)ms, -99);
+                if (rad_memcpy_async(h_routes.data(), cvec_views_[0].cast_seq_route, ms * 4,
+                                     ranks_[0]->ctx.stream()) >= 0 &&
+                    rad_stream_sync(ranks_[0]->ctx.stream()) >= 0) {
+                    for (int32_t sl : routed) {
+                        const int32_t rt = (sl >= 0 && sl < ms) ? h_routes[(size_t)sl] : -99;
+                        const char* rname = (rt >= 0 && (size_t)rt < cvec_.cast_route_names.size())
+                                                ? cvec_.cast_route_names[(size_t)rt].c_str()
+                                                : "?";
+                        fprintf(stderr, "[CAST] latched slot=%d -> route=%d (%s) step=%d\n",
+                                (int)sl, (int)rt, rname, b->step);
+                        fflush(stderr);
+                    }
+                }
+            }
+        }
+
         /* --profile-ops also prints during the run. Counters are cumulative, so each dump covers
          * the run so far. Every 32 steps by default (RADIANCE_PROFILE_EVERY): per-op timing
          * synchronises around every launch (over a thousand per step on a large model), so a
@@ -3166,7 +3188,9 @@ std::string Engine::cvec_json() const {
         o["n_layers"] = cvec_.n_layers;
         o["scale"]   = cvec_.user_scale;
         o["file"]    = cvec_.path;
-        o["mode"]    = "project";
+        o["mode"]    = cvec_.mode == RAD_CVEC_MODE_CAST ? "cast"
+                     : cvec_.mode == RAD_CVEC_MODE_ADD  ? "add"
+                                                        : "project";
     }
     return o.dump();
 }

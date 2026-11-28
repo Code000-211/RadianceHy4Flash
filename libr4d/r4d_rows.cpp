@@ -599,6 +599,22 @@ static const RadOperandSpec oHcProject[] = {
 static const RadConstraint cHcProject[] = {
     C_GE("M", 1), C_GE("n", 1), C_GE("hc", 2), C_LE("hc", 8), C_IN("dtype", "bf16"),
 };
+static const RadParamSpec pHcCastRoute[] = {
+    P_INT("M"), P_INT("n"), P_INT("hc"), P_INT("n_routes"), P_INT("max_slots"),
+    P_F64("min_margin"), P_STR("dtype"),
+};
+static const RadOperandSpec oHcCastRoute[] = {
+    { "h", RAD_OPD_IN, 0 }, { "rtbl", RAD_OPD_IN, 0 }, { "on", RAD_OPD_IN, 0 },
+    { "seq_route", RAD_OPD_OUT, 0 },
+};
+static const RadParamSpec pHcCastAdd[] = {
+    P_INT("M"), P_INT("n"), P_INT("hc"), P_INT("n_routes"), P_INT("n_experts"), P_INT("max_slots"),
+    P_F64("scale"), P_STR("dtype"),
+};
+static const RadOperandSpec oHcCastAdd[] = {
+    { "h", RAD_OPD_INOUT, 0 }, { "v", RAD_OPD_IN, 0 }, { "on", RAD_OPD_IN, 0 },
+    { "seq_route", RAD_OPD_IN, 0 }, { "rmap", RAD_OPD_IN, 0 },
+};
 /* The gated residual. `hc_enter` and `hc_write` share a parameter list; `hc_read` adds the two
  * switches its operand list depends on: `inject` 0 is the final mixer and `group` 0 a read whose
  * consumer wants bf16. Both default on, as every trunk connection uses both. */
@@ -4027,6 +4043,19 @@ static const RadOpSchema kSchemas[] = {
            "0, or a per-stream table [hc, n] when `vsep` is n -- and scale its stored norm. A row "
            "whose flag is 0 is neither read nor written, so an unprojected request's stream is the "
            "stock model's."),
+    SCHEMA("hc_add", pHcProject, oHcProject,
+           "additive control vector (`mode: \"add\"`): for each of the hc streams of a row whose "
+           "`on` flag is nonzero, h[s] += scale * v_s, v_s that layer's unnormalised f32 direction "
+           "for stream s -- one vector for every stream when `vsep` is 0, or a per-stream table "
+           "[hc, n] when `vsep` is n -- and scale a finite non-zero multiplier. A row whose flag "
+           "is 0 is neither read nor written, so an unsteered request's stream is the stock "
+           "model's."),
+    SCHEMA("hc_cast_route", pHcCastRoute, oHcCastRoute,
+           "sequence-latched CAST activation router: computes centered-normalized linear scores "
+           "on last prefill tokens ((on[r]&0xF)==1) and latches argmax into seq_route[slot]."),
+    SCHEMA("hc_cast_add", pHcCastAdd, oHcCastAdd,
+           "sequence-latched CAST additive steering: adds the expert vector selected by "
+           "rmap[seq_route[slot]*3 + (phase-2)] for each hc stream."),
     SCHEMA("hc_write", pHcPlain, oHcWrite,
            "the write half: h[s] += inj[s] * y, into the UNNORMED stream."),
     SCHEMA("mtp_enter", pMtpEnter, oMtpEnter,
@@ -9144,6 +9173,33 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   ROW(cHcProject), NOTUNE,
   nullptr, nullptr, r4d_rad_hc_project, nullptr, nullptr, nullptr,
   r4d_shape_hc_project },
+
+{ "hc_add_bf16", "hc_add", "norm",
+  "additive control vector: h[s] += scale * v_s where the row's flag is on",
+  "any M, any n, hc 2..8",
+  "bf16 stream, f32 direction, i32 switch",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cHcProject), NOTUNE,
+  nullptr, nullptr, r4d_rad_hc_add, nullptr, nullptr, nullptr,
+  r4d_shape_hc_add },
+
+{ "hc_cast_route_bf16", "hc_cast_route", "norm",
+  "CAST activation router: latches sequence route on last prefill token",
+  "any M, any n, hc 2..8",
+  "bf16 stream, f32 router table, i32 switch, i32 seq_route",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cHcProject), NOTUNE,
+  nullptr, nullptr, r4d_rad_hc_cast_route, nullptr, nullptr, nullptr,
+  r4d_shape_hc_cast_route },
+
+{ "hc_cast_add_bf16", "hc_cast_add", "norm",
+  "CAST additive steering: applies routed expert per-stream direction",
+  "any M, any n, hc 2..8",
+  "bf16 stream, f32 expert table, i32 switch, i32 seq_route, i32 rmap",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cHcProject), NOTUNE,
+  nullptr, nullptr, r4d_rad_hc_cast_add, nullptr, nullptr, nullptr,
+  r4d_shape_hc_cast_add },
 
 { "mtp_enter_bf16", "mtp_enter", "norm",
   "MTP head entry: two norms, a per-sub-stream fc and one broadcast fc",

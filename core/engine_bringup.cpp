@@ -32,6 +32,7 @@
 #include "runtime/xprefetch.h"
 #include "runtime/w2.h"
 #include "sample/gbnf.h"
+#include "sched/derive.h"
 #include "sched/scheduler.h"
 #include "text/token_view.h"
 #include "text/tokenizer.h"
@@ -1681,9 +1682,13 @@ int Engine::declare() {
             cvec_.rank > 1 ? " (rank " + std::to_string(cvec_.rank) + ", " +
                                   std::to_string(cvec_.n_dirs * cvec_.rank) + " total)"
                             : "";
-        RAD_INFO("control vectors: %s: %lld directions of %lld%s, layers %d..%d, scale %.3f -- "
+        const char* mode_name = cvec_.mode == RAD_CVEC_MODE_CAST ? "cast"
+                              : cvec_.mode == RAD_CVEC_MODE_ADD  ? "add"
+                                                                 : "project";
+        cvec_set_cast_mode(cvec_.is_cast(), cvec_.cast_think_after);
+        RAD_INFO("control vectors: %s: mode=%s, %lld directions of %lld%s, layers %d..%d, scale %.3f -- "
                  "default %s%s",
-                 cvec_.path.c_str(), (long long) cvec_.n_dirs,
+                 cvec_.path.c_str(), mode_name, (long long) cvec_.n_dirs,
                  (long long) cvec_.n_embd, rank_note.c_str(),
                  cvec_.first, cvec_.last, (double) cvec_.user_scale,
                  default_on ? "ON" : "off",
@@ -1695,6 +1700,7 @@ int Engine::declare() {
                "requests opt in");
     } else {
         cvec_default_.store(false);
+        cvec_set_cast_mode(false, 24);
     }
 
     /* Declare once per rank (rank and world_size in RadBuildCtx; the plugin declares dimensions

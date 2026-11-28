@@ -70,7 +70,9 @@ int         avx_par_force(int threads);
 #define AVX_OP_LIST(X)                                                                            \
     /* ---- elementwise and norms */                                                              \
     X(rmsnorm)              X(rmsnorm_p)            X(rmsnorm_add)          X(hc_enter)           \
-    X(hc_read)              X(hc_write)             X(hc_project)           X(mtp_enter)          \
+    X(hc_read)              X(hc_write)             X(hc_project)           X(hc_add)             \
+    X(hc_cast_route)        X(hc_cast_add)                                                        \
+    X(mtp_enter)                                                                                  \
     X(layernorm)            X(mhc_pre)              X(mhc_post)             X(mhc_contract)       \
     X(kda_update)           X(mhc_pre_partial)      X(mhc_pre_finish)                             \
     X(swiglu_clamped)       X(ssd_update)                                                         \

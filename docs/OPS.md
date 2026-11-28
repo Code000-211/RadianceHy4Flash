@@ -203,7 +203,10 @@ at once. Run it before adding a kernel plugin; the loader names only the first c
 | `mhc_contract` | `M`(range) `n` `hc` `dtype` | `h` → `x` |
 | `hc_read` | `M`(range) `n` `hc` `lowrank` `eps`:f64 `dtype` `wadd`:f64/opt `inject`/opt `group`/opt `rotate`/opt `mix`/opt | `h`, `w`w, `mix_down`w, `mix_up`w, `inject_w`w? → `x`, `inj`?, `q`?, `scale`?, `rq`?, `rscale`? |
 | `hc_write` | `M`(range) `n` `hc` `dtype` | `y`, `inj`, `h`:inout |
-| `hc_project` | `M`(range) `n` `hc` `scale`:f64 `dtype` | `h`:inout, `v`, `on` |
+| `hc_project` | `M`(range) `n` `hc` `vsep`/opt `scale`:f64 `dtype` | `h`:inout, `v`, `on` |
+| `hc_add` | `M`(range) `n` `hc` `vsep`/opt `scale`:f64 `dtype` | `h`:inout, `v`, `on` |
+| `hc_cast_route` | `M`(range) `n` `hc` `n_routes` `max_slots` `min_margin`:f64 `dtype` | `h`, `rtbl`, `on` → `seq_route` |
+| `hc_cast_add` | `M`(range) `n` `hc` `n_routes` `n_experts` `max_slots` `scale`:f64 `dtype` | `h`:inout, `v`, `on`, `seq_route`, `rmap` |
 | `layernorm` | `M`(range) `n` `eps`:f64 `dtype` | `x`, `w`w, `b`w? → `y` |
 | `grid_embed` | `M`(range) `n` `side` `dtype` | `x`:inout, `table`w, `coord` |
 | `grid_embed_pad` | `M`(range) `n` `side` `dtype` | `x`:inout, `table`w, `coord` |
@@ -389,12 +392,27 @@ the column naming which: it gets `prefix[k]` instead.
 
 ### Hyper-connections
 
-`hc_project` is the control vector's projection (core/cvec.h): `h[s] -= scale * (h[s] . v) * v`
-for each of the `hc` streams of a row whose `on` flag (an int32 per row) is 1, `v` being that
-layer's unit f32 direction and `scale` the norm the file stored. It is llama.cpp's
-`--cvec-mode project`, applied after a layer's write into the stream. A row whose flag is 0 is
-neither read nor written. It is declared only by an architecture given a vector
-(`RadBuildCtx::cvec`), and not issued on a pass where no row takes it (`RadBatch::control_vector`).
+`hc_project` is the control vector's projection (core/cvec.h): `h[s] -= scale * (h[s] . v_s) * v_s`
+for each of the `hc` streams of a row whose `on` flag (an int32 per row) is 1, `v_s` being that
+layer's unit f32 direction (`vsep` 0 = one shared vector, `vsep` `n` = per-stream table `[hc, n]`)
+and `scale` the norm the file stored. It is llama.cpp's `--cvec-mode project`, applied after a
+layer's write into the stream. A row whose flag is 0 is neither read nor written. It is declared
+only by an architecture given a vector (`RadBuildCtx::cvec`), and not issued on a pass where no row
+takes it (`RadBatch::control_vector`).
+
+`hc_add` is the additive control vector (`mode: "add"`, `RAD_CVEC_MODE_ADD`):
+`h[s] += scale * v_s` for each of the `hc` streams of a row whose `on` flag is nonzero, where `v_s`
+keeps the unnormalised f32 values from the GGUF (`vsep` 0 = one shared vector, `vsep` `n` =
+per-stream table `[hc, n]`) and `scale` is any finite non-zero multiplier (negative scales invert
+the steering vector). A row whose flag is 0 is neither read nor written.
+
+`hc_cast_route` and `hc_cast_add` implement sequence-latched Conditional Activation Steering
+(`mode: "cast"`, `RAD_CVEC_MODE_CAST`). `hc_cast_route` runs at `cast.router_layer` on rows whose
+packed `on` flag carries phase `1` (last prefill token), scores the centered, L2-normalised
+`hc * n` residual activation against `rtbl` (`[mu, W[0..n_routes-1], bias[0..n_routes-1]]`), and
+latches the winning route (or `-1` if below `min_margin`) into `seq_route[slot]` on device with no
+host sync. `hc_cast_add` runs on steered layers for decode/verify rows (phase `2..4`), resolves
+`expert = rmap[seq_route[slot] * 3 + (phase - 2)]`, and applies `h[s] += scale * v[expert, s]`.
 
 `hc_read` and `hc_write` are the gated residual pair a hyper-connection model has instead of a
 pre-norm and a residual add. The stream is `hc` times the model width; every block reads a mix of

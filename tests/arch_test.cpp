@@ -14147,6 +14147,21 @@ TEST(the_control_vector_projection_is_issued_only_when_a_row_takes_it) {
     HcProject q;
     CHECK_OK(q.declare(&b0, "proj", g, 1, nullptr, 0, h, 4));
     CHECK(!q.steered());
+
+    /* Additive mode: declares hc_add (supporting negative scales) and obeys batch.control_vector. */
+    RadBuilder ba;
+    const rad_buf ha = rad_decl_buffer(&ba, "h", &hd);
+    float neg_scales[4] = { 0.0f, -0.75f, 0.0f, 0.5f };
+    const RadControlVector cva{ dir.data(), neg_scales, 64, 4, 1, 0, RAD_CVEC_MODE_ADD };
+    const rad_buf maska = HcProject::declare_mask(&ba, "on", g, &cva);
+    REQUIRE(maska != 0);
+    HcProject pa[4];
+    for (int l = 0; l < 4; ++l) CHECK_OK(pa[l].declare(&ba, "add", g, l, &cva, maska, ha, 4));
+    CHECK_EQ(count_op(ba, "hc_add"), 2);
+    CHECK_EQ(count_op(ba, "hc_project"), 0);
+    RadCtx ca{ .b = &ba, .batch = &some };
+    for (const HcProject& x : pa) x.step(&ca, &some, 0, 3);
+    CHECK_EQ(ca.issues.size(), (size_t)2);
 }
 
 RAD_TEST_MAIN()

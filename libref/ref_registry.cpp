@@ -129,6 +129,18 @@ static const RadParamSpec pHcWrite[] = { P_INT("M"), P_INT("n"), P_INT("hc"), P_
 static const RadParamSpec pHcProject[] = { P_INT("M"), P_INT("n"), P_INT("hc"), P_INTO("vsep"),
                                            P_F64("scale"), P_STR("dtype") };
 static const RadOperandSpec oHcProject[] = { INOUT("h"), OPD("v"), OPD("on") };
+static const RadParamSpec pHcCastRoute[] = {
+    P_INT("M"), P_INT("n"), P_INT("hc"), P_INT("n_routes"), P_INT("max_slots"),
+    P_F64("min_margin"), P_STR("dtype"),
+};
+static const RadOperandSpec oHcCastRoute[] = { OPD("h"), OPD("rtbl"), OPD("on"), OUT("seq_route") };
+static const RadParamSpec pHcCastAdd[] = {
+    P_INT("M"), P_INT("n"), P_INT("hc"), P_INT("n_routes"), P_INT("n_experts"),
+    P_INT("max_slots"), P_F64("scale"), P_STR("dtype"),
+};
+static const RadOperandSpec oHcCastAdd[] = {
+    INOUT("h"), OPD("v"), OPD("on"), OPD("seq_route"), OPD("rmap"),
+};
 static const RadOperandSpec oHcEnter[] = { OPD("x"), OUT("h") };
 static const RadOperandSpec oHcWrite[] = { OPD("y"), OPD("inj"), INOUT("h") };
 static const RadParamSpec pMhcPre[] = { P_INT("M"), P_INT("n"), P_INT("hc"),
@@ -1318,6 +1330,16 @@ static const RadOpSchema kSchemas[] = {
   "direction and scale the norm the file stored. The dot is per stream, not on the stream mean. A "
   "row whose flag is 0 is not read and not written, so an unprojected request is byte-identical to "
   "a deployment with no vector loaded." },
+{ "hc_add", ARR(pHcProject), ARR(oHcProject),
+  "Additive control vector (`mode: \"add\"`): for each of the hc streams of a row whose `on` flag "
+  "is nonzero, h[s] += scale * v_s, with v_s that layer's unnormalised f32 direction (vsep 0 = one "
+  "shared vector, vsep n = per-stream table [hc, n]) and scale a finite non-zero multiplier. A row "
+  "whose flag is 0 is not read and not written, so an unsteered request is byte-identical to a "
+  "deployment with no vector loaded." },
+{ "hc_cast_route", ARR(pHcCastRoute), ARR(oHcCastRoute),
+  "Sequence-latched CAST activation router." },
+{ "hc_cast_add", ARR(pHcCastAdd), ARR(oHcCastAdd),
+  "Sequence-latched CAST additive expert steering." },
 { "mtp_enter", ARR(pMtpEnter), ARR(oMtpEnter),
   "The MTP head's entry for a wide residual stream: x[k*n+i] = fc_h[i] . grouped_norm(h)[k] "
   "+ fc_e[i] . norm(e), for each of the hc sub-streams k. `ngroup` == hc is one rsqrt per "
@@ -2597,6 +2619,15 @@ SIMPLE("ref_hc_write", "hc_write", "norm", "gated residual write: h[s] += inj[s]
 SIMPLE("ref_hc_project", "hc_project", "norm",
        "control vector: h[s] -= scale * (h[s] . v) * v where the row's flag is on",
        DT_FLOAT, ref_hc_project),
+SIMPLE("ref_hc_add", "hc_add", "norm",
+       "additive control vector: h[s] += scale * v_s where the row's flag is on",
+       DT_FLOAT, ref_hc_add),
+SIMPLE("ref_hc_cast_route", "hc_cast_route", "norm",
+       "CAST activation router: latches sequence route on last prefill token",
+       DT_FLOAT, ref_hc_cast_route),
+SIMPLE("ref_hc_cast_add", "hc_cast_add", "norm",
+       "CAST additive steering: applies routed expert per-stream direction",
+       DT_FLOAT, ref_hc_cast_add),
 SIMPLE("ref_layernorm", "layernorm", "norm", "layer norm with gain and bias", DT_FLOAT,
        ref_layernorm),
 SIMPLE("ref_grid_embed", "grid_embed", "elem",

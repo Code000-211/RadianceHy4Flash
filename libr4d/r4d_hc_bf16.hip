@@ -57,9 +57,11 @@
 #include <hip/hip_runtime.h>
 
 #include <atomic>
+#include <cstdio>
 #include <type_traits>
 #include <cstdlib>
 #include <mutex>
+#include <vector>
 #include "r4d.h"
 #include "r4d_emit.h"
 #include "r4d_gdn_args.h"
@@ -477,6 +479,130 @@ void hc_project_kernel(unsigned short* __restrict__ h, const float* __restrict__
 
     const float g = s_g[0];
     for (long i = threadIdx.x; i < n; i += kThreads) hp[i] = f2bf(bf2f(hp[i]) - g * vs[i]);
+}
+
+/* ============================================================== hc_add
+ *
+ * Additive control vector (core/cvec.h, mode="add"): h[s] += scale * v_s for each of the hc
+ * streams of a row whose `on` flag is nonzero. `vsep` = 0 shares one vector across all streams;
+ * `vsep` = n reads stream s's own row at v + s*n. Single-pass, no LDS or reduction needed; a row
+ * whose flag is 0 returns immediately without reading or writing `h`. */
+__global__ __launch_bounds__(kThreads)
+void hc_add_kernel(unsigned short* __restrict__ h, const float* __restrict__ v,
+                   const int32_t* __restrict__ on, long rows, long n, long hrow, float scale,
+                   long vsep) {
+    const long r = blockIdx.y;
+    if (r >= rows) return;
+    const int32_t flag = on[r];
+    if (flag == 0) return;   /* a row's switch: the whole workgroup takes it */
+    const float rscale = (flag > 0) ? scale : (scale * ((float)(-flag) * 1e-4f));
+    const long s = (long)blockIdx.x;
+    const float* vs = v + s * vsep;
+    unsigned short* hp = h + r * hrow + s * n;
+
+    for (long i = threadIdx.x; i < n; i += kThreads) hp[i] = f2bf(bf2f(hp[i]) + rscale * vs[i]);
+}
+
+/* ============================================================== hc_cast_route
+ *
+ * Sequence-latched CAST router (mode="cast"): on rows with (on[r] & 0xF) == 1 (last prefill
+ * token), computes centered-normalized linear scores against rtbl=[mu, W[0..R-1], bias[0..R-1]]
+ * across all hc*n channels and latches argmax into seq_route[slot] on GPU. Zero D2H sync. */
+__global__ __launch_bounds__(kThreads)
+void hc_cast_route_kernel(const unsigned short* __restrict__ h,
+                          const float* __restrict__ rtbl,
+                          const int32_t* __restrict__ on,
+                          int32_t* __restrict__ seq_route,
+                          long rows, long n, int hc, long hrow,
+                          int n_routes, int max_slots, float min_margin) {
+    const long r = blockIdx.x;
+    if (r >= rows) return;
+    const int32_t flag = on[r];
+    if ((flag & 0xF) != 1) return;
+    const int slot = (flag >> 8) & 0xFFF;
+    if (slot < 0 || slot >= max_slots) return;
+
+    const long hn = (long)hc * n;
+    const unsigned short* hp = h + r * hrow;
+    const float* mu = rtbl;
+
+    float ss = 0.0f;
+    for (long j = threadIdx.x; j < hn; j += kThreads) {
+        const float d = bf2f(hp[j]) - mu[j];
+        ss += d * d;
+    }
+    __shared__ float s_red[kWaves];
+    float w = r4d_wave_sum(ss);
+    if ((threadIdx.x % kWave) == 0) s_red[threadIdx.x / kWave] = w;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float tot = 0.0f;
+        for (int k = 0; k < kWaves; ++k) tot += s_red[k];
+        s_red[0] = rsqrtf(tot + 1e-12f);
+    }
+    __syncthreads();
+    const float inv_norm = s_red[0];
+
+    const float* bias = rtbl + (long)(1 + n_routes) * hn;
+    __shared__ float s_scores[8];
+    for (int c = 0; c < n_routes && c < 8; ++c) {
+        const float* wc = rtbl + (long)(1 + c) * hn;
+        float acc = 0.0f;
+        for (long j = threadIdx.x; j < hn; j += kThreads)
+            acc += (bf2f(hp[j]) - mu[j]) * wc[j];
+        float wsum = r4d_wave_sum(acc);
+        if ((threadIdx.x % kWave) == 0) s_red[threadIdx.x / kWave] = wsum;
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            float tot = 0.0f;
+            for (int k = 0; k < kWaves; ++k) tot += s_red[k];
+            s_scores[c] = bias[c] + tot * inv_norm;
+        }
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0) {
+        int best = -1;
+        float best_s = -1e30f, second_s = -1e30f;
+        for (int c = 0; c < n_routes && c < 8; ++c) {
+            const float sc = s_scores[c];
+            if (sc > best_s) { second_s = best_s; best_s = sc; best = c; }
+            else if (sc > second_s) { second_s = sc; }
+        }
+        if (n_routes > 1 && (best_s - second_s) < min_margin) best = -1;
+        seq_route[slot] = best;
+    }
+}
+
+/* ============================================================== hc_cast_add
+ *
+ * Sequence-latched CAST additive steering: reads route=seq_route[slot], maps (route, phase) ->
+ * expert via rmap[route*3 + (phase-2)], and adds scale * v[expert, s] into h[r, s]. */
+__global__ __launch_bounds__(kThreads)
+void hc_cast_add_kernel(unsigned short* __restrict__ h,
+                        const float* __restrict__ v,
+                        const int32_t* __restrict__ on,
+                        const int32_t* __restrict__ seq_route,
+                        const int32_t* __restrict__ rmap,
+                        long rows, long n, int hc, long hrow,
+                        int n_routes, int n_experts, int max_slots, float scale) {
+    const long r = blockIdx.y;
+    if (r >= rows) return;
+    const int32_t flag = on[r];
+    const int phase = flag & 0xF;
+    if (phase < 2 || phase > 4) return;
+    const int slot = (flag >> 8) & 0xFFF;
+    if (slot < 0 || slot >= max_slots) return;
+    const int route = seq_route[slot];
+    if (route < 0 || route >= n_routes) return;
+    const int expert = rmap[route * 3 + (phase - 2)];
+    if (expert < 0 || expert >= n_experts) return;
+
+    const long s = (long)blockIdx.x;
+    const float* vs = v + ((long)expert * hc + s) * n;
+    unsigned short* hp = h + r * hrow + s * n;
+    for (long i = threadIdx.x; i < n; i += kThreads)
+        hp[i] = f2bf(bf2f(hp[i]) + scale * vs[i]);
 }
 
 /* A wave's dot product of the LDS vector with a contiguous bf16 row, using 512-byte loads but
@@ -5565,6 +5691,77 @@ extern "C" int r4d_rad_hc_project(const RadArgs* a, RadStream stream) {
                     0, (unsigned short*)h->data, (const float*)v->data,
                     (const int32_t*)on->data, (long)rows, (long)n, (long)hrow,
                     (float)r4d_getf(a, "scale", 1.0), (long)vsep);
+}
+
+/* Additive control vector: h[s] += scale * v_s where on[r] != 0. Same operands and vsep contract
+ * as r4d_rad_hc_project. */
+extern "C" int r4d_rad_hc_add(const RadArgs* a, RadStream stream) {
+    const RadTensor* h  = r4d_opt(a, HCP_H);
+    const RadTensor* v  = r4d_opt(a, HCP_V);
+    const RadTensor* on = r4d_opt(a, HCP_ON);
+    if (!h || !v || !on) return R4D_NO(RAD_E_INVAL);
+    R4D_DT(h, RAD_BF16); R4D_DT(v, RAD_F32); R4D_DT(on, RAD_I32);
+    long long rows = 0, n = 0, hc = 0, hrow = 0;
+    const int rc = hc_common(a, h, &rows, &n, &hc, &hrow);
+    if (rc != RAD_OK) return rc;
+    const long long vsep = r4d_geti_or(a, "vsep", 0);
+    if (vsep != 0 && vsep != n) return R4D_NO(RAD_E_INVAL);
+    long long vrows = 0, onrows = 0;
+    if (r4d_rows_pitch(v, n, &vrows) < 0) return R4D_NO(RAD_E_STRIDE);
+    if (vrows != (vsep != 0 ? hc : 1)) return R4D_NO(RAD_E_STRIDE);
+    if (r4d_rows_pitch(on, 1, &onrows) < 0 || onrows < rows) return R4D_NO(RAD_E_STRIDE);
+
+    return R4D_EMIT(stream, hc_add_kernel, dim3((unsigned)hc, (unsigned)rows), dim3(kThreads),
+                    0, (unsigned short*)h->data, (const float*)v->data,
+                    (const int32_t*)on->data, (long)rows, (long)n, (long)hrow,
+                    (float)r4d_getf(a, "scale", 1.0), (long)vsep);
+}
+
+extern "C" int r4d_rad_hc_cast_route(const RadArgs* a, RadStream stream) {
+    const RadTensor* h         = r4d_opt(a, 0);
+    const RadTensor* rtbl      = r4d_opt(a, 1);
+    const RadTensor* on        = r4d_opt(a, 2);
+    const RadTensor* seq_route = r4d_opt(a, 3);
+    if (!h || !rtbl || !on || !seq_route) return R4D_NO(RAD_E_INVAL);
+    R4D_DT(h, RAD_BF16); R4D_DT(rtbl, RAD_F32); R4D_DT(on, RAD_I32); R4D_DT(seq_route, RAD_I32);
+    long long rows = 0, n = 0, hc = 0, hrow = 0;
+    const int rc = hc_common(a, h, &rows, &n, &hc, &hrow);
+    if (rc != RAD_OK) return rc;
+    const int n_routes  = (int)r4d_geti_or(a, "n_routes", 0);
+    const int max_slots = (int)r4d_geti_or(a, "max_slots", 0);
+    const float min_margin = (float)r4d_getf(a, "min_margin", 0.0);
+    if (n_routes < 1 || n_routes > 8 || max_slots < 1) return R4D_NO(RAD_E_INVAL);
+
+    return R4D_EMIT(stream, hc_cast_route_kernel, dim3((unsigned)rows), dim3(kThreads),
+                    0, (const unsigned short*)h->data, (const float*)rtbl->data,
+                    (const int32_t*)on->data, (int32_t*)seq_route->data,
+                    (long)rows, (long)n, (int)hc, (long)hrow,
+                    n_routes, max_slots, min_margin);
+}
+
+extern "C" int r4d_rad_hc_cast_add(const RadArgs* a, RadStream stream) {
+    const RadTensor* h         = r4d_opt(a, 0);
+    const RadTensor* v         = r4d_opt(a, 1);
+    const RadTensor* on        = r4d_opt(a, 2);
+    const RadTensor* seq_route = r4d_opt(a, 3);
+    const RadTensor* rmap      = r4d_opt(a, 4);
+    if (!h || !v || !on || !seq_route || !rmap) return R4D_NO(RAD_E_INVAL);
+    R4D_DT(h, RAD_BF16); R4D_DT(v, RAD_F32); R4D_DT(on, RAD_I32);
+    R4D_DT(seq_route, RAD_I32); R4D_DT(rmap, RAD_I32);
+    long long rows = 0, n = 0, hc = 0, hrow = 0;
+    const int rc = hc_common(a, h, &rows, &n, &hc, &hrow);
+    if (rc != RAD_OK) return rc;
+    const int n_routes  = (int)r4d_geti_or(a, "n_routes", 0);
+    const int n_experts = (int)r4d_geti_or(a, "n_experts", 0);
+    const int max_slots = (int)r4d_geti_or(a, "max_slots", 0);
+    if (n_routes < 1 || n_routes > 8 || n_experts < 1 || n_experts > 8 || max_slots < 1)
+        return R4D_NO(RAD_E_INVAL);
+
+    return R4D_EMIT(stream, hc_cast_add_kernel, dim3((unsigned)hc, (unsigned)rows), dim3(kThreads),
+                    0, (unsigned short*)h->data, (const float*)v->data,
+                    (const int32_t*)on->data, (const int32_t*)seq_route->data,
+                    (const int32_t*)rmap->data, (long)rows, (long)n, (int)hc, (long)hrow,
+                    n_routes, n_experts, max_slots, (float)r4d_getf(a, "scale", 1.0));
 }
 
 enum { MTE_H = 0, MTE_E, MTE_WH, MTE_WE, MTE_FCH, MTE_FCE, MTE_X };

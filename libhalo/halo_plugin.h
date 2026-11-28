@@ -564,6 +564,7 @@ int halo_rad_dflash_tree(const RadArgs*, RadStream);
 /* -- the gated residual (halo_hc_bf16.hip) -- */
 int     halo_rad_hc_enter       (const RadArgs*, RadStream);
 int     halo_rad_hc_project     (const RadArgs*, RadStream);
+int     halo_rad_hc_add         (const RadArgs*, RadStream);
 int halo_rad_mhc_pre(const RadArgs*, RadStream);
 int halo_rad_mhc_pre_partial(const RadArgs*, RadStream);
 int halo_rad_mhc_pre_finish(const RadArgs*, RadStream);
@@ -1052,6 +1053,7 @@ int halo_shape_mtp_enter      (const RadParam*, int, int operand, RadOpdDesc*);
 int halo_shape_hc_read        (const RadParam*, int, int operand, RadOpdDesc*);
 int halo_shape_hc_write       (const RadParam*, int, int operand, RadOpdDesc*);
 int halo_shape_hc_project     (const RadParam*, int, int operand, RadOpdDesc*);
+int halo_shape_hc_add         (const RadParam*, int, int operand, RadOpdDesc*);
 int halo_shape_binary         (const RadParam*, int, int operand, RadOpdDesc*);
 int halo_shape_mul_weight     (const RadParam*, int, int operand, RadOpdDesc*);
 int halo_shape_scatter_rows_bf16(const RadParam*, int, int operand, RadOpdDesc*);

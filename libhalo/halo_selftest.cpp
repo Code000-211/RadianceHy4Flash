@@ -8349,6 +8349,90 @@ static void hc_project_case(const Plugin& pl) {
     }
 }
 
+/* hc_add, against an f64 evaluation of h[s] += scale * v_s from the bf16 stream the kernel reads,
+ * testing both shared (vsep=0) and per-stream (vsep=n) layouts, positive and negative scales, and
+ * confirming switched-off rows stay byte-identical. */
+static void hc_add_case(const Plugin& pl) {
+    const char* what = "hc_add vs an f64 evaluation, and switched-off rows untouched";
+    const RadKernelInfo* r = find(pl, "hc_add_bf16");
+    if (!r) { ok(what, false, "row absent"); return; }
+
+    struct Shape { int64_t M, n, hc; double scale; bool per_stream; };
+    for (const Shape sh : { Shape{ 5, 2560, 4, 0.75, false }, Shape{ 4, 2560, 4, -0.5, true },
+                            Shape{ 3, 128, 2, 1.25, true } }) {
+        const int64_t M = sh.M, n = sh.n, hc = sh.hc, W = hc * n;
+        const int64_t vrows = sh.per_stream ? hc : 1;
+        std::vector<float> v((size_t)(vrows * n));
+        for (int64_t vr = 0; vr < vrows; ++vr)
+            for (int64_t i = 0; i < n; ++i)
+                v[(size_t)(vr * n + i)] = (float)((1.0 + 0.3 * (double)vr) *
+                                                  std::sin(0.37 * (double)i + 0.2 * (double)vr));
+        std::vector<uint16_t> h((size_t)(M * W));
+        double hmax = 0.0;
+        for (int64_t m = 0; m < M; ++m)
+            for (int64_t c = 0; c < hc; ++c)
+                for (int64_t i = 0; i < n; ++i) {
+                    const double x = 0.5 * std::cos(0.11 * (double)(m * W + c * n + i)) +
+                                     0.2 * (double)(c - m);
+                    h[(size_t)(m * W + c * n + i)] = h_to_bf16((float)x);
+                    hmax = std::max(hmax, std::fabs(x));
+                }
+        std::vector<int32_t> on((size_t)M);
+        for (int64_t m = 0; m < M; ++m) on[(size_t)m] = (M == 1 || m % 2 == 0) ? 1 : 0;
+
+        std::vector<double> want((size_t)(M * W));
+        for (int64_t m = 0; m < M; ++m)
+            for (int64_t c = 0; c < hc; ++c) {
+                const size_t b = (size_t)(m * W + c * n);
+                const size_t vb = (size_t)((sh.per_stream ? c : 0) * n);
+                for (int64_t i = 0; i < n; ++i)
+                    want[b + i] = (double)h_bf16(h[b + i]) +
+                                  (on[(size_t)m] ? sh.scale * (double)v[vb + i] : 0.0);
+            }
+
+        void* d_h = dalloc(h.size() * 2);
+        void* d_v = dalloc(v.size() * 4);
+        void* d_on = dalloc(on.size() * 4);
+        if (!d_h || !d_v || !d_on) { ok(what, false, "hipMalloc failed"); return; }
+        st_memcpy(d_h, h.data(), h.size() * 2, hipMemcpyHostToDevice);
+        st_memcpy(d_v, v.data(), v.size() * 4, hipMemcpyHostToDevice);
+        fill_i32(d_on, on);
+
+        std::vector<RadTensor> ts = {
+            T(d_h, RAD_BF16, { M, W }),
+            sh.per_stream ? T(d_v, RAD_F32, { hc, n }) : T(d_v, RAD_F32, { n }),
+            T(d_on, RAD_I32, { M }),
+        };
+        std::vector<RadParam> ps = { PI("M", M), PI("n", n), PI("hc", hc),
+                                     PI("vsep", sh.per_stream ? n : 0),
+                                     PF("scale", sh.scale), PS("dtype", "bf16") };
+        RadArgs a;
+        std::memset(&a, 0, sizeof(a));
+        a.t = ts.data(); a.n_t = (int)ts.size();
+        a.p = ps.data(); a.n_p = (int)ps.size();
+        const int rc = r->launch(&a, nullptr);
+        st_stream_sync(nullptr);
+        const std::string at = fmt("M=%lld n=%lld hc=%lld scale=%g ps=%d", (long long)M,
+                                   (long long)n, (long long)hc, sh.scale, (int)sh.per_stream);
+        if (rc != RAD_OK) { ok(what, false, "launch rc=" + std::to_string(rc) + " " + at); return; }
+
+        std::vector<uint16_t> got(h.size());
+        st_memcpy(got.data(), d_h, got.size() * 2, hipMemcpyDeviceToHost);
+        double worst = 0.0;
+        int64_t bad = 0, touched = 0;
+        for (int64_t m = 0; m < M; ++m)
+            for (int64_t j = 0; j < W; ++j) {
+                const size_t k = (size_t)(m * W + j);
+                if (!on[(size_t)m]) { touched += got[k] != h[k]; continue; }
+                const double e = std::fabs((double)h_bf16(got[k]) - want[k]);
+                worst = std::max(worst, e);
+                if (e > 1e-2 * std::fabs(want[k]) + 2e-3 * std::max(1.0, hmax)) ++bad;
+            }
+        ok(what, bad == 0 && touched == 0, at + " worst_abs=" + std::to_string(worst) +
+             " bad=" + std::to_string(bad) + " off_rows_changed=" + std::to_string(touched));
+    }
+}
+
 /* rmsnorm_p, against an f64 evaluation of the weightless normalisation.
  *
  * Two eps values: the model's (Gemma 4 issues 1e-6) and 1e-2, so a hard-wired 1e-6 or a dropped
@@ -37001,6 +37085,12 @@ static void device_phase(const Plugin& pl) {
         if (!g_case) std::printf("\nthe control vector's projection, against the formula it "
                                  "implements\n");
         hc_project_case(pl);
+    }
+
+    if (sel("hc_add_bf16")) {
+        if (!g_case) std::printf("\nthe additive control vector, against the formula it "
+                                 "implements\n");
+        hc_add_case(pl);
     }
 
     if (sel("gelu_mul_bf16")) {

@@ -218,11 +218,11 @@ TEST(the_packages_json_sets_the_range_and_scale) {
     CHECK_EQ(a.cv.scales[(size_t) 7], 0.0f);
     CHECK_EQ(a.cv.scales[(size_t) 21], 0.0f);
 
-    /* Another mode is not implemented. */
-    const Loaded b = load(make_vector(2560, 47), 2560, 48, "json-add.gguf",
-                          R"({"mode":"add","scale":0.1,"layer_range":[16,32]})");
+    /* Unknown mode is refused by name. */
+    const Loaded b = load(make_vector(2560, 47), 2560, 48, "json-bad-mode.gguf",
+                          R"({"mode":"multiply","scale":0.1,"layer_range":[16,32]})");
     CHECK(b.rc < 0);
-    CHECK(b.err.find("'add'") != std::string::npos);
+    CHECK(b.err.find("'multiply'") != std::string::npos);
 
     /* Not JSON. */
     const Loaded c = load(make_vector(2560, 47), 2560, 48, "json-broken.gguf", "{ not json");
@@ -410,6 +410,107 @@ TEST(a_malformed_basis_is_refused) {
                             "basis-big.gguf");
     CHECK(big.rc < 0);
     CHECK(big.err.find("at most") != std::string::npos);
+}
+
+/* Additive control vectors (`mode: "add"`): raw per-layer and per-stream magnitudes are preserved
+ * without unit-normalisation, zero rows are allowed, negative scales are allowed, non-unit /
+ * non-orthogonal warnings are suppressed, and prefix-cache salts stay distinct from `project`. */
+TEST(additive_mode_preserves_raw_values_negative_scales_and_distinct_salt) {
+    const int64_t n = 16;
+    GgufWriter w;
+    w.strs.push_back({ "general.architecture", "controlvector" });
+    w.strs.push_back({ "controlvector.model_hint", "qwen4exp" });
+    w.ints.push_back({ "controlvector.layer_count", 3 });
+    /* Layer 1: norm != 1; Layer 2: all zeros (legal in add mode); Layer 3: negative entries. */
+    std::vector<float> d1((size_t) n, 0.0f);
+    for (int64_t i = 0; i < n; ++i) d1[(size_t) i] = 0.5f * (float) (i + 1);
+    std::vector<float> d2((size_t) n, 0.0f);
+    std::vector<float> d3((size_t) n, -2.25f);
+    w.tensors.push_back({ "direction.1", d1, 1 });
+    w.tensors.push_back({ "direction.2", d2, 1 });
+    w.tensors.push_back({ "direction.3", d3, 1 });
+
+    Loaded a;
+    const std::string warn = stderr_of([&] {
+        a = load(w, n, 5, "add-neg.gguf",
+                 R"({"mode":"add","scale":-0.5,"layer_range":[1,3]})");
+    });
+    CHECK_OK(a.rc);
+    CHECK_EQ(a.cv.mode, (int64_t) RAD_CVEC_MODE_ADD);
+    CHECK_EQ(a.cv.first, 1);
+    CHECK_EQ(a.cv.last, 3);
+    CHECK_NEAR(a.cv.user_scale, -0.5f, 1e-6);
+    CHECK(warn.find("not unit-normalised") == std::string::npos);
+    CHECK(warn.find("not orthogonal") == std::string::npos);
+    for (int l = 1; l <= 3; ++l) {
+        CHECK_EQ(a.cv.covers(l), true);
+        CHECK_NEAR(a.cv.scales[(size_t) l], -0.5f, 1e-6);
+    }
+    CHECK_EQ(a.cv.covers(0), false);
+    CHECK_EQ(a.cv.covers(4), false);
+    CHECK_EQ(a.cv.scales[4], 0.0f);
+    /* Raw F32 values are preserved verbatim (not unit-normalised). */
+    for (int64_t i = 0; i < n; ++i) {
+        CHECK_EQ(a.cv.dir[(size_t) (1 * n + i)], d1[(size_t) i]);
+        CHECK_EQ(a.cv.dir[(size_t) (2 * n + i)], 0.0f);
+        CHECK_EQ(a.cv.dir[(size_t) (3 * n + i)], -2.25f);
+    }
+    const RadControlVector va = rad::control_vector_view(a.cv, a.cv.dir.data());
+    CHECK_EQ(va.mode, (int64_t) RAD_CVEC_MODE_ADD);
+
+    /* Per-stream additive with non-orthogonal, non-unit rows: loads without warnings and keeps raw
+     * per-stream magnitudes. */
+    const int64_t k = 8;
+    GgufWriter ps = make_basis(n, 3, k, true);
+    for (auto& t : ps.tensors)
+        for (int64_t j = 0; j < k; ++j)
+            for (int64_t i = 0; i < n; ++i)
+                t.data[(size_t) (j * n + i)] = (float) (j + 1) * 0.25f;
+    Loaded p;
+    const std::string pwarn = stderr_of([&] {
+        p = load(ps, n, 5, "add-ps.gguf",
+                 R"({"mode":"add","scale":1.5,"layer_range":[1,3]})");
+    });
+    CHECK_OK(p.rc);
+    CHECK_EQ(p.cv.mode, (int64_t) RAD_CVEC_MODE_ADD);
+    CHECK_EQ(p.cv.per_stream, (int64_t) 1);
+    CHECK_EQ(p.cv.rank, k);
+    CHECK(pwarn.find("not unit-normalised") == std::string::npos);
+    CHECK(pwarn.find("not orthogonal") == std::string::npos);
+    for (int64_t j = 0; j < k; ++j)
+        CHECK_NEAR(p.cv.dir[(size_t) ((1 * k + j) * n + 0)], (float) (j + 1) * 0.25f, 1e-6);
+
+    /* Same unit vector loaded under `project` vs `add` has identical dir & scales, yet must yield
+     * distinct prefix-cache salts so cached KV never aliases across modes. */
+    const GgufWriter u = make_vector(n, 3);
+    const Loaded up = load(u, n, 5, "salt-proj.gguf",
+                           R"({"mode":"project","scale":1.0,"layer_range":[1,3]})");
+    const Loaded ua = load(u, n, 5, "salt-add.gguf",
+                           R"({"mode":"add","scale":1.0,"layer_range":[1,3]})");
+    CHECK_OK(up.rc);
+    CHECK_OK(ua.rc);
+    CHECK_EQ(up.cv.mode, (int64_t) RAD_CVEC_MODE_PROJECT);
+    CHECK_EQ(ua.cv.mode, (int64_t) RAD_CVEC_MODE_ADD);
+    CHECK(rad::control_vector_salt(up.cv) != rad::control_vector_salt(ua.cv));
+
+    /* Refusals in add mode: scale == 0, non-finite values, and missing layers even with scale < 0. */
+    const Loaded zero_s = load(w, n, 5, "add-zero-scale.gguf",
+                               R"({"mode":"add","scale":0.0,"layer_range":[1,3]})");
+    CHECK(zero_s.rc < 0);
+
+    GgufWriter bad_nan = w;
+    bad_nan.tensors[0].data[3] = std::nanf("");
+    const Loaded nan_r = load(bad_nan, n, 5, "add-nan.gguf",
+                              R"({"mode":"add","scale":1.0,"layer_range":[1,3]})");
+    CHECK(nan_r.rc < 0);
+    CHECK(nan_r.err.find("non-finite") != std::string::npos);
+
+    GgufWriter gap = w;
+    gap.tensors.erase(gap.tensors.begin() + 1);   /* drop direction.2 */
+    const Loaded gap_r = load(gap, n, 5, "add-gap.gguf",
+                              R"({"mode":"add","scale":-1.0,"layer_range":[1,3]})");
+    CHECK(gap_r.rc < 0);
+    CHECK(gap_r.err.find("2") != std::string::npos);
 }
 
 RAD_TEST_MAIN()

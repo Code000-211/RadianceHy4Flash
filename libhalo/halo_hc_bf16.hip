@@ -348,6 +348,28 @@ void hc_project_kernel(unsigned short* __restrict__ h, const float* __restrict__
     for (long i = threadIdx.x; i < n; i += kThreads) hp[i] = f2bf(bf2f(hp[i]) - g * vs[i]);
 }
 
+/* ============================================================== hc_add
+ *
+ * Additive control vector (core/cvec.h, mode="add"): h[s] += scale * v_s for each of the hc
+ * streams of a row whose `on` flag is nonzero. `vsep` = 0 shares one vector across all streams;
+ * `vsep` = n reads stream s's own row at v + s*n. Single-pass, no LDS or reduction needed; a row
+ * whose flag is 0 returns immediately without reading or writing `h`. */
+__global__ __launch_bounds__(kThreads)
+void hc_add_kernel(unsigned short* __restrict__ h, const float* __restrict__ v,
+                   const int32_t* __restrict__ on, long rows, long n, long hrow, float scale,
+                   long vsep) {
+    const long r = blockIdx.y;
+    if (r >= rows) return;
+    const int32_t flag = on[r];
+    if (flag == 0) return;   /* a row's switch: the whole workgroup takes it */
+    const float rscale = (flag > 0) ? scale : (scale * ((float)(-flag) * 1e-4f));
+    const long s = (long)blockIdx.x;
+    const float* vs = v + s * vsep;
+    unsigned short* hp = h + r * hrow + s * n;
+
+    for (long i = threadIdx.x; i < n; i += kThreads) hp[i] = f2bf(bf2f(hp[i]) + rscale * vs[i]);
+}
+
 /* A wave's dot product of the LDS vector with a contiguous bf16 row, using 512-byte loads but
 
 /* hc_read, its scratch sizing and mtp_enter are the rest of libr4d's r4d_hc_bf16.hip:
@@ -442,6 +464,30 @@ extern "C" int halo_rad_hc_project(const RadArgs* a, RadStream stream) {
     if (halo_rows_pitch(on, 1, &onrows) < 0 || onrows < rows) return HALO_NO(RAD_E_STRIDE);
 
     return HALO_EMIT(stream, hc_project_kernel, dim3((unsigned)hc, (unsigned)rows), dim3(kThreads),
+                    0, (unsigned short*)h->data, (const float*)v->data,
+                    (const int32_t*)on->data, (long)rows, (long)n, (long)hrow,
+                    (float)halo_getf(a, "scale", 1.0), (long)vsep);
+}
+
+/* Additive control vector: h[s] += scale * v_s where on[r] != 0. Same operands and vsep contract
+ * as halo_rad_hc_project. */
+extern "C" int halo_rad_hc_add(const RadArgs* a, RadStream stream) {
+    const RadTensor* h  = halo_opt(a, HCP_H);
+    const RadTensor* v  = halo_opt(a, HCP_V);
+    const RadTensor* on = halo_opt(a, HCP_ON);
+    if (!h || !v || !on) return HALO_NO(RAD_E_INVAL);
+    HALO_DT(h, RAD_BF16); HALO_DT(v, RAD_F32); HALO_DT(on, RAD_I32);
+    long long rows = 0, n = 0, hc = 0, hrow = 0;
+    const int rc = hc_common(a, h, &rows, &n, &hc, &hrow);
+    if (rc != RAD_OK) return rc;
+    const long long vsep = halo_geti_or(a, "vsep", 0);
+    if (vsep != 0 && vsep != n) return HALO_NO(RAD_E_INVAL);
+    long long vrows = 0, onrows = 0;
+    if (halo_rows_pitch(v, n, &vrows) < 0) return HALO_NO(RAD_E_STRIDE);
+    if (vrows != (vsep != 0 ? hc : 1)) return HALO_NO(RAD_E_STRIDE);
+    if (halo_rows_pitch(on, 1, &onrows) < 0 || onrows < rows) return HALO_NO(RAD_E_STRIDE);
+
+    return HALO_EMIT(stream, hc_add_kernel, dim3((unsigned)hc, (unsigned)rows), dim3(kThreads),
                     0, (unsigned short*)h->data, (const float*)v->data,
                     (const int32_t*)on->data, (long)rows, (long)n, (long)hrow,
                     (float)halo_getf(a, "scale", 1.0), (long)vsep);

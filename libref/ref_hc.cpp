@@ -314,6 +314,135 @@ int ref_hc_project(const RadArgs* a, RadStream) {
     return RAD_OK;
 }
 
+/* ------------------------------------------------------------------ hc_add */
+/* Additive control vector (core/cvec.h, mode="add"): h[row, s*n + i] += scale * v[s*vsep + i], for
+ * each of the hc streams s, on the rows whose `on` flag is nonzero. A row whose flag is 0 is
+ * neither read nor written, keeping unsteered requests bit-identical to the stock model. */
+int ref_hc_add(const RadArgs* a, RadStream) {
+    if (!have(a, 3)) return RAD_E_INVAL;
+    const RadTensor* h  = &a->t[0];
+    const RadTensor* v  = &a->t[1];
+    const RadTensor* on = &a->t[2];
+
+    const int64_t n  = p_int(a, "n", 0);
+    const int64_t hc = p_int(a, "hc", 0);
+    const float   sc = p_f32(a, "scale", 1.0f);
+    const int64_t vsep = p_int(a, "vsep", 0);
+    if (vsep != 0 && vsep != n) return RAD_E_INVAL;
+    const int64_t vrows = vsep != 0 ? hc : 1;
+    if (n <= 0 || hc <= 1) return RAD_E_SHAPE;
+    if (numel(v) < vrows * n) return RAD_E_SHAPE;
+    const int64_t hn = hc * n;
+
+    const int64_t rows = rows_of(h, hn);
+    if (rows <= 0 || numel(on) < rows) return RAD_E_SHAPE;
+
+    REF_PAR_FOR(rows * hc)
+    for (int64_t k = 0; k < rows * hc; ++k) {
+        const int64_t r = k / hc, c = k % hc;
+        const int64_t flag = ld_int(on->dtype, on->data, offlin(on, r));
+        if (flag == 0) continue;
+        const float rsc = (flag > 0) ? sc : (sc * ((float)(-flag) * 1e-4f));
+        const int64_t hb = rowoff(h, r, hn), hs = laststride(h);
+        const int64_t vb = rowoff(v, vsep != 0 ? c : 0, n), vl = laststride(v);
+        for (int64_t i = 0; i < n; ++i) {
+            const int64_t j = hb + (c * n + i) * hs;
+            stt(h, j, ldt(h, j) + rsc * ldt(v, vb + i * vl));
+        }
+    }
+    return RAD_OK;
+}
+
+int ref_hc_cast_route(const RadArgs* a, RadStream) {
+    if (!have(a, 4)) return RAD_E_INVAL;
+    const RadTensor* h         = &a->t[0];
+    const RadTensor* rtbl      = &a->t[1];
+    const RadTensor* on        = &a->t[2];
+    const RadTensor* seq_route = &a->t[3];
+    const int64_t n = p_int(a, "n", 0), hc = p_int(a, "hc", 0);
+    const int64_t n_routes = p_int(a, "n_routes", 0), max_slots = p_int(a, "max_slots", 0);
+    const float min_margin = p_f32(a, "min_margin", 0.0f);
+    if (n <= 0 || hc <= 1 || n_routes < 1 || n_routes > 8 || max_slots < 1) return RAD_E_SHAPE;
+    const int64_t hn = hc * n;
+    const int64_t rows = rows_of(h, hn);
+    if (rows <= 0 || numel(on) < rows || numel(seq_route) < max_slots) return RAD_E_SHAPE;
+    if (numel(rtbl) < (1 + n_routes) * hn + n_routes) return RAD_E_SHAPE;
+
+    const float* rt = (const float*)rtbl->data;
+    const float* mu = rt;
+    const float* bias = rt + (1 + n_routes) * hn;
+    int32_t* sr = (int32_t*)seq_route->data;
+    for (int64_t r = 0; r < rows; ++r) {
+        const int64_t flag = ld_int(on->dtype, on->data, offlin(on, r));
+        if ((flag & 0xF) != 1) continue;
+        const int64_t slot = (flag >> 8) & 0xFFF;
+        if (slot < 0 || slot >= max_slots) continue;
+        const int64_t hb = rowoff(h, r, hn), hs = laststride(h);
+        double ss = 0.0;
+        for (int64_t j = 0; j < hn; ++j) {
+            const double d = (double)ldt(h, hb + j * hs) - (double)mu[j];
+            ss += d * d;
+        }
+        const double inv = 1.0 / std::sqrt(ss + 1e-12);
+        int32_t best = -1;
+        double best_s = -1e30, second_s = -1e30;
+        for (int64_t c = 0; c < n_routes; ++c) {
+            const float* wc = rt + (1 + c) * hn;
+            double acc = 0.0;
+            for (int64_t j = 0; j < hn; ++j)
+                acc += ((double)ldt(h, hb + j * hs) - (double)mu[j]) * (double)wc[j];
+            const double sc = (double)bias[c] + acc * inv;
+            if (sc > best_s) { second_s = best_s; best_s = sc; best = (int32_t)c; }
+            else if (sc > second_s) { second_s = sc; }
+        }
+        if (n_routes > 1 && (best_s - second_s) < (double)min_margin) best = -1;
+        sr[slot] = best;
+    }
+    return RAD_OK;
+}
+
+int ref_hc_cast_add(const RadArgs* a, RadStream) {
+    if (!have(a, 5)) return RAD_E_INVAL;
+    const RadTensor* h         = &a->t[0];
+    const RadTensor* v         = &a->t[1];
+    const RadTensor* on        = &a->t[2];
+    const RadTensor* seq_route = &a->t[3];
+    const RadTensor* rmap      = &a->t[4];
+    const int64_t n = p_int(a, "n", 0), hc = p_int(a, "hc", 0);
+    const int64_t n_routes = p_int(a, "n_routes", 0), n_experts = p_int(a, "n_experts", 0);
+    const int64_t max_slots = p_int(a, "max_slots", 0);
+    const float sc = p_f32(a, "scale", 1.0f);
+    if (n <= 0 || hc <= 1 || n_routes < 1 || n_experts < 1 || max_slots < 1) return RAD_E_SHAPE;
+    const int64_t hn = hc * n;
+    const int64_t rows = rows_of(h, hn);
+    if (rows <= 0 || numel(v) < n_experts * hn || numel(on) < rows ||
+        numel(seq_route) < max_slots || numel(rmap) < n_routes * 3)
+        return RAD_E_SHAPE;
+    const float* vt = (const float*)v->data;
+    const int32_t* sr = (const int32_t*)seq_route->data;
+    const int32_t* rm = (const int32_t*)rmap->data;
+    for (int64_t r = 0; r < rows; ++r) {
+        const int64_t flag = ld_int(on->dtype, on->data, offlin(on, r));
+        const int64_t phase = flag & 0xF;
+        if (phase < 2 || phase > 4) continue;
+        const int64_t slot = (flag >> 8) & 0xFFF;
+        if (slot < 0 || slot >= max_slots) continue;
+        const int32_t route = sr[slot];
+        if (route < 0 || route >= n_routes) continue;
+        const int32_t expert = rm[route * 3 + (phase - 2)];
+        if (expert < 0 || expert >= n_experts) continue;
+        const int64_t hb = rowoff(h, r, hn), hs = laststride(h);
+        for (int64_t c = 0; c < hc; ++c) {
+            const float* vs = vt + ((int64_t)expert * hc + c) * n;
+            for (int64_t i = 0; i < n; ++i) {
+                const int64_t j = hb + (c * n + i) * hs;
+                stt(h, j, ldt(h, j) + sc * vs[i]);
+            }
+        }
+    }
+    return RAD_OK;
+}
+
 /* ================================================================== mtp_enter
  *
  * The multi-token-prediction head's entry for a model whose residual stream is `hc` wide.

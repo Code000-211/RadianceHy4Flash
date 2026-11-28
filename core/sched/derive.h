@@ -45,4 +45,23 @@ int              derive_index(const char* name);
 const DeriveRow* derive_row(int index);
 int              derive_count();
 
+/* Shared control-vector think-phase / prefill gating, used by both `projection_on_rows` and
+ * `BatchBuilder::build` so `RadBatch::control_vector` and the per-row mask always agree. */
+struct CvecGate {
+    bool    think_only        = false;
+    bool    output_only       = false;
+    bool    prefill_last_only = false;
+    int64_t think_after       = 0;
+    int64_t think_ramp        = 0;
+    bool    cast_mode         = false;
+    int64_t cast_think_after  = 24;
+};
+void                 cvec_set_cast_mode(bool enabled, int64_t think_after = 24);
+std::vector<int32_t> cvec_take_cast_route_slots();
+CvecGate             cvec_gate_from_env();
+bool     cvec_req_active(const Request* r, const CvecGate& g);
+bool     cvec_token_active(const Request* r, int64_t pos, const CvecGate& g);
+int32_t  cvec_row_flag(const Request* r, int64_t pos, const CvecGate& g);
+bool     cvec_entry_has_active_rows(const StepEntry& e, const CvecGate& g);
+
 }  /* namespace rad */

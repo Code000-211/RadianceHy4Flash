@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <fstream>
 
 #include "util/json.h"
@@ -22,11 +23,18 @@ uint64_t hash_table(const ControlVector& cv) {
     };
     mix(cv.dir.data(), cv.dir.size() * sizeof(float));
     mix(cv.scales.data(), cv.scales.size() * sizeof(float));
-    /* The layout is part of the identity: the same bytes read as one shared direction and as a
-     * per-stream table are different operators, and blocks computed under one must never be served
-     * to a request steered by the other. */
-    const int64_t shape[2] = { cv.rank, cv.per_stream };
+    /* The layout and mode are part of the identity: the same bytes read as one shared direction,
+     * as a per-stream table, or as `add` vs `project` are different operators, and blocks computed
+     * under one must never be served to a request steered by another. */
+    const int64_t shape[3] = { cv.rank, cv.per_stream, cv.mode };
     mix(shape, sizeof(shape));
+    if (cv.is_cast()) {
+        mix(cv.cast_router.data(), cv.cast_router.size() * sizeof(float));
+        mix(cv.cast_rmap.data(), cv.cast_rmap.size() * sizeof(int32_t));
+        const int64_t cmeta[4] = { cv.cast_router_layer, cv.cast_n_routes, cv.cast_n_experts, cv.cast_think_after };
+        mix(cmeta, sizeof(cmeta));
+        mix(&cv.cast_min_margin, sizeof(cv.cast_min_margin));
+    }
     return h ? h : 1ull;
 }
 
@@ -92,13 +100,24 @@ int control_vector_discover(const std::string& model_path, const std::string& ar
 
 /* The package's own JSON beside the vector (`<stem>.json`), the only place the operation's
  * parameters are stated: `{"mode": "project", "scale": 1.0, "layer_range": [4, 44]}` for the
- * published Flash-Next vector. Absent, the defaults apply. A file that is not JSON or names a mode
- * other than `project` is refused: the directions were tuned for that operation. */
+ * published Flash-Next vector, or `"mode": "add"` for additive steering. Absent, the defaults
+ * apply (`project`, scale 1, full layer range). A file that is not JSON or names an unknown mode
+ * is refused. */
 namespace {
 
 struct PackageJson {
-    int   first = 0, last = -1;   /* -1: not stated */
-    float scale = 1.0f;
+    int64_t mode  = RAD_CVEC_MODE_PROJECT;
+    int     first = 0, last = -1;   /* -1: not stated */
+    float   scale = 1.0f;
+    /* CAST metadata (required when mode == RAD_CVEC_MODE_CAST). */
+    int64_t              cast_router_layer = 0;
+    int64_t              cast_n_routes     = 0;
+    int64_t              cast_n_experts    = 0;
+    int64_t              cast_think_after  = 24;
+    float                cast_min_margin   = 0.0f;
+    std::vector<float>   cast_bias;
+    std::vector<int32_t> cast_rmap;
+    std::vector<std::string> cast_route_names;
 };
 
 int read_package_json(const std::string& gguf_path, PackageJson* out, std::string* why) {
@@ -113,11 +132,23 @@ int read_package_json(const std::string& gguf_path, PackageJson* out, std::strin
     if (!f) return RAD_OK;
     try {
         const Json j = Json::parse(f);
-        if (const auto m = j.find("mode"); m != j.end() && m->is_string() &&
-                                          m->get<std::string>() != "project") {
-            *why = "control vector " + path + ": mode '" + m->get<std::string>() +
-                   "'; only 'project' is implemented";
-            return RAD_E_UNSUPPORTED;
+        if (const auto m = j.find("mode"); m != j.end()) {
+            if (!m->is_string()) {
+                *why = "control vector " + path + ": 'mode' must be a string ('project', 'add', or 'cast')";
+                return RAD_E_INVAL;
+            }
+            const std::string mode_s = m->get<std::string>();
+            if (mode_s == "project") {
+                out->mode = RAD_CVEC_MODE_PROJECT;
+            } else if (mode_s == "add") {
+                out->mode = RAD_CVEC_MODE_ADD;
+            } else if (mode_s == "cast") {
+                out->mode = RAD_CVEC_MODE_CAST;
+            } else {
+                *why = "control vector " + path + ": mode '" + mode_s +
+                       "'; only 'project', 'add', and 'cast' are implemented";
+                return RAD_E_UNSUPPORTED;
+            }
         }
         if (const auto r = j.find("layer_range"); r != j.end() && r->is_array() && r->size() == 2 &&
                                                   (*r)[0].is_number_integer() &&
@@ -127,6 +158,34 @@ int read_package_json(const std::string& gguf_path, PackageJson* out, std::strin
         }
         if (const auto s = j.find("scale"); s != j.end() && s->is_number())
             out->scale = (float) s->get<double>();
+        if (out->mode == RAD_CVEC_MODE_CAST) {
+            const auto cj = j.find("cast");
+            if (cj == j.end() || !cj->is_object()) {
+                *why = "control vector " + path + ": mode 'cast' requires a 'cast' object in JSON";
+                return RAD_E_INVAL;
+            }
+            out->cast_router_layer = cj->value("router_layer", (int64_t)0);
+            out->cast_n_routes     = cj->value("n_routes", (int64_t)0);
+            out->cast_n_experts    = cj->value("n_experts", (int64_t)0);
+            out->cast_think_after  = cj->value("think_after", (int64_t)24);
+            out->cast_min_margin   = (float) cj->value("min_margin", 0.0);
+            if (const auto b = cj->find("router_bias"); b != cj->end() && b->is_array()) {
+                for (const auto& v : *b) out->cast_bias.push_back((float) v.get<double>());
+            }
+            if (const auto rm = cj->find("route_map"); rm != cj->end() && rm->is_array()) {
+                for (const auto& row : *rm) {
+                    if (!row.is_array() || row.size() != 3) {
+                        *why = "control vector " + path + ": each cast.route_map entry must be [think_early, think_late, output]";
+                        return RAD_E_INVAL;
+                    }
+                    for (int q = 0; q < 3; ++q) out->cast_rmap.push_back(row[q].get<int32_t>());
+                }
+            }
+            if (const auto rn = cj->find("route_names"); rn != cj->end() && rn->is_array()) {
+                for (const auto& nm : *rn)
+                    if (nm.is_string()) out->cast_route_names.push_back(nm.get<std::string>());
+            }
+        }
     } catch (const std::exception& e) {
         *why = "control vector " + path + ": not readable JSON (" + e.what() + ")";
         return RAD_E_INVAL;
@@ -165,13 +224,13 @@ int control_vector_load(const std::string& path, const std::string& arch, int64_
                     "', this container is '" + arch + "' -- a direction from another model's "
                     "residual basis would move hidden states along a meaningless axis");
 
-    /* The file's directions: direction.<l>, one or more rows, F32, n_embd wide. A rank-1 tensor is
-     * one direction (the original format); a rank-2 [n_embd, rank] tensor is `rank` directions for
-     * that layer, applied in order. Anything else is refused rather than skipped, because a quietly
-     * missing layer is a differently steered model. */
+    /* The file's directions: direction.<l>, one or more rows, F32, n_embd wide. In `cast` mode,
+     * the GGUF also carries `router.mu` ([n_embd, 4]) and `router.w` ([n_embd, 4 * n_routes]),
+     * validated below after the package JSON is read. */
     int64_t n_dir = 0, dir_first = -1, dir_last = -1;
     int64_t file_rank = 0;
     for (const GgufTensor& t : f.tensors()) {
+        if (t.name == "router.mu" || t.name == "router.w") continue;
         if (t.name.rfind("direction.", 0) != 0)
             return fail("control vector " + path + ": tensor '" + t.name +
                         "' is not a direction.<layer> entry");
@@ -227,6 +286,7 @@ int control_vector_load(const std::string& path, const std::string& arch, int64_
     if (const int prc = read_package_json(path, &pj, &pj_why); prc != RAD_OK) return fail(pj_why);
     int first = pj.first, last = pj.last;
     float scale = pj.scale;
+    const int64_t mode = pj.mode;
     if (last < 0) { first = (int) dir_first; last = (int) dir_last; }
     if (first < 1 || last < first)
         return fail("control vector " + path + ": the layer range " + std::to_string(first) + ":" +
@@ -235,8 +295,13 @@ int control_vector_load(const std::string& path, const std::string& arch, int64_
         return fail("control vector " + path + ": the layer range " + std::to_string(first) + ":" +
                     std::to_string(last) + " runs past this model's " +
                     std::to_string(n_model_layers) + " layers");
-    if (!(scale > 0.0f) || !std::isfinite(scale))
-        return fail("control vector " + path + ": its scale is not a positive number");
+    if (mode == RAD_CVEC_MODE_ADD || mode == RAD_CVEC_MODE_CAST) {
+        if (scale == 0.0f || !std::isfinite(scale))
+            return fail("control vector " + path + ": its scale is not a finite non-zero number");
+    } else {
+        if (!(scale > 0.0f) || !std::isfinite(scale))
+            return fail("control vector " + path + ": its scale is not a positive number");
+    }
 
     out->n_embd = n_embd;
     /* Indexed by layer: rows 0..n_layers-1. Row 0 stays zero, the format carrying no direction
@@ -245,7 +310,7 @@ int control_vector_load(const std::string& path, const std::string& arch, int64_
     out->n_dirs = n_dir;
     out->rank = file_rank;
     /* The package says whether its rows are per-stream. A per-stream file carries
-     * `rank = streams * groups` rows per layer; the engine projects group k of stream s against
+     * `rank = streams * groups` rows per layer; the engine steers group k of stream s with
      * its own vector. Confirmed against the row count so a mislabelled file is refused. */
     int64_t per_stream_kv = 0;
     const bool per_stream = f.get_i64("controlvector.per_stream", &per_stream_kv) && per_stream_kv;
@@ -254,6 +319,7 @@ int control_vector_load(const std::string& path, const std::string& arch, int64_
                     std::to_string(file_rank) + " rows per layer, which is not a multiple of 4 "
                     "hyper-connection streams");
     out->per_stream = per_stream ? 1 : 0;
+    out->mode = mode;
     out->first = first;
     out->last = last;
     out->user_scale = scale;
@@ -261,12 +327,89 @@ int control_vector_load(const std::string& path, const std::string& arch, int64_
     out->dir.assign((size_t) (out->n_layers * file_rank * n_embd), 0.0f);
     out->scales.assign((size_t) out->n_layers, 0.0f);
 
+    if (mode == RAD_CVEC_MODE_CAST) {
+        if (!per_stream)
+            return fail("control vector " + path + ": cast mode requires controlvector.per_stream=1");
+        const int64_t n_routes  = pj.cast_n_routes;
+        const int64_t n_experts = pj.cast_n_experts;
+        const int64_t rlayer    = pj.cast_router_layer;
+        if (n_routes < 1 || n_routes > 8 || n_experts < 1 || n_experts > 8)
+            return fail("control vector " + path + ": cast n_routes and n_experts must be in 1..8");
+        if (rlayer < 1 || rlayer >= n_model_layers)
+            return fail("control vector " + path + ": cast router_layer out of range");
+        if (file_rank != 4 * n_experts)
+            return fail("control vector " + path + ": cast rank must equal 4 * n_experts");
+        if ((int64_t) pj.cast_bias.size() != n_routes || (int64_t) pj.cast_rmap.size() != n_routes * 3)
+            return fail("control vector " + path + ": cast router_bias / route_map size mismatch");
+
+        const GgufTensor* t_mu = f.tensor("router.mu");
+        const GgufTensor* t_w  = f.tensor("router.w");
+        if (!t_mu || !t_w)
+            return fail("control vector " + path + ": cast mode requires 'router.mu' and 'router.w' tensors");
+        if (t_mu->n_dims != 2 || t_mu->ne[0] != n_embd || t_mu->ne[1] != 4 ||
+            gguf_to_rad_dtype(t_mu->ggml_type) != RAD_F32)
+            return fail("control vector " + path + ": router.mu must be F32 [n_embd, 4]");
+        if (t_w->n_dims != 2 || t_w->ne[0] != n_embd || t_w->ne[1] != 4 * n_routes ||
+            gguf_to_rad_dtype(t_w->ggml_type) != RAD_F32)
+            return fail("control vector " + path + ": router.w must be F32 [n_embd, 4*n_routes]");
+        const float* mu_p = (const float*) f.tensor_data(*t_mu);
+        const float* w_p  = (const float*) f.tensor_data(*t_w);
+        if (!mu_p || !w_p)
+            return fail("control vector " + path + ": router tensors lie outside the file");
+
+        const int64_t hn = 4 * n_embd;
+        out->cast_router.resize((size_t) ((1 + n_routes) * hn + n_routes));
+        for (int64_t i = 0; i < hn; ++i) {
+            if (!std::isfinite(mu_p[i])) return fail("control vector " + path + ": non-finite router.mu");
+            out->cast_router[(size_t) i] = mu_p[i];
+        }
+        for (int64_t i = 0; i < n_routes * hn; ++i) {
+            if (!std::isfinite(w_p[i])) return fail("control vector " + path + ": non-finite router.w");
+            out->cast_router[(size_t) (hn + i)] = w_p[i];
+        }
+        for (int64_t r = 0; r < n_routes; ++r) {
+            if (!std::isfinite(pj.cast_bias[(size_t) r]))
+                return fail("control vector " + path + ": non-finite router_bias");
+            out->cast_router[(size_t) ((1 + n_routes) * hn + r)] = pj.cast_bias[(size_t) r];
+        }
+        out->cast_rmap         = pj.cast_rmap;
+        out->cast_router_layer = rlayer;
+        out->cast_n_routes     = n_routes;
+        out->cast_n_experts    = n_experts;
+        out->cast_think_after  = pj.cast_think_after;
+        out->cast_min_margin   = pj.cast_min_margin;
+        out->cast_route_names  = pj.cast_route_names;
+    } else {
+        if (f.tensor("router.mu") || f.tensor("router.w"))
+            return fail("control vector " + path + ": router tensors require mode 'cast'");
+    }
+
+    std::vector<uint8_t> has_dir((size_t) out->n_layers, 0);
     double worst = 0.0, worst_dot = 0.0;
     for (int64_t l = 1; l < n_model_layers; ++l) {
         const GgufTensor* t = f.tensor("direction." + std::to_string(l));
         if (!t) continue;
         const float* d = (const float*) f.tensor_data(*t);
         if (!d) return fail("control vector " + path + ": " + t->name + " lies outside the file");
+        has_dir[(size_t) l] = 1;
+
+        if (mode == RAD_CVEC_MODE_ADD || mode == RAD_CVEC_MODE_CAST) {
+            /* Additive control vectors keep their raw per-layer / per-stream F32 magnitudes
+             * unnormalised; zero rows are legal (no-op on that stream/layer), only NaN/Inf is
+             * rejected. */
+            for (int64_t k = 0; k < file_rank; ++k) {
+                const float* src = d + (size_t) k * (size_t) n_embd;
+                float* dst = &out->dir[(size_t) ((l * file_rank + k) * n_embd)];
+                for (int64_t i = 0; i < n_embd; ++i) {
+                    if (!std::isfinite(src[i]))
+                        return fail("control vector " + path + ": " + t->name + " direction " +
+                                    std::to_string(k) + " has a non-finite element");
+                    dst[i] = src[i];
+                }
+            }
+            out->scales[(size_t) l] = (l >= first && l <= last) ? scale : 0.0f;
+            continue;
+        }
 
         double first_norm = 1.0;
         for (int64_t k = 0; k < file_rank; ++k) {
@@ -307,21 +450,46 @@ int control_vector_load(const std::string& path, const std::string& arch, int64_
         /* A layer inside the range with no direction would silently be unsteered. */
     }
     for (int64_t l = first; l <= last; ++l)
-        if (out->scales[(size_t) l] == 0.0f)
+        if (!has_dir[(size_t) l] || out->scales[(size_t) l] == 0.0f)
             return fail("control vector " + path + ": the range " + std::to_string(first) + ":" +
                         std::to_string(last) + " includes layer " + std::to_string(l) +
                         ", which has no direction in the file");
 
-    if (worst > 1e-2)
+    if (mode == RAD_CVEC_MODE_PROJECT && worst > 1e-2)
         RAD_WARN("control vector: %s: the directions are not unit-normalised (worst |norm - 1| "
                  "= %.4f); each is divided by its own norm, so the operation is unchanged",
                  path.c_str(), worst);
-    if (worst_dot > 1e-2)
+    if (mode == RAD_CVEC_MODE_PROJECT && worst_dot > 1e-2)
         RAD_WARN("control vector: %s: the rows of a layer are not orthogonal (worst |v_i.v_j| = "
                  "%.4f); the chained projections then remove more than the intended %lld-space",
                  path.c_str(), worst_dot, (long long) (per_stream ? file_rank / 4 : file_rank));
     return RAD_OK;
 }
+
+namespace {
+struct CastDevLayout {
+    int64_t off_router    = 0;
+    int64_t off_rmap      = 0;
+    int64_t off_seq_route = 0;
+    int64_t total_bytes   = 0;
+};
+
+int64_t align64(int64_t n) { return (n + 63) & ~int64_t(63); }
+
+CastDevLayout cast_dev_layout(const ControlVector& cv) {
+    CastDevLayout l{};
+    const int64_t dir_bytes = (int64_t) cv.dir.size() * 4;
+    if (!cv.is_cast()) {
+        l.total_bytes = dir_bytes;
+        return l;
+    }
+    l.off_router    = align64(dir_bytes);
+    l.off_rmap      = align64(l.off_router + (int64_t) cv.cast_router.size() * 4);
+    l.off_seq_route = align64(l.off_rmap + (int64_t) cv.cast_rmap.size() * 4);
+    l.total_bytes   = align64(l.off_seq_route + kCastMaxSlots * 4);
+    return l;
+}
+}  /* namespace */
 
 RadControlVector control_vector_view(const ControlVector& cv, const float* dir_device) {
     RadControlVector v{};
@@ -331,12 +499,27 @@ RadControlVector control_vector_view(const ControlVector& cv, const float* dir_d
     v.n_layers = cv.n_layers;
     v.rank = cv.rank > 0 ? cv.rank : 1;
     v.per_stream = cv.per_stream ? 1 : 0;
+    v.mode = cv.mode;
+    if (cv.is_cast() && dir_device) {
+        const CastDevLayout lay = cast_dev_layout(cv);
+        const char* base = (const char*) dir_device;
+        v.cast_router       = (const float*)   (base + lay.off_router);
+        v.cast_rmap         = (const int32_t*) (base + lay.off_rmap);
+        v.cast_seq_route    = (int32_t*)       (const_cast<char*>(base) + lay.off_seq_route);
+        v.cast_router_layer = cv.cast_router_layer;
+        v.cast_n_routes     = cv.cast_n_routes;
+        v.cast_n_experts    = cv.cast_n_experts;
+        v.cast_think_after  = cv.cast_think_after;
+        v.cast_max_slots    = kCastMaxSlots;
+        v.cast_min_margin   = cv.cast_min_margin;
+    }
     return v;
 }
 
 const float* control_vector_upload(const ControlVector& cv, int rank) {
     if (!cv.loaded()) return nullptr;
-    const int64_t bytes = (int64_t) cv.dir.size() * 4;
+    const CastDevLayout lay = cast_dev_layout(cv);
+    const int64_t bytes = lay.total_bytes;
     void* d = rad_dev_alloc(bytes, RAD_MEM_DEVICE);
     if (!d) {
         RAD_ERR("control vector: rank %d: could not allocate %.2f MiB on the card for the "
@@ -348,7 +531,21 @@ const float* control_vector_upload(const ControlVector& cv, int rank) {
         rad_dev_free(d, RAD_MEM_DEVICE);
         return nullptr;
     }
-    const int rc = rad_memcpy_async(d, cv.dir.data(), bytes, s);
+    int rc = RAD_OK;
+    if (!cv.is_cast()) {
+        rc = rad_memcpy_async(d, cv.dir.data(), bytes, s);
+    } else {
+        std::vector<uint8_t> staging((size_t) bytes, 0);
+        std::memcpy(staging.data(), cv.dir.data(), cv.dir.size() * sizeof(float));
+        std::memcpy(staging.data() + lay.off_router, cv.cast_router.data(),
+                    cv.cast_router.size() * sizeof(float));
+        std::memcpy(staging.data() + lay.off_rmap, cv.cast_rmap.data(),
+                    cv.cast_rmap.size() * sizeof(int32_t));
+        std::vector<int32_t> init_slots((size_t) kCastMaxSlots, -1);
+        std::memcpy(staging.data() + lay.off_seq_route, init_slots.data(),
+                    init_slots.size() * sizeof(int32_t));
+        rc = rad_memcpy_async(d, staging.data(), bytes, s);
+    }
     rad_stream_sync(s);
     rad_stream_destroy(s);
     if (rc < 0) {
