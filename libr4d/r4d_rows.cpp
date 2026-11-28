@@ -9070,8 +9070,8 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   r4d_shape_mla_expand_gate, nullptr, r4d_fuse_mla_expand_gate },
 { "mla_expand_gate_had_quant_i8g", "mla_expand_gate_had_quant_i8g", "attn",
   "the expansion with the gate and the rotated int8 quantiser of attn_output's input in one launch, "
-  "a workgroup a (token tile of 16, head, 128-column group)",
-  "heads 1..64, k_dim 192, v_dim 256, latent 512, group 128, M 1..64; 16-byte rows",
+  "a workgroup a (token tile of 16, head, 128-column group), four token tiles of 16 from 64 rows up",
+  "heads 1..64, k_dim 192, v_dim 256, latent 512, group 128, M 1..65535; 16-byte rows",
   "bf16 in, int8 codes with an f32 scale per (row, 128 columns), an optional bf16 product",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cMlaExpandGateQuant), NOTUNE,
   nullptr, nullptr, r4d_rad_mla_expand_gate_had_quant_i8g, nullptr, nullptr, nullptr,

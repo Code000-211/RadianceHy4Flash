@@ -3962,9 +3962,10 @@ the op issues the pair (`arch/hyv4flash`, `rad_op_declared`).
 `mla_expand_gate_had_quant_i8g` (G-3c, levers-general L3) is `mla_expand_gate` followed by
 `had_quant_act_i8g` over its `[M, heads * v_dim]` product (`group` 128): `q` int8 `[M, heads * v_dim]`,
 `scale` f32 `[M, heads * v_dim / 128]`, `out_bf16?` the unrotated product. libref and libavx run the chain
-itself; libr4d's row (M up to 64, a workgroup a token tile of 16 x head x 128-column group) is held to the
-three rows it replaces byte for byte (the fusion oracle). `swiglu_clamped_had_quant_i8g` (G-3a) is the
-same for `swiglu_clamped` then `had_quant_act_i8g` (the routed arm's clamped product and the rotated int8
+itself; libr4d's row (a workgroup a token tile of 16 x head x 128-column group, four token tiles a
+workgroup from 64 rows up, K-50b) is held to the three rows it replaces byte for byte (the fusion
+oracle). `swiglu_clamped_had_quant_i8g` (G-3a) is the same for `swiglu_clamped` then
+`had_quant_act_i8g` (the routed arm's clamped product and the rotated int8
 quantiser of its down projection). `rmsnorm_ihc_junction` / `ar_rmsnorm_ihc_junction` with `group` 128 and
 `xq`, `xs` (G-3b) additionally write `had_quant_act_i8g`'s codes of `xn` (tail 1 only), so the linears that
 read `xn` issue no quantiser; the chain gains the quantiser as its last step.
