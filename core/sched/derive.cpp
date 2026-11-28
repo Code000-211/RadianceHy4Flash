@@ -5,6 +5,7 @@
 #include "rad_core.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 
 namespace rad {
@@ -94,17 +95,142 @@ static int d_state_chunk_seq(const DeriveInput& in, int32_t* out, int64_t cap, i
  *
  * All zeros is the ordinary model, byte for byte: the op skips a zero row without writing, so a
  * request that did not ask for the vector computes what it computes with no vector loaded. */
+static bool                 g_cvec_cast_enabled     = false;
+static int64_t              g_cvec_cast_think_after = 24;
+static std::vector<int32_t> g_cvec_cast_route_slots;
+
+void cvec_set_cast_mode(bool enabled, int64_t think_after) {
+    g_cvec_cast_enabled     = enabled;
+    g_cvec_cast_think_after = std::max<int64_t>(0, think_after);
+    g_cvec_cast_route_slots.clear();
+}
+
+std::vector<int32_t> cvec_take_cast_route_slots() {
+    std::vector<int32_t> out;
+    out.swap(g_cvec_cast_route_slots);
+    return out;
+}
+
+CvecGate cvec_gate_from_env() {
+    static const CvecGate env_g = []() {
+        CvecGate out;
+        if (const char* e = std::getenv("RADIANCE_CVEC_THINK_ONLY"))
+            out.think_only = *e && std::strcmp(e, "0") != 0;
+        if (const char* e = std::getenv("RADIANCE_CVEC_OUTPUT_ONLY"))
+            out.output_only = *e && std::strcmp(e, "0") != 0;
+        if (const char* e = std::getenv("RADIANCE_CVEC_PREFILL_LAST_ONLY"))
+            out.prefill_last_only = *e && std::strcmp(e, "0") != 0;
+        if (const char* e = std::getenv("RADIANCE_CVEC_THINK_AFTER"))
+            if (*e) out.think_after = std::max<int64_t>(0, std::strtoll(e, nullptr, 10));
+        if (const char* e = std::getenv("RADIANCE_CVEC_THINK_RAMP"))
+            if (*e) out.think_ramp = std::max<int64_t>(0, std::strtoll(e, nullptr, 10));
+        return out;
+    }();
+    CvecGate g = env_g;
+    g.cast_mode        = g_cvec_cast_enabled;
+    g.cast_think_after = g_cvec_cast_think_after;
+    return g;
+}
+
+static ReasoningCount::State cvec_think_state(const Request* r, int64_t* body_out) {
+    ReasoningCount rc;
+    rc.start(r->sp.reasoning);
+    for (int32_t tok : r->output) {
+        rc.push(r->sp.reasoning, tok);
+        if (rc.st == ReasoningCount::Done) break;
+    }
+    if (body_out) *body_out = rc.body;
+    return rc.st;
+}
+
+bool cvec_req_active(const Request* r, const CvecGate& g) {
+    if (!r || !r->sp.use_control_vector) return false;
+    if (g.cast_mode) return true;
+    if (g.output_only) {
+        if (!r->sp.reasoning.known()) return true;
+        const auto st = cvec_think_state(r, nullptr);
+        return st == ReasoningCount::Done;
+    }
+    if ((!g.think_only && g.think_after <= 0 && g.think_ramp <= 0) || !r->sp.reasoning.known())
+        return true;
+    int64_t body = 0;
+    const auto st = cvec_think_state(r, &body);
+    if (st == ReasoningCount::Done) return false;
+    if (g.think_after > 0 && body < g.think_after) return false;
+    return true;
+}
+
+bool cvec_token_active(const Request* r, int64_t pos, const CvecGate& g) {
+    if (!r) return false;
+    const int64_t prompt_len = (int64_t) r->prompt.size();
+    if (g.cast_mode) return pos >= prompt_len - 1;
+    /* OUTPUT_ONLY, THINK_AFTER > 0, and THINK_RAMP > 0 leave all prompt/prefill tokens
+     * (pos < prompt_len) unsteered even if recomputed after preemption. */
+    if (g.output_only && pos < prompt_len) return false;
+    if ((g.think_after > 0 || g.think_ramp > 0) && r->sp.reasoning.known() && pos < prompt_len)
+        return false;
+    if (g.prefill_last_only && pos < prompt_len - 1) return false;
+    return true;
+}
+
+int32_t cvec_row_flag(const Request* r, int64_t pos, const CvecGate& g) {
+    if (!cvec_token_active(r, pos, g)) return 0;
+    if (g.cast_mode) {
+        const int64_t prompt_len = (int64_t) r->prompt.size();
+        if (pos == prompt_len - 1) return 1;  /* ROUTE_PREFILL_LAST */
+        if (!r->sp.reasoning.known()) return 4;  /* OUTPUT (reasoning_effort="none") */
+        int64_t body = 0;
+        if (cvec_think_state(r, &body) == ReasoningCount::Done) return 4;  /* OUTPUT */
+        const int64_t committed_last = prompt_len + (int64_t) r->output.size() - 1;
+        const int64_t extra = std::max<int64_t>(0, pos - committed_last);
+        return ((body + extra) < g.cast_think_after) ? 2 : 3;  /* THINK_EARLY / THINK_LATE */
+    }
+    if (g.output_only || g.think_ramp <= 0 || !r->sp.reasoning.known()) return 1;
+    int64_t body = 0;
+    if (cvec_think_state(r, &body) == ReasoningCount::Done) return 0;
+    /* Advance body offset for speculative draft tokens beyond the last committed output token. */
+    const int64_t committed_last = (int64_t) r->prompt.size() + (int64_t) r->output.size() - 1;
+    const int64_t extra = std::max<int64_t>(0, pos - committed_last);
+    const int64_t into = (body + extra) - g.think_after;
+    if (into < 0) return 0;
+    if (into >= g.think_ramp) return 1;
+    const double frac = (double) (into + 1) / (double) (g.think_ramp + 1);
+    const int32_t milli = (int32_t) std::clamp<long long>(std::llround(frac * 10000.0), 1LL, 9999LL);
+    return -milli;
+}
+
+bool cvec_entry_has_active_rows(const StepEntry& e, const CvecGate& g) {
+    if (!e.req || e.n_tokens <= 0 || !cvec_req_active(e.req, g)) return false;
+    const int64_t end_pos = (int64_t) e.ctx_len + (int64_t) e.n_tokens - 1;
+    return cvec_token_active(e.req, end_pos, g);
+}
+
 static int d_projection_on_rows(const DeriveInput& in, int32_t* out, int64_t cap, int64_t* n_out) {
     if (in.n_tok > cap) return RAD_E_FULL;
     /* Zero first. The ranges below cover every row a step carries today, but the region is reused
      * across steps and a row outside them would otherwise keep the previous step's flag -- which
-     * would project a request that did not ask for it. The fill is a memset of a few KiB. */
+     * would steer a request that did not ask for it. The fill is a memset of a few KiB. */
     std::memset(out, 0, (size_t) in.n_tok * sizeof(int32_t));
+    const CvecGate g = cvec_gate_from_env();
+    static const bool cast_trace = []() {
+        const char* e = std::getenv("RADIANCE_CAST_TRACE");
+        return e && *e && e[0] != '0';
+    }();
     for (int64_t i = 0; i < in.n_seq; ++i) {
         const StepEntry& e = in.plan->e[(size_t) i];
-        const int32_t on = (e.req && e.req->sp.use_control_vector) ? 1 : 0;
+        if (!cvec_req_active(e.req, g)) continue;
         const int64_t b = in.cu_seqlens[i], end = in.cu_seqlens[i + 1];
-        for (int64_t k = b; k < end && k < in.n_tok; ++k) out[k] = on;
+        const int32_t slot = e.card >= 0 ? e.card : (e.slot >= 0 ? e.slot : 0);
+        for (int64_t k = b; k < end && k < in.n_tok; ++k) {
+            const int64_t pos = (int64_t) e.ctx_len + (k - b);
+            const int32_t f = cvec_row_flag(e.req, pos, g);
+            if (g.cast_mode && f > 0) {
+                out[k] = (1 << 20) | ((slot & 0xFFF) << 8) | (f & 0xF);
+                if (cast_trace && f == 1) g_cvec_cast_route_slots.push_back(slot);
+            } else {
+                out[k] = f;
+            }
+        }
     }
     *n_out = in.n_tok;
     return RAD_OK;

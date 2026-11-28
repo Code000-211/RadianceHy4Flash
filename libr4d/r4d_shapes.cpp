@@ -668,6 +668,47 @@ extern "C" int r4d_shape_hc_project(const RadParam* p, int n_p, int operand, Rad
     R4D_PICK(l);
 }
 
+/* hc_add's three: the bf16 stream (in place), the layer's additive f32 vector(s), and the int32
+ * per-row switch. */
+extern "C" int r4d_shape_hc_add(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M"), n = pi(p, n_p, "n"), hc = pi(p, n_p, "hc");
+    const int64_t vsep = pi(p, n_p, "vsep", 0);
+    const uint32_t D = dt_act(p, n_p, "dtype");
+    const RadOpdDesc l[] = {
+        opd(D, M, hc * n),                                                      /* h, in place */
+        vsep != 0 ? opd((uint32_t) RAD_F32, hc, n) : opd((uint32_t) RAD_F32, n),/* v */
+        opd_idx(M, 1, 1, 0),                                                    /* on: 0 or 1 */
+    };
+    R4D_PICK(l);
+}
+
+extern "C" int r4d_shape_hc_cast_route(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M"), n = pi(p, n_p, "n"), hc = pi(p, n_p, "hc");
+    const int64_t nr = pi(p, n_p, "n_routes"), ms = pi(p, n_p, "max_slots");
+    const uint32_t D = dt_act(p, n_p, "dtype");
+    const RadOpdDesc l[] = {
+        opd(D, M, hc * n),
+        opd((uint32_t) RAD_F32, (1 + nr) * hc * n + nr),
+        opd_idx(M, 1, 1, 0),
+        opd_idx(ms, 1, nr, 0),
+    };
+    R4D_PICK(l);
+}
+
+extern "C" int r4d_shape_hc_cast_add(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M"), n = pi(p, n_p, "n"), hc = pi(p, n_p, "hc");
+    const int64_t nr = pi(p, n_p, "n_routes"), ne = pi(p, n_p, "n_experts"), ms = pi(p, n_p, "max_slots");
+    const uint32_t D = dt_act(p, n_p, "dtype");
+    const RadOpdDesc l[] = {
+        opd(D, M, hc * n),
+        opd((uint32_t) RAD_F32, ne * hc, n),
+        opd_idx(M, 1, 1, 0),
+        opd_idx(ms, 1, nr, 0),
+        opd_idx(nr * 3, 1, ne, 0),
+    };
+    R4D_PICK(l);
+}
+
 /* hc_write's operands with the all-reduce in front; `y` is also the message. */
 extern "C" int r4d_shape_ar_hc_write(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     return r4d_shape_hc_write(p, n_p, operand, out);

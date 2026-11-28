@@ -23,7 +23,7 @@ extern "C" {
 /* The most control-vector directions per layer an architecture declares hooks for. The
  * loader refuses a file carrying more, so "loaded" and "steered" cannot disagree. It lives
  * in the ABI because a plugin sees only abi/ headers, never core/. */
-#define RAD_CONTROL_VECTOR_MAX_RANK 8
+#define RAD_CONTROL_VECTOR_MAX_RANK 32
 
 /* ================================================================== plugin identity */
 /* One value per plugin, not flags (QUANT is 3). RAD_PLUGIN_QUANT is a quantiser plugin:

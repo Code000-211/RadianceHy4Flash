@@ -1256,7 +1256,7 @@ TEST(plugin_surface) {
 TEST(op_vocabulary) {
     static const char* kOps[] = {
         "rmsnorm", "rmsnorm_p", "rmsnorm_add", "hc_enter", "hc_read", "hc_write", "hc_project",
-        "mtp_enter",
+        "hc_add", "hc_cast_route", "hc_cast_add", "mtp_enter",
         "mhc_pre", "mhc_pre_partial", "mhc_pre_finish", "mhc_post", "mhc_contract", "swiglu_clamped", "router_sigmoid_topk", "dsa_pool", "dsa_query", "dsa_score", "mla_attn", "mla_project", "gemm_nt_f32",
         "swiglu_step", "router_sigmoid_group_topk", "mla_attn_paged",
         /* Hy4-flash: independent hyper-connections, sink attention, the compressed indexer, Engram. */
@@ -6795,6 +6795,46 @@ TEST(hc_project_per_stream_table_projects_each_stream_against_its_own_row) {
     CHECK(run("hc_project", c) != RAD_OK);
 }
 
+/* hc_add adds scale * v_s to every stream of steered rows and leaves off rows bit-identical. */
+TEST(hc_add_adds_scaled_vector_per_stream_and_skips_off_rows) {
+    T h(RAD_F32, {2, 4}); h.f({ 1.0f, 2.0f, 3.0f, 4.0f, 10.0f, 20.0f, 30.0f, 40.0f });
+    T v(RAD_F32, {2});    v.f({ 0.5f, -2.0f });
+    T on(RAD_I32, {2});   on.n({ 1, 0 });
+    A a; a.t(h).t(v).t(on).i("M", 2).i("n", 2).i("hc", 2).i("vsep", 0).d("scale", -0.5)
+          .s("dtype", "f32");
+    CHECK_OK(run("hc_add", a));
+    /* Row 0: both streams get + (-0.5) * (0.5, -2.0) = (-0.25, +1.0). */
+    CHECK_NEAR(h.at(0), 0.75f, 1e-6);
+    CHECK_NEAR(h.at(1), 3.0f,  1e-6);
+    CHECK_NEAR(h.at(2), 2.75f, 1e-6);
+    CHECK_NEAR(h.at(3), 5.0f,  1e-6);
+    /* Row 1: switch is 0 -> untouched bit-for-bit. */
+    CHECK_EQ(h.at(4), 10.0f);
+    CHECK_EQ(h.at(5), 20.0f);
+    CHECK_EQ(h.at(6), 30.0f);
+    CHECK_EQ(h.at(7), 40.0f);
+}
+
+/* With `vsep` = n, hc_add reads stream s's own row from v[hc, n]; invalid vsep is refused. */
+TEST(hc_add_per_stream_table_adds_each_streams_own_row) {
+    T h(RAD_F32, {1, 4}); h.f({ 1.0f, 2.0f, 3.0f, 4.0f });
+    T v(RAD_F32, {2, 2}); v.f({ 10.0f, 20.0f, -1.0f, -2.0f });
+    T on(RAD_I32, {1});   on.n({ 1 });
+    A a; a.t(h).t(v).t(on).i("M", 1).i("n", 2).i("hc", 2).i("vsep", 2).d("scale", 0.5)
+          .s("dtype", "f32");
+    CHECK_OK(run("hc_add", a));
+    CHECK_NEAR(h.at(0), 6.0f,  1e-6);
+    CHECK_NEAR(h.at(1), 12.0f, 1e-6);
+    CHECK_NEAR(h.at(2), 2.5f,  1e-6);
+    CHECK_NEAR(h.at(3), 3.0f,  1e-6);
+
+    /* Invalid vsep is refused. */
+    T h1(RAD_F32, {1, 4}); h1.f({ 1.0f, 2.0f, 3.0f, 4.0f });
+    A bad; bad.t(h1).t(v).t(on).i("M", 1).i("n", 2).i("hc", 2).i("vsep", 1).d("scale", 0.5)
+              .s("dtype", "f32");
+    CHECK(run("hc_add", bad) != RAD_OK);
+}
+
 /* With `group`, hc_read also emits x as block-scaled fp8 taken over the stored (narrowed) x: byte
  * for byte what quant_act_fp8 produces from the stored x. `rotate` adds the Hadamard-rotated twin
  * beside it and leaves the plain pair as it is. */
@@ -10628,6 +10668,9 @@ std::vector<Geo> geometries() {
                              .s("dtype", "f32").i("group", 4).i("rotate", 1)),
         G("hc_write", "M", 2, a.i("M", R).i("n", 8).i("hc", 2).s("dtype", "f32")),
         G("hc_project", "M", 2, a.i("M", R).i("n", 8).i("hc", 2).d("scale", 1.0).s("dtype", "f32")),
+        G("hc_add", "M", 2, a.i("M", R).i("n", 8).i("hc", 2).d("scale", 1.0).s("dtype", "f32")),
+        G("hc_cast_route", "M", 2, a.i("M", R).i("n", 8).i("hc", 2).i("n_routes", 2).i("max_slots", 4).d("min_margin", 0.0).s("dtype", "f32")),
+        G("hc_cast_add", "M", 2, a.i("M", R).i("n", 8).i("hc", 2).i("n_routes", 2).i("n_experts", 2).i("max_slots", 4).d("scale", 1.0).s("dtype", "f32")),
         G("mtp_enter", "M", 2, a.i("M", R).i("n", 8).i("hc", 2).d("eps", 1e-6).s("dtype", "f32")),
         G("grid_embed", "M", 3, a.i("M", R).i("n", 8).i("side", 4).s("dtype", "f32")),
         G("grid_embed_pad", "M", 3, a.i("M", R).i("n", 8).i("side", 4).s("dtype", "f32")),

@@ -181,6 +181,8 @@ struct Layer {
      * kMaxCvecRank chained directions; inert when no vector is loaded, this layer is outside its
      * range, or no row asked for it. */
     HcProject proj[kMaxCvecRank]{};
+    HcCastRoute cast_route{};
+    HcCastAdd   cast_add{};
     /* The same stream a projection would read, for deriving a vector offline
      * (RADIANCE_HY4_TAPS=1 + RADIANCE_DUMP_BUF=dbg.cvec.<l>:<rows>). Off, not declared. */
     Tap t_cvec{};
@@ -941,9 +943,16 @@ static int trunk_layer(RadBuilder* b, Model& m, int l, MoeFP8::Src* msrc,
                                            lay.ffn.op_join, lay.ffn.op_ar, nullptr));
     /* The projection reads the streams after this layer's final write, so it is declared after
      * j_end / hc_ffn.declare_post and before the next reader, t_resid. */
-    for (int64_t k = 0; k < m.proj_rank; ++k)
-        RAD_ARCH_TRY(lay.proj[k].declare(b, nm.f("blk.%lld.proj.%lld", (long long) l, (long long) k),
-                                         g, l, cvec, m.proj_on, m.tr.h, s.hc, k));
+    if (cvec && cvec->mode == RAD_CVEC_MODE_CAST) {
+        RAD_ARCH_TRY(lay.cast_route.declare(b, nm.f("blk.%lld.cast_route", (long long) l),
+                                            g, l, cvec, m.proj_on, m.tr.h, s.hc));
+        RAD_ARCH_TRY(lay.cast_add.declare(b, nm.f("blk.%lld.cast_add", (long long) l),
+                                          g, l, cvec, m.proj_on, m.tr.h, s.hc));
+    } else {
+        for (int64_t k = 0; k < m.proj_rank; ++k)
+            RAD_ARCH_TRY(lay.proj[k].declare(b, nm.f("blk.%lld.proj.%lld", (long long) l, (long long) k),
+                                             g, l, cvec, m.proj_on, m.tr.h, s.hc, k));
+    }
     /* The stream the projection reads, for deriving a vector from real prompts. Gated by
      * RADIANCE_HY4_CVEC_TAPS, not RADIANCE_HY4_TAPS: the full tap set costs a ~12.4 GiB arena. */
     /* Gate the declare itself, not Tap::declare's `force`: `force` is checked only when taps are
@@ -1131,7 +1140,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     RAD_ARCH_TRY(buffers(b, m));
     m.proj_on = HcProject::declare_mask(b, nm.f("projection_on"), g, ctx->cvec);
     /* Directions per layer, clamped to the array the Layer holds. */
-    if (ctx->cvec && ctx->cvec->dir) {
+    if (ctx->cvec && ctx->cvec->dir && ctx->cvec->mode != RAD_CVEC_MODE_CAST) {
         m.proj_rank = ctx->cvec->rank > 0 ? ctx->cvec->rank : 1;
         /* A per-stream package carries one direction per stream inside each group, so the number
          * of chained projections is the group count, not the row count. */
@@ -1634,6 +1643,8 @@ static void step(RadCtx* c, const RadBatch* batch) {
             pipe_issue(c, [&] { l.j_end.step(c, n0, n1, pipe_lane()); });
             pipe_join(c);
             for (int64_t k = 0; k < m.proj_rank; ++k) l.proj[k].step(c, batch, 0, rows.n);
+            l.cast_route.step(c, batch, 0, rows.n);
+            l.cast_add.step(c, batch, 0, rows.n);
             l.t_cvec.step(c, brows(m.tr.h, rows.n), rows.n);
             entered = je && l.j_end.tail;
             continue;
@@ -1646,6 +1657,8 @@ static void step(RadCtx* c, const RadBatch* batch) {
         m.calib.after_ffn(c, (int)i, rows.n);
         if (!je) l.hc_ffn.post_add(c, m.tr.y, m.tr.post, m.tr.h, rows.n);
         for (int64_t k = 0; k < m.proj_rank; ++k) l.proj[k].step(c, batch, 0, rows.n);
+        l.cast_route.step(c, batch, 0, rows.n);
+        l.cast_add.step(c, batch, 0, rows.n);
         l.t_cvec.step(c, brows(m.tr.h, rows.n), rows.n);
         l.t_resid.step(c, brows(m.tr.h, rows.n), rows.n);
         entered = je && l.j_end.tail;

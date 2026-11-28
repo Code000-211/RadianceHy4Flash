@@ -496,16 +496,17 @@ struct HcProject {
         ps  = cv->per_stream ? 1 : 0;
         dir = cv->dir + (size_t) ((layer * rank) + (k * per)) * (size_t) n;
 
-        op = rw(b, RAD_OP(b, "hc_project",
+        const char* op_name = cv->mode == RAD_CVEC_MODE_ADD ? "hc_add" : "hc_project";
+        op = rw(b, RAD_OP(b, op_name,
                    RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", n), RAD_INT("hc", hc),
                               RAD_INT("vsep", ps ? n : 0),
                               RAD_F64("scale", (double) scale), RAD_STR("dtype", g.dtype)),
                    RAD_NOWEIGHTS),
                {h, mask}, {h});
         if (!op) {
-            fprintf(stderr, "radiance: %s: hc_project resolves to no kernel at n %lld, hc %lld -- "
+            fprintf(stderr, "radiance: %s: %s resolves to no kernel at n %lld, hc %lld -- "
                             "this rank cannot serve the control vector\n",
-                    name, (long long) n, (long long) hc);
+                    name, op_name, (long long) n, (long long) hc);
             return RAD_E_INVAL;
         }
         return RAD_OK;
@@ -520,6 +521,110 @@ struct HcProject {
                     brow_slice(h, r0, rows, hc * n),
                     praw(dir, RAD_F32, ps ? n * hc : n),
                     praw((const int32_t*) rad_buf_ptr(c_, on) + r0, RAD_I32, rows));
+    }
+};
+
+/* Sequence-latched CAST router (run ONCE per step at `cv->cast_router_layer`, e.g. L18).
+ * Reads `h` on rows where `(on[r] & 0xF) == 1` (last prefill token), computes centered-normalized
+ * linear scores against `cv->cast_router` (mu, W, bias), and latches `cast_seq_route[slot]` on GPU. */
+struct HcCastRoute {
+    rad_op       op = 0;
+    const float* rtbl = nullptr;
+    int32_t*     seq_route = nullptr;
+    rad_buf      on = 0;
+    rad_buf      h = 0;
+    int64_t      n = 0, hc = 0, n_routes = 0, max_slots = 0, rtbl_elems = 0;
+
+    int declare(RadBuilder* b, const char* name, const Geom& g, int64_t layer,
+                const RadControlVector* cv, rad_buf mask, rad_buf stream, int64_t hc_streams) {
+        if (!b || !mask || !stream || !cv || cv->mode != RAD_CVEC_MODE_CAST) return RAD_OK;
+        if (!cv->cast_router || !cv->cast_seq_route || layer != cv->cast_router_layer) return RAD_OK;
+        n          = g.n_embd;
+        hc         = hc_streams;
+        n_routes   = cv->cast_n_routes;
+        max_slots  = cv->cast_max_slots;
+        rtbl_elems = (1 + n_routes) * hc * n + n_routes;
+        rtbl       = cv->cast_router;
+        seq_route  = cv->cast_seq_route;
+        on         = mask;
+        h          = stream;
+
+        op = rw(b, RAD_OP(b, "hc_cast_route",
+                   RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", n), RAD_INT("hc", hc),
+                              RAD_INT("n_routes", n_routes), RAD_INT("max_slots", max_slots),
+                              RAD_F64("min_margin", (double) cv->cast_min_margin),
+                              RAD_STR("dtype", g.dtype)),
+                   RAD_NOWEIGHTS),
+               {h, mask}, {});
+        if (!op) {
+            fprintf(stderr, "radiance: %s: hc_cast_route resolves to no kernel\n", name);
+            return RAD_E_INVAL;
+        }
+        return RAD_OK;
+    }
+
+    void step(RadCtx* c_, const RadBatch* batch, int64_t r0, int64_t rows) const {
+        if (!op || !batch || !batch->control_vector) return;
+        RAD_ISSUE_N(c_, op, rows,
+                    brow_slice(h, r0, rows, hc * n),
+                    praw(rtbl, RAD_F32, rtbl_elems),
+                    praw((const int32_t*) rad_buf_ptr(c_, on) + r0, RAD_I32, rows),
+                    praw(seq_route, RAD_I32, max_slots));
+    }
+};
+
+/* Sequence-latched CAST additive steering: looks up `route = seq_route[slot]` and
+ * `expert = rmap[route * 3 + (phase - 2)]`, and adds that expert's per-stream vector to `h`. */
+struct HcCastAdd {
+    rad_op         op = 0;
+    const float*   dir = nullptr;
+    const int32_t* rmap = nullptr;
+    const int32_t* seq_route = nullptr;
+    rad_buf        on = 0;
+    rad_buf        h = 0;
+    int64_t        n = 0, hc = 0, n_routes = 0, n_experts = 0, max_slots = 0;
+
+    int declare(RadBuilder* b, const char* name, const Geom& g, int64_t layer,
+                const RadControlVector* cv, rad_buf mask, rad_buf stream, int64_t hc_streams) {
+        if (!b || !mask || !stream || !cv || cv->mode != RAD_CVEC_MODE_CAST) return RAD_OK;
+        if (!cv->dir || !cv->cast_rmap || !cv->cast_seq_route) return RAD_OK;
+        if (layer <= 0 || layer >= cv->n_layers || layer >= g.n_layer) return RAD_OK;
+        const float scale = cv->scales ? cv->scales[(size_t) layer] : 0.0f;
+        if (scale == 0.0f) return RAD_OK;
+
+        n         = g.n_embd;
+        hc        = hc_streams;
+        n_routes  = cv->cast_n_routes;
+        n_experts = cv->cast_n_experts;
+        max_slots = cv->cast_max_slots;
+        dir       = cv->dir + (size_t) (layer * cv->rank) * (size_t) n;
+        rmap      = cv->cast_rmap;
+        seq_route = cv->cast_seq_route;
+        on        = mask;
+        h         = stream;
+
+        op = rw(b, RAD_OP(b, "hc_cast_add",
+                   RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", n), RAD_INT("hc", hc),
+                              RAD_INT("n_routes", n_routes), RAD_INT("n_experts", n_experts),
+                              RAD_INT("max_slots", max_slots),
+                              RAD_F64("scale", (double) scale), RAD_STR("dtype", g.dtype)),
+                   RAD_NOWEIGHTS),
+               {h, mask}, {h});
+        if (!op) {
+            fprintf(stderr, "radiance: %s: hc_cast_add resolves to no kernel\n", name);
+            return RAD_E_INVAL;
+        }
+        return RAD_OK;
+    }
+
+    void step(RadCtx* c_, const RadBatch* batch, int64_t r0, int64_t rows) const {
+        if (!op || !batch || !batch->control_vector) return;
+        RAD_ISSUE_N(c_, op, rows,
+                    brow_slice(h, r0, rows, hc * n),
+                    praw(dir, RAD_F32, n_experts * hc * n),
+                    praw((const int32_t*) rad_buf_ptr(c_, on) + r0, RAD_I32, rows),
+                    praw(seq_route, RAD_I32, max_slots),
+                    praw(rmap, RAD_I32, n_routes * 3));
     }
 };
 

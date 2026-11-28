@@ -327,9 +327,15 @@ static inline int rad_build_slot(const RadBuildCtx* c) { return c->slot_base + c
  * Flash-Next vector carries 47 of 48 rows). The steered range is not a separate field: a layer is
  * steered exactly when its `scales` entry is nonzero, so a plugin asks that and cannot disagree
  * with the loader. */
+enum {
+    RAD_CVEC_MODE_PROJECT = 0,
+    RAD_CVEC_MODE_ADD     = 1,
+    RAD_CVEC_MODE_CAST    = 2
+};
+
 typedef struct RadControlVector {
-    const float* dir;        /* device, [n_layers, rank, n_embd] f32, unit rows */
-    const float* scales;     /* host,    [n_layers]     f32, |d_l| * user scale; 0 = not steered */
+    const float* dir;        /* device, [n_layers, rank, n_embd] f32; unit rows for project, raw for add/cast */
+    const float* scales;     /* host,    [n_layers]     f32, |d_l| * user scale (project) or user scale (add/cast); 0 = not steered */
     int64_t      n_embd;
     int64_t      n_layers;
     /* Directions per layer. `dir` holds layer l's direction k at ((l*rank)+k)*n_embd. 1 is the
@@ -338,12 +344,28 @@ typedef struct RadControlVector {
     int64_t      rank;
     /* 1: `dir` is per-stream: `rank` still counts the rows of a layer, and they form rank / hc
      * GROUPS of one direction per hyper-connection stream ([n_layers, rank/hc, hc, n_embd]), so
-     * stream s of group k is at ((l*rank) + k*hc + s)*n_embd and a kernel must project stream s
-     * against its own vector. 0:
+     * stream s of group k is at ((l*rank) + k*hc + s)*n_embd and a kernel must steer stream s
+     * with its own vector. 0:
      * one direction per group, applied to every stream (the pre-45 behaviour). The four streams of
      * this architecture carry the refusal signal differently (cosines 0.1-0.6), which is why the
      * published refusal vector is per-stream. Trailing and zero-defaulted. */
     int64_t      per_stream;
+    /* RAD_CVEC_MODE_PROJECT (0): h[s] -= scale * (h[s] . v_s) * v_s (`hc_project`).
+     * RAD_CVEC_MODE_ADD (1):     h[s] += scale * v_s (`hc_add`, raw unnormalised rows).
+     * RAD_CVEC_MODE_CAST (2):    sequence-latched conditional activation steering (`hc_cast_route` + `hc_cast_add`).
+     * Trailing and zero-defaulted. */
+    int64_t      mode;
+    /* CAST fields (non-null / nonzero only when mode == RAD_CVEC_MODE_CAST; trailing and zero-defaulted). */
+    const float*   cast_router;       /* device: packed [(1 + n_routes) * hc * n_embd + n_routes] f32 (mu, W, bias) */
+    const int32_t* cast_rmap;         /* device: [n_routes * 3] i32: (route, phase_bucket) -> expert_id or -1 */
+    int32_t*       cast_seq_route;    /* device (mutable): [cast_max_slots] i32 latched per sequence card */
+    int64_t        cast_router_layer; /* layer at which hc_cast_route latches seq_route on last prefill tok */
+    int64_t        cast_n_routes;     /* number of routes in router.w / route_map */
+    int64_t        cast_n_experts;    /* number of per-stream experts stored in direction.<l> */
+    int64_t        cast_think_after;  /* think token boundary between THINK_EARLY and THINK_LATE */
+    int64_t        cast_max_slots;    /* capacity of cast_seq_route (e.g. 256) */
+    float          cast_min_margin;   /* min (top1 - top2) router margin; below -> -1 (stock fallback) */
+    int32_t        _cast_pad;
 } RadControlVector;
 
 /* ================================================================== weights */

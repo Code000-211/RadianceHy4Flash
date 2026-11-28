@@ -129,6 +129,18 @@ static const RadOperandSpec oHcWrite[] = { OPD("y"), OPD("inj"), INOUT("h") };
 static const RadParamSpec pHcProject[] = { P_INT("M"), P_INT("n"), P_INT("hc"), P_INTO("vsep"),
                                            P_F64("scale"), P_STR("dtype") };
 static const RadOperandSpec oHcProject[] = { INOUT("h"), OPD("v"), OPD("on") };
+static const RadParamSpec pHcCastRoute[] = {
+    P_INT("M"), P_INT("n"), P_INT("hc"), P_INT("n_routes"), P_INT("max_slots"),
+    P_F64("min_margin"), P_STR("dtype"),
+};
+static const RadOperandSpec oHcCastRoute[] = { OPD("h"), OPD("rtbl"), OPD("on"), OUT("seq_route") };
+static const RadParamSpec pHcCastAdd[] = {
+    P_INT("M"), P_INT("n"), P_INT("hc"), P_INT("n_routes"), P_INT("n_experts"),
+    P_INT("max_slots"), P_F64("scale"), P_STR("dtype"),
+};
+static const RadOperandSpec oHcCastAdd[] = {
+    INOUT("h"), OPD("v"), OPD("on"), OPD("seq_route"), OPD("rmap"),
+};
 
 static const RadParamSpec pMtpEnter[]   = { P_INT("M"), P_INT("n"), P_INT("hc"), P_F64("eps"),
                                             P_STR("dtype"), P_F64O("wadd"), P_INTO("ngroup"),
@@ -1108,6 +1120,13 @@ static const RadOpSchema kSchemas[] = {
 { "hc_project", ARR(pHcProject), ARR(oHcProject),
   "The control vector's projection (llama.cpp's `--cvec-mode project`): h[s] -= scale * "
   "(h[s] . v) * v for each of the hc streams of a row whose flag is on. A zero flag is not read." },
+{ "hc_add", ARR(pHcProject), ARR(oHcProject),
+  "Additive control vector (`mode: \"add\"`): h[s] += scale * v_s for each of the hc streams of a "
+  "row whose flag is on (vsep 0 = shared v, vsep n = per-stream table). A zero flag is not read." },
+{ "hc_cast_route", ARR(pHcCastRoute), ARR(oHcCastRoute),
+  "Sequence-latched CAST activation router." },
+{ "hc_cast_add", ARR(pHcCastAdd), ARR(oHcCastAdd),
+  "Sequence-latched CAST additive expert steering." },
 { "mtp_enter", ARR(pMtpEnter), ARR(oMtpEnter),
   "MTP head entry: two norms, a per-sub-stream fc and a broadcast fc. `fc` names the two "
   "matrices' stored format; a host kernel reads them as the dense tensors it is handed." },
@@ -1891,6 +1910,15 @@ SIMPLE("avx_hc_write", "hc_write", "norm", "gated residual write: h[s] += inj[s]
 SIMPLE("avx_hc_project", "hc_project", "norm",
        "control vector: h[s] -= scale * (h[s] . v_s) * v_s where the row's flag is on; vsep 0 is "
        "one shared v, vsep n is a per-stream table", DT_FLOAT, L(hc_project)),
+SIMPLE("avx_hc_add", "hc_add", "norm",
+       "additive control vector: h[s] += scale * v_s where the row's flag is on; vsep 0 is "
+       "one shared v, vsep n is a per-stream table", DT_FLOAT, L(hc_add)),
+SIMPLE("avx_hc_cast_route", "hc_cast_route", "norm",
+       "CAST activation router: latches sequence route on last prefill token", DT_FLOAT,
+       L(hc_cast_route)),
+SIMPLE("avx_hc_cast_add", "hc_cast_add", "norm",
+       "CAST additive steering: applies routed expert per-stream direction", DT_FLOAT,
+       L(hc_cast_add)),
 ROWL("avx_mtp_enter", "mtp_enter", "norm",
      "MTP head entry: two norms, a per-sub-stream fc and a broadcast fc",
      DT_FLOAT ", or fc matrices of E4M3 / int8 codes with a scale plane, joined", L(mtp_enter),

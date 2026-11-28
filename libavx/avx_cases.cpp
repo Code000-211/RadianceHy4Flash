@@ -284,6 +284,10 @@ std::vector<Case> build_cases() {
          * geometry is what says whether 41 of these a step is affordable. */
         add("hc_project",{ HI("M", 4), HI("n", 2560), HI("hc", 4), HF("scale", 1.0),
                            HS("dtype", "bf16") });
+        add("hc_add",    { HI("M", 5), HI("n", 128), HI("hc", 4), HF("scale", -0.5),
+                           HS("dtype", dt) });
+        add("hc_add",    { HI("M", 4), HI("n", 2560), HI("hc", 4), HI("vsep", 2560),
+                           HF("scale", 0.25), HS("dtype", "bf16") });
         add("hc_read",   { HI("M", 5), HI("n", 128), HI("hc", 4), HI("lowrank", 8),
                            HF("eps", 1e-6), HS("dtype", dt), HF("wadd", 1), HI("inject", 1),
                            HI("group", 0) });

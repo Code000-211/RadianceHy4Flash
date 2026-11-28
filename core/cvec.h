@@ -37,25 +37,40 @@ namespace rad {
 constexpr int64_t kControlVectorMaxRank = RAD_CONTROL_VECTOR_MAX_RANK;
 
 /* What a loaded vector keeps on the host, before it is uploaded per rank. `dir` is
- * [n_layers * rank * n_embd] f32, unit rows, layer 0 unused (the format has no direction for
- * layer 0); layer l's direction k is at ((l*rank)+k)*n_embd. `scales[l]` is |d_l| * user scale
- * for a rank-1 file (the file's own magnitude is the strength), or the package scale for a rank-k
- * basis (which removes each component whole), or 0 where the layer is outside the loaded range;
- * one strength is shared by the layer's `rank` rows. */
+ * [n_layers * rank * n_embd] f32, layer 0 unused (the format has no direction for layer 0); layer
+ * l's direction k is at ((l*rank)+k)*n_embd. In `project` mode (`mode == RAD_CVEC_MODE_PROJECT`),
+ * rows are unit-normalised and `scales[l]` is |d_l| * user scale for a rank-1 file or the package
+ * scale for a rank-k basis. In `add` mode (`mode == RAD_CVEC_MODE_ADD`), raw F32 values are kept
+ * unnormalised and `scales[l]` is the package scale (which may be negative). Unsteered layers carry
+ * scale 0. One strength is shared by the layer's `rank` rows. */
+constexpr int64_t kCastMaxSlots = 256;
+
 struct ControlVector {
     std::vector<float> dir;
     std::vector<float> scales;
     int64_t n_embd = 0;
     int64_t n_layers = 0;
     int64_t n_dirs = 0;               /* direction tensors the file carried (one per layer) */
-    int64_t rank = 1;                 /* direction groups per layer */
+    int64_t rank = 1;                 /* direction rows per layer */
     int64_t per_stream = 0;           /* 1: each group holds one direction per hc stream */
+    int64_t mode = RAD_CVEC_MODE_PROJECT; /* PROJECT (0), ADD (1), or CAST (2) */
     int     first = -1, last = -1;    /* inclusive layer range */
     float   user_scale = 1.0f;
     std::string path;
 
+    /* CAST fields (populated when mode == RAD_CVEC_MODE_CAST). */
+    std::vector<float>   cast_router;       /* packed [(1 + n_routes) * 4 * n_embd + n_routes] f32 */
+    std::vector<int32_t> cast_rmap;         /* [n_routes * 3] i32: [think_early, think_late, output] */
+    int64_t              cast_router_layer = 0;
+    int64_t              cast_n_routes     = 0;
+    int64_t              cast_n_experts    = 0;
+    int64_t              cast_think_after  = 24;
+    float                cast_min_margin   = 0.0f;
+    std::vector<std::string> cast_route_names;
+
     bool loaded() const { return n_layers > 0 && n_embd > 0; }
-    /* Whether layer `l` is steered, i.e. a kernel has something to project. Mirror of the loader's
+    bool is_cast() const { return loaded() && mode == RAD_CVEC_MODE_CAST && cast_n_routes > 0; }
+    /* Whether layer `l` is steered, i.e. a kernel has something to apply. Mirror of the loader's
      * range check, used by the architecture plugin at declare. */
     bool covers(int64_t l) const {
         return loaded() && l >= first && l <= last && l < (int64_t) scales.size() &&
@@ -64,8 +79,9 @@ struct ControlVector {
 };
 
 /* Read and validate `path` against a model of `n_embd` and `n_model_layers`. `path`'s own
- * `<stem>.json` supplies `layer_range` and `scale`; one that is not JSON or names a mode other than
- * `project` is refused. Without it, every layer the file carries steers at scale 1. */
+ * `<stem>.json` supplies `mode` (`project` or `add`), `layer_range` and `scale`; one that is not
+ * JSON or names an unknown mode is refused. Without it, every layer the file carries steers in
+ * `project` mode at scale 1. */
 int control_vector_load(const std::string& path, const std::string& arch, int64_t n_embd,
                         int64_t n_model_layers, ControlVector* out, std::string* err);
 

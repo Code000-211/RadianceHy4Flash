@@ -1056,7 +1056,7 @@ const RadBatch* BatchBuilder::build(const StepPlan& plan, const IKVManager& kv, 
             if (ls >= 0 && e.n_tokens > 0) lora_rows = true;
         }
         /* The same rows derive.cpp's projection_on_rows sets (RadBatch::control_vector). */
-        if (e.req && e.req->sp.use_control_vector && e.n_tokens > 0) cvec_rows = 1;
+        if (cvec_entry_has_active_rows(e, cvec_gate_from_env())) cvec_rows = 1;
         /* Rotary position of each row at its own position (draft-head rows rotate at the index
          * they write, not the token they embed). Three planes of n_tok. */
         if (mm_on_) {

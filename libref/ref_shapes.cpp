@@ -469,6 +469,45 @@ int ref_hc_project_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* ou
     return o.finish("hc_project", operand, out);
 }
 
+int ref_hc_add_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const uint32_t D = act_dt(p, n_p);
+    const int64_t M    = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);
+    const int64_t hc   = gi(p, n_p, "hc", 0);
+    const int64_t vsep = gi(p, n_p, "vsep", 0);
+    Opd o;
+    o.t(D, { M, hc * n });                           /* h, in place */
+    if (vsep != 0) o.t((uint32_t) RAD_F32, { hc, n });
+    else           o.t((uint32_t) RAD_F32, { n });   /* v: one layer's additive direction */
+    o.t((uint32_t) RAD_I32, { M });                  /* on: nonzero = steer this row */
+    return o.finish("hc_add", operand, out);
+}
+
+int ref_hc_cast_route_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const uint32_t D = act_dt(p, n_p);
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0), hc = gi(p, n_p, "hc", 0);
+    const int64_t nr = gi(p, n_p, "n_routes", 0), ms = gi(p, n_p, "max_slots", 0);
+    Opd o;
+    o.t(D, { M, hc * n });
+    o.t((uint32_t) RAD_F32, { (1 + nr) * hc * n + nr });
+    o.t((uint32_t) RAD_I32, { M });
+    o.t((uint32_t) RAD_I32, { ms });
+    return o.finish("hc_cast_route", operand, out);
+}
+
+int ref_hc_cast_add_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const uint32_t D = act_dt(p, n_p);
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0), hc = gi(p, n_p, "hc", 0);
+    const int64_t nr = gi(p, n_p, "n_routes", 0), ne = gi(p, n_p, "n_experts", 0);
+    const int64_t ms = gi(p, n_p, "max_slots", 0);
+    Opd o;
+    o.t(D, { M, hc * n });
+    o.t((uint32_t) RAD_F32, { ne * hc, n });
+    o.t((uint32_t) RAD_I32, { M });
+    o.t((uint32_t) RAD_I32, { ms });
+    o.t((uint32_t) RAD_I32, { nr * 3 });
+    return o.finish("hc_cast_add", operand, out);
+}
+
 int ref_mtp_enter_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const uint32_t D = act_dt(p, n_p);
     const int64_t M  = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);

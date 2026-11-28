@@ -5245,6 +5245,55 @@ TEST(a_per_stream_control_vector_declares_one_projection_per_group) {
     for (const RecBuf& x : b0->bufs) CHECK(x.name.find("projection_on") == std::string::npos);
 }
 
+/* Additive control vector (`mode = RAD_CVEC_MODE_ADD`): hyv4flash declares `hc_add` (never
+ * `hc_project`) for both per-stream multi-group and shared single-direction vectors, preserving
+ * negative scales and exact `vsep`. */
+TEST(an_additive_control_vector_declares_hc_add_for_hyv4flash) {
+    const int64_t E = 128, hc = 2, groups = 2, rank = groups * hc, layers = 3;
+    std::vector<float> dir((size_t) (layers * rank * E), 0.0f);
+    float scales[3] = { 0.0f, -0.5f, -0.5f };
+    RadControlVector cv{ dir.data(), scales, E, layers, rank, 1, RAD_CVEC_MODE_ADD };
+
+    auto declared = [&](const RadControlVector* v, int* rc) {
+        MetaKV mk = mini_meta();
+        auto b = std::make_unique<RadBuilder>();
+        bf16_encs(b.get());
+        RadBuildCtx ctx = build_ctx();
+        ctx.cvec = v;
+        G3Env g3env;
+        stderr_of([&] { *rc = hyv4flash::declare(b.get(), mk.meta(), &ctx); });
+        return b;
+    };
+    int rc = 0;
+    auto b = declared(&cv, &rc);
+    REQUIRE_EQ(rc, RAD_OK);
+    CHECK_EQ(count_op(*b, "hc_add"), (int) ((layers - 1) * groups));
+    CHECK_EQ(count_op(*b, "hc_project"), 0);
+    for (const RecOp& o : b->ops) {
+        if (o.op != "hc_add") continue;
+        bool vsep = false, sc = false;
+        for (const RecParam& p : o.p) {
+            if (p.key == "vsep")  { vsep = true; CHECK_EQ(p.ival, (long long) E); }
+            if (p.key == "scale") { sc = true;   CHECK_NEAR(p.dval, -0.5, 1e-6); }
+        }
+        CHECK(vsep);
+        CHECK(sc);
+    }
+
+    float pos_scales[3] = { 0.0f, 0.25f, 0.0f };
+    RadControlVector one{ dir.data(), pos_scales, E, layers, 1, 0, RAD_CVEC_MODE_ADD };
+    auto b1 = declared(&one, &rc);
+    REQUIRE_EQ(rc, RAD_OK);
+    CHECK_EQ(count_op(*b1, "hc_add"), 1);
+    CHECK_EQ(count_op(*b1, "hc_project"), 0);
+    for (const RecOp& o : b1->ops)
+        if (o.op == "hc_add")
+            for (const RecParam& p : o.p) {
+                if (p.key == "vsep")  CHECK_EQ(p.ival, 0LL);
+                if (p.key == "scale") CHECK_NEAR(p.dval, 0.25, 1e-6);
+            }
+}
+
 RAD_TEST_MAIN()
 
 /* G-3: with the fusions on, the junctions write the codes of the next norm (their `group` 128 and the

@@ -3651,6 +3651,13 @@ static const RadOpSchema kSchemas[] = {
            "layer's unit direction -- the same v for every stream -- and scale its stored norm. A "
            "row whose flag is 0 is neither read nor written, so an unprojected request's stream is "
            "the stock model's."),
+    SCHEMA("hc_add", pHcProject, oHcProject,
+           "additive control vector (`mode: \"add\"`): for each of the hc streams of a row whose "
+           "`on` flag is nonzero, h[s] += scale * v_s, v_s that layer's unnormalised f32 direction "
+           "for stream s -- one vector for every stream when `vsep` is 0, or a per-stream table "
+           "[hc, n] when `vsep` is n -- and scale a finite non-zero multiplier. A row whose flag "
+           "is 0 is neither read nor written, so an unsteered request's stream is the stock "
+           "model's."),
     SCHEMA("hc_write", pHcPlain, oHcWrite,
            "the write half: h[s] += inj[s] * y, into the UNNORMED stream."),
     SCHEMA("mtp_enter", pMtpEnter, oMtpEnter,
@@ -8987,6 +8994,15 @@ HALO_WIN_TREE_PAIR(512, 4) HALO_WIN_TREE_PAIR(512, 8)
   ROW(cHcProject), NOTUNE,
   nullptr, nullptr, halo_rad_hc_project, nullptr, nullptr, nullptr,
   halo_shape_hc_project },
+
+{ "hc_add_bf16", "hc_add", "norm",
+  "additive control vector: h[s] += scale * v_s where the row's flag is on",
+  "any M, any n, hc 2..8",
+  "bf16 stream, f32 direction, i32 switch",
+  RAD_DOMAIN_DEVICE, HALO_PRIO_ONLY,
+  ROW(cHcProject), NOTUNE,
+  nullptr, nullptr, halo_rad_hc_add, nullptr, nullptr, nullptr,
+  halo_shape_hc_add },
 
 { "mtp_enter_bf16", "mtp_enter", "norm",
   "MTP head entry: two norms, a per-sub-stream fc and one broadcast fc",

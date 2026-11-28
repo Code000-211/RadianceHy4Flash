@@ -400,6 +400,159 @@ AVX_KERNEL(hc_project) {
     return RAD_OK;
 }
 
+
+/* ------------------------------------------------------------------ hc_add */
+/* Additive control vector (core/cvec.h, mode="add"): h[s] += scale * v_s for each of the hc
+ * streams of a row whose switch is nonzero. v is f32 (unnormalised), the stream may be
+ * bf16/f16/f32; a row with a zero switch is skipped without reading or writing h. */
+AVX_KERNEL(hc_add) {
+    if (!rad_args_have(a, 3)) return RAD_E_INVAL;
+    const RadTensor* h  = &a->t[0];
+    const RadTensor* v  = &a->t[1];
+    const RadTensor* on = &a->t[2];
+
+    const int64_t n  = p_int(a, "n", 0);
+    const int64_t hc = p_int(a, "hc", 0);
+    const float   sc = p_f32(a, "scale", 1.0f);
+    const int64_t vsep = p_int(a, "vsep", 0);
+    if (vsep != 0 && vsep != n) return RAD_E_INVAL;
+    const int64_t vrows = vsep != 0 ? hc : 1;
+    if (n <= 0 || hc <= 1 || numel(v) < vrows * n) return RAD_E_SHAPE;
+    const int64_t hn = hc * n;
+    const int64_t rows = numel(h) / hn;
+    if (rows <= 0 || numel(on) < rows) return RAD_E_SHAPE;
+
+    const int64_t vb = rowoff(v, 0, n);
+    float* vbuf = scratch_f32_c((size_t) (vrows * n));
+    const float* vtab = in_row(v, vb, vrows * n, vbuf);
+
+    AVX_PARALLEL_FOR_IF(rows * hn >= AVX_PAR_MIN)
+    for (int64_t k = 0; k < rows * hc; ++k) {
+        const int64_t r = k / hc, c = k % hc;
+        const int64_t flag = ldi(on, offlin(on, r));
+        if (flag == 0) continue;
+        const float rsc = (flag > 0) ? sc : (sc * ((float)(-flag) * 1e-4f));
+        const int64_t hb = rowoff(h, r, hn), hs = laststride(h);
+        const float* vec = vtab + (vsep != 0 ? c * n : 0);
+        if (hs != 1) {
+            for (int64_t i = 0; i < n; ++i) {
+                const int64_t j = hb + (c * n + i) * hs;
+                stt(h, j, ldt(h, j) + rsc * vec[i]);
+            }
+            continue;
+        }
+        const int64_t base = hb + c * n;
+        float* hv = scratch_f32((size_t) n);
+        const float* row = in_row(h, base, n, hv);
+        if (row != hv) std::memcpy(hv, row, (size_t) n * sizeof(float));
+        const vf vsc = vf_set1(rsc);
+        int64_t i = 0;
+        for (; i + VF_N <= n; i += VF_N)
+            vf_storeu(hv + i, vf_fma(vsc, vf_loadu(vec + i), vf_loadu(hv + i)));
+        for (; i < n; ++i) hv[i] += rsc * vec[i];
+        out_row(h, base, n, hv);
+    }
+    return RAD_OK;
+}
+
+AVX_KERNEL(hc_cast_route) {
+    if (!rad_args_have(a, 4)) return RAD_E_INVAL;
+    const RadTensor* h         = &a->t[0];
+    const RadTensor* rtbl      = &a->t[1];
+    const RadTensor* on        = &a->t[2];
+    const RadTensor* seq_route = &a->t[3];
+    const int64_t n = p_int(a, "n", 0), hc = p_int(a, "hc", 0);
+    const int64_t n_routes = p_int(a, "n_routes", 0), max_slots = p_int(a, "max_slots", 0);
+    const float min_margin = p_f32(a, "min_margin", 0.0f);
+    if (n <= 0 || hc <= 1 || n_routes < 1 || n_routes > 8 || max_slots < 1) return RAD_E_SHAPE;
+    const int64_t hn = hc * n;
+    const int64_t rows = numel(h) / hn;
+    if (rows <= 0 || numel(on) < rows || numel(seq_route) < max_slots) return RAD_E_SHAPE;
+    if (numel(rtbl) < (1 + n_routes) * hn + n_routes) return RAD_E_SHAPE;
+
+    const float* rt = (const float*)rtbl->data;
+    const float* mu = rt;
+    const float* bias = rt + (1 + n_routes) * hn;
+    int32_t* sr = (int32_t*)seq_route->data;
+    for (int64_t r = 0; r < rows; ++r) {
+        const int64_t flag = ldi(on, offlin(on, r));
+        if ((flag & 0xF) != 1) continue;
+        const int64_t slot = (flag >> 8) & 0xFFF;
+        if (slot < 0 || slot >= max_slots) continue;
+        const int64_t hb = rowoff(h, r, hn);
+        float* hbuf = scratch_f32((size_t)hn);
+        const float* hr = in_row(h, hb, hn, hbuf);
+        double ss = 0.0;
+        for (int64_t j = 0; j < hn; ++j) {
+            const double d = (double)hr[j] - (double)mu[j];
+            ss += d * d;
+        }
+        const double inv = 1.0 / std::sqrt(ss + 1e-12);
+        int32_t best = -1;
+        double best_s = -1e30, second_s = -1e30;
+        for (int64_t c = 0; c < n_routes; ++c) {
+            const float* wc = rt + (1 + c) * hn;
+            double acc = 0.0;
+            for (int64_t j = 0; j < hn; ++j)
+                acc += ((double)hr[j] - (double)mu[j]) * (double)wc[j];
+            const double sc = (double)bias[c] + acc * inv;
+            if (sc > best_s) { second_s = best_s; best_s = sc; best = (int32_t)c; }
+            else if (sc > second_s) { second_s = sc; }
+        }
+        if (n_routes > 1 && (best_s - second_s) < (double)min_margin) best = -1;
+        sr[slot] = best;
+    }
+    return RAD_OK;
+}
+
+AVX_KERNEL(hc_cast_add) {
+    if (!rad_args_have(a, 5)) return RAD_E_INVAL;
+    const RadTensor* h         = &a->t[0];
+    const RadTensor* v         = &a->t[1];
+    const RadTensor* on        = &a->t[2];
+    const RadTensor* seq_route = &a->t[3];
+    const RadTensor* rmap      = &a->t[4];
+    const int64_t n = p_int(a, "n", 0), hc = p_int(a, "hc", 0);
+    const int64_t n_routes = p_int(a, "n_routes", 0), n_experts = p_int(a, "n_experts", 0);
+    const int64_t max_slots = p_int(a, "max_slots", 0);
+    const float sc = p_f32(a, "scale", 1.0f);
+    if (n <= 0 || hc <= 1 || n_routes < 1 || n_experts < 1 || max_slots < 1) return RAD_E_SHAPE;
+    const int64_t hn = hc * n;
+    const int64_t rows = numel(h) / hn;
+    if (rows <= 0 || numel(v) < n_experts * hn || numel(on) < rows ||
+        numel(seq_route) < max_slots || numel(rmap) < n_routes * 3)
+        return RAD_E_SHAPE;
+    const float* vt = (const float*)v->data;
+    const int32_t* sr = (const int32_t*)seq_route->data;
+    const int32_t* rm = (const int32_t*)rmap->data;
+    for (int64_t r = 0; r < rows; ++r) {
+        const int64_t flag = ldi(on, offlin(on, r));
+        const int64_t phase = flag & 0xF;
+        if (phase < 2 || phase > 4) continue;
+        const int64_t slot = (flag >> 8) & 0xFFF;
+        if (slot < 0 || slot >= max_slots) continue;
+        const int32_t route = sr[slot];
+        if (route < 0 || route >= n_routes) continue;
+        const int32_t expert = rm[route * 3 + (phase - 2)];
+        if (expert < 0 || expert >= n_experts) continue;
+        const int64_t hb = rowoff(h, r, hn);
+        for (int64_t c = 0; c < hc; ++c) {
+            const float* vec = vt + ((int64_t)expert * hc + c) * n;
+            const int64_t base = hb + c * n;
+            float* hv = scratch_f32((size_t)n);
+            const float* row = in_row(h, base, n, hv);
+            if (row != hv) std::memcpy(hv, row, (size_t)n * sizeof(float));
+            const vf vsc = vf_set1(sc);
+            int64_t i = 0;
+            for (; i + VF_N <= n; i += VF_N)
+                vf_storeu(hv + i, vf_fma(vsc, vf_loadu(vec + i), vf_loadu(hv + i)));
+            for (; i < n; ++i) hv[i] += sc * vec[i];
+            out_row(h, base, n, hv);
+        }
+    }
+    return RAD_OK;
+}
+
 /* ================================================================== mtp_enter
  *
  * Entry of the multi-token-prediction head for a model with an `hc`-wide residual stream.
