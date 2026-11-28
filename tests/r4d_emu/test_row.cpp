@@ -14,6 +14,7 @@
 #include "ref_host.h"
 #include "r4d_plugin.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <random>
@@ -229,6 +230,218 @@ Cfg base() {
     return c;
 }
 
+/* X-07 (#136): the int8 latent row. The cache's row is one KV head's
+ *
+ *     [L int8 codes][L/128 f32 scales][R rope columns as bf16]      L + 4 * (L / 128) + 2 * R
+ *
+ * and the three launch shapes that write it must write the same row: the fused
+ * mla_row_norm_rope_store into an int8 cache, kv_store's int8 form fed the row it just wrote, and
+ * kv_store_streamed's into a mirror and a ring. Held byte for byte, against the chain the fused op
+ * stands for (rmsnorm, rope, kv_store), with slots that are padding (a negative one, one past the
+ * blocks) and a block whose slots none of them names. The row's byte count is a multiple of 16 at
+ * these geometries, so every row of a 16-byte-aligned cache starts 16-byte aligned: the test also
+ * checks that, since a row is what a wave's 16-byte loads read. */
+struct I8Cfg {
+    int L = 512, R = 64, M = 3, pitch = 576, bs = 8, blocks = 3, slots = 2;
+    std::vector<int> slot, pos, res;
+    double theta = 5000000.0, eps = 1e-6, scale = 1.0;
+    uint32_t seed = 7;
+};
+
+int i8(const I8Cfg& c) {
+    const int W = c.L + c.R, L = c.L, R = c.R, hd = W / 2;
+    const int64_t rowb = L + 4 * (L / 128) + 2 * R;   /* the layout, written out here on purpose */
+    const int64_t brow = (int64_t)c.bs * rowb;
+    if (rowb % 16) {
+        std::printf("row i8 L%d R%d: row_bytes %lld is not a multiple of 16\n", L, R, (long long)rowb);
+        return 1;
+    }
+    std::mt19937 rng(c.seed);
+    std::uniform_real_distribution<float> u(-1.0f, 1.0f);
+    std::vector<uint16_t> row0((size_t)c.M * c.pitch), gain((size_t)L);
+    for (auto& x : row0) x = f2b(u(rng));
+    for (auto& g : gain) g = f2b(u(rng) * 2.0f);
+    /* Fillers that are not zero and not one: an untouched byte stays visible. */
+    std::vector<uint8_t> kv0((size_t)c.blocks * brow), host0((size_t)c.blocks * brow),
+        ring0((size_t)c.slots * brow);
+    for (auto& x : kv0) x = (uint8_t)(0x40 + (rng() & 0x3f));
+    for (auto& x : host0) x = (uint8_t)(0x40 + (rng() & 0x3f));
+    for (auto& x : ring0) x = (uint8_t)(0x40 + (rng() & 0x3f));
+    /* 16-byte aligned planes, as the ABI's cache is: std::vector's allocation is. */
+    std::vector<int32_t> slot(c.slot.begin(), c.slot.end()), pos(c.pos.begin(), c.pos.end()),
+        res(c.res.begin(), c.res.end());
+    RadTensor t_sm = tens(slot.data(), RAD_I32, { c.M });
+    RadTensor t_pos = tens(pos.data(), RAD_I32, { c.M });
+    auto kv_t = [&](void* p) { return tens(p, RAD_I8, { c.blocks, 1, c.bs, rowb }); };
+
+    /* (a) the fused op into the int8 cache. */
+    std::vector<uint16_t> rowF = row0;
+    std::vector<uint8_t> kvF = kv0;
+    int rc_f;
+    {
+        std::vector<RadTensor> t{ tens(rowF.data(), RAD_BF16, { c.M, W }, { c.pitch, 1 }),
+                                  tens(gain.data(), RAD_BF16, { L }), t_pos, t_sm, kv_t(kvF.data()) };
+        std::vector<RadParam> p{ pi("M", c.M), pi("latent", L), pi("rope_dim", R),
+                                 pi("block_size", c.bs), pf("theta", c.theta), pf("eps", c.eps),
+                                 pf("scale", c.scale), ps("mode", "gptj"), ps("dtype", "bf16") };
+        RadArgs a = mk(t, p);
+        rc_f = r4d_rad_mla_row_norm_rope_store(&a, nullptr);
+    }
+
+    /* (b) the chain: the row in bf16, then kv_store's int8 form. */
+    std::vector<uint16_t> rowC = row0;
+    std::vector<uint8_t> kvC = kv0;
+    int rc_c = RAD_OK;
+    {
+        std::vector<RadTensor> t{ tens(rowC.data(), RAD_BF16, { c.M, L }, { c.pitch, 1 }),
+                                  tens(gain.data(), RAD_BF16, { L }),
+                                  tens(rowC.data(), RAD_BF16, { c.M, L }, { c.pitch, 1 }) };
+        std::vector<RadParam> p{ pi("M", c.M), pi("n", L), pf("eps", c.eps), ps("dtype", "bf16") };
+        RadArgs a = mk(t, p);
+        rc_c = r4d_rad_rmsnorm(&a, nullptr);
+    }
+    if (rc_c == RAD_OK) {
+        std::vector<RadTensor> t{ tens((uint16_t*)rowC.data() + L, RAD_BF16, { c.M, R }, { c.pitch, 1 }),
+                                  t_pos };
+        std::vector<RadParam> p{ pi("M", c.M), pi("head_dim", R), pi("n_head", 1),
+                                 pi("n_head_kv", 0), pf("theta", c.theta), pf("scale", c.scale),
+                                 ps("mode", "gptj"), pi("rotary_dim", R) };
+        RadArgs a = mk(t, p);
+        rc_c = r4d_rad_rope(&a, nullptr);
+    }
+    if (rc_c == RAD_OK) {
+        std::vector<RadTensor> t{ tens(rowC.data(), RAD_BF16, { c.M, hd }, { c.pitch, 1 }),
+                                  tens((uint16_t*)rowC.data() + hd, RAD_BF16, { c.M, hd },
+                                       { c.pitch, 1 }),
+                                  t_sm, kv_t(kvC.data()) };
+        std::vector<RadParam> p{ pi("M", c.M), pi("head_dim", hd), pi("n_head_kv", 1),
+                                 pi("block_size", c.bs), ps("kv_dtype", "i8"),
+                                 pi("rope_dim", R) };
+        RadArgs a = mk(t, p);
+        rc_c = r4d_rad_kv_store_i8(&a, nullptr);
+    }
+
+    /* (c) kv_store from the fused op's row: the store's own bytes, not the chain's. */
+    std::vector<uint8_t> kvS = kv0;
+    int rc_s = RAD_OK;
+    {
+        std::vector<RadTensor> t{ tens(rowF.data(), RAD_BF16, { c.M, hd }, { c.pitch, 1 }),
+                                  tens((uint16_t*)rowF.data() + hd, RAD_BF16, { c.M, hd },
+                                       { c.pitch, 1 }),
+                                  t_sm, kv_t(kvS.data()) };
+        std::vector<RadParam> p{ pi("M", c.M), pi("head_dim", hd), pi("n_head_kv", 1),
+                                 pi("block_size", c.bs), ps("kv_dtype", "i8"),
+                                 pi("rope_dim", R) };
+        RadArgs a = mk(t, p);
+        rc_s = r4d_rad_kv_store_i8(&a, nullptr);
+    }
+
+    /* (d) kv_store_streamed: the mirror always, the ring where the block is resident. */
+    std::vector<uint8_t> hostD = host0, ringD = ring0;
+    int rc_d = RAD_OK;
+    {
+        std::vector<RadTensor> t{ tens(rowF.data(), RAD_BF16, { c.M, hd }, { c.pitch, 1 }),
+                                  tens((uint16_t*)rowF.data() + hd, RAD_BF16, { c.M, hd },
+                                       { c.pitch, 1 }),
+                                  t_sm, tens(ringD.data(), RAD_I8, { c.slots, 1, c.bs, rowb }),
+                                  tens(res.data(), RAD_I32, { c.blocks }),
+                                  tens(hostD.data(), RAD_U8, { c.blocks, brow }) };
+        std::vector<RadParam> p{ pi("M", c.M), pi("head_dim", hd), pi("n_head_kv", 1),
+                                 pi("block_size", c.bs), ps("kv_dtype", "i8"),
+                                 pi("rope_dim", R) };
+        RadArgs a = mk(t, p);
+        rc_d = r4d_rad_kv_store_streamed(&a, nullptr);
+    }
+
+    int bad = 0;
+    if (rc_f != RAD_OK || rc_c != RAD_OK || rc_s != RAD_OK || rc_d != RAD_OK) {
+        std::printf("row i8 L%d R%d M%d: launch failed (fused %d, chain %d, store %d, streamed %d)\n",
+                    L, R, c.M, rc_f, rc_c, rc_s, rc_d);
+        return 1;
+    }
+    for (size_t i = 0; i < rowF.size(); ++i)
+        if (rowF[i] != rowC[i]) {
+            if (!bad) std::printf("row i8 L%d R%d: row column %zu is %04x, the chain's %04x\n", L, R,
+                                  i, rowF[i], rowC[i]);
+            ++bad;
+        }
+    for (size_t i = 0; i < kvF.size(); ++i) {
+        if (kvF[i] != kvC[i]) {
+            if (!bad) std::printf("row i8 L%d R%d: cache byte %zu is %02x, the chain's %02x\n", L, R,
+                                  i, kvF[i], kvC[i]);
+            ++bad;
+        }
+        if (kvS[i] != kvF[i]) {
+            if (!bad) std::printf("row i8 L%d R%d: kv_store byte %zu is %02x, the fused %02x\n", L,
+                                  R, i, kvS[i], kvF[i]);
+            ++bad;
+        }
+    }
+    /* The streamed form's two planes: the mirror holds every named slot's row at its block's
+     * offset, the ring only a resident block's, and every other byte is the filler it started
+     * with -- a slot no token names keeps it, and so does a block. */
+    std::vector<int> used((size_t)c.blocks, 0);
+    for (int s : slot)
+        if (s >= 0 && s < c.blocks * c.bs) used[(size_t)(s / c.bs)] = 1;
+    auto named = [&](int64_t k, int64_t o) {
+        return used[(size_t)k] &&
+               std::find(slot.begin(), slot.end(), (int32_t)(k * c.bs + o)) != slot.end();
+    };
+    for (int64_t k = 0; k < c.blocks; ++k)
+        for (int64_t o = 0; o < c.bs; ++o)
+            for (int64_t j = 0; j < rowb; ++j) {
+                const int64_t i = ((k * c.bs + o) * rowb) + j;   /* the same offset in kvF */
+                const uint8_t want = named(k, o) ? kvF[(size_t)i] : host0[(size_t)i];
+                if (hostD[(size_t)i] != want) {
+                    if (!bad) std::printf("row i8 L%d R%d: mirror byte %lld is %02x, want %02x\n",
+                                          L, R, (long long)i, hostD[(size_t)i], want);
+                    ++bad;
+                }
+            }
+    for (int64_t r = 0; r < c.slots; ++r) {
+        int64_t src = -1;
+        for (int64_t k = 0; k < c.blocks; ++k)
+            if (used[(size_t)k] && res[(size_t)k] == r) src = k;
+        for (int64_t o = 0; o < c.bs; ++o)
+            for (int64_t j = 0; j < rowb; ++j) {
+                const int64_t i = ((r * c.bs + o) * rowb) + j;
+                const uint8_t want = (src >= 0 && named(src, o))
+                                         ? kvF[(size_t)(((src * c.bs + o) * rowb) + j)]
+                                         : ring0[(size_t)i];
+                if (ringD[(size_t)i] != want) {
+                    if (!bad) std::printf("row i8 L%d R%d: ring byte %lld is %02x, want %02x\n", L,
+                                          R, (long long)i, ringD[(size_t)i], want);
+                    ++bad;
+                }
+            }
+    }
+    /* The row's columns: L codes, L/128 f32 scales, R rope columns. The rope columns are the row's
+     * own bf16 (no rotation, no rounding), which is the one column group an oracle can name
+     * without the quantiser: the latent columns are checked against the chain above. */
+    for (int m = 0; m < c.M; ++m) {
+        const int s = slot[(size_t)m];
+        if (s < 0 || s >= c.blocks * c.bs) continue;
+        const int64_t base = ((int64_t)(s / c.bs) * c.bs + (s % c.bs)) * rowb;
+        if (base % 16) {
+            if (!bad) std::printf("row i8 L%d R%d: slot %d starts at %lld, not 16-byte aligned\n", L,
+                                  R, s, (long long)base);
+            ++bad;
+        }
+        const uint16_t* const d = (const uint16_t*)(kvF.data() + base + L + 4 * (L / 128));
+        for (int i = 0; i < R; ++i) {
+            const uint16_t want = rowF[(size_t)m * c.pitch + (size_t)(L + i)];
+            if (d[i] != want) {
+                if (!bad) std::printf("row i8 L%d R%d: token %d rope column %d is %04x, the row's %04x\n",
+                                      L, R, m, i, d[i], want);
+                ++bad;
+            }
+        }
+    }
+    std::printf("row i8 L%-4d R%-3d M%d pitch%-4d bs%d blocks%d: %s\n", L, R, c.M, c.pitch, c.bs,
+                c.blocks, bad ? "FAIL" : "ok");
+    return bad ? 1 : 0;
+}
+
 
 /* D-02 (#88): DFly2's chain reads rows k + 1 of every sequence's block of the final norm in round
  * k. The plugin now gathers every round's rows in one launch and normalises them in one launch,
@@ -360,6 +573,36 @@ int main() {
         c.slot = { 0, 8 };
         c.pos = { 3, 7 };
         fails += one(c);
+    }
+    {   /* X-07 (#136): the int8 latent row -- the served geometry, three tokens into two blocks,
+         * one of them not resident in the ring, and a fourth that is padding both ways. */
+        I8Cfg c;
+        c.slot = { 0, 9, -1, c.blocks * c.bs };
+        c.pos = { 3, 7, 11, 5 };
+        c.M = 4;
+        c.res = { -1, 0, -1 };
+        fails += i8(c);
+    }
+    {   /* A wider rotary: 192 rope columns, so the row is 912 bytes, still a multiple of 16. */
+        I8Cfg c;
+        c.R = 192;
+        c.pitch = 704;
+        c.slot = { 5, 0, 16 };
+        c.pos = { 1, 2, 3 };
+        c.res = { 0, -1, 1 };
+        c.slots = 3;
+        fails += i8(c);
+    }
+    {   /* One token, one block, the whole ring resident. */
+        I8Cfg c;
+        c.M = 1;
+        c.bs = 4;
+        c.blocks = 1;
+        c.slots = 1;
+        c.slot = { 2 };
+        c.pos = { 9 };
+        c.res = { 0 };
+        fails += i8(c);
     }
     {   /* D-02: the chain's hoisted gather and norm, at the stream counts and depths served. */
         int h = 0, cases = 0;

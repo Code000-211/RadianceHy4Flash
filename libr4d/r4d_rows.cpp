@@ -2568,6 +2568,10 @@ static const RadParamSpec pKvStore[] = {
      * be derived from the tokens written. */
     P_F64O("k_scale"),
     P_F64O("v_scale"),
+    /* The int8 latent row (design note X-07): the row's rotary columns, so the row is
+     * L + 4 * (L / 128) + 2 * R at L = 2 * head_dim - R. Absent -- the generic int8 cache.
+     * Unused at bf16, fp8 and f32. */
+    P_INTO("rope_dim"),
 };
 static const RadOperandSpec oKvStore[] = {
     { "k",            RAD_OPD_IN,    0 },
@@ -2585,6 +2589,7 @@ static const RadParamSpec pKvStoreStreamed[] = {
     { "kv_dtype",   RAD_P_STR, RAD_REQUIRED },
     P_F64O("k_scale"),
     P_F64O("v_scale"),
+    P_INTO("rope_dim"),      /* as kv_store's: the int8 latent row's rotary columns (X-07) */
 };
 static const RadOperandSpec oKvStoreStreamed[] = {
     { "k",            RAD_OPD_IN,    0 },
@@ -7687,15 +7692,19 @@ static const RadKernelInfo kKernels[] = {
   r4d_shape_kv_store },
 
 { "kv_store_i8", "kv_store", "attn",
-  "scatter k and v into a paged int8 cache, one workgroup a token and head",
+  "scatter k and v into a paged int8 cache, one workgroup a token and head -- or, at `rope_dim`, "
+  "into Hy4-flash's rotated latent row (X-07: [L codes][L/128 f32 scales][R rope columns], one row "
+  "a workgroup, one KV head)",
   "cache exactly [n_blocks, kv_heads, block_size, 2*head_dim+4]; head_dim a multiple of 4, at most "
-  "1024; a negative or out-of-range slot stores nothing",
-  "bf16 k / v, int8 K and V with one f16 scale each per token and head (the head's absmax / 127), "
-  "i32 slot mapping",
+  "1024; a negative or out-of-range slot stores nothing; at `rope_dim` the cache is "
+  "[n_blocks, 1, block_size, L + 4*(L/128) + 2*R] at L = 2*head_dim - R",
+  "bf16 k / v, int8 K and V with one f16 scale each per token and head (the head's absmax / 127) "
+  "-- or the latent row: the rotation of a block of 128 latent columns, a f32 scale a block and "
+  "the rope columns as they arrive -- i32 slot mapping",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cKvStoreI8), NOTUNE,
   nullptr, nullptr, r4d_rad_kv_store_i8, nullptr, nullptr, nullptr,
-  nullptr },
+  r4d_shape_kv_store },
 
 /* The store of a streamed KV group: the host mirror always, the ring slot when resident. One
  * workgroup a token, two destinations; the mirror's row pitch is the block's, so a token's bytes
@@ -7713,12 +7722,13 @@ static const RadKernelInfo kKernels[] = {
 { "kv_store_streamed_i8", "kv_store_streamed", "attn",
   "scatter k and v into the host mirror always and into the ring slot the residency map names",
   "cache exactly [slots, kv_heads, block_size, 2*head_dim+4], mirror [blocks, the same row pitch]; "
-  "head_dim a multiple of 4, at most 1024; a negative slot stores nothing",
+  "head_dim a multiple of 4, at most 1024; a negative slot stores nothing -- or, at `rope_dim`, the "
+  "latent row of kv_store_i8 in both planes",
   "bf16 k / v, int8 mirror and ring (kv_store_i8's bytes), i32 slot mapping and residency map",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cKvStoreStreamedI8), NOTUNE,
   nullptr, nullptr, r4d_rad_kv_store_streamed, nullptr, nullptr, nullptr,
-  nullptr },
+  r4d_shape_kv_store_streamed },
 
 /* The same store into a bf16 cache: the mirror and the ring hold the values themselves, as
  * kv_store_bf16 writes them. */

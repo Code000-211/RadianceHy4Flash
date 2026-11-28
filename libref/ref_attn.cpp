@@ -99,6 +99,47 @@ static inline void kv_i8_put(void* cache, int64_t row, int64_t head_dim, int hal
     std::memcpy((uint8_t*)cache + row + 2 * head_dim + 2 * half, &h, sizeof h);
 }
 
+/* The int8 latent row (design note X-07, X-07a): one KV head's row of a latent cache, as the
+ * stores write it and libr4d/r4d_row_i8.h reads it back --
+ *
+ *     [L int8 codes][L/128 f32 scales][R rope columns as bf16]      L + 4 * (L / 128) + 2 * R
+ *
+ * The L latent columns are one block-scaled int8 group a 128: the block is rotated by the
+ * Walsh-Hadamard transform (unnormalised, each block independent, fwht's butterfly in f32 -- the
+ * kernel's wave transform is the same butterfly in the same order, so the two agree bit for bit),
+ * the rotation's 1 / sqrt(128) is folded into the block's scale, and the codes are the rotated
+ * block over `amax * (1/127) * 1/sqrt(128)`, rounded to nearest even and clamped to +-127. The
+ * scale of an all-zero block is 1. The R rope columns are not rotated and not quantised: they go
+ * in as the bf16 they arrive as, the writer's own rounding of the angle. */
+constexpr float kRowRotScale = 0.08838834764831845f;   /* 1 / sqrt(128) */
+static inline int64_t row_i8_bytes(int64_t L, int64_t R) {
+    return L + 4 * (L / 128) + 2 * R;
+}
+
+/* `col(c)` is the row's column c: the store's K columns first, then its V columns. */
+template <class C>
+static inline void row_i8_put(void* cache, int64_t off, int64_t L, int64_t R, const C& col) {
+    uint8_t* const d = (uint8_t*)cache + off;
+    float* const scales = (float*)(d + L);
+    for (int64_t b = 0; b < L / 128; ++b) {
+        float buf[128];
+        for (int64_t i = 0; i < 128; ++i) buf[i] = col(b * 128 + i);
+        fwht(buf, 128);
+        float amax = 0.0f;
+        for (int64_t i = 0; i < 128; ++i) amax = std::fmax(amax, std::fabs(buf[i]));
+        const float sc = amax > 0.0f ? amax * (1.0f / 127.0f) * kRowRotScale : 1.0f;
+        const float inv = 1.0f / sc;
+        scales[b] = sc;
+        int8_t* const c = (int8_t*)(d + b * 128);
+        for (int64_t i = 0; i < 128; ++i) {
+            const float q = buf[i] * inv;
+            c[i] = (int8_t)(int)std::nearbyint(std::fmin(std::fmax(q, -127.0f), 127.0f));
+        }
+    }
+    uint16_t* const rp = (uint16_t*)(d + L + 4 * (L / 128));
+    for (int64_t i = 0; i < R; ++i) rp[i] = f32_to_bf16(col(L + i));
+}
+
 }  /* namespace */
 
 /* ------------------------------------------------------------------ attn_paged */
@@ -650,7 +691,16 @@ int ref_kv_store(const RadArgs* a, RadStream) {
      * latent attention) stores k / k_scale, where the scales are the reader's descales (default
      * 1.0). A wider cache stores the value itself. */
     const bool i8 = kv->dtype == RAD_I8;
-    if (i8 && (kv->rank != 4 || kv->shape[3] != 2 * head_dim + 4 || kv->stride[3] != 1))
+    /* The int8 latent row (X-07): at `rope_dim` the cache's row is one KV head's row of
+     * row_i8_bytes(L, R) at L = 2 * head_dim - R, laid out by row_i8_put above. */
+    const int64_t rope_dim = p_int(a, "rope_dim", 0);
+    const int64_t lat = 2 * head_dim - rope_dim;
+    const bool row_i8 = i8 && rope_dim > 0;
+    if (row_i8 && (kv->rank != 4 || kv->stride[3] != 1 || kv_heads != 1 || (rope_dim & 1) ||
+                   lat <= 0 || lat % 128 || kv->shape[3] != row_i8_bytes(lat, rope_dim)))
+        return RAD_E_SHAPE;
+    if (i8 && !row_i8 &&
+        (kv->rank != 4 || kv->shape[3] != 2 * head_dim + 4 || kv->stride[3] != 1))
         return RAD_E_SHAPE;
     const bool  fp8 = kv->dtype == RAD_F8E4M3 || kv->dtype == RAD_F8E5M2;
     const float ks = fp8 ? 1.0f / p_f32(a, "k_scale", 1.0f) : 1.0f;
@@ -666,6 +716,13 @@ int ref_kv_store(const RadArgs* a, RadStream) {
         const int64_t slot = ld_int(sm->dtype, sm->data, offlin(sm, t));
         if (slot < 0) continue;
         const int64_t blk = slot / block_size, off = slot % block_size;
+        if (row_i8) {
+            const int64_t kx = t * k_rs, vx = t * v_rs;   /* one KV head: the row is the head */
+            row_i8_put(kv->data, blk * kvv.sb + off * kvv.so, lat, rope_dim, [&](int64_t c) {
+                return c < head_dim ? ldt(k, kx + c * k_ds) : ldt(v, vx + (c - head_dim) * v_ds);
+            });
+            continue;
+        }
         for (int64_t h = 0; h < kv_heads; ++h) {
             const int64_t cb = blk * kvv.sb + h * kvv.sh + off * kvv.so;
             if (i8) {
@@ -711,7 +768,16 @@ int ref_kv_store_streamed(const RadArgs* a, RadStream) {
     const float ks = fp8 ? 1.0f / p_f32(a, "k_scale", 1.0f) : 1.0f;
     const float vs = fp8 ? 1.0f / p_f32(a, "v_scale", 1.0f) : 1.0f;
     if (kv->rank != 4) return RAD_E_SHAPE;
-    const int64_t rowe = i8 ? 2 * head_dim + 4 : 2 * head_dim;   /* a token's row in a head */
+    /* The int8 group has two rows, as kv_store does: the generic 2 * head_dim + 4, and -- X-07 --
+     * the latent row of row_i8_bytes(L, R) at L = 2 * head_dim - R, one KV head a row. */
+    const int64_t rope_dim = p_int(a, "rope_dim", 0);
+    const int64_t lat = 2 * head_dim - rope_dim;
+    const bool row_i8 = i8 && rope_dim > 0;
+    if (row_i8 && (kv_heads != 1 || (rope_dim & 1) || lat <= 0 || lat % 128))
+        return RAD_E_SHAPE;
+    const int64_t rowe = row_i8 ? row_i8_bytes(lat, rope_dim)    /* a token's row in a head */
+                        : i8   ? 2 * head_dim + 4
+                               : 2 * head_dim;
     if (kv->shape[1] != kv_heads || kv->shape[2] != block_size || kv->shape[3] != rowe ||
         kv->stride[3] != 1) return RAD_E_SHAPE;
     if (host->rank != 2) return RAD_E_SHAPE;
@@ -765,6 +831,19 @@ int ref_kv_store_streamed(const RadArgs* a, RadStream) {
         const int64_t cb = R[blk] >= 0 ? R[blk] * kvv.sb + off * kvv.so : -1;
         for (int64_t h = 0; h < kv_heads; ++h) {
             const int64_t kx = t * k_rs + h * k_hs, vx = t * v_rs + h * v_hs;
+            if (row_i8) {
+                const int64_t kx1 = t * k_rs, vx1 = t * v_rs;   /* one KV head: the row */
+                row_i8_put(hkv.data, hb, lat, rope_dim, [&](int64_t c) {
+                    return c < head_dim ? ldt(k, kx1 + c * k_ds)
+                                       : ldt(v, vx1 + (c - head_dim) * v_ds);
+                });
+                if (cb >= 0)
+                    row_i8_put(kv->data, cb, lat, rope_dim, [&](int64_t c) {
+                        return c < head_dim ? ldt(k, kx1 + c * k_ds)
+                                           : ldt(v, vx1 + (c - head_dim) * v_ds);
+                    });
+                continue;
+            }
             if (i8) {
                 kv_i8_put(hkv.data, hb + h * hv.sh, head_dim, 0, k, kx, k_ds);
                 kv_i8_put(hkv.data, hb + h * hv.sh, head_dim, 1, v, vx, v_ds);

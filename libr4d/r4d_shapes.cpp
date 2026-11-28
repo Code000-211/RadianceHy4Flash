@@ -977,7 +977,12 @@ extern "C" int r4d_shape_rope(const RadParam* p, int n_p, int operand,
  * The paged layout (libref/ref_ops.h, checked by the shim) is
  * kv_cache[n_blocks, kv_heads, block_size, 2 * head_dim], K at [.., d] and V at [.., head_dim + d].
  * The block count belongs to the deployment's cache, not to any parameter, so any count large
- * enough for the slots will do. */
+ * enough for the slots will do.
+ *
+ * The int8 cache has two rows: the generic one, 2 * head_dim + 4 elements, and -- design note X-07
+ * -- the rotated latent row [L codes][L/128 scales][R rope columns] of libr4d/r4d_row_i8.h,
+ * L + 4 * (L / 128) + 2 * R bytes at L = 2 * head_dim - R, selected by the group's `rope_dim` as
+ * the kernels select it. */
 extern "C" int r4d_shape_kv_store(const RadParam* p, int n_p, int operand,
                                   RadOpdDesc* out) {
 
@@ -985,8 +990,18 @@ extern "C" int r4d_shape_kv_store(const RadParam* p, int n_p, int operand,
     const int64_t hd  = pi(p, n_p, "head_dim");
     const int64_t kvh = pi(p, n_p, "n_head_kv");
     const int64_t bs  = pi(p, n_p, "block_size");
+    const int64_t R   = pi(p, n_p, "rope_dim");
     const uint32_t KV = dt_act(p, n_p, "kv_dtype");
     if (M <= 0 || bs <= 0) return RAD_E_UNSUPPORTED;
+    int64_t rowe = 2 * hd;
+    if (KV == (uint32_t)RAD_I8) {
+        rowe = 2 * hd + 4;
+        if (R > 0) {
+            const int64_t L = 2 * hd - R;
+            if ((R & 1) || L <= 0 || L % 128) return RAD_E_UNSUPPORTED;
+            rowe = L + 4 * (L / 128) + 2 * R;
+        }
+    }
     /* Two blocks of slack, so the slot mapping is not a dense prefix and the block index is
      * actually tested. */
     const int64_t nb = (M + bs - 1) / bs + 2;
@@ -998,7 +1013,7 @@ extern "C" int r4d_shape_kv_store(const RadParam* p, int n_p, int operand,
         /* A scatter destination, so no slot may repeat (two tokens on one slot race). It indexes
          * positions, n_blocks * block_size, which is no operand's leading extent. */
         opd_idx(M, 0, nb * bs, -1, RAD_OPD_F_IDX_UNIQUE),
-        opd(KV, nb, kvh, bs, 2 * hd),
+        opd(KV, nb, kvh, bs, rowe),
     };
     R4D_PICK(l);
 }
@@ -1012,17 +1027,28 @@ extern "C" int r4d_shape_kv_store_streamed(const RadParam* p, int n_p, int opera
     const int64_t hd  = pi(p, n_p, "head_dim");
     const int64_t kvh = pi(p, n_p, "n_head_kv");
     const int64_t bs  = pi(p, n_p, "block_size");
+    const int64_t R   = pi(p, n_p, "rope_dim");
     const uint32_t KV = dt_act(p, n_p, "kv_dtype");
     if (M <= 0 || hd <= 0 || kvh <= 0 || bs <= 0 || M > bs) return RAD_E_UNSUPPORTED;
-    /* E4M3 or bf16: the mirror and the ring are byte planes of the same paged layout, and the
-     * mirror's row pitch doubles for a two-byte element. */
-    if (KV != (uint32_t)RAD_F8E4M3 && KV != (uint32_t)RAD_BF16) return RAD_E_UNSUPPORTED;
-    const int64_t row = kvh * bs * 2 * hd * (KV == (uint32_t)RAD_BF16 ? 2 : 1);
+    /* E4M3, bf16 or -- design note X-07 -- int8: the mirror and the ring are byte planes of the
+     * same paged layout, and the mirror's row pitch is the row's byte count (twice it for bf16). */
+    if (KV != (uint32_t)RAD_F8E4M3 && KV != (uint32_t)RAD_BF16 && KV != (uint32_t)RAD_I8)
+        return RAD_E_UNSUPPORTED;
+    int64_t rowe = 2 * hd;
+    if (KV == (uint32_t)RAD_I8) {
+        rowe = 2 * hd + 4;
+        if (R > 0) {
+            const int64_t L = 2 * hd - R;
+            if ((R & 1) || L <= 0 || L % 128) return RAD_E_UNSUPPORTED;
+            rowe = L + 4 * (L / 128) + 2 * R;
+        }
+    }
+    const int64_t row = kvh * bs * rowe * (KV == (uint32_t)RAD_BF16 ? 2 : 1);
     const RadOpdDesc l[] = {
         opd((uint32_t)RAD_BF16, M, kvh, hd),
         opd((uint32_t)RAD_BF16, M, kvh, hd),
         opd_idx(M, 0, bs, -1, RAD_OPD_F_IDX_UNIQUE),   /* slot_mapping, one block */
-        opd(KV, 1, kvh, bs, 2 * hd),              /* kv_cache -- the ring */
+        opd(KV, 1, kvh, bs, rowe),                /* kv_cache -- the ring */
         opd_idx(1, 0, 1, 0),                      /* res -- the block, resident in slot 0 */
         opd((uint32_t)RAD_U8, 1, row),            /* host -- the layer's mirror */
     };
