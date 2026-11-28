@@ -257,6 +257,17 @@ std::vector<Case> build_cases() {
                                         HI("latent_dim", 61), HS("mode", mode), HS("dtype", "bf16") });
                 add("mla_project_kv", { HI("M", 2), HI("heads", 2), HI("k_dim", 192), HI("v_dim", 256),
                                         HI("latent_dim", 512), HS("mode", mode), HS("dtype", "bf16") });
+                /* X-07's rotated frame: the absorb's row is R(q_lat) (one 128-block row too), the
+                 * expansion's is inert -- both are checked against libref either way */
+                add("mla_project_kv", { HI("M", 2), HI("heads", 2), HI("k_dim", 192), HI("v_dim", 256),
+                                        HI("latent_dim", 512), HS("mode", mode), HS("dtype", "bf16"),
+                                        HS("kv_rot", "wht128") });
+                add("mla_project_kv", { HI("M", 3), HI("heads", 3), HI("k_dim", 17), HI("v_dim", 23),
+                                        HI("latent_dim", 128), HS("mode", mode), HS("dtype", "bf16"),
+                                        HS("kv_rot", "wht128") });
+                add("mla_project_kv", { HI("M", 2), HI("heads", 2), HI("k_dim", 192), HI("v_dim", 256),
+                                        HI("latent_dim", 512), HS("mode", mode), HS("dtype", "bf16"),
+                                        HS("kv_rot", "none") });
             }
         if (!std::strcmp(dt, "bf16"))
             add("mla_expand_gate", { HI("M", 3), HI("heads", 2), HI("k_dim", 192), HI("v_dim", 256),

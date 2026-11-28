@@ -587,5 +587,38 @@ static inline bool i8_steps_dtype(const char* dt) {
     return false;
 }
 
+/* ================================================================== the latent row's rotation
+ * X-07's rotated int8 latent cache stores each 128-column block of a row as WHT(x) * 1/sqrt(128)
+ * (libr4d/r4d_row_i8.h's store), and the query is read in that frame too: R(x) = M x with
+ * M[i][j] = (-1)^popcount(i & j) * (1/sqrt(128)), the Walsh-Hadamard transform in the order the
+ * tree's butterfly produces it (Sylvester order, no bit reversal), the row's own normaliser as the
+ * entry. The product accumulates in double: this form's own rounding (about 1e-16 a sum) is far
+ * below the kernel's f32 butterfly, which is the difference a comparison sees, and it is part of
+ * the reference's definition (docs/OPS.md, `mla_project_kv`). */
+constexpr float kRowRotScale = 0.08838834764831845f;   /* 1 / sqrt(128) */
+struct RowRot {
+    double m[128 * 128];
+    RowRot() {
+        const double k = (double)kRowRotScale;
+        for (int i = 0; i < 128; ++i)
+            for (int j = 0; j < 128; ++j)
+                m[i * 128 + j] = (__builtin_popcount((unsigned)(i & j)) & 1) ? -k : k;
+    }
+};
+static inline const RowRot& row_rot() {
+    static const RowRot r;
+    return r;
+}
+/* One block in the frame: `out(i)` is R(x)(i) for the 128 columns x(0..127). */
+template <class X, class O>
+static inline void row_rot_block(const X& x, const O& out) {
+    const RowRot& rot = row_rot();
+    for (int64_t i = 0; i < 128; ++i) {
+        double y = 0.0;
+        for (int64_t j = 0; j < 128; ++j) y += rot.m[i * 128 + j] * (double)x(j);
+        out(i, (float)y);
+    }
+}
+
 }  /* namespace ref */
 #endif /* RAD_REF_COMMON_H */

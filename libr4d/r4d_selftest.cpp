@@ -36836,6 +36836,14 @@ static void hy4_mla_project_kv_case(const Plugin& pl) {
                 hy_check(pl, "mla_project_kv_bf16",
                          fmt("mla_project_kv %s vs libref: heads %lld M %lld", mode, (long long)H,
                              (long long)M), ps, ops);
+                /* X-07: the rotated frame. The absorb's row is R(q_lat) -- the wave's f32 butterfly
+                 * against libref's double matrix, so one bf16 ulp: ops[2]'s bound already is that. */
+                if (ab) {
+                    ps.push_back(PS("kv_rot", "wht128"));
+                    hy_check(pl, "mla_project_kv_bf16",
+                             fmt("mla_project_kv absorb kv_rot wht128 vs libref: heads %lld M %lld",
+                                 (long long)H, (long long)M), ps, ops);
+                }
             }
     /* The law (r4d_mla_kv_bf16.hip, WP16.3): a token's bytes are its own row's, whatever M, `mb`
      * (every value of the row's axis), the chained form or the operand layout (16-byte fragments
@@ -36874,16 +36882,18 @@ static void hy4_mla_project_kv_case(const Plugin& pl) {
                 t.stride[0] = pitch;
                 return t;
             };
-            auto prm = [&](int64_t m, long long mb, long long chain, bool gate, long long stage) {
+            auto prm = [&](int64_t m, long long mb, long long chain, bool gate, long long stage,
+                           const char* kv_rot = nullptr) {
                 std::vector<RadParam> ps = { PI("M", m), PI("heads", H), PI("k_dim", kd), PI("v_dim", vd),
                                              PI("latent_dim", L), PS("dtype", "bf16"), PI("mb", mb),
                                              PI("chain", chain), PI("stage", stage) };
+                if (kv_rot) ps.push_back(PS("kv_rot", kv_rot));
                 if (!gate) ps.push_back(PS("mode", mode));
                 return ps;
             };
             /* y of rows [r0, r0 + m) through `r`, packed on the host */
             auto launch = [&](const RadKernelInfo* r, int64_t r0, int64_t m, long long mb, long long chain,
-                              bool pitched, bool gate, long long stage = 0) {
+                              bool pitched, bool gate, long long stage = 0, const char* kv_rot = nullptr) {
                 const int64_t xp = pitched ? XW + 3 : XW, wp = pitched ? L + 3 : L,
                               gp = pitched ? GW + 3 : GW, ypt = pitched ? YW + 3 : YW;
                 uint16_t* y = (uint16_t*)dalloc((size_t)(m * ypt + 8) * 2) + (pitched ? 1 : 0);
@@ -36891,7 +36901,7 @@ static void hy4_mla_project_kv_case(const Plugin& pl) {
                                               T2(pitched ? pw : dw, WR, L, wp) };
                 if (gate) ts.push_back(T2((pitched ? pg : dg) + r0 * gp, m, GW, gp));
                 ts.push_back(T2(y, m, YW, ypt));
-                std::vector<RadParam> ps = prm(m, mb, chain, gate, stage);
+                std::vector<RadParam> ps = prm(m, mb, chain, gate, stage, kv_rot);
                 run_case(r, ts, ps);
                 std::vector<uint16_t> o((size_t)(m * YW)), rowb((size_t)ypt);
                 for (int64_t i = 0; i < m; ++i) {
@@ -36923,7 +36933,36 @@ static void hy4_mla_project_kv_case(const Plugin& pl) {
             if (pit != alone) { same = false; where = "pitched"; }
             ok(fmt("mla_project_kv %s heads %lld: a token's bytes do not depend on M, mb, stage, the chained form or "
                    "the operand layout", mode, (long long)H).c_str(), same, where);
-            if (ab) continue;
+            if (ab) {
+                /* X-07's frame has its own arm (NC 8, one token tile a wave, unchained); the law holds
+                 * there too: every row's bytes are the row's alone, whatever M, mb, chain, the layout,
+                 * a slice, and it is not the plain arm's bytes (else the flag did nothing). */
+                std::vector<uint16_t> rot((size_t)(M * YW));
+                for (int64_t t = 0; t < M; ++t) {
+                    const auto o = launch(row, t, 1, 0, 0, false, false, 0, "wht128");
+                    std::memcpy(&rot[(size_t)(t * YW)], o.data(), o.size() * 2);
+                }
+                bool rsame = true;
+                const bool rdiff = rot != alone;
+                std::string rwhere;
+                for (const long long chain : { 0, 1 })
+                    for (const long long mb : { 0, 1, 2, 4, 8 })
+                        for (const int64_t m : { M, (int64_t)9 }) {
+                            const auto o = launch(row, 0, m, mb, chain, false, false, 0, "wht128");
+                            if (!std::equal(o.begin(), o.end(), rot.begin())) {
+                                rsame = false;
+                                rwhere = fmt("M %lld mb %lld chain %lld", (long long)m, mb, chain);
+                            }
+                        }
+                const auto rtail = launch(row, 5, M - 5, 0, 0, false, false, 0, "wht128");
+                if (!std::equal(rtail.begin(), rtail.end(), rot.begin() + 5 * YW)) { rsame = false; rwhere = "rows 5.."; }
+                const auto rpit = launch(row, 0, M, 0, 0, true, false, 0, "wht128");
+                if (rpit != rot) { rsame = false; rwhere = "pitched"; }
+                ok(fmt("mla_project_kv absorb heads %lld at kv_rot wht128: a token's bytes do not depend on M, mb, "
+                       "the chained form, the layout or a slice, and are not the plain row's", (long long)H).c_str(),
+                   rsame && rdiff, rwhere);
+                continue;
+            }
             /* the fused gate against gate_mul over the expansion */
             uint16_t* dao = up(alone, M, YW, YW, 0);
             uint16_t* dag = (uint16_t*)dalloc((size_t)(M * GW) * 2);
@@ -36946,6 +36985,9 @@ static void hy4_mla_project_kv_case(const Plugin& pl) {
                                 where = fmt("mb %lld chain %lld stage %lld%s", mb, chain, stage, pitched ? " pitched" : "");
                             }
                         }
+            /* X-07: the expansion takes the flag and cannot act on it (the sink un-rotated the
+             * latent, design note §5), so its bytes and the fused pair's are the plain ones */
+            if (launch(fused, 0, M, 0, 0, false, true, 0, "wht128") != want) { fsame = false; where = "kv_rot wht128"; }
             const auto o9 = launch(fused, 0, 9, 0, 1, false, true);
             if (!std::equal(o9.begin(), o9.end(), want.begin())) { fsame = false; where = "M 9 chained"; }
             ok(fmt("mla_expand_gate heads %lld == mla_project_kv expand + gate_mul, bit for bit", (long long)H).c_str(),

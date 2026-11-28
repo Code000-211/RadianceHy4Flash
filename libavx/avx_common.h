@@ -410,5 +410,11 @@ static inline const void* byte_at(const void* base, uint32_t dt, int64_t i) {
     }
 }
 
+/* The rotated latent row's normaliser (X-07): a block of 128 columns is stored as WHT(x) scaled
+ * by it, so a reader's R(x) is the unnormalised transform times this, and the query the cache is
+ * compared against carries the same one. avx_attn.cpp's store folds it into the block's scale;
+ * avx_hy4.cpp's mla_project_kv applies it to the rotated query row. */
+constexpr float kRowRotScale = 0.08838834764831845f;   /* 1 / sqrt(128) */
+
 }  /* namespace avx */
 #endif /* RAD_AVX_COMMON_H */

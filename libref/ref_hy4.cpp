@@ -240,7 +240,10 @@ int ref_rmsnorm_ihc_junction(const RadArgs* a, RadStream s) {
 /* The checkpoint's kv_b read per head: head h's rows start at h (k_dim + v_dim), its k_dim key rows
  * first, then its v_dim value rows.
  *   absorb: y[m,h,j] = sum_{c<k_dim} a[m,h,c] b[h(kd+vd) + c][j]          [M,H,kd] -> [M,H,L]
- *   expand: y[m,h,c] = sum_{j<L}     a[m,h,j] b[h(kd+vd) + kd + c][j]     [M,H,L]  -> [M,H,vd] */
+ *   expand: y[m,h,c] = sum_{j<L}     a[m,h,j] b[h(kd+vd) + kd + c][j]     [M,H,L]  -> [M,H,vd]
+ * With `kv_rot` `wht128` (X-07's rotated latent cache) the absorb's row is the rotation of that
+ * sum, R(y) over each 128-column block (row_rot_block, ref_common.h), before the row's one bf16
+ * rounding; the expansion takes the flag and is inert, the sink having un-rotated the latent. */
 int ref_mla_project_kv(const RadArgs* a, RadStream) {
     if (!have(a, 3)) return RAD_E_INVAL;
     RadTensor x = a->t[0], y = a->t[2];
@@ -248,8 +251,12 @@ int ref_mla_project_kv(const RadArgs* a, RadStream) {
     const int64_t H = p_int(a, "heads", 0), kd = p_int(a, "k_dim", 0), vd = p_int(a, "v_dim", 0),
                   L = p_int(a, "latent_dim", 0);
     const char* mode = p_str(a, "mode", "");
+    const char* kvr = p_str(a, "kv_rot", "");
+    if (kvr && *kvr && std::strcmp(kvr, "wht128") && std::strcmp(kvr, "none")) return RAD_E_SHAPE;
     const bool absorb = !std::strcmp(mode, "absorb"), expand = !std::strcmp(mode, "expand");
+    const bool rot = absorb && kvr && !std::strcmp(kvr, "wht128");
     if ((!absorb && !expand) || H < 1 || kd < 1 || vd < 1 || L < 1) return RAD_E_SHAPE;
+    if (rot && L % 128 != 0) return RAD_E_SHAPE;
     const int64_t in_w = absorb ? kd : L, out_w = absorb ? L : vd;
     heads_view(x, H, in_w);
     heads_view(y, H, out_w);
@@ -261,6 +268,25 @@ int ref_mla_project_kv(const RadArgs* a, RadStream) {
     REF_PAR_FOR(M * H * out_w * in_w)
     for (int64_t job = 0; job < M * H; ++job) {
         const int64_t r = job / H, head = job % H;
+        if (rot) {
+            /* One row of the absorb, then each 128-column block in the cache's frame */
+            std::vector<float> row((size_t)out_w);
+            for (int64_t col = 0; col < out_w; ++col) {
+                float sum = 0;
+                for (int64_t j = 0; j < in_w; ++j)
+                    sum += ldt(&x, r * x.stride[0] + head * x.stride[1] + j * x.stride[2]) *
+                           ldt(&w, (head * (kd + vd) + j) * w.stride[0] + col * w.stride[1]);
+                row[(size_t)col] = sum;
+            }
+            for (int64_t b = 0; b < out_w / 128; ++b) {
+                row_rot_block([&](int64_t i) { return row[(size_t)(b * 128 + i)]; },
+                              [&](int64_t i, float v) {
+                                  stt(&y, r * y.stride[0] + head * y.stride[1] +
+                                              (b * 128 + i) * y.stride[2], v);
+                              });
+            }
+            continue;
+        }
         for (int64_t col = 0; col < out_w; ++col) {
             float sum = 0;
             for (int64_t j = 0; j < in_w; ++j) {

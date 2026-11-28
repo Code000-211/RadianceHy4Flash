@@ -3894,8 +3894,8 @@ refuses the graph rather than resolving a similar op.
 | `ihc_pre` | `M`(range) `n` `hc` `rows` `eps`:f64 `hc_eps`:f64 `post_mag`:f64/opt `dtype` | `h`, `fn`w, `scale`w, `base`w → `x`, `post`? |
 | `ihc_post` | `M`(range) `n` `hc` `dtype` | `y`, `post`, `h`:inout |
 | `rmsnorm_ihc_junction` | `M`(range) `n` `hc` `rows` `eps`:f64 `ihc_eps`:f64/opt `hc_eps`:f64/opt `post_mag`:f64/opt `tail`/opt `dtype` `group`/opt | `a`:inout, `b`?, `w_post`w, `post`:inout, `h`:inout, `fn`w?, `scale`w?, `base`w?, `w_next`w?, `xn`?, `y`?, `x`?, `xq`?, `xs`? |
-| `mla_project_kv` | `M`(range) `heads` `k_dim` `v_dim` `latent_dim` `mode` `dtype` | `a`, `b`w → `y` |
-| `mla_expand_gate` | `M`(range) `heads` `k_dim` `v_dim` `latent_dim` `dtype` | `x`, `w`w, `g` → `y` |
+| `mla_project_kv` | `M`(range) `heads` `k_dim` `v_dim` `latent_dim` `mode` `dtype` `kv_rot`? | `a`, `b`w → `y` |
+| `mla_expand_gate` | `M`(range) `heads` `k_dim` `v_dim` `latent_dim` `dtype` `kv_rot`? | `x`, `w`w, `g` → `y` |
 | `mla_expand_gate_had_quant_i8g` | `M`(range) `heads` `k_dim` `v_dim` `latent_dim` `group` `dtype` | `x`, `w`w, `g` → `q`, `scale`, `out_bf16`? |
 | `mla_attn_paged_sink` | `M`(range) `heads` `latent_dim` `rope_dim` `block_size` `window` `scale`:f64 `dtype` `stable`/opt `row0`/opt `rope_theta`:f64/opt `rope_scale`:f64/opt `rope_mode`/opt `rope_sections`/opt | `q`, `q_rope`, `kv`, `block_table`, `seqused`, `cu_seqlens`, `sinks`w → `out`, `rope_pos`/opt |
 | `mla_attn_sel_sink` | `M`(range) `heads` `latent_dim` `rope_dim` `blocks` `block_size` `scale`:f64 `dtype` `stable`/opt `rope_theta`:f64/opt `rope_scale`:f64/opt `rope_mode`/opt `rope_sections`/opt | `q`, `q_rope`, `kv`, `bt`, `length`, `sinks`w → `out`, `rope_pos`/opt |
@@ -3992,6 +3992,17 @@ libr4d's expand at four token tiles (prefill heights, aligned operands, not chai
 sixteen waves that stages the 64 tokens' latent block in LDS once for four column tiles, rather than
 each of a head's 16 column-tile workgroups loading it (K-50); its `stage` axis (1 = the unstaged form)
 moves no bit either.
+
+`kv_rot` (X-07, `none` when absent) names the frame of the latent cache the row is read in.
+`wht128` says the cache stores each 128-column block of a row as `WHT(x) / sqrt(128)`
+(`mla_row_norm_rope_store`, `r4d_row_i8.h`), so `absorb` rotates its result into that frame before
+its one rounding: `y[m,h,j'] = sum_{i<128} M[j'][i] * sum_{c<k_dim} a[m,h,c] * b[h*(kd+vd) + c][b*128 + i]`
+with `M[i][j] = (-1)^popcount(i & j) / sqrt(128)` (Sylvester order, no bit reversal) and `j = b*128 + i`.
+The scores are then the plain ones, `(R q) . (R x) = q . x`; the sum is still `c` ascending, and only
+the rotated row's rounding changes. `latent` must be a multiple of 128. `mla_expand_gate` (and
+`expand`) accept the flag and are inert: the latent a reader expands is the sink's output, un-rotated
+before it was written (design note §5), so both arms are byte-identical there. `none` is every byte
+this row had before the parameter existed.
 
 `mla_expand_gate` is `expand` followed by `gate_mul` over its output, `y[m, h*v_dim + c] =
 round(f32(round(expand[m,h,c])) * sigmoid(f32(g[m, h*v_dim + c])))`: the expansion is rounded to

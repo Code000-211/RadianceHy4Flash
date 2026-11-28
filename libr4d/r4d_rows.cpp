@@ -698,7 +698,7 @@ static const RadOperandSpec oGateMul[] = {
 };
 static const RadParamSpec pMlaProjectKv[] = {
     P_INT("M"), P_INT("heads"), P_INT("k_dim"), P_INT("v_dim"), P_INT("latent_dim"),
-    P_STR("mode"), P_STR("dtype"),
+    P_STR("mode"), P_STR("dtype"), P_STRO("kv_rot"),
 };
 static const RadOperandSpec oMlaProjectKv[] = {
     {"x", RAD_OPD_IN, 0}, {"w", RAD_OPD_WEIGHT, 0}, {"y", RAD_OPD_OUT, 0},
@@ -706,6 +706,7 @@ static const RadOperandSpec oMlaProjectKv[] = {
 /* mla_expand_gate: mla_project_kv's expand with gate_mul folded into its store (libr4d only). */
 static const RadParamSpec pMlaExpandGate[] = {
     P_INT("M"), P_INT("heads"), P_INT("k_dim"), P_INT("v_dim"), P_INT("latent_dim"), P_STR("dtype"),
+    P_STRO("kv_rot"),
 };
 static const RadOperandSpec oMlaExpandGate[] = {
     {"x", RAD_OPD_IN, 0}, {"w", RAD_OPD_WEIGHT, 0}, {"g", RAD_OPD_IN, 0}, {"y", RAD_OPD_OUT, 0},
@@ -3993,11 +3994,16 @@ static const RadOpSchema kSchemas[] = {
     SCHEMA("mla_project_kv", pMlaProjectKv, oMlaProjectKv,
            "Per-head absorption or expansion through the checkpoint's kv_b, rows head-major with each head's "
            "k_dim key rows then its v_dim value rows. absorb: [M,heads,k_dim] -> [M,heads,latent]; expand: "
-           "[M,heads,latent] -> [M,heads,v_dim]. mla_project with unequal K and V widths."),
+           "[M,heads,latent] -> [M,heads,v_dim]. mla_project with unequal K and V widths. `kv_rot` "
+           "`wht128` says the latent cache's rows are rotated (r4d_row_i8.h), so absorb rotates its q_lat "
+           "into that frame: each (token, head) row's 128-column blocks by the same WHT and kRotScale, "
+           "before the one rounding. `none` is the plain row. The expand ignores it (the sink un-rotated "
+           "the latent it reads before it wrote it)."),
     SCHEMA("mla_expand_gate", pMlaExpandGate, oMlaExpandGate,
            "mla_project_kv's expand followed by gate_mul in one launch: y = round(f32(round(sum_j "
            "x[m,h,j] * w[h*(k_dim+v_dim) + k_dim + c][j])) * sigmoid(f32(g[m, h*v_dim + c]))). "
-           "Byte-identical to the two ops it replaces."),
+           "Byte-identical to the two ops it replaces. `kv_rot` is accepted and inert: the expansion "
+           "reads the latent after the sink's un-rotation."),
     SCHEMA("mla_expand_gate_had_quant_i8g", pMlaExpandGateQuant, oMlaExpandGateQuant,
            "mla_expand_gate and had_quant_act_i8g in one launch: the expansion's gated bf16 product "
            "[M, heads * v_dim], a 128-wide Hadamard along it and the int8 quantiser (the codes "
