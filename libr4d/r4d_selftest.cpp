@@ -21943,6 +21943,73 @@ static void mla_sink_bytes(const Plugin& pl, int64_t heads, std::vector<int64_t>
     }
 }
 
+/* P-17 (#301): the pipelined prefill's attention pieces, mla_attn_paged_sink. One prefill sequence
+ * of T rows after `pre` cached tokens, launched whole, then as the trunk launches its two pieces
+ * (hyv4flash_attn.h, Attn::core_piece): piece 1 (rows [n0, T)) at bounds {0, n1} and the step's
+ * seqused; piece 0 (rows [0, n0)) at {0, n0} and the seqused less n1; and piece 0 again through the
+ * launch's `row0` argument instead (row0 = -n1 over the step's seqused). Every piece row must be the
+ * whole launch's bytes. A piece 0 at the unshifted seqused must not be: the case sees the bound. */
+static void mla_sink_piece_bytes(const Plugin& pl, int64_t heads, int64_t T, int64_t pre, int64_t n0,
+                                 int64_t window, int64_t bs, int stable) {
+    const auto* paged = find(pl, "mla_attn_paged_sink_bf16");
+    std::string label = fmt("sink pieces H=%lld w=%lld bs=%lld stable=%d %lld+%lld after %lld",
+                            (long long)heads, (long long)window, (long long)bs, stable,
+                            (long long)n0, (long long)(T - n0), (long long)pre);
+    if (!paged) {
+        ok(label.c_str(), false, "kernel missing");
+        return;
+    }
+    const int64_t n1 = T - n0, ctx = pre + T;
+    SinkOps all = sink_ops(false, heads, { T }, { ctx }, window, bs, 0, 1, stable);
+    std::vector<uint8_t> base;
+    if (!sink_device(pl, paged, all, 0, base)) {
+        ok(label.c_str(), false, "device launch failed");
+        return;
+    }
+    const auto& ot = all.host[(size_t)all.out];
+    auto row_bytes = [&](const std::vector<uint8_t>& b, const RadTensor& t, int64_t r) {
+        std::vector<uint16_t> v;
+        for (int64_t h = 0; h < heads; ++h)
+            for (int64_t d = 0; d < 512; ++d)
+                v.push_back(((const uint16_t*)(b.data() + 128))[r * t.stride[0] + h * t.stride[1] + d]);
+        return v;
+    };
+    /* A piece of `n` rows from row r0 at context `used`, with `row0` passed when nonzero; its rows
+     * against the whole launch's rows [r0, r0 + n). */
+    auto piece = [&](int64_t r0, int64_t n, int64_t used, int64_t row0, bool& ran) {
+        SinkOps p = sink_ops(false, heads, { n }, { used }, window, bs, 0, 1, stable);
+        if (row0) p.ps.push_back(PI("row0", row0));
+        p.bytes[2] = all.bytes[2];   /* the whole launch's cache and table */
+        p.host[2] = all.host[2];
+        p.host[2].data = p.bytes[2].data() + 128;
+        const RadTensor& bt = all.host[3];
+        for (int64_t b = 0; b < p.host[3].shape[1]; ++b)
+            ((int32_t*)p.host[3].data)[b] = ((int32_t*)bt.data)[b];
+        for (int k = 0; k < 2; ++k) {
+            const RadTensor &src = all.host[(size_t)k], &dst = p.host[(size_t)k];
+            for (int64_t i = 0; i < n; ++i)
+                for (int64_t h = 0; h < heads; ++h)
+                    for (int64_t d = 0; d < src.shape[2]; ++d)
+                        ((uint16_t*)dst.data)[i * dst.stride[0] + h * dst.stride[1] + d] =
+                            ((uint16_t*)src.data)[(r0 + i) * src.stride[0] + h * src.stride[1] + d];
+        }
+        std::vector<uint8_t> g;
+        ran = sink_device(pl, paged, p, 0, g);
+        bool same = ran;
+        for (int64_t i = 0; same && i < n; ++i)
+            same = row_bytes(g, p.host[(size_t)p.out], i) == row_bytes(base, ot, r0 + i);
+        return same;
+    };
+    bool ran = false;
+    ok(fmt("%s piece 1 == whole rows", label.c_str()).c_str(), piece(n0, n1, ctx, 0, ran) && ran);
+    ok(fmt("%s piece 0 (seqused - n1) == whole rows", label.c_str()).c_str(),
+       piece(0, n0, ctx - n1, 0, ran) && ran);
+    ok(fmt("%s piece 0 (row0 -n1) == whole rows", label.c_str()).c_str(),
+       piece(0, n0, ctx, -n1, ran) && ran);
+    const bool unshifted = piece(0, n0, ctx, 0, ran);
+    ok(fmt("%s piece 0 unshifted != whole rows", label.c_str()).c_str(), ran && !unshifted);
+}
+
 /* An environment variable set (or, with a null value, cleared) for one scope and restored after
  * it: the MLA launcher reads its counting switch at every call. */
 struct ScopedEnv {
@@ -29173,6 +29240,118 @@ static void attn_kv_sink_check(const Plugin& pl, std::vector<int64_t> qlen, std:
         ok(fmt("%s later keys leave a row's bytes", label.c_str()).c_str(), causal);
     }
     dlclose(ref);
+}
+
+/* P-17 (#301): the pipelined prefill's attention pieces on the dense form (attn_kv_sink_h256), a fresh
+ * prompt's sliding layers. One sequence of T rows launched whole, then as the trunk launches its two
+ * pieces over the same planes (hyv4flash_attn.h, Attn::core_piece): piece 0 = queries and keys
+ * [0, n0) at bounds {0, n0}; piece 1 = queries [n0, T) at {0, n1} over keys [0, T) at {0, T} (a query
+ * at key n - m + i). Both pieces' output rows must be the whole launch's bytes, margins included. A
+ * piece 1 over its own keys alone must not be: the case sees the key bound. */
+static void attn_kv_sink_piece_bytes(const Plugin& pl, int64_t rows, int64_t n0, int64_t heads,
+                                     int64_t window, int64_t bq) {
+    const auto* row = find(pl, "attn_kv_sink_h256");
+    const std::string label = fmt("attn_kv_sink pieces %lld+%lld H=%lld window=%lld bq %lld",
+                                  (long long)n0, (long long)(rows - n0), (long long)heads,
+                                  (long long)window, (long long)bq);
+    if (!row) {
+        ok(label.c_str(), false, "kernel missing");
+        return;
+    }
+    const int64_t D = 256, n1 = rows - n0;
+    /* q, k, v, out (whole), out (pieces): pitched, poisoned margins */
+    std::vector<RadTensor> plane(5);
+    plane[0] = T(nullptr, RAD_BF16, { rows, heads, D });
+    plane[0].stride[1] = D + 8;
+    plane[0].stride[0] = heads * (D + 8) + 16;
+    plane[1] = T(nullptr, RAD_BF16, { rows, heads, D });
+    plane[1].stride[1] = D + 16;
+    plane[1].stride[0] = heads * (D + 16) + 8;
+    plane[2] = T(nullptr, RAD_BF16, { rows, heads, D });
+    plane[3] = T(nullptr, RAD_BF16, { rows, heads, D });
+    plane[3].stride[1] = D + 8;
+    plane[3].stride[0] = heads * (D + 8) + 8;
+    plane[4] = plane[3];
+    std::vector<std::vector<uint8_t>> bytes(5);
+    std::vector<void*> mem(5, nullptr);
+    for (int i = 0; i < 5; ++i) {
+        const int64_t elements = plane[(size_t)i].shape[0] * plane[(size_t)i].stride[0];
+        bytes[(size_t)i].assign((size_t)elements * 2 + 256, 0xa5);
+        if (i <= 2)
+            for (int64_t e = 0; e < elements; ++e) {
+                const float v = (float)((int)(st_mix32((uint32_t)(e * 7 + i * 7919 + 31)) % 2001) - 1000) /
+                                (i == 2 ? 250.0f : 500.0f);
+                ((uint16_t*)(bytes[(size_t)i].data() + 128))[e] = h_to_bf16(v);
+            }
+        mem[(size_t)i] = dalloc(bytes[(size_t)i].size());
+        if (!mem[(size_t)i]) {
+            ok(label.c_str(), false, "allocation failed");
+            return;
+        }
+        st_memcpy(mem[(size_t)i], bytes[(size_t)i].data(), bytes[(size_t)i].size(), hipMemcpyHostToDevice);
+        plane[(size_t)i].data = (char*)mem[(size_t)i] + 128;
+    }
+    std::vector<float> sk((size_t)heads);
+    for (int64_t h = 0; h < heads; ++h) sk[(size_t)h] = (float)((h % 7) - 3) * 1.5f;
+    void* skd = dalloc(sk.size() * 4);
+    void* cud = dalloc(8 * 4);
+    if (!skd || !cud) {
+        ok(label.c_str(), false, "allocation failed");
+        return;
+    }
+    st_memcpy(skd, sk.data(), sk.size() * 4, hipMemcpyHostToDevice);
+    /* the bounds: {0, rows} at 0, {0, n0} at 2, {0, n1} at 4 */
+    const int32_t cu[8] = { 0, (int32_t)rows, 0, (int32_t)n0, 0, (int32_t)n1, 0, 0 };
+    st_memcpy(cud, cu, sizeof cu, hipMemcpyHostToDevice);
+    /* One launch: queries [q0, q0 + m) at bounds `cq`, keys [0, nk) at `ck`, into `out`. */
+    auto launch = [&](int64_t q0, int64_t m, int64_t nk, int cq, int ck, int out) {
+        auto view = [&](int i, int64_t r0, int64_t cnt) {
+            RadTensor t = plane[(size_t)i];
+            t.data = (char*)t.data + r0 * t.stride[0] * 2;
+            t.shape[0] = cnt;
+            return t;
+        };
+        std::vector<RadTensor> ts = { view(0, q0, m), view(1, 0, nk), view(2, 0, nk),
+                                      T((int32_t*)cud + cq, RAD_I32, { 2 }),
+                                      T((int32_t*)cud + ck, RAD_I32, { 2 }),
+                                      T(skd, RAD_F32, { heads }), view(out, q0, m) };
+        std::vector<RadParam> ps = { PI("M", m), PI("N", nk), PI("heads", heads), PI("head_dim", D),
+                                     PI("window", window), PF("scale", 1.0 / 16.0), PS("dtype", "bf16"),
+                                     PI("bq", bq) };
+        return run_once(row, ts, ps);
+    };
+    auto fetch = [&](int i) {
+        std::vector<uint8_t> g(bytes[(size_t)i].size());
+        st_memcpy(g.data(), mem[(size_t)i], g.size(), hipMemcpyDeviceToHost);
+        return g;
+    };
+    const bool ran = launch(0, rows, rows, 0, 0, 3) && launch(0, n0, n0, 2, 2, 4) && launch(n0, n1, rows, 4, 0, 4);
+    const std::vector<uint8_t> whole = fetch(3), pieces = fetch(4);
+    ok(fmt("%s == whole bytes", label.c_str()).c_str(), ran && whole == pieces);
+    /* piece 1 over its own keys only (keys [n0, rows) as if they were the sequence) */
+    st_memcpy(mem[4], bytes[4].data(), bytes[4].size(), hipMemcpyHostToDevice);
+    bool ran2 = true;
+    {
+        RadTensor q = plane[0], k = plane[1], v = plane[2], o = plane[4];
+        q.data = (char*)q.data + n0 * q.stride[0] * 2;
+        k.data = (char*)k.data + n0 * k.stride[0] * 2;
+        v.data = (char*)v.data + n0 * v.stride[0] * 2;
+        o.data = (char*)o.data + n0 * o.stride[0] * 2;
+        q.shape[0] = k.shape[0] = v.shape[0] = o.shape[0] = n1;
+        std::vector<RadTensor> ts = { q, k, v, T((int32_t*)cud + 4, RAD_I32, { 2 }),
+                                      T((int32_t*)cud + 4, RAD_I32, { 2 }), T(skd, RAD_F32, { heads }), o };
+        std::vector<RadParam> ps = { PI("M", n1), PI("N", n1), PI("heads", heads), PI("head_dim", D),
+                                     PI("window", window), PF("scale", 1.0 / 16.0), PS("dtype", "bf16"),
+                                     PI("bq", bq) };
+        ran2 = run_once(row, ts, ps);
+    }
+    const std::vector<uint8_t> own = fetch(4);
+    bool differs = false;
+    const RadTensor& t = plane[3];
+    for (int64_t r = n0; r < rows && !differs; ++r)
+        differs = std::memcmp(own.data() + 128 + r * t.stride[0] * 2, whole.data() + 128 + r * t.stride[0] * 2,
+                              (size_t)(heads * t.stride[1] * 2)) != 0;
+    ok(fmt("%s piece 1 over its own keys != whole", label.c_str()).c_str(), ran2 && differs);
 }
 
 /* sam_attn, against a host port of deepencoder.py's attention (get_rel_pos + window_partition).
@@ -37371,6 +37550,12 @@ static void device_phase(const Plugin& pl) {
         attn_kv_sink_check(pl, { 1, 16, 64, 100 }, { 0, 0, 511, 37 }, 32, 512, false, 64);
         attn_kv_sink_check(pl, { 129 }, { 0 }, 32, 0, false, 64);
         attn_kv_sink_check(pl, { 128 }, { 64 }, 32, 128, false, 64);
+        /* P-17: the pipelined prefill's pieces against the whole step, at the sliding window and
+         * none, both bq points, an even and an uneven cut, and the served height. */
+        attn_kv_sink_piece_bytes(pl, 512, 256, 32, 512, 128);
+        attn_kv_sink_piece_bytes(pl, 512, 256, 32, 512, 64);
+        attn_kv_sink_piece_bytes(pl, 448, 192, 16, 0, 128);
+        attn_kv_sink_piece_bytes(pl, 4096, 2048, 16, 512, 128);
     }
     if (sel("attn_vit_h72_bf16")) {
         const RadKernelInfo* r = find(pl, "attn_vit_h72_bf16");
@@ -39964,6 +40149,15 @@ static void device_phase(const Plugin& pl) {
         mla_sink_bytes(pl, 32, { 6, 6, 6, 6 }, { 2049, 600, 1500, 2100 }, 0, 4, 1);
         mla_sink_bytes(pl, 32, { 16, 16, 8, 1, 1, 1, 1 }, { 2100, 600, 1500, 1, 15, 16, 17 }, 0, 4, 1);
         mla_sink_bytes(pl, 8, { 33, 31 }, { 700, 2000 }, 0, 4, 1);
+        /* P-17: the pipelined prefill's two pieces against the whole step, the prefill instance
+         * (stable 0): fresh and after a cached prefix, at the sliding window and none, an even and
+         * an uneven cut, and the served height (4096 rows cut 2048 + 2048). */
+        mla_sink_piece_bytes(pl, 16, 256, 0, 128, 0, 16, 0);
+        mla_sink_piece_bytes(pl, 16, 256, 300, 128, 512, 16, 0);
+        mla_sink_piece_bytes(pl, 32, 192, 1000, 64, 0, 4, 0);
+        mla_sink_piece_bytes(pl, 64, 160, 37, 96, 512, 4, 0);
+        mla_sink_piece_bytes(pl, 16, 4096, 0, 2048, 512, 16, 0);
+        mla_sink_piece_bytes(pl, 16, 4096, 4096, 2048, 0, 16, 0);
     }
     if (sel("mla_attn_sel_sink_bf16")) {
         /* The indexer's selection: full selections below 2048 keys, a 2048-key subset (512 blocks

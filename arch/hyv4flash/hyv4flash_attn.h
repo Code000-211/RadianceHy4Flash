@@ -119,6 +119,26 @@ struct AttnWire {
     }
 };
 
+/* P-17 (RADIANCE_HY4_PIPE_ATTN): the pipelined prefill's attention pieces, rows [0, n0) and
+ * [n0, T) of one prefill sequence. Eight i32 at `base` of `buf` (the trunk's rebased bounds plane,
+ * w.cu_p, behind its own entries), written once a step before the layers (hyv4flash.cpp, step):
+ * {0, n0} at +0 (piece 0's query bounds, and its key bounds on the dense form), {0, n1} at +2
+ * (piece 1's query bounds), and at +4 + k the seqused of KV group `groups[k]` less n1, which is what
+ * piece 0's paged form reads as its context: its rows' positions are `used - qlen + i`
+ * (r4d_mla_sink.hip sink_range), the last qlen rows' formula. */
+struct PieceCut {
+    rad_buf buf = 0;
+    int64_t base = 0;
+    int64_t n0 = 0, n1 = 0;
+    rad_kvgroup groups[2] = { 0, 0 };
+    static constexpr int64_t kSlots = 8;
+    int used_slot(rad_kvgroup g) const {
+        for (int k = 0; k < 2; ++k)
+            if (g && groups[k] == g) return 4 + k;
+        return -1;
+    }
+};
+
 struct Indexer;   /* hyv4flash_indexer.h */
 
 struct Attn {
@@ -796,6 +816,94 @@ struct Attn {
     void tail_taps(RadCtx* c, int64_t T) const {
         t_o_proj.step(c, brows(w.o, T), T);
         t_out.step(c, brows(ya, T), T);
+    }
+
+    /* P-17: whether this layer's core can run as the pipeline's two pieces (core_piece). One
+     * prefill sequence and nothing else (no decode rows, no compact tail pass: the pieces are the
+     * step's rows), a cache group that does not stream (its resolve and stage run whole), a step
+     * too tall for the G-3c fused quantiser, and the bounds plane naming this layer's group. Every
+     * attention form splits: the paged and selection forms by their query rows, the dense form
+     * because attn_kv_sink takes more keys than queries (a query at key n - m + i,
+     * r4d_attn_kv_sink_h256.hip), so piece 1 reads every key before it. */
+    bool piece_ok(const RadBatch* batch, const StepPlan& p, const QueryRows& rows,
+                  const PieceCut& cut) const {
+        const auto* kb = kv_batch(batch, kv);
+        if (!kb || kb->stream || !kb->seqused || !kb->block_table || !cut.buf) return false;
+        if (rows.ids || rows.n != p.T || p.D || p.DT || p.P != 1 || p.T != batch->n_tok) return false;
+        if (cut.n0 <= 0 || cut.n1 <= 0 || cut.n0 + cut.n1 != p.T) return false;
+        if (op_expand_quant && p.T <= kFuseRows) return false;
+        const bool selecting = !sliding && p.select;
+        if (selecting) return op_sel_pf != 0;
+        if (p.nonabs) return op_dense && op_lat_copy && op_kvb && op_split && op_qn_copy && op_qr_copy;
+        return op_paged_pf && cut.used_slot(kv) >= 0;
+    }
+
+    /* P-17: core() over one piece, `piece` 0 (rows [0, n0)) or 1 (rows [n0, T)), stopping behind
+     * o_proj as core() does with `fused_tail` (the layer's junction pieces follow). Every launch is
+     * core()'s at the piece's rows; only the attention's bounds move (PieceCut): piece 0 reads
+     * {0, n0} and its group's seqused less n1, piece 1 reads {0, n1} and the step's seqused. The dense
+     * form's keys are made whole by piece 0; piece 1 attends keys [0, T) through its key bounds, the
+     * step's (w.cu_p). Call only where piece_ok() holds. */
+    void core_piece(RadCtx* c, const RadBatch* batch, const StepPlan& p, rad_buf sel, rad_buf len,
+                    const PieceCut& cut, int piece, int64_t sel0 = 0) const {
+        const int64_t r0 = piece ? cut.n0 : 0, n = piece ? cut.n1 : cut.n0;
+        const int64_t L = s.kv_lora, R = a.qk_rope, H = a.heads, N = a.qk_nope, Q = a.qk(),
+                      vw = a.v_width();
+        const auto* kb = kv_batch(batch, kv);
+        auto act = [](rad_buf x) {
+            ActFP8 v{};
+            v.x = x;
+            return v;
+        };
+        auto rows_of = [&](rad_buf b, int64_t pitch) { return brow_slice(b, r0, n, pitch); };
+        const RadOperand qcu = brow_slice(cut.buf, cut.base + (piece ? 2 : 0), 2, 1);
+        const bool selecting = !sliding && p.select;
+        if (selecting || !p.nonabs) {
+            RAD_ISSUE_N(c, op_absorb, n, rows_of(w.q_nope, H * N), RAD_W(kv_b), rows_of(w.q_lat, H * L));
+            if (selecting) {
+                const int64_t K = s.ix_group_topk;
+                RAD_ISSUE_N(c, op_sel_pf, n, rows_of(w.q_lat, H * L), rows_of(w.q_rope, H * R),
+                            kv_cache(kv, layer), brow_slice(sel, sel0 + r0, n, K),
+                            brow_slice(len, r0, n, 1), RAD_W(sinks), rows_of(w.lat, H * L));
+            } else {
+                const RadOperand used = piece ? praw(kb->seqused, RAD_I32, 1)
+                                              : brow_slice(cut.buf, cut.base + cut.used_slot(kv), 1, 1);
+                RAD_ISSUE_N(c, op_paged_pf, n, rows_of(w.q_lat, H * L), rows_of(w.q_rope, H * R),
+                            kv_cache(kv, layer),
+                            praw2(kb->block_table, RAD_I32, 1, kb->block_table_pitch), used, qcu,
+                            RAD_W(sinks), rows_of(w.lat, H * L));
+            }
+            if (op_expand_gate)
+                RAD_ISSUE_N(c, op_expand_gate, n, rows_of(w.lat, H * L), RAD_W(kv_b),
+                            rows_of(w.gate, vw), rows_of(w.ag, vw));
+            else
+                RAD_ISSUE_N(c, op_expand, n, rows_of(w.lat, H * L), RAD_W(kv_b), rows_of(w.ao, vw));
+        } else {
+            /* Every key of the step in piece 0, as core() makes them: the cache row's planes are
+             * planned live up to the key split alone (declaration order), so a piece-1 read of
+             * w.row behind piece 0's q_full write could read bytes the planner gave q_full. */
+            if (!piece) {
+                const int64_t T = p.T;
+                RAD_ISSUE_N(c, op_lat_copy, T, bcol_at(w.row, 0, L + R, 0, L, T), brows(w.latc, T));
+                RAD_ISSUE_N(c, op_kvb, T, brows(w.latc, T), RAD_W(kv_b), brows(w.kvb, T));
+                RAD_ISSUE_N(c, op_split, T, brows(w.kvb, T), bcol_at(w.row, 0, L + R, L, R, T),
+                            brows(w.k, T), brows(w.v, T));
+            }
+            RadOperand qn = rows_of(w.q_full, H * Q), qr = qn;
+            qn.cols = N;
+            qr.offset += N;
+            qr.cols = R;
+            RAD_ISSUE_N(c, op_qn_copy, n, rows_of(w.q_nope, H * N), qn);
+            RAD_ISSUE_N(c, op_qr_copy, n, rows_of(w.q_rope, H * R), qr);
+            const int64_t keys = r0 + n;
+            RAD_ISSUE_N(c, op_dense, n, rows_of(w.q_full, H * Q), brow_slice(w.k, 0, keys, H * Q),
+                        brow_slice(w.v, 0, keys, H * a.v), qcu,
+                        piece ? brows(w.cu_p, 2) : brow_slice(cut.buf, cut.base, 2, 1), RAD_W(sinks),
+                        rows_of(w.ao, vw));
+        }
+        if (!(selecting || !p.nonabs) || !op_expand_gate)
+            RAD_ISSUE_N(c, op_gate, n, rows_of(w.ao, vw), rows_of(w.gate, vw), rows_of(w.ag, vw));
+        out.step(c, act(w.ag), w.o, p.T, r0, n);
     }
 };
 

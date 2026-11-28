@@ -32,6 +32,7 @@
 #include <set>
 #include <string>
 #include <vector>
+#include <tuple>
 
 /* ==================================================================== the recording builder */
 namespace rad_fake {
@@ -1328,6 +1329,125 @@ std::vector<std::string> lane1_unnamed(const RadBuilder& b, const std::vector<co
         }
     return bad;
 }
+
+/* The elements [lo, hi) of its buffer an operand spans: rows from its offset at the declared row
+ * pitch (a column slice keeps the pitch, so it is counted as its whole rows), or the declared
+ * extent from the offset when it names no rows. */
+inline void operand_span(const RadBufDecl& d, const RadOperand& o, int64_t& lo, int64_t& hi) {
+    int64_t pitch = 1, total = d.rank ? d.shape[0] : 1;
+    for (uint32_t k = 1; k < d.rank; ++k) pitch *= d.shape[k];
+    total *= pitch;
+    lo = o.offset;
+    hi = o.rows > 0 ? o.offset + o.rows * pitch : total;
+    if (o.rows > 0 && o.cols > 0) lo -= o.offset % pitch;   /* the slice's first row, whole */
+}
+
+/* P-17: the two lanes' issues that may run at once, touching the same elements of one buffer with
+ * at least one of them writing it. Lane 1's issue i runs after every lane-0 issue before the last
+ * join 0 -> 1 recorded ahead of it; lane 0's issue j after every lane-1 issue before the last join
+ * 1 -> 0 ahead of it; any other pair overlaps in time. A write is a buffer the op declares it
+ * writes. lane1_unnamed covers the planner's byte sharing; this covers the rows the pieces
+ * themselves hand between the lanes (an attention piece writing rows a junction piece beside it
+ * reads, #301). One finding a buffer and op pair, by name. */
+std::vector<std::string> lane_races(const RadBuilder& b, const std::vector<const RadCtx*>& passes) {
+    std::vector<std::string> bad;
+    std::set<std::string> said;
+    for (const RadCtx* c : passes) {
+        const size_t n = c->issues.size();
+        std::vector<size_t> fork(n, 0), join(n, 0);   /* the last join 0->1 / 1->0 at or before i */
+        size_t f = 0, jn = 0, k = 0;
+        for (size_t i = 0; i < n; ++i) {
+            for (; k < c->joins.size() && c->joins[k].at <= i; ++k) {
+                if (c->joins[k].from == 0 && c->joins[k].to == 1) f = c->joins[k].at;
+                if (c->joins[k].from == 1 && c->joins[k].to == 0) jn = c->joins[k].at;
+            }
+            fork[i] = f;
+            join[i] = jn;
+        }
+        auto touches = [&](const RecIssue& is, std::vector<std::tuple<rad_buf, int64_t, int64_t, bool>>& v) {
+            v.clear();
+            const RecOp* o = b.op_of(is.op);
+            for (const RadOperand& od : is.opd) {
+                if (od.kind != RAD_OPK_BUF || od.handle == 0 || od.handle > b.bufs.size()) continue;
+                int64_t lo, hi;
+                operand_span(b.bufs[od.handle - 1].d, od, lo, hi);
+                const bool w = o && std::find(o->writes.begin(), o->writes.end(), od.handle) != o->writes.end();
+                v.emplace_back(od.handle, lo, hi, w);
+            }
+        };
+        std::vector<std::tuple<rad_buf, int64_t, int64_t, bool>> a, z;
+        for (size_t i = 0; i < n; ++i) {
+            if (c->issues[i].lane != 1) continue;
+            touches(c->issues[i], a);
+            for (size_t j = fork[i]; j < n; ++j) {
+                if (c->issues[j].lane != 0 || join[j] > i) continue;
+                touches(c->issues[j], z);
+                for (const auto& x : a)
+                    for (const auto& y : z) {
+                        if (std::get<0>(x) != std::get<0>(y) || !(std::get<3>(x) || std::get<3>(y))) continue;
+                        if (std::get<1>(x) >= std::get<2>(y) || std::get<1>(y) >= std::get<2>(x)) continue;
+                        const RecOp* o1 = b.op_of(c->issues[i].op);
+                        const RecOp* o0 = b.op_of(c->issues[j].op);
+                        const std::string m = "'" + b.bufs[std::get<0>(x) - 1].name + "': lane 1 (" +
+                                              (o1 ? o1->op : std::string("?")) + ", elements " +
+                                              std::to_string(std::get<1>(x)) + ".." + std::to_string(std::get<2>(x)) +
+                                              ") beside lane 0 (" + (o0 ? o0->op : std::string("?")) +
+                                              ", elements " + std::to_string(std::get<1>(y)) + ".." +
+                                              std::to_string(std::get<2>(y)) + ")";
+                        if (said.insert(m).second) bad.push_back(m);
+                    }
+            }
+        }
+    }
+    return bad;
+}
+
+/* P-17: the step's small integer launches replayed on the host (`fill`, `sub_i32`), so a test can
+ * read what a device bound operand holds when an attention piece reads it. A raw operand reads the
+ * kit's host array it points at; a buffer operand the replayed contents (zero before any write). */
+struct IntReplay {
+    std::map<rad_buf, std::vector<int64_t>> mem;
+    int64_t at(const RadBuilder& b, const RadOperand& o, int64_t k) const {
+        if (o.kind == RAD_OPK_RAW) return o.raw ? ((const int32_t*)o.raw)[k] : 0;
+        if (o.kind != RAD_OPK_BUF) return 0;
+        auto it = mem.find(o.handle);
+        const int64_t e = o.offset + k;
+        (void)b;
+        return it != mem.end() && e >= 0 && e < (int64_t)it->second.size() ? it->second[(size_t)e] : 0;
+    }
+    std::vector<int64_t>& buf(const RadBuilder& b, rad_buf h) {
+        auto& v = mem[h];
+        if (v.empty()) {
+            int64_t total, lo;
+            operand_span(b.bufs[h - 1].d, RAD_B(h), lo, total);
+            v.assign((size_t)total, 0);
+        }
+        return v;
+    }
+    /* Replays issues [0, upto) of `c`. */
+    void run(const RadBuilder& b, const RadCtx& c, size_t upto) {
+        for (size_t i = 0; i < upto && i < c.issues.size(); ++i) {
+            const RecIssue& is = c.issues[i];
+            const RecOp* o = b.op_of(is.op);
+            if (!o) continue;
+            if (o->op == "fill" && !is.opd.empty() && is.opd[0].kind == RAD_OPK_BUF) {
+                int64_t lo, hi;
+                operand_span(b.bufs[is.opd[0].handle - 1].d, is.opd[0], lo, hi);
+                auto& v = buf(b, is.opd[0].handle);
+                for (int64_t e = lo; e < hi && e < (int64_t)v.size(); ++e) v[(size_t)e] = 0;
+            } else if (o->op == "sub_i32" && is.opd.size() >= 3 && is.opd[2].kind == RAD_OPK_BUF) {
+                const RadOperand &x = is.opd[0], &s = is.opd[1], &y = is.opd[2];
+                int64_t lo, hi;
+                operand_span(b.bufs[y.handle - 1].d, y, lo, hi);
+                const int64_t s0 = at(b, s, 0);
+                std::vector<int64_t> vals;
+                for (int64_t k = 0; k < hi - lo; ++k) vals.push_back(at(b, x, k) - s0);
+                auto& v = buf(b, y.handle);
+                for (int64_t k = 0; k < hi - lo && lo + k < (int64_t)v.size(); ++k) v[(size_t)(lo + k)] = vals[(size_t)k];
+            }
+        }
+    }
+};
 
 /* The lint as a check: every finding is printed, and the step passes only with none. */
 size_t report_lint(const std::vector<std::string>& f) {

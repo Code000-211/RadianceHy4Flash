@@ -3523,7 +3523,10 @@ ihc_pre (hc_head), rmsnorm (output_norm), gather_rows, logits_gemm
   runs as two row pieces: piece 0's junction (the `add`, the `overlap 1` exact all-reduce, the
   sandwich norm) exposed, then piece 1's junction on lane 1 beside piece 0's arms
   (`Ffn::body(c, T, r0, n)`), then piece 0's junction beside piece 1's arms, then piece 1's. Every
-  collective rides lane 1, the exposed pieces too: the ranks must agree on one lane. A step of
+  collective rides lane 1, the exposed pieces too: the ranks must agree on one lane. With
+  `RADIANCE_HY4_PIPE_ATTN=1` the attention core runs as the same two pieces (`Attn::core_piece`,
+  bounds on the device, docs/TP4.md P-17), and piece 0's attention junction moves beside piece 1's
+  attention. A step of
   *one* checkpoint interval is the shape it needs (`checkpoint-interval: 4096`,
   `max-num-batched-tokens: 8192`), because the span already overlaps intervals inside a wider step.
   Measured on 4x R9700 at 4096-row pieces: pieces on lane 0 -3.2%, on lane 1 +3.9% over the same
