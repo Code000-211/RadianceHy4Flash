@@ -70,6 +70,7 @@
 
 #include "aql.h"
 #include "directio.h"
+#include "karg_report.h"
 #include "kfd_evict.h"
 #include "rad_format.h"
 #include "../rad_internal.h"
@@ -530,6 +531,15 @@ bool module_load(Module* m, int ord, const ModuleImage& im, std::string* why) {
 std::mutex g_names_mu;
 std::unordered_map<uint64_t, std::string> g_names;
 
+/* The argument layout of each kernel object, for the queue dump's per-launch lines
+ * (karg_report.h): the launch's own segment length and its parameters in the code object's order,
+ * so the dump names each operand and each size instead of guessing at pointer-shaped words. */
+struct KargLayout {
+    uint32_t kernarg_size = 0;
+    std::vector<KernelArg> args;
+};
+std::unordered_map<uint64_t, KargLayout> g_klayout;
+
 KernelRec* resolve(Func* fn, int ord) {
     if (KernelRec* k = fn->rec[ord].load(std::memory_order_acquire)) return k;
     Module* m = fn->mod;
@@ -593,6 +603,7 @@ KernelRec* resolve(Func* fn, int ord) {
     {
         std::lock_guard<std::mutex> nl(g_names_mu);
         g_names[k->object] = k->name;
+        g_klayout[k->object] = KargLayout{k->kernarg_size, meta->args};
     }
     KernelRec* out = k.release();
     fn->rec[ord].store(out, std::memory_order_release);
@@ -997,9 +1008,11 @@ hsa_status_t on_system_event(const hsa_amd_event_t* e, void*) {
 }
 
 /* The running kernel and its arguments. A queue's read index stays on a packet until it
- * completes, so the packet there is in flight. Every pointer-shaped argument word is located
- * like the address, which names the operand that got a stale or short buffer. Only card
- * `card`'s queues; the host reads the arguments at the packet's kernarg_address. */
+ * completes, so the packet there is in flight. Every parameter of that launch is printed by the
+ * name and the size its code object gives it, an address located like the fault address itself,
+ * which names the operand that got a stale or short buffer, and the chained-launch record it
+ * waited on. Only card `card`'s queues; the host reads the arguments at the packet's
+ * kernarg_address. */
 void report_running(int card) {
     std::lock_guard<std::mutex> sl(G().streams_mu);
     for (Stream* s : G().streams) {
@@ -1011,16 +1024,32 @@ void report_running(int card) {
         const uint16_t h = __atomic_load_n(&p->header, __ATOMIC_ACQUIRE);
         if (((h >> HSA_PACKET_HEADER_TYPE) & 0xff) != HSA_PACKET_TYPE_KERNEL_DISPATCH) continue;
         std::string name;
+        KargLayout lay;
         {
             std::lock_guard<std::mutex> nl(g_names_mu);
             auto it = g_names.find(p->kernel_object);
             name = it != g_names.end() ? it->second : fmt("%#" PRIx64, p->kernel_object);
+            auto li = g_klayout.find(p->kernel_object);
+            if (li != g_klayout.end()) lay = li->second;
         }
         RAD_ERR("device %d: queue %p packet %" PRIu64 " (of %" PRIu64 " written) ran kernel %s", card,
                 (void*)s->q, rd, wr, name.c_str());
-        const uint64_t* ka = static_cast<const uint64_t*>(p->kernarg_address);
-        if (!ka) continue;
+        const unsigned char* slot = static_cast<const unsigned char*>(p->kernarg_address);
+        if (!slot) continue;
         std::lock_guard<std::mutex> lk(g_alloc_mu);
+        /* Every line names one parameter of this launch, in the code object's order: an address
+         * with the location it lies in, a value as the number it is. The slot's bytes past the
+         * launch's segment belong to whatever used the slot before, and are not printed. */
+        const std::vector<std::string> lines =
+            karg_lines(KargSlot{slot, kKargSlot, lay.kernarg_size, &lay.args},
+                       [](uintptr_t a) { return where_is(a); });
+        if (!lines.empty()) {
+            for (const std::string& l : lines) RAD_ERR("  %s", l.c_str());
+            continue;
+        }
+        /* No metadata for this kernel object (a library's own code object, say): print the
+         * pointer-shaped words of the slot, as the dump always did. */
+        const uint64_t* ka = static_cast<const uint64_t*>(p->kernarg_address);
         for (uint32_t i = 0; i < kKargMax / 8; ++i) {
             const uint64_t w = ka[i];
             if (!looks_like_pointer(w)) continue;
