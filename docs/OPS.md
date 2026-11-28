@@ -1271,13 +1271,18 @@ set it binds the same bytes as before). At `rope_dim` the int8 store writes one 
 
 at `L = 2 * head_dim - R`, `L` a multiple of 128, so the rope columns of a head are kept
 unquantised and the L latent columns are one block-scaled int8 group a 128: a block is rotated by
-the unnormalised Walsh-Hadamard transform with the rotation's `1 / sqrt(128)` folded into the
-block's scale. `s = amax * (1/127) * 1/sqrt(128)` (`1` for an all-zero block), a code is
-`rint(x * (1/s))` clamped to +-127, and a latent column's value is `s * code`. `libr4d/r4d_row_i8.h`
+the unnormalised Walsh-Hadamard transform, and it has two scales. The quantiser's is
+`q = amax / 127` and divides the rotated block: a code is `rint(x / q)` clamped to +-127, and a
+block whose absmax is zero or not finite stores codes `0`. The *stored* scale carries the rotation's `1 / sqrt(128)`
+as well, `s = q * 1/sqrt(128) = amax * (1/127) * 1/sqrt(128)` (`1` for a block whose absmax is
+zero), so a latent column's decoded value is `s * code`. Folding `1/sqrt(128)` into the divisor
+instead would scale every code by `sqrt(128)` and clip most of them. `libr4d/r4d_row_i8.h`
 is the form in one place, and `mla_row_norm_rope_store`, `kv_store` and `kv_store_streamed` all
 write it, one row a workgroup, from the same bf16 columns: the fused store quantises the row it has
 just normed and roped, so the three write the same bytes. `row_bytes` must be a multiple of 16 (a
-wave's 16-byte loads read a row), and libref and libavx write the same bytes.
+wave's 16-byte loads read a row), and libref and libavx write the same row (libref builds the
+rotation as an explicit matrix normalised before the quantiser, so its one scale is the stored
+one; the two agree to a code step, the row's own bound).
 
 **A streamed group's cache operand is its ring.** Its pool holds `slots` blocks while the block
 table names up to `blocks` ids, so the sparse path resolves the selected ids to ring slots first

@@ -119,10 +119,12 @@ static inline bool kv_i8_shape(const RadTensor* kv, int64_t head_dim) {
 /* The int8 latent row (design note X-07), as libref's row_i8_put and libr4d's r4d_row_i8.h write
  * it: [L int8 codes][L/128 f32 scales][R rope columns as bf16] = L + 4 * (L / 128) + 2 * R bytes.
  * `x` holds the row's L + R columns (the store's K columns, then its V). A block of 128 latent
- * columns is rotated by the unnormalised Walsh-Hadamard transform with 1 / sqrt(128) folded into
- * its scale, so a block's codes are the rotated values over `amax * (1/127) * 1/sqrt(128)`, rounded
- * to nearest even and clamped to +-127; an all-zero block's scale is 1. The rope columns are
- * copied as the bf16 they arrive as. */
+ * columns is rotated by the unnormalised Walsh-Hadamard transform; its quantiser scale is
+ * `amax / 127` and the codes are the rotated block over it, rounded to nearest even and clamped to
+ * +-127. The scale the row stores also carries the rotation's 1 / sqrt(128), so a reader's
+ * `scale * code` is the rotated column (design note X-07 § 2: two scales, one to quantise and one
+ * to store). A block whose absmax is zero or not finite stores codes 0 and scale 1. The rope
+ * columns are copied as the bf16 they arrive as. */
 constexpr float kRowRotScale = 0.08838834764831845f;   /* 1 / sqrt(128) */
 static inline int64_t row_i8_bytes(int64_t L, int64_t R) {
     return L + 4 * (L / 128) + 2 * R;
@@ -136,12 +138,13 @@ static inline void row_i8_put(void* cache, int64_t row, int64_t L, int64_t R, co
         fwht(buf, 128);
         float am = 0.0f;
         for (int64_t i = 0; i < 128; ++i) am = std::fmax(am, std::fabs(buf[i]));
-        const float sc = am > 0.0f ? am * (1.0f / 127.0f) * kRowRotScale : 1.0f;
-        const float inv = 1.0f / sc;
-        scales[b] = sc;
+        const bool live = am > 0.0f && am < 3.402823466e38f;   /* FLT_MAX: false for an inf too */
+        const float qs = live ? am * (1.0f / 127.0f) : 1.0f;     /* the quantiser's */
+        scales[b] = live ? qs * kRowRotScale : 1.0f;             /* the stored one */
         int8_t* const c = (int8_t*)(d + b * 128);
+        const float inv = 1.0f / qs;
         for (int64_t i = 0; i < 128; ++i) {
-            const float q = buf[i] * inv;
+            const float q = live ? buf[i] * inv : 0.0f;
             c[i] = (int8_t)(int)std::nearbyint(std::fmin(std::fmax(q, -127.0f), 127.0f));
         }
     }

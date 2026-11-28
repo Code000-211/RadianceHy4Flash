@@ -16,13 +16,17 @@
  * 16 for every L the latent group uses (512 + 16 + 128 = 656), so the readers' uint4 loads land
  * whole. Hy4-flash's latent cache is one KV head: the row is the group.
  *
- * The scale is the activation path's (r4d_q8.h:18's q8_top, 1 / sqrt(128) folded in), so a block
- * of an all-zero row stores codes 0 and scale 1 as an activation block does. The rotation is
- * orthogonal and 1 / sqrt(128) normalises it, so a decoded column is its stored value to the
- * quantiser's step -- the row's own bound (design note X-07 §2).
+ * A block has two scales (design note X-07 §2). The quantiser's is its absmax / 127, the
+ * activation path's (r4d_q8.h:18's q8_top), and the codes are the rotated block over it; it is
+ * not the stored one. The stored scale also carries the rotation's 1 / sqrt(128), so a decoded
+ * column is `scale * code ~= WHT(x_b) / sqrt(128)`, the rotated value itself. Folding the
+ * normaliser into the divisor as well would scale every code by sqrt(128) and clip most of them.
+ * A block whose absmax is zero or not finite stores codes 0 and scale 1, as an activation block
+ * does, so an inf out of the rotation cannot make a NaN block on decode.
  *
- * libref does not borrow this header (its form builds the rotation as an explicit matrix); the
- * kernels of the three store rows and the readers of X-07b share it. */
+ * libref does not borrow this header (its form builds the rotation as an explicit matrix, and its
+ * block is normalised before it is quantised); the kernels of the three store rows and the
+ * readers of X-07b share it. */
 #ifndef R4D_ROW_I8_H
 #define R4D_ROW_I8_H
 
@@ -50,10 +54,23 @@ __host__ __device__ __forceinline__ constexpr int codes_offset() { return 0; }
 __host__ __device__ __forceinline__ constexpr int scales_offset(int L) { return L; }
 __host__ __device__ __forceinline__ constexpr int rope_offset(int L) { return L + 4 * (L / (int)kBlock); }
 
-/* A block's scale: its absmax / (127 * sqrt(kBlock)), and 1 for an all-zero block as the
- * activation path stores it (q8_row_i8g). */
+/* Whether a block has any code worth writing: a finite, positive absmax. An all-zero block and a
+ * block whose absmax is inf or NaN are stored as scale 1 / codes 0 (design note X-07 §2), and the
+ * absmax is a wave maximum, so the answer is the same in every lane of the wave. */
+__device__ __forceinline__ bool block_live(float amax) {
+    return amax > 0.0f && amax < 3.402823466e38f;   /* FLT_MAX: false for an inf too */
+}
+
+/* A block's quantiser scale: its absmax / 127, the activation path's (q8_row_i8g). The codes are
+ * the rotated block over this one. */
+__device__ __forceinline__ float block_qscale(float amax) {
+    return amax * (1.0f / q8_top<true>());
+}
+
+/* A block's stored scale: the quantiser scale with the rotation's 1 / sqrt(kBlock) folded in, so
+ * the reader's `scale * code` is the rotated column and no separate normalisation is needed. */
 __device__ __forceinline__ float block_scale(float amax) {
-    return amax > 0.0f ? amax * (1.0f / q8_top<true>()) * kRotScale : 1.0f;
+    return block_qscale(amax) * kRotScale;
 }
 
 /* Quantise one block of the row: a wave's 128 columns, the four contiguous ones in `v` rotated in
@@ -70,10 +87,10 @@ __device__ __forceinline__ void quant_block(float* v, uint8_t* __restrict__ code
     m = fmaxf(m, fabsf(v[2]));
     m = fmaxf(m, fabsf(v[3]));
     m = r4d_wave_max(m);
-    const float sc = block_scale(m);
-    if (lane == 0) scales[block] = sc;
+    const bool live = block_live(m);
+    if (lane == 0) scales[block] = live ? block_scale(m) : 1.0f;
     *(uint32_t*)(codes + block * kBlock + lane * 4u) =
-        q8_pack4<true>(v[0], v[1], v[2], v[3], 1.0f / sc);
+        live ? q8_pack4<true>(v[0], v[1], v[2], v[3], 1.0f / block_qscale(m)) : 0u;
 }
 
 /* Quantise a whole row of `L` latent columns held as bf16 in `row` (L a multiple of kBlock).
