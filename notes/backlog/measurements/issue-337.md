@@ -94,16 +94,20 @@ concluded from this machine either way.
 
 ### The head arm, through the fixed harness
 
-The same command on the head tree (`19b993f2`; this note's commit sits on top of it and changes
-nothing but this file) runs the harness end to end for
-the first time on this machine: the wait finds the server up, the script echoes the configuration it
-started, and it sums its own run up. Two sessions, one after the other:
+The same command on the head tree (`19b993f2`, the tree both arms below ran) runs the harness end to
+end for the first time on this machine: the wait finds the server up, the script echoes the
+configuration it started, and it sums its own run up. Two sessions, one after the other:
 
 | arm | tree | requests | largest prompt | cache ≥ 90k | decode tok/s (median, min–max) | TTFT s (median, min–max) | fault lines |
 |---|---|---|---|---|---|---|---|
 | base-a | `82b82ce8` | 32 | 128,036 | 31 | 112.5 (84.4–175.8) | 1.06 (0.15–2.71) | 0 |
 | head-a | `19b993f2` | 36 | 128,800 | 35 | 106.5 (85.5–141.2) | 1.09 (0.18–2.69) | 0 |
 | head-b | `19b993f2` | 30 | 130,211 | 29 | 111.1 (81.7–149.6) | 1.05 (0.17–2.53) | 0 |
+
+Two commits sit above the measured tree: this note's, and `de408132`, which replaces three copies
+of one `g_live` lookup in the fault report with a helper and changes no inference path
+(`karg_report_test` and `device_test`'s cases re-run green). Neither is measured; the rows above
+are `19b993f2`'s.
 
 The three arms are within each other's spread, so there is no regression beyond noise on the decode
 and TTFT rows (the number to beat was 120–138 tok/s and 0.4–1.8 s on the reporter's box, whose
