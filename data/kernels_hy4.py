@@ -120,12 +120,15 @@ def setp(c, k, v):
         if p[0] == k:
             if p[1] == 1: p[2] = v
             else: p[3] = float(v)
-def fresh(c, salt):
+def fresh(c, salt, keep_encodings=False):
     c = copy.deepcopy(c)
     c['seed'] = (c['seed'] * 0x9E3779B97F4A7C15 + salt) & 0xffffffffffffffff
     for o in c['opd']:
         o['have_ref'] = 0; o.pop('ref', None)
-        if o['has_enc']: o['has_enc'] = 0; o.pop('enc', None); o.pop('sel', None)   # drawn plain
+        # Drawn plain, unless the caller keeps the container's encodings: a clone that resizes the
+        # operand an encoding was recorded for must drop it, one that leaves it alone must not.
+        if o['has_enc'] and not keep_encodings:
+            o['has_enc'] = 0; o.pop('enc', None); o.pop('sel', None)
     return c
 
 def heads_clone(c, H2, salt):
@@ -153,7 +156,10 @@ def wide_clone(c, n2, salt):
     return d
 
 def m_clone(c, M2, salt):
-    M = c['m']; d = fresh(c, salt)
+    # The M rows are the only thing this touches, so the weights -- and the affine `fwht128` codes
+    # the container recorded with them -- are still the container's: a quantised row handed a plain
+    # weight answers something else than the reference (tests/kbench_recipe_test.py).
+    M = c['m']; d = fresh(c, salt, keep_encodings=True)
     for o in d['opd']:
         if o['shape'] and o['shape'][0] == M and not (o['flags'] & 4) and o['role'] != 3: o['shape'][0] = M2
         if o['idx_max'] == M and (o['flags'] & 4): o['idx_max'] = M2
@@ -367,5 +373,94 @@ def g3(out, src='data/kernels_hy4.rkb'):
               recorded='2026-11-22', cases=cases)
     save(fx, out); print(len(cases), 'cases ->', out)
 
+# T-04: the Hy4 TP2 shapes the fixture does not hold after T-05's re-record from the container (the
+# container declares the TP1 geometry -- 32 sparse / 64 sliding heads -- and M steps that jump 16 -> 32),
+# and the chunk heights `gemm_nt_q` is launched at (its sweep stops at 512). Written by hand, recorded by
+# libref, appended. The source is the fixture as it was before T-04, never the fixture itself: the clones
+# it writes are trunk cases too, so reading back what was appended would clone the clones.
+#   git show ac66d3a0:data/kernels_hy4.rkb > base_hy4.rkb
+#   python3 data/kernels_hy4.py t04 raw_t04.rkb base_hy4.rkb
+#   rad-kbench --fixture raw_t04.rkb --kernels libref --rerecord t04.rkb
+#   python3 data/kernels_hy4.py append base_hy4.rkb t04.rkb data/kernels_hy4.rkb
+# The trunk's own rows (docs/ARCHITECTURES.md, `hyv4flash`: one layer's chain), which D-10 wants at the
+# verify heights: the embed / engram lines, the junction, the attention linears and their norms, the
+# indexer, the MLA absorb / sink / sel / expand, the MoE router and the lm_head. The M clone keeps the
+# encodings the container recorded with a case's operands -- it resizes the M rows and nothing else, so
+# the weights are still the container's, and a quantised row handed plain weights answers something
+# else than the reference (tests/kbench_recipe_test.py).
+TRUNK = ('embed_lookup', 'cast', 'engram_norm', 'engram_gate', 'grid_embed_sf', 'iota', 'sub_i32',
+         'ihc_pre', 'ihc_post', 'rmsnorm', 'rmsnorm_ihc_junction', 'gemm_nt_q', 'gemm_nt', 'gemm_nt_f32',
+         'gemm_nt_bias', 'rope', 'rope_rows', 'kv_store', 'gate_mul', 'mla_kv_split', 'attn_kv_sink',
+         'mla_project_kv', 'mla_attn_paged_sink', 'mla_attn_sel_sink', 'mla_expand_gate',
+         'mla_expand_gate_had_quant_i8g', 'had_quant_act_i8g', 'swiglu_clamped_had_quant_i8g',
+         'router_sigmoid_topk', 'gather_rows', 'qsa_work', 'idx_pool_gated', 'qsa_tail_store', 'idx_score',
+         'qsa_select', 'logits_gemm')
+
+def t04a_sliding(src):
+    """mla_attn_paged_sink: the 30 sliding layers at TP2 (32 heads a rank, window 512), M = 1, `stable` 0
+    and 1 -- the shape K-14's 19 us `merge_sink` bracket is about, which no recorded case reaches (the
+    container's sliding geometry is 64 heads). Its chained form is replayed with `--chain-forms`."""
+    out, salt = [], 0xa04a0000
+    for c in load(src)['cases']:
+        if c['op'] != 'mla_attn_paged_sink' or par(c, 'window') != 512: continue
+        if par(c, 'heads') != 64 or c['m'] != 1: continue
+        out.append(heads_clone(c, 32, salt)); salt += 1
+    return out
+
+def t04b_sel(src):
+    """mla_attn_sel_sink: the 12 sparse layers at TP2 (16 heads a rank), M = 1 and 8, over the recorded
+    512-page cache. The table is a real `qsa_select` one when timed: `timing_input` draws a page table's
+    rows in block order (distinct, ascending), not one shuffled run over the whole operand."""
+    out, salt = [], 0xb04b0000
+    for c in load(src)['cases']:
+        if c['op'] != 'mla_attn_sel_sink' or par(c, 'heads') != 32 or c['m'] not in (1, 8): continue
+        out.append(heads_clone(c, 16, salt)); salt += 1
+    return out
+
+def t04_clone(c, M2, salt):
+    """`m_clone`, plus the row axes that do not sit in shape[0]: a cu histogram is M + 1 long, the Engram
+    grid's and the rope's position table are [components, M], and the indexer's pooling reads one row per
+    M * ratio. `m_clone` moves shape[0] and leaves the rest, which is the right clone only for a row whose
+    every operand has M first."""
+    d = m_clone(c, M2, salt)
+    for o in d['opd']:
+        if o['flags'] & 4 and o['shape'] and o['shape'][0] == c['m'] + 1: o['shape'][0] = M2 + 1
+    if c['op'] == 'grid_embed_sf': d['opd'][2]['shape'][1] = M2
+    elif c['op'] in ('rope', 'rope_rows'):
+        o = d['opd'][1]; o['shape'][1] = M2; o['idx_max'] = M2
+    elif c['op'] == 'idx_pool_gated': d['opd'][0]['shape'][0] = M2 * par(c, 'ratio')
+    return d
+
+def t04c_verify(src):
+    """every trunk row at the c8 verify heights M = 24 / 40 / 48 (D-10), cloned from that row's M = 8 case
+    so it keeps the band it has a decode-class case in (a row whose cases start at 65 is prefill-class and
+    is left)."""
+    fx, out, salt = load(src), [], 0xc04c0000
+    for c in fx['cases']:
+        if c['op'] not in TRUNK or c['m'] != 8: continue
+        for M2 in (24, 40, 48):
+            out.append(t04_clone(c, M2, salt)); salt += 1
+    return out
+
+def t04d_gemm_q(src):
+    """gemm_nt_q at the pipelined chunk heights M = 1024 / 2048 / 3072 (`kPipeMinRows` and the 4096-row
+    chunk's halves) at the trunk's two dense planes (K = 1536, the absorb's rank, and 8192, d_model): the
+    recorded sweep stops at 512, so a chunk's GEMM is timed at a band no case reaches. The expert planes
+    (K = 13824, 16384) keep their recorded sweep at the heights: a full-height expert GEMM is 150 GFLOP
+    of reference per case, and the card-less gate replays every case."""
+    fx, out, salt = load(src), [], 0xd04d0000
+    for c in fx['cases']:
+        if c['op'] != 'gemm_nt_q' or c['m'] != 512 or par(c, 'K') not in (1536, 8192): continue
+        for M2 in (1024, 2048, 3072):
+            out.append(m_clone(c, M2, salt)); salt += 1
+    return out
+
+def t04(out, src):
+    cases = (t04a_sliding(src) + t04b_sel(src) + t04c_verify(src) + t04d_gemm_q(src))
+    fx = dict(version=6, samples=1024, source='hy4-flash TP2 shapes and c8 verify heights (T-04, D-10)',
+              oracle='libref', recorded='2026-11-28', cases=cases)
+    save(fx, out); print(len(cases), 'cases ->', out)
+
 if __name__ == '__main__':
-    {'raw': raw, 'merge': merge, 'vis': vis, 'wp163': wp163, 'junction': junction, 'append': append, 'dfly': dfly, 'g3': g3}[sys.argv[1]](*sys.argv[2:])
+    {'raw': raw, 'merge': merge, 'vis': vis, 'wp163': wp163, 'junction': junction, 'append': append, 'dfly': dfly,
+     'g3': g3, 't04': t04}[sys.argv[1]](*sys.argv[2:])
