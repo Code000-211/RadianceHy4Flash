@@ -703,6 +703,13 @@ struct Stream {
     void unlock() { busy.store(false, std::memory_order_release); }
 };
 
+/* What the packet at ring index `i` needs before its ring position may be rewritten: the completion
+ * counter value the chained dispatch in that slot waits for, 0 for a packet that is not chained
+ * (there is no slot_need table when the backend has no chain). */
+inline uint64_t slot_need_at(const Stream* s, uint64_t i) {
+    return s->slot_need.empty() ? 0 : s->slot_need[i & s->mask];
+}
+
 /* Every live queue, by an id that is never reused, so "packet i of queue n" stays meaningful after
  * the queue is destroyed: queue_of answers null for a destroyed queue's id, and everything it held
  * has been consumed. At most kMaxQueues are live at once; a destroyed queue's slot is taken again
@@ -819,7 +826,7 @@ void (*g_dump_lanes)() = nullptr;
  * the report is: the thread that holds it may be the one that is stuck. */
 std::string chain_line(Stream* s, uint64_t rd) {
     const uint64_t ctr = s->chain_ctr ? *reinterpret_cast<volatile uint64_t*>(s->chain_ctr) : 0;
-    const uint64_t need = s->slot_need.empty() ? 0 : s->slot_need[rd & s->mask];
+    const uint64_t need = slot_need_at(s, rd);
     return fmt("chain: issued %" PRIu64 ", counter reads %" PRIu64 " (largest read %" PRIu64
                "), the slot at the read index needs %" PRIu64 ", flush %s for %" PRIu64
                "; gates %d, last packet %s, plain in flight %d, collective in flight %d",
@@ -1055,7 +1062,8 @@ void report_one(Stream* s, uint64_t idx, const char* note) {
 }
 
 /* How many dispatches a stopped queue's report prints in full. One chained plan keeps a handful in
- * the card at a time, and the fault is in the oldest of them. */
+ * the card at a time, and a fault is in one of the last few launches to go out -- not in the oldest
+ * packet the ring still holds, which is a lap old. */
 constexpr size_t kReportRuns = 6;
 
 /* The launches a stopped queue may have faulted in, and their parameters (issue #337).
@@ -1068,12 +1076,13 @@ constexpr size_t kReportRuns = 6;
  * launch of the same kernel looks like, and the faulting address was in none of them, so the
  * report sent readers after a launch that had not faulted.
  *
- * So the report names the dispatches that may still be running, oldest first (aql_inflight.h), and
- * the queue stopped at the first of them: that is the launch to read. The chain record each one
- * waited on is printed with it, because a stale slot shows up there first. A queue with nothing
- * recorded as unfinished -- every packet kept its barrier bit -- prints the packet at the read
- * index, as the dump always did. Only card `card`'s queues; the host reads the arguments at the
- * packet's kernarg_address. */
+ * So the report names the dispatches that may still be running (aql_inflight.h) -- the newest
+ * few, since the ring is long and the launch that faulted is one of the last to go out -- oldest
+ * first among those, because the queue stops at the first launch that faults: that is the launch
+ * to read first. The chain record each one waited on is printed with it, because a stale slot
+ * shows up there first. A queue with nothing recorded as unfinished -- every packet kept its
+ * barrier bit -- prints the packet at the read index, as the dump always did. Only card `card`'s
+ * queues; the host reads the arguments at the packet's kernarg_address. */
 void report_running(int card) {
     std::lock_guard<std::mutex> sl(G().streams_mu);
     for (Stream* s : G().streams) {
@@ -1082,12 +1091,15 @@ void report_running(int card) {
         const uint64_t wr = hsa_queue_load_write_index_scacquire(s->q);
         if (rd >= wr) continue;
         const bool open = s->frontier_open || s->plain_inflight || s->peer_inflight;
+        /* The counter as the card has it now, not the host's last read: that read lags, so a
+         * chained dispatch it names unfinished may have counted long ago (chain_line above reads
+         * it the same way). A wrong candidate in front of the right one sends the reader after a
+         * launch that is done, which is the defect this report exists to not have. */
+        const uint64_t counter = s->chain_ctr ? *reinterpret_cast<volatile uint64_t*>(s->chain_ctr)
+                                             : s->chain_seen;
         const std::vector<uint64_t> run =
-            aql::still_running(rd, wr, s->mask + 1, s->chain_seen, open,
-                               [s](uint64_t i) {
-                                   return s->slot_need.empty() ? 0 : s->slot_need[i & s->mask];
-                               },
-                               kReportRuns);
+            aql::still_running(rd, wr, s->mask + 1, counter, open,
+                               [s](uint64_t i) { return slot_need_at(s, i); }, kReportRuns);
         if (run.empty()) {
             RAD_ERR("device %d: queue %p packet %" PRIu64 " (of %" PRIu64 " written): no"
                     " dispatch is recorded as unfinished, so the packet at the read index is"
@@ -1096,15 +1108,17 @@ void report_running(int card) {
             continue;
         }
         RAD_ERR("device %d: queue %p packet %" PRIu64 " (of %" PRIu64 " written): %zu"
-                " dispatch(es) may still be running, oldest first, and the queue stopped at the"
-                " first", card, (void*)s->q, rd, wr, run.size());
+                " dispatch(es) may still be running, oldest first of the newest %zu written; the"
+                " queue stops at the first launch that faults, so read them from the top", card,
+                (void*)s->q, rd, wr, run.size(), (size_t)kReportRuns);
         for (uint64_t idx : run) {
-            const uint64_t need = s->slot_need.empty() ? 0 : s->slot_need[idx & s->mask];
+            const uint64_t need = slot_need_at(s, idx);
             report_one(s, idx, "may have run");
             if (need)
                 RAD_ERR("device %d:   packet %" PRIu64 " is chained: it waits for the queue's"
-                        " counter to reach %" PRIu64 ", which the host has seen at %" PRIu64,
-                        card, idx, need, s->chain_seen);
+                        " counter to reach %" PRIu64 ", which the card is at %" PRIu64 " (the host"
+                        " has read %" PRIu64 ")",
+                        card, idx, need, counter, s->chain_seen);
             else
                 RAD_ERR("device %d:   packet %" PRIu64 " went out without its barrier bit", card,
                         idx);
@@ -1249,7 +1263,7 @@ inline void full_nap() {
  * a row, so a kernel can still be running (and re-read its arguments after its wait, and its
  * record at its end) when the read index is far past it. Its blocks all having counted does. */
 inline bool slot_free(Stream* s, uint64_t idx) {
-    const uint64_t need = s->slot_need[idx & s->mask];
+    const uint64_t need = slot_need_at(s, idx);
     if (need <= s->chain_seen) return true;
     const uint64_t c = *reinterpret_cast<volatile uint64_t*>(s->chain_ctr);
     s->chain_seen = std::max(s->chain_seen, c > s->test_lag ? c - s->test_lag : 0);

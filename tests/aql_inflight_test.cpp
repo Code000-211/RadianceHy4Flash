@@ -69,11 +69,29 @@ TEST(a_plain_dispatch_behind_the_read_index_is_done) {
 }
 
 /* An unbarriered packet went out (frontier_open, or a plain or collective packet launched since the
- * last barrier): every packet the ring still holds and the processor has read is a candidate. */
+ * last barrier): every packet the ring still holds and the processor has read is a candidate --
+ * when the cap is large enough to hold them. */
 TEST(an_open_frontier_makes_every_read_packet_a_candidate) {
     Ring r;                      /* size 64: the ring holds [wr - 64, wr) */
     const uint64_t rd = 70, wr = 72;
     CHECK_EQ(list(r.run(rd, wr, 0, true, 100)), range(8, 70));
+}
+
+/* A chained dispatch whose blocks have all counted is done, and the card's counter says so whatever
+ * the packet processor did: it is dropped as a candidate even with the frontier open. Dropping it
+ * matters, because the report has room for six and a stale one in front of the right one is what
+ * sent #337's readers after a launch that had not faulted. */
+TEST(a_counted_chained_dispatch_is_done_with_the_frontier_open) {
+    Ring r;
+    for (uint64_t i = 0; i < 20; ++i) r.need[i] = 500;   /* a chained run, counter at 500 */
+    CHECK(r.run(20, 20, 500, true).empty());
+    /* One of them has not counted: exactly that one comes back, not its counted elders. */
+    r.need[18] = 600;
+    CHECK_EQ(list(r.run(20, 20, 500, true)), "18");
+    /* A plain packet beside it is a candidate while the frontier is open, and only then. */
+    r.need[19] = 0;
+    CHECK_EQ(list(r.run(20, 20, 500, true)), "18,19");
+    CHECK_EQ(list(r.run(20, 20, 500, false)), "18");
 }
 
 /* Only what the ring still holds: a slot older than wr - size has been rewritten, so the packet
@@ -88,11 +106,29 @@ TEST(the_window_is_the_last_size_packets) {
     CHECK(still_running(4, 4, 0, 0, true, [](uint64_t) { return (uint64_t)0; }, 8).empty());
 }
 
-/* The oldest first, at most `cap` of them: the queue stops at the first launch that faults. */
-TEST(oldest_first_and_capped) {
+/* The cap keeps the newest packets written, nearest the read index, and they come back oldest
+ * first: the queue stops at the first launch that faults. With an open frontier the ring holds a
+ * lap of packets that are long done; printing the six oldest of them, thousands of packets behind
+ * the read index, names launches that cannot have faulted. */
+TEST(the_cap_keeps_the_newest_near_the_read_index) {
+    Ring r;                      /* every slot plain: an open frontier makes them all candidates */
+    const uint64_t rd = 4000, wr = 4000;
+    CHECK_EQ(list(r.run(rd, wr, 0, true, 3)), "3997,3998,3999");
+    CHECK(r.run(rd, wr, 0, true, 0).empty());
+    /* Mixed: the newest three written are 47 (chained, not counted), 48 and 49 (plain). */
+    r.need[47] = 900;
+    CHECK_EQ(list(r.run(50, 50, 800, true, 3)), "47,48,49");
+    /* A counted chained packet at the read index's edge is not a candidate, and the cap reaches
+     * past it to the next ones. */
+    r.need[49] = 700;
+    CHECK_EQ(list(r.run(50, 50, 800, true, 3)), "46,47,48");
+}
+
+/* The oldest first, at most `cap` of them, none when the cap is 0. */
+TEST(oldest_first_of_the_candidates) {
     Ring r;
     for (uint64_t i = 10; i < 20; ++i) r.need[i] = 500;   /* chained, counter at 400 */
-    CHECK_EQ(list(r.run(30, 50, 400, false, 3)), range(10, 13));
+    CHECK_EQ(list(r.run(30, 50, 400, false, 3)), "17,18,19");
     CHECK(r.run(30, 50, 400, false, 0).empty());
 }
 
