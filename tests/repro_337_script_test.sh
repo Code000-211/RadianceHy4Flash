@@ -18,7 +18,8 @@ script="$root/scripts/repro-337.sh"
 [ -x "$script" ] || [ -f "$script" ] || { echo "repro_337_script_test: no $script" >&2; exit 1; }
 
 tmp=$(mktemp -d)
-trap 'rm -rf "$tmp"' EXIT
+hp=
+trap 'if [ -n "$hp" ]; then kill "$hp" 2>/dev/null || true; fi; rm -rf "$tmp"' EXIT
 
 row1='{"conversation": "p0", "kind": "parent", "prompt_tokens": 95935, "cached_tokens": 90100, "ttft_ms": 900, "prev_prompt_tokens": 0, "tool_calls": 1, "t": 1}'
 row2='{"conversation": "p0", "kind": "parent", "prompt_tokens": 99153, "cached_tokens": 95000, "ttft_ms": 700, "prev_prompt_tokens": 95935, "tool_calls": 1, "t": 2}'
@@ -108,5 +109,40 @@ set -e
 [ "$rc" = 2 ] || { echo "repro_337_script_test: --summarise without a directory gave rc=$rc" >&2
                    echo "$out" >&2; exit 1; }
 
+# 5. The server-up wait asks the server over HTTP and needs nothing the harness does not already
+#    need: python3, which drives the replay anyway. A box without curl (iks has none) ran the wait's
+#    900 sleeps with the server up and then reported "the server did not come up".
+if command -v python3 > /dev/null 2>&1; then
+    if grep -v '^[[:space:]]*#' "$script" | grep -q 'curl'; then
+        echo "repro_337_script_test: a line of the script calls curl, which a measurement box need not have" >&2
+        exit 1
+    fi
+    mkdir "$tmp/www"
+    printf 'up\n' > "$tmp/www/index.html"
+    python3 -u -m http.server 0 --bind 127.0.0.1 --directory "$tmp/www" > "$tmp/http.log" 2>&1 &
+    hp=$!
+    port=
+    for _ in $(seq 1 100); do
+        port=$(sed -n 's/.*port \([0-9][0-9]*\).*/\1/p' "$tmp/http.log" | head -n 1)
+        [ -n "$port" ] && break
+        sleep 0.1
+    done
+    [ -n "$port" ] || { echo "repro_337_script_test: the probe's test server did not start" >&2
+                        cat "$tmp/http.log" >&2; exit 1; }
+    if ! python3 "$root/scripts/agentreplay.py" --probe "http://127.0.0.1:$port/"; then
+        echo "repro_337_script_test: --probe says a serving port is not up" >&2
+        exit 1
+    fi
+    kill "$hp" 2>/dev/null || true
+    wait "$hp" 2>/dev/null || true
+    hp=
+    if python3 "$root/scripts/agentreplay.py" --probe "http://127.0.0.1:$port/" 2>/dev/null; then
+        echo "repro_337_script_test: --probe says a closed port is up" >&2
+        exit 1
+    fi
+else
+    echo "repro_337_script_test: no python3, the readiness probe is not checked" >&2
+fi
+
 echo "repro_337_script_test: a fault is counted and printed, a clean run is not, half written runs"
-echo "  are summarised (5 cases)"
+echo "  are summarised (5 cases), and the readiness probe asks the server with python3 only"

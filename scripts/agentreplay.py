@@ -298,6 +298,19 @@ def selftest():
     print("agentreplay: selftest ok (%d turns with 12 tools, %d without)" % (len(log), len(plain)))
 
 
+def probe(url, timeout=2.0):
+    """True when `url` answers with a 2xx, false for everything else: a refused connection, a
+    timeout, a 503 from a server whose model is not ready. This is the whole of the server-up wait
+    of scripts/repro-337.sh, and it asks with python3 because the harness needs python3 anyway -- a
+    box without curl must not stop the wait (iks has none, and the wait then ran 900 sleeps while
+    the server was up). """
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as r:
+            return 200 <= r.status < 300
+    except Exception:           # refused, timed out, HTTPError: all of them are "not up"
+        return False
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     p.add_argument("--url", default="http://127.0.0.1:8100")
@@ -325,10 +338,14 @@ def main():
                         " call the reply asks for before the next one (0: plain completions)")
     p.add_argument("--selftest", action="store_true",
                    help="check the turn loop against a fake server, without a card")
+    p.add_argument("--probe", metavar="URL",
+                   help="exit 0 when URL answers 2xx, 1 when it does not (the server-up wait)")
     a = p.parse_args()
     if a.selftest:
         selftest()
         return
+    if a.probe:
+        sys.exit(0 if probe(a.probe) else 1)
     a.turn = tuple(int(x) for x in a.turn.split(","))
     a.toolset = tools(a.tools)
     key = None

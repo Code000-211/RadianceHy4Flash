@@ -137,7 +137,11 @@ trap 'kill $PID 2>/dev/null || true' EXIT
 up=0
 for _ in $(seq 1 900); do
   kill -0 $PID 2>/dev/null || break
-  if curl -sf -m 2 "http://127.0.0.1:$PORT/health" > /dev/null; then up=1; break; fi
+  # The readiness probe is python3's, not curl's: the replay needs python3 on any box this runs on,
+  # and a box without curl (iks) would otherwise sleep out the whole loop with the server up.
+  if python3 "$ROOT/scripts/agentreplay.py" --probe "http://127.0.0.1:$PORT/health" > /dev/null 2>&1; then
+    up=1; break
+  fi
   sleep 1
 done
 if [ "$up" != 1 ]; then
