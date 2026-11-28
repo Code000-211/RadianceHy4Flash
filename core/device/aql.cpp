@@ -958,7 +958,6 @@ KargRange live_range_at(uintptr_t a) {
     const AllocRec* rec = rec_below(a);
     if (!rec || a >= rec->base + (uintptr_t)rec->bytes) return r;
     r.rec = rec->seq;
-    r.lo = rec->base;
     r.hi = rec->base + (uintptr_t)rec->bytes;
     return r;
 }

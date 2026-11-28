@@ -32,10 +32,11 @@ namespace rad {
 namespace aql {
 
 /* The live range an address lies in, as the caller knows them: a record number that is equal for
- * two addresses in one range, and the range's bounds. `rec` 0 means no range holds the address. */
+ * two addresses in one range, and where the range ends. `rec` 0 means no range holds the address.
+ * Only the end is needed: the fault address is always at or past an operand that ran off the end of
+ * its range (aql_inflight.h's fault_ran_off), so no line asks where a range starts. */
 struct KargRange {
     uint64_t  rec = 0;
-    uintptr_t lo = 0;
     uintptr_t hi = 0;
 };
 
