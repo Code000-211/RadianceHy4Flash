@@ -931,6 +931,40 @@ TEST(glm_index_cache_pages_are_sized_by_the_real_pool_consumer) {
     CHECK_EQ(b.program().kv_groups[group].bytes_per_block, (int64_t)(2 * 136));
 }
 
+/* X-07: a paged group whose row is not a head's K then V carries its own byte count, and the
+ * helper every sizing site asks returns it: the int8 latent row of Hy4-flash's cache is 656 bytes
+ * (512 latent columns as int8, four f32 block scales, 64 rope columns as bf16) where the generic
+ * int8 row of 1 head of 288 would be 580. A row is what a wave's 16-byte loads read, so one that is
+ * not a multiple of 16 -- or one shorter than the generic row -- is refused by name rather than
+ * made into a page whose rows straddle a piece. */
+TEST(a_kv_group_row_bytes_sizes_the_row_and_must_be_whole_pieces) {
+    RadKVGroupDecl kd{};
+    kd.kind = RAD_KV_FULL;
+    kd.dtype = RAD_I8;
+    kd.n_head_kv = 1;
+    kd.head_dim = 288;
+    CHECK_EQ(rad_kv_group_row_elems(RAD_I8, 288, 0), (int64_t)(2 * 288 + 4));
+    CHECK_EQ(rad_kv_group_row_elems(RAD_I8, 288, 656), (int64_t)656);
+    CHECK_EQ(656 % 16, 0);              /* the latent row of the served geometry, 41 pieces */
+
+    Registry reg;
+    Builder b(reg, make_meta(), make_ctx());
+    kd.row_bytes = 656;
+    const auto g = b.decl_kv_group("hy4_latent", &kd);
+    CHECK(g > 0);
+    CHECK_EQ(b.program().kv_groups[g].decl.row_bytes, (int64_t)656);
+
+    kd.row_bytes = 580 + 8;             /* 588: a row of a piece and a half */
+    CHECK_EQ(b.decl_kv_group("straddling", &kd), (rad_kvgroup)RAD_NULL_HANDLE);
+    CHECK_EQ(b.status(), (int)RAD_E_INVAL);
+    CHECK(has(b.errors().back(), "not a multiple of 16"));
+    CHECK_EQ(b.program().kv_groups.size(), 2u);   /* only the one above was added */
+
+    kd.row_bytes = 400;                 /* under what 2 * 288 int8 columns take */
+    CHECK_EQ(b.decl_kv_group("short", &kd), (rad_kvgroup)RAD_NULL_HANDLE);
+    CHECK(has(b.errors().back(), "is under the"));
+}
+
 TEST(a_kv_group_with_no_layers_is_an_error) {
     NEED_PLUGIN(reg)
     Builder b(reg, make_meta(), make_ctx());
