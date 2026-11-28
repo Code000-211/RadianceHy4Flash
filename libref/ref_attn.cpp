@@ -114,30 +114,12 @@ static inline void kv_i8_put(void* cache, int64_t row, int64_t head_dim, int hal
  * in, so a reader's `scale * code` is the rotated column. A block whose absmax is zero or not
  * finite stores codes 0 and scale 1. The R rope columns are not rotated and not quantised: they
  * go in as the bf16 they arrive as, the writer's own rounding of the angle. */
-constexpr float kRowRotScale = 0.08838834764831845f;   /* 1 / sqrt(128) */
 static inline int64_t row_i8_bytes(int64_t L, int64_t R) {
     return L + 4 * (L / 128) + 2 * R;
 }
 
-/* The rotation as an explicit matrix: M[i][j] = (-1)^popcount(i & j) * (1/sqrt(128)), the
- * Walsh-Hadamard transform in the order the tree's butterfly produces it (Sylvester order, no bit
- * reversal), with the row's own normaliser as its entry so that dividing it back out below gives
- * the unnormalised block the quantiser takes. Built once; the product accumulates in double, so
- * this form's own rounding (about 1e-16 a sum) is far below the kernel's f32 butterfly, which is
- * the difference the comparison sees. */
-struct RowRot {
-    double m[128 * 128];
-    RowRot() {
-        const double k = (double)kRowRotScale;
-        for (int i = 0; i < 128; ++i)
-            for (int j = 0; j < 128; ++j)
-                m[i * 128 + j] = (__builtin_popcount((unsigned)(i & j)) & 1) ? -k : k;
-    }
-};
-static inline const RowRot& row_rot() {
-    static const RowRot r;
-    return r;
-}
+/* The rotation is ref_common.h's row_rot: the explicit matrix with the row's normaliser as its
+ * entry, so dividing it back out below gives the unnormalised block the quantiser takes. */
 
 /* `col(c)` is the row's column c: the store's K columns first, then its V columns. */
 template <class C>
