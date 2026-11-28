@@ -3443,6 +3443,27 @@ ihc_pre (hc_head), rmsnorm (output_norm), gather_rows, logits_gemm
   and never streams; the indexer's key cache is read whole every step and stays resident
   (`rad_kv_group_dense_read`). Like every streamed model, a context under the ring's floor of
   32 768 tokens does not stream.
+
+  The three groups' geometry, per rank. All three are declared `rad_kv_group_replicated`
+  (`hyv4flash.cpp:1213-1215`), so every rank holds the whole latent row and TP splits heads, not the
+  cache: the host mirror and the ring are priced a rank (design X-05 §3's ledger and §7 price the
+  mirror at 13.8 GB a rank, and §8's X-05c notes four ranks pin the same 13.8 GB four times).
+  A row is `kv_lora + qk_rope` values
+  (latent 512 + rope 64 = 576; `latent_group`, `hyv4flash.cpp:811`) and the group's `head_dim` is half
+  its row bytes (`hyv4flash.cpp:705`), so bf16 gives 1,152 B a token a layer:
+
+  | group | rows | per token | page (block) | at 60K a sequence | at 1M a sequence |
+  |---|---|---|---|---|---|
+  | `kv_latent_sparse` (bf16, 12 layers) | latent 512 + rope 64, one head | **13,824 B** | 4 tokens = **55,296 B** (4,608 B a layer) | 829 MB | **13.8 GB** |
+  | `kv_latent_sliding` (bf16, 30 layers) | same row, window 512 | 34,560 B | 16 tokens | 17.7 MB (window-bounded) | 17.7 MB |
+  | `kv_index_keys` (bf16 or fp8, 12 layers) | one pooled key: `head_dim = index_head_dim / 8` = 16, K **and** V halves, so a row is `2 * head_dim` = 32 bf16 = 64 B a layer; at fp8/int8 the packed page is `2 * 17 + 4` = 38 B a layer (the `+ 4` is its f32 scale) — both from `hyv4flash.cpp:833-845` read against `core/runtime/ctx.h:143-144` | 768 B (456 B at fp8) | 4 tokens = 3,072 B (1,824 B at fp8) | 46 MB (27 MB at fp8) | 768 MB (456 MB at fp8) |
+
+  Only the first row streams. `kv_resolve`'s `block_bytes` is that row's per-layer page (4,608 B,
+  `bytes_per_block / n_bound`, which is what core/kvstream/plan.cpp derives), its `sel_pitch` is
+  `compressed_indexer_group_topk` (`ix_group_topk`, `hyv4flash.cpp:260`; 512), and the ring
+  `--kv-resident` carves is raised to `max-num-seqs x (1 + n_spec) x 512` blocks: every row a sequence
+  plans reaches back over 512 pages, 2,048 tokens (`kvstream_ceiling_blocks`; the shape is held by
+  `sched_test`'s and `mem_test`'s Hy4 cases).
 - **iHC junction at TP4** (WP16.2). `ar_rmsnorm_ihc_junction` (the all-reduce fused into the
   junction) is used at world 1..2 by default (`rmsnorm_ihc_junction` at world 1). It has not run on
   four cards, so at world 4 the plugin issues the tested chain (add, standalone exact `all_reduce`,

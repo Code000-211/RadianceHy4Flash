@@ -9617,6 +9617,81 @@ TEST(without_a_span_the_scheduler_plans_and_stages_the_pinned_steps) {
     }
 }
 
+/* ================================== a Hy4-shaped ring against one decode step's claims (X-05a)
+ * Design X-05 §5.2's second gap. `Engine::stream_report` prints `largest launch claims` and says a
+ * value above `max_seqs x sel_pitch` means the derivation is wrong (core/engine.cpp, the comment
+ * over stream_report). That bound only holds with no drafter: a verify pass is 1 + n_spec rows a
+ * sequence and every row brings its own selection, so the launch's claims are
+ * `max_seqs x (1 + n_spec) x sel_pitch`, which is exactly what kvstream_ceiling_blocks prices the
+ * ring with (core/kvstream/plan.cpp:71-76) and what the plugin states as `kv_resolve`'s `slots`
+ * (arch/common/rad_arch.h:1254). A ring under it is not slow, it is wrong: a selection the ring
+ * cannot hold latches ctl[3] and fails the request (docs/KV-STREAMING.md §3.4), so the two numbers
+ * have to be tied by a test rather than by two files agreeing. Nothing tied them at a Hy4 shape
+ * with n_spec > 0. The geometry is Hy4-flash's as declared: `sel_pitch` is `ix_group_topk` = 512
+ * (arch/hyv4flash/hyv4flash.cpp:260 -> hyv4flash_attn.h:484), the sparse latent's page is block 4
+ * tokens, 4,608 B a layer over twelve bound layers (design X-05 §2), and DFly2's depth in the
+ * served container is 5. */
+TEST(a_hy4_shaped_decode_step_claims_n_times_one_plus_n_spec_rows_of_the_pitch) {
+    constexpr int64_t kSelPitch = 512;    /* the row's selection pitch; the page it walks (4 tokens of
+                                           * 4,608 B a layer over 12 layers) is asserted in the emu
+                                           * fixture, where it can fail a build */
+    const int n = 4, n_spec = 5;                    /* N4 at DFly2's depth: design §3.1's ledger */
+
+    Fixture f;
+    f.build(/*blocks=*/4096, /*states=*/64, /*max_tok=*/512);
+    f.cfg.n_spec = n_spec;
+    f.cfg.max_seqs = n;
+    CHECK_OK(f.start());
+
+    uint64_t s[4] = { 0, 0, 0, 0 };
+    for (int i = 0; i < n; ++i) { s[i] = f.submit(160, 64); REQUIRE(s[i] != 0); }
+    /* Four 160-token prompts are past one 512-row step, so run until every sequence has produced a
+     * token: from there they decode together. */
+    for (int st = 0; st < 40; ++st) {
+        bool all_out = true;
+        for (int i = 0; i < n; ++i)
+            if (f.sch.find(s[i])->output.empty()) all_out = false;
+        if (all_out) break;
+        REQUIRE(f.sch.step() != nullptr);
+        f.commit_plain(7);
+    }
+
+    /* A decode pass with no draft table is one row a sequence: `n x sel_pitch`, the bound
+     * stream_report's own comment states for a launch. */
+    const RadBatch* d = f.sch.step();
+    REQUIRE(d != nullptr);
+    CHECK_EQ((int)d->n_spec, 0);
+    CHECK_EQ((int)d->n_seq_decode, n);
+    CHECK_EQ((int64_t)d->n_tok_decode * kSelPitch, (int64_t)n * kSelPitch);
+    f.commit_plain(7);
+
+    /* The drafter's table for each: a verify pass is 1 + n_spec rows a sequence, every row with its
+     * own selection, so the launch's claims carry the (1 + n_spec) term the no-drafter bound lacks.
+     */
+    int32_t draft[5] = { 21, 22, 23, 24, 25 };
+    for (int i = 0; i < n; ++i) CHECK_OK(f.sch.set_draft(s[i], draft, n_spec));
+
+    const RadBatch* b = f.sch.step();
+    REQUIRE(b != nullptr);
+    CHECK_EQ((int)b->n_seq_decode, n);
+    CHECK_EQ((int)b->n_spec, n_spec);
+    CHECK_EQ((int64_t)b->n_tok_decode, (int64_t)n * (1 + n_spec));    /* 24 rows: one a proposal */
+    const int64_t claims = (int64_t)b->n_tok_decode * kSelPitch;
+    CHECK_EQ(claims, (int64_t)n * (1 + n_spec) * kSelPitch);           /* 12,288 */
+    CHECK(claims > (int64_t)f.cfg.max_seqs * kSelPitch);      /* past the no-drafter bound */
+    /* The page that pitch walks is 4 tokens of 4,608 B a layer over the twelve bound layers: 55,296 B
+     * a page, 13,824 B a token, so one row's claims reach back over 2,048 tokens (design §2). That
+     * arithmetic is pinned where it can fail a build rather than here -- `tests/r4d_emu/test_kvres.cpp`
+     * holds it as `static_assert` on the same constants -- because a CHECK of two local constants
+     * against a literal tests nothing the code can get wrong.
+     * The engine side -- that kvstream_ceiling_blocks and kvstream_ring give exactly this number, and
+     * that a ring under it is what ctl[3] latches on -- is mem_test's
+     * a_hy4_shaped_ring_is_raised_to_exactly_one_verify_step_s_claims, not here: this binary's fakes
+     * are weak definitions of the device C ABI, and core/kvstream/plan.cpp.o pulls in the real device
+     * layer beside them, which is the collision sched_fakes.h warns of. */
+    f.commit_plain(7);
+}
+
 /* A recycled slot keeps its struct: add_locked only allocates when the slot's pointer is null, so
  * every field it does not list survives from the request before. admitted_us is the one such field
  * with no backstop where it is read -- the prefill figure is computed from it whenever it is
