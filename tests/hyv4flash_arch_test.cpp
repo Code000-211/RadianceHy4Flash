@@ -251,6 +251,7 @@ TEST(the_mini_graph_declares_every_layer_kind) {
     CHECK_EQ(count_op(b, "router_sigmoid_topk"), 2);
     CHECK_EQ(count_op(b, "swiglu_clamped"), 2);         /* the routed arms; the shared ones are not */
     CHECK_EQ(count_op(b, "logits_gemm"), 1);
+    CHECK_EQ(count_op(b, "hc_enter"), 1);             /* K-28: the embedding into every stream */
     CHECK_EQ(count_op(b, "cast") > 0, true);
     CHECK(find_b(b, "dbg.resid.0") == nullptr);         /* no taps unless asked */
 
@@ -4234,6 +4235,16 @@ struct Replay {
                    v[0].rows * v[0].cols == v[1].rows * v[1].cols) {   /* a copy, cell for cell */
             const std::vector<uint64_t> x = v[0].all();
             for (size_t i = 0; i < x.size(); ++i) *v[1].at[i] = x[i];
+        } else if (o.op == "hc_enter") {
+            if (!need(2)) return;
+            const int64_t hc = pint(&o, "hc"), n = pint(&o, "n");
+            if (v[0].cols != n || v[1].cols != hc * n) {
+                bad.push_back("hc_enter: an output that is not hc copies of its input's width");
+                return;
+            }
+            for (int64_t r = 0; r < v[1].rows; ++r)
+                for (int64_t c = 0; c < hc; ++c)
+                    for (int64_t i = 0; i < n; ++i) put(v[1], r, c * n + i, v[0].get(r, i));
         } else if (o.op == "embed_lookup") {
             if (!need(3)) return;
             for (int64_t r = 0; r < v[2].rows; ++r)
@@ -4323,6 +4334,153 @@ struct DflyAt {
     }
 };
 }  // namespace
+
+/* K-28: the wide stream is entered from the one read of the embedding, in one `hc_enter` a step
+ * (the four 2-D copies of x0 it replaces were 4 x 13.6 us at the pass head). The tape carries one
+ * hc_enter and no copy of the embedding into the streams beside it, and what hc_enter leaves in the
+ * streams is hc identical copies of the embedding row -- the values the four copies left there. */
+TEST(the_pass_head_enters_every_stream_in_one_hc_enter) {
+    Declared d;
+    REQUIRE_EQ(d.rc, RAD_OK);
+    const RecBuf* se = find_b(d.b, "streams");
+    const RecBuf* xe = find_b(d.b, "embed");
+    REQUIRE(se != nullptr);
+    REQUIRE(xe != nullptr);
+    const int64_t hc = se->d.shape[1] / xe->d.shape[1];
+    REQUIRE(hc > 1);                                  /* hc_enter is declared for two to eight */
+    const rad_buf streams = buf_named(d.b, "streams"), embed = buf_named(d.b, "embed");
+    REQUIRE(streams != 0);
+    REQUIRE(embed != 0);
+    auto k = kit(d.b, { 1, 1, 1 }, {}, 0);
+    k->b.positions_h = k->pos.data();
+    const int64_t T = (int64_t)k->b.n_tok;   /* the rows this step carries */
+    auto v = run_passes(d.b, hyv4flash::step, { k.get() }, 0, 1);
+    CHECK_PASSES(d.b, v);
+    REQUIRE(!v.empty());
+    const RadCtx& c = *v[0];
+    CHECK_EQ(count_issued(d.b, c, "hc_enter"), 1);
+
+    /* One copy of the embedding into the streams, not hc of them. */
+    int copies = 0;
+    for (const RecIssue& is : c.issues) {
+        const RecOp* o = d.b.op_of(is.op);
+        if (!o || o->op != "cast" || pstr(o, "from") != pstr(o, "to")) continue;
+        bool reads = false, writes = false;
+        for (const RadOperand& od : is.opd) {
+            if (od.kind != RAD_OPK_BUF && od.kind != RAD_OPK_WEIGHT) continue;
+            if (od.handle == embed) reads = true;
+            if (od.handle == streams) writes = true;
+        }
+        copies += reads && writes;
+    }
+    CHECK_EQ(copies, 0);
+
+    /* Replayed: the streams right after the head are hc copies of the embedding, row for row. */
+    Replay rp(d.b);
+    int compared = 0;
+    for (const RecIssue& is : c.issues) {
+        rp.issue(is);
+        const RecOp* o = d.b.op_of(is.op);
+        if (!o || o->op != "hc_enter") continue;
+        const std::vector<uint64_t> x = rp.rows_of(embed, T), h = rp.rows_of(streams, T);
+        REQUIRE_EQ(x.size(), (size_t)T * (size_t)xe->d.shape[1]);
+        REQUIRE_EQ(h.size(), (size_t)T * (size_t)se->d.shape[1]);
+        const int64_t E = xe->d.shape[1];
+        int diff = 0;
+        for (int64_t r = 0; r < T; ++r)
+            for (int64_t s = 0; s < hc; ++s)
+                for (int64_t i = 0; i < E; ++i)
+                    diff += h[(size_t)(r * hc * E + s * E + i)] != x[(size_t)(r * E + i)];
+        CHECK_EQ(diff, 0);
+        ++compared;
+    }
+    CHECK_EQ(compared, 1);
+}
+
+static void one_stream(MetaKV& k) { k.set("hc_mult", "1"); }
+static void nine_streams(MetaKV& k) { k.set("hc_mult", "9"); }
+static void sixteen_streams(MetaKV& k) { k.set("hc_mult", "16"); }
+
+/* K-28: the stream counts `hc_enter` does not admit -- a one-stream checkpoint, or one with more
+ * than eight -- keep the per-stream copies the pass head made before it: one 2-D `cast` of the
+ * embedding row, declared once and issued once a stream, and no `hc_enter` beside it. What the
+ * copies leave in the streams is hc identical copies of the embedding row, as before. */
+TEST(a_pass_head_outside_hc_enters_range_copies_each_stream) {
+    struct Case { void (*set)(MetaKV&); int64_t hc; };
+    const Case cases[] = { { one_stream, 1 }, { nine_streams, 9 }, { sixteen_streams, 16 } };
+    for (const Case& g : cases) {
+        Declared d(bf16_encs, 1, 0, false, 128, 0, 0, 0, g.set);
+        REQUIRE_EQ(d.rc, RAD_OK);
+        const RecBuf* se = find_b(d.b, "streams");
+        const RecBuf* xe = find_b(d.b, "embed");
+        REQUIRE(se != nullptr);
+        REQUIRE(xe != nullptr);
+        const int64_t E = xe->d.shape[1];
+        CHECK_EQ(se->d.shape[1] / E, g.hc);
+        const rad_buf streams = buf_named(d.b, "streams"), embed = buf_named(d.b, "embed");
+        REQUIRE(streams != 0);
+        REQUIRE(embed != 0);
+
+        /* Declared: the one wide copy of the embedding, no hc_enter. */
+        int enters = 0, decl_copies = 0;
+        for (const RecOp& o : d.b.ops) {
+            enters += o.op == "hc_enter";
+            if (o.op != "cast" || pstr(&o, "from") != pstr(&o, "to")) continue;
+            bool reads = false, writes = false;
+            for (rad_buf r : o.reads) reads = reads || r == embed;
+            for (rad_buf w : o.writes) writes = writes || w == streams;
+            if (!reads || !writes) continue;
+            ++decl_copies;
+            CHECK_EQ(pint(&o, "n"), E);   /* the row, not a stream: the copies slice it off */
+        }
+        CHECK_EQ(enters, 0);
+        CHECK_EQ(decl_copies, 1);
+
+        auto k = kit(d.b, { 1, 1, 1 }, {}, 0);
+        k->b.positions_h = k->pos.data();
+        const int64_t T = (int64_t)k->b.n_tok;   /* the rows this step carries */
+        auto v = run_passes(d.b, hyv4flash::step, { k.get() }, 0, 1);
+        CHECK_PASSES(d.b, v);
+        REQUIRE(!v.empty());
+        const RadCtx& c = *v[0];
+        CHECK_EQ(count_issued(d.b, c, "hc_enter"), 0);
+
+        /* Issued: hc copies of that one op, one per stream. */
+        int copies = 0;
+        size_t last = 0;
+        bool seen = false;
+        for (size_t i = 0; i < c.issues.size(); ++i) {
+            const RecIssue& is = c.issues[i];
+            const RecOp* o = d.b.op_of(is.op);
+            if (!o || o->op != "cast" || pstr(o, "from") != pstr(o, "to")) continue;
+            bool reads = false, writes = false;
+            for (const RadOperand& od : is.opd) {
+                if (od.kind != RAD_OPK_BUF && od.kind != RAD_OPK_WEIGHT) continue;
+                if (od.handle == embed) reads = true;
+                if (od.handle == streams) writes = true;
+            }
+            if (!reads || !writes) continue;
+            ++copies;
+            last = i;
+            seen = true;
+        }
+        CHECK_EQ(copies, g.hc);
+        REQUIRE(seen);
+
+        /* Replayed: past the last copy the streams are hc copies of the embedding, row for row. */
+        Replay rp(d.b);
+        for (size_t i = 0; i <= last; ++i) rp.issue(c.issues[i]);
+        const std::vector<uint64_t> x = rp.rows_of(embed, T), h = rp.rows_of(streams, T);
+        REQUIRE_EQ(x.size(), (size_t)T * (size_t)E);
+        REQUIRE_EQ(h.size(), (size_t)T * (size_t)(g.hc * E));
+        int diff = 0;
+        for (int64_t r = 0; r < T; ++r)
+            for (int64_t s = 0; s < g.hc; ++s)
+                for (int64_t i = 0; i < E; ++i)
+                    diff += h[(size_t)(r * g.hc * E + s * E + i)] != x[(size_t)(r * E + i)];
+        CHECK_EQ(diff, 0);
+    }
+}
 
 /* D-02: at every stream count the server runs (1, 2, 8, 16) and every depth to the configured one,
  * full block and short, greedy and coupled, each chain round's corrected state is the header's
@@ -4764,12 +4922,12 @@ TEST(the_trunk_writes_its_selection_into_the_snapshot_and_clears_it_on_a_dense_s
         hyv4flash::step(&c, &k->b);
         CHECK(c.step_fail.empty());
         CHECK_LINT(d.b, &c);
-        size_t sel = SIZE_MAX, cp = SIZE_MAX, zero = SIZE_MAX, attn = SIZE_MAX;
+        size_t sel = SIZE_MAX, zero = SIZE_MAX, attn = SIZE_MAX;
         int cps = 0, zeros = 0;
         for (size_t i = 0; i < c.issues.size(); ++i) {
             const rad_op op = c.issues[i].op;
             if (op == m.layers[2].ix.op_select && sel == SIZE_MAX) sel = i;
-            if (op == m.df.op_sel) { cp = i; ++cps; }
+            if (op == m.df.op_sel) ++cps;
             if (op == m.df.op_zero) { zero = i; ++zeros; }
             if ((op == m.layers[2].attn.op_sel || op == m.layers[2].attn.op_paged) &&
                 attn == SIZE_MAX)

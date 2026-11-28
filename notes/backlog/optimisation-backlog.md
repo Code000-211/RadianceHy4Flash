@@ -440,6 +440,13 @@ Round 5: the block rule has arms of its own. `dual_block_rows` says in which blo
 - Change: `hyv4flash.cpp:964` (decl), `:1147-1148` (4 `cast` launches) -> `hc_enter` (`r4d_rows.cpp:8848`) or lookup straight into stream 0 + one copy. `r4d_model_bf16.hip:82` (`embed_lookup` copies 2-byte elements): uint4.
 - Why: M: `copy2d16` 4 x 13.6 us + `embed_lookup` 23.4 us at the pass head = 78 us (0.6 %).
 - Verify: taps `t_embed`; greedy equal.
+- Status (measured on `local`, gpu2, 2026-11-27; base `0fe700b7`, branch `4ae1d77c`; the shipped HIP compiler with
+  `-DRAD_HIP_VOPD_REPEATABLE=ON`, `-DRAD_WITH_HIP=ON -DRAD_GPU_TARGETS=gfx1201`; 210 W cap read back on both cards;
+  `RAD_SRC=<base tree> RADIANCE_AQL_STAMP=1 scripts/backlog/run.sh <tag> nospec.yaml c1,greedy` on each arm, 8 runs a
+  side interleaved): the four `copy2d16` casts are gone from the `c1` window and one `hc_enter` (8.5 us) stands in their
+  place, `embed_lookup` 14.95 -> 12.55 us a launch: the pass head **47.3 -> 21.1 us a step** (-26.3 us, -56 %).
+  `c1` `ms_step` 13.7345 -> 13.778 ms (+0.32 %, +0.12 % without the two runs that shared the host), tok/s 71.62 ->
+  71.26; the greedy texts are byte-identical in all 16 runs. Record: `notes/backlog/measurements/K-28.md`.
 
 #### K-29 Step metadata read before the chain wait in short kernels
 - Area kernel · BI if no kernel of the pass writes the operand (unverified for DFly2's device-written tables) · Gain 0.3-0.5 % / 0.2 % / ? / 0 · Conf low · Effort M

@@ -205,6 +205,7 @@ struct Model {
     rad_kvgroup kv_sparse = 0, kv_sliding = 0, kv_index = 0, kv_tail = 0, kv_engram = 0;
     rad_weight token = 0, head = 0, final_gain = 0;
     rad_op embed = 0, op_stream = 0, op_norm = 0, op_gather = 0, op_head = 0;
+    HcEnter stream_in{};   /* K-28: the embedding into every stream, one launch */
     Hyper hc_head{};
     std::vector<Layer> layers;
     std::vector<Engram> engrams;
@@ -1173,9 +1174,16 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                              {}, { m.mm_rows, m.x0 }, { m.x0 });
         HY4_NEED(m.op_mm_copy && m.op_mm_scatter, "the media rows' cast and scatter_rows");
     }
-    m.op_stream = decl_copy(b, T, E, RAD_BF16, m.x0, m.tr.h);
+    /* The wide streams start as hc copies of the embedding row, which one `hc_enter` a step writes
+     * from the one read of x0 (K-28: four 2-D copies, 4 x 13.6 us, become one launch). The op
+     * admits two to eight streams, so a one-stream shape keeps the plain copy. */
+    if (s.hc >= 2 && s.hc <= 8) {
+        RAD_ARCH_TRY(m.stream_in.declare(b, g, s.hc, m.x0, m.tr.h));
+    } else {
+        m.op_stream = decl_copy(b, T, E, RAD_BF16, m.x0, m.tr.h);
+        HY4_NEED(m.op_stream, "cast");
+    }
     HY4_NEED(m.embed, "embed_lookup");
-    HY4_NEED(m.op_stream, "cast");
     /* P-04: one rebase a step for every layer's prefill attention, declared where step() issues it. */
     m.op_rebase = mk(b, "sub_i32", { RAD_RANGE("M", 1, g.max_seqs + 1) }, {}, {}, { m.cu_prefill });
     HY4_NEED(m.op_rebase, "sub_i32");
@@ -1454,8 +1462,12 @@ static void step(RadCtx* c, const RadBatch* batch) {
                     praw(batch->mm_rows, RAD_I32, nmm), brows(m.x0, T));
     }
     m.t_embed.step(c, brows(m.x0, T), T);
-    for (int64_t j = 0; j < s.hc; ++j)
-        RAD_ISSUE_N(c, m.op_stream, T, brows(m.x0, T), bcol(m.tr.h, j * E, E, T));
+    if (m.stream_in.op) {
+        m.stream_in.step(c, T);
+    } else {
+        for (int64_t j = 0; j < s.hc; ++j)
+            RAD_ISSUE_N(c, m.op_stream, T, brows(m.x0, T), bcol(m.tr.h, j * E, E, T));
+    }
 
     /* P-04: the prefill sequences' bounds rebased to 0, once for every layer (both geometries'
      * absorbed prefill instance and the non-absorbed attention read m.cu_prefill). */

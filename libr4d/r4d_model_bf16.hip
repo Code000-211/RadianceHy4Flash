@@ -67,20 +67,47 @@ __device__ __forceinline__ float block_sum(float v, float* lds) {
 // Summing the ranks reconstructs x. `mult` scales every entry with one rounding (Gemma's
 // sqrt(hidden)); 1 is a plain copy.
 //
-// The body; embed_lookup_kernel and its chained form wrap it (its blocks return early).
+// The body; embed_lookup_kernel and its chained form wrap it (its blocks return early). V = 8
+// copies a 16-byte group (eight entries, uint4) a thread and V = 1 one entry, which a width or a
+// pitch the wide access would misalign keeps. A group's loads all precede its stores, so a source
+// and a destination that overlapped would still read what the copy writes over.
+template <uint32_t V>
 __device__ __forceinline__ void embed_lookup_body(
     const int32_t* __restrict__ tok, const uint16_t* __restrict__ wte, uint16_t* __restrict__ x,
     uint32_t n_embd, int32_t n_vocab, int32_t vocab_off, uint32_t x_ld, float mult) {
     const uint32_t m = blockIdx.x;
     const int32_t id = tok[m] - vocab_off;
     uint16_t* __restrict__ dst = x + (size_t)m * x_ld;
+    /* One group a thread: the emit chose V from the width, so `nv` covers the row exactly. */
+    const uint32_t nv = n_embd / V;
     if (id < 0 || id >= n_vocab) {
-        for (uint32_t i = threadIdx.x; i < n_embd; i += kThreads) dst[i] = 0;
+        if constexpr (V == 8) {
+            const uint4 zero = make_uint4(0u, 0u, 0u, 0u);
+            for (uint32_t j = threadIdx.x; j < nv; j += kThreads) *(uint4*)(dst + (size_t)j * V) = zero;
+        } else {
+            for (uint32_t i = threadIdx.x; i < n_embd; i += kThreads) dst[i] = 0;
+        }
         return;
     }
     const uint16_t* __restrict__ src = wte + (size_t)id * n_embd;
     if (mult == 1.0f) {
-        for (uint32_t i = threadIdx.x; i < n_embd; i += kThreads) dst[i] = src[i];
+        if constexpr (V == 8) {
+            /* Two groups a pass, both loaded before either is stored: a 3072-entry row is 384
+             * groups, so a 256-thread block covers it in two. A thread with no second group reads
+             * its own again, which stays inside the row whatever the width. */
+            const uint4* __restrict__ s4 = (const uint4*)src;
+            uint4* __restrict__ d4 = (uint4*)dst;
+            for (uint32_t j = threadIdx.x; j < nv; j += 2 * kThreads) {
+                const uint32_t j1 = j + kThreads;
+                const bool two = j1 < nv;
+                const uint4 a = s4[j];
+                const uint4 b = s4[two ? j1 : j];
+                d4[j] = a;
+                if (two) d4[j1] = b;
+            }
+        } else {
+            for (uint32_t i = threadIdx.x; i < n_embd; i += kThreads) dst[i] = src[i];
+        }
         return;
     }
     for (uint32_t i = threadIdx.x; i < n_embd; i += kThreads) dst[i] = f32_to_bf16(bf16_to_f32(src[i]) * mult);
@@ -90,11 +117,19 @@ __device__ __forceinline__ void embed_lookup_body(
     uint16_t* __restrict__ x, uint32_t n_embd, int32_t n_vocab, int32_t vocab_off, uint32_t x_ld, \
     float mult
 __global__ __launch_bounds__(kThreads) void embed_lookup_kernel(R4D_EL_PARAMS) {
-    embed_lookup_body(tok, wte, x, n_embd, n_vocab, vocab_off, x_ld, mult);
+    embed_lookup_body<8>(tok, wte, x, n_embd, n_vocab, vocab_off, x_ld, mult);
+}
+__global__ __launch_bounds__(kThreads) void embed_lookup_1_kernel(R4D_EL_PARAMS) {
+    embed_lookup_body<1>(tok, wte, x, n_embd, n_vocab, vocab_off, x_ld, mult);
 }
 __global__ __launch_bounds__(kThreads) void r4dchain_embed_lookup(R4D_EL_PARAMS) {
     r4d_chain_wait();
-    embed_lookup_body(tok, wte, x, n_embd, n_vocab, vocab_off, x_ld, mult);
+    embed_lookup_body<8>(tok, wte, x, n_embd, n_vocab, vocab_off, x_ld, mult);
+    r4d_chain_done();
+}
+__global__ __launch_bounds__(kThreads) void r4dchain_embed_lookup_1(R4D_EL_PARAMS) {
+    r4d_chain_wait();
+    embed_lookup_body<1>(tok, wte, x, n_embd, n_vocab, vocab_off, x_ld, mult);
     r4d_chain_done();
 }
 #undef R4D_EL_PARAMS
@@ -1131,7 +1166,12 @@ static int embed_lookup_bf16_emit(long tok, long wte, long x, int M, int n_embd,
     if (!tok || !wte || !x) return -1;
     if (M <= 0 || n_embd <= 0 || n_vocab <= 0 || vocab_off < 0) return -2;
     if (!x_ld) x_ld = n_embd;
-    return R4D_EMIT(stream, (chain ? r4dchain_embed_lookup : embed_lookup_kernel),
+    /* The 16-byte group when width, pitch and both bases allow it (a bf16 group of eight is 16
+     * bytes); otherwise one entry a thread. */
+    const bool wide = n_embd % 8 == 0 && x_ld % 8 == 0 && r4d_aligned((const void*)(uintptr_t)x, 16) &&
+                      r4d_aligned((const void*)(uintptr_t)wte, 16);
+    return R4D_EMIT(stream, (chain ? (wide ? r4dchain_embed_lookup : r4dchain_embed_lookup_1)
+                                  : (wide ? embed_lookup_kernel : embed_lookup_1_kernel)),
                     dim3((uint32_t)M), dim3(kThreads), 0,
                     (const int32_t*)tok, (const uint16_t*)wte,
                     (uint16_t*)x, (uint32_t)n_embd, (int32_t)n_vocab, (int32_t)vocab_off,
