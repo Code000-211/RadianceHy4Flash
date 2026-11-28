@@ -96,7 +96,7 @@ int32_t heat_down(int32_t h) { return h > 0 ? (h >> 1) : 0; }
  * sweep over the same two-bit heat counter, the same revert of what it could not place, the same
  * copies and rewrite. The fixtures are legal calls, so the refusals are not repeated here. */
 void ref_resolve(Fix& f) {
-    const int64_t M = f.M, blocks = f.blocks, slots = f.slots, pitch = f.pitch, bbytes = f.bbytes;
+    const int64_t M = f.M, slots = f.slots, pitch = f.pitch, bbytes = f.bbytes;
     int32_t* const R = f.res.data();
     int32_t* const SB = f.sblk.data();
     int32_t* const ST = f.sst.data();

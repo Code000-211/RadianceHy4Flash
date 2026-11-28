@@ -875,7 +875,7 @@ void shape_cases(std::vector<Hand>& hs) {
             const int64_t len = 4 * n + 3;
             Hand h((std::string("f32 -> ") + to + " past the range").c_str(), "cast", 0.0);
             const uint32_t dt = rad_dtype_parse(to);
-            h.dense(RAD_F32, { 1, len }, [&big, n](int64_t i) { return big[i % n]; })
+            h.dense(RAD_F32, { 1, len }, [&big](int64_t i) { return big[i % n]; })
              .dense(dt, { 1, len }, [](int64_t) { return 0.0f; }, true)
              .pi("M", 1).pi("n", len).ps("from", "f32").ps("to", to);
             hs.push_back(std::move(h));
@@ -884,7 +884,7 @@ void shape_cases(std::vector<Hand>& hs) {
          * gets tested (a scalar tail's NaN would mask it). */
         Hand s("rows of -inf: one fully masked, one partly", "softmax", 1e-6);
         const int64_t w = 48;
-        s.dense(RAD_F32, { 3, w }, [w](int64_t i) {
+        s.dense(RAD_F32, { 3, w }, [](int64_t i) {
                 const int64_t r = i / w, c = i % w;
                 if (r == 0) return -INFINITY;
                 if (r == 1 && c % 3 == 0) return -INFINITY;
@@ -998,7 +998,7 @@ void format_cases(std::vector<Hand>& hs) {
         const auto hw = hfill(70);
         Hand h("tied ids, pads below, past and at -1", "logit_rerank", 1e-5);
         h.dense(RAD_F32, { M, K }, hfill(71))
-         .dense(RAD_F32, { NV, K }, [hw, K](int64_t i) {
+         .dense(RAD_F32, { NV, K }, [hw](int64_t i) {
                 const int64_t r = i / K;
                 return hw((r == 7 ? 3 : r) * K + i % K);
             })
@@ -1226,7 +1226,7 @@ Hand anchor_case(const AnLayout& L, const char* name, int64_t ql0, int64_t ql1,
         return -1.0f;
     };
     const auto rnd = hfill(120 + (uint64_t)L.K, 0.1f);
-    auto state_fill = [stamp, rnd, H, L](int64_t i) {
+    auto state_fill = [stamp, rnd, L](int64_t i) {
         const int64_t blk = L.V * L.K, slot = i / (H * blk), h = (i / blk) % H, w = i % blk;
         const float st = stamp(slot, h);
         if (st >= 0.0f) {
@@ -2192,7 +2192,7 @@ void gen_cases(std::vector<Hand>& hs) {
         /* ---- the rotaries over three position components ---------------------------------- */
         {
             const int64_t M = 9, hd = 64, nh = 2, nkv = 2, W = (nh + 2 * nkv) * hd;
-            auto pos = [M](int64_t i) {
+            auto pos = [](int64_t i) {
                 const int64_t c = i / M, m = i % M;
                 return (float)(c == 0 ? 3 : c == 1 ? m / 3 : m % 3);
             };
@@ -3569,7 +3569,7 @@ void kv_cases(std::vector<Hand>& hs) {
          .dense(RAD_I32, { slots, 2 }, [](int64_t) { return 0.0f; }, true)
          .idx(ctl_ok, true)
          .view(RAD_U8, { blocks, bbytes }, { stride, 1 }, blocks * stride,
-               [bbytes](int64_t i) { return (float)((29 * (i / stride) + i % bbytes) & 0xff); })
+               [](int64_t i) { return (float)((29 * (i / stride) + i % bbytes) & 0xff); })
          .dense(RAD_U8, { slots, bbytes }, [](int64_t) { return (float)kNOB; }, true)
          .pi("M", 1).pi("blocks", blocks).pi("slots", slots).pi("sel_pitch", pitch)
          .pi("block_bytes", bbytes)
@@ -3585,8 +3585,8 @@ void kv_cases(std::vector<Hand>& hs) {
          .idx(res_ok, true).idx(sblk_ok, true)
          .dense(RAD_I32, { slots, 2 }, [](int64_t) { return 0.0f; }, true)
          .idx(ctl_ok, true)
-         .dense(RAD_U8, { blocks, bbytes }, [bbytes](int64_t i) { return block_byte(i / bbytes,
-                                                                                   i % bbytes); })
+         .dense(RAD_U8, { blocks, bbytes }, [](int64_t i) { return block_byte(i / bbytes,
+                                                                           i % bbytes); })
          .dense(RAD_U8, { slots - 1, bbytes }, [](int64_t) { return (float)kNOB; }, true)
          .pi("M", 1).pi("blocks", blocks).pi("slots", slots).pi("sel_pitch", pitch)
          .pi("block_bytes", bbytes)
@@ -4524,7 +4524,7 @@ void audio_cases(std::vector<Hand>& hs) {
             const int64_t n = 67;
             Hand h(("trained alphas, a large argument, NaN and infinity" + sfx).c_str(), "snake",
                    norm_tol);
-            h.dense(dt, { 5, n }, [n](int64_t i) {
+            h.dense(dt, { 5, n }, [](int64_t i) {
                  if (i == 3 * n + 4) return 30000.0f;
                  if (i == 2 * n + 10) return NAN;
                  if (i == 4 * n + 66) return INFINITY;
