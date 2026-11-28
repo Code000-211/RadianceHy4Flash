@@ -1945,15 +1945,16 @@ std::vector<unsigned char> two_kernels() {
     m.str(".private_segment_fixed_size"); m.uint(16);
     m.str(".uses_dynamic_stack"); m.boolean(false);
     m.str(".args"); m.arr(4);
-    const struct { uint32_t off, size; const char* kind; } args[4] = {
-        { 0, 4, "by_value" }, { 8, 8, "global_buffer" }, { 16, 4, "hidden_block_count_x" },
-        { 24, 8, "hidden_hostcall_buffer" },
+    const struct { uint32_t off, size; const char* kind; const char* name; } args[4] = {
+        { 0, 4, "by_value", "scale" }, { 8, 8, "global_buffer", "in" },
+        { 16, 4, "hidden_block_count_x", "" }, { 24, 8, "hidden_hostcall_buffer", "" },
     };
     for (const auto& a : args) {
-        m.map(3);
+        m.map(4);
         m.str(".offset"); m.uint(a.off);
         m.str(".size"); m.uint(a.size);
         m.str(".value_kind"); m.str(a.kind);
+        m.str(".name"); m.str(a.name);
     }
     m.map(3);
     m.str(".symbol"); m.str("a_kernel_whose_symbol_is_longer_than_31.kd");
@@ -2042,6 +2043,10 @@ TEST(kernel_argument_layouts_come_from_the_metadata_note) {
         CHECK(k.args[i].hidden == want[i].h);
     }
     CHECK_EQ(k.args[3].kind, std::string("hidden_hostcall_buffer"));
+    /* The parameter's own name, which the fault report prints instead of a byte offset. */
+    CHECK_EQ(k.args[0].name, std::string("scale"));
+    CHECK_EQ(k.args[1].name, std::string("in"));
+    CHECK(k.args[2].name.empty());
     CHECK_EQ(ks[1].symbol, std::string("a_kernel_whose_symbol_is_longer_than_31.kd"));
     CHECK(ks[1].dynamic_stack);
     CHECK(ks[1].args.empty());

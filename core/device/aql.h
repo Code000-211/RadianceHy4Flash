@@ -36,6 +36,7 @@ struct KernelArg {
     uint32_t size   = 0;
     Hidden   hidden = Hidden::None;
     std::string kind;              /* the metadata's value_kind, for the refusal message */
+    std::string name;              /* the metadata's parameter name, for the fault report */
 };
 
 struct KernelMeta {

@@ -307,6 +307,7 @@ bool code_object_kernels(const void* elf, size_t size, std::vector<KernelMeta>* 
                         if (const MP* v = a.get(".offset"))     ka.offset = (uint32_t)v->i;
                         if (const MP* v = a.get(".size"))       ka.size   = (uint32_t)v->i;
                         if (const MP* v = a.get(".value_kind")) ka.kind   = v->str();
+                        if (const MP* v = a.get(".name"))       ka.name   = v->str();
                         ka.hidden = hidden_kind(ka.kind);
                         m.args.push_back(std::move(ka));
                     }
