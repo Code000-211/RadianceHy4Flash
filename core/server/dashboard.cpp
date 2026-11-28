@@ -355,6 +355,7 @@ HttpResponse Server::handle_stats(const HttpRequest&) {
                 { "live",          s.live },
                 { "spare_tokens",  s.spare_tokens },
                 { "loan_tokens",   s.loan_tokens },
+                { "compacted",     s.compacted },
             };
         }
         o["kv_tokens_max"]   = m.kv_tokens_max;

@@ -432,7 +432,7 @@ int KVManager::carve(Pool& kv_pool) {
 void KVManager::forget() {
     plans_.clear(); free_blocks_.clear(); refcount_.clear(); free_states_.clear();
     live_.clear(); free_usable_.clear(); bucket_blocks_.clear(); held_hist_.clear();
-    chunk_blocks_.clear(); short_peak_.clear();
+    chunk_blocks_.clear(); short_peak_.clear(); relocated_.clear();
     pool_ = nullptr;
     stage_ = nullptr;
     stage_off_ = 0;
@@ -626,6 +626,7 @@ int KVManager::carve_into(Pool& kv_pool) {
     refcount_.resize(plans_.size());
     cached_.resize(plans_.size());
     cache_only_.assign(plans_.size(), 0);
+    relocated_.assign(plans_.size(), 0);
     free_states_.resize(plans_.size());
     for (size_t i = 0; i < plans_.size(); ++i) {
         const auto& p = plans_[i];
@@ -1006,6 +1007,7 @@ KVManager::SpareSplit KVManager::spare_split() const {
         o.buffer_blocks = buf_blocks(i);
         o.live          = live_[i];
         o.spare_tokens  = t;
+        o.compacted     = i < relocated_.size() ? relocated_[i] : 0;
     }
     if (spare < 0) o.spare_tokens = 0;
     return o;
@@ -1541,6 +1543,38 @@ void KVManager::release_block(int32_t g, int32_t b) {
     uint8_t& mark = cached_[(size_t)g][(size_t)b];
     if (mark && refcount_[(size_t)g][(size_t)b] > 1) mark = 0;
     drop_block(g, b);
+}
+
+/* Compaction (M-15b, see kv.h). The free list is a min-heap, so grab_block hands out the lowest
+ * free id: if that is not below `src`, nothing is. The guard ahead of it keeps grab_block from
+ * recalling the loan (it does when nothing is usable) and keeps the buffer the cache holds for
+ * the next request while the move's source is still reserved. */
+int KVManager::relocate_cached_block(int32_t g, int32_t src, int32_t* dst) {
+    if (!dst) return RAD_E_INVAL;
+    *dst = -1;
+    if (g < 0 || g >= (int32_t)plans_.size() || !lendable(g)) return RAD_E_INVAL;
+    if (src < 0 || src >= plans_[(size_t)g].n_blocks) return RAD_E_INVAL;
+    auto& rc = refcount_[(size_t)g];
+    auto& mk = cached_[(size_t)g];
+    if (rc[(size_t)src] != 1 || !mk[(size_t)src]) return RAD_E_STATE;
+    if (free_usable_[(size_t)g] <= buf_blocks((size_t)g)) return RAD_E_FULL;
+    int32_t b = -1;
+    const int st = grab_block(g, &b);
+    if (st < 0) return st;
+    if (b >= src) {
+        drop_block(g, b);      /* unmarked at one: straight back to the free list */
+        return RAD_E_FULL;
+    }
+    /* The cache's reference moves: `b` becomes the cache's block at one, `src` a reservation. */
+    mk[(size_t)b] = 1;
+    mk[(size_t)src] = 0;       /* cache_only_ is unchanged: one cache-only block for another */
+    ++relocated_[(size_t)g];
+    *dst = b;
+    return RAD_OK;
+}
+
+int64_t KVManager::relocated_blocks(int32_t g) const {
+    return (g >= 0 && g < (int32_t)relocated_.size()) ? relocated_[(size_t)g] : 0;
 }
 
 int64_t KVManager::cache_only_blocks(int32_t g) const {

@@ -18,6 +18,7 @@
 #include "gen_config.h"
 #include "kvstream/stage.h"
 #include "place/rtrace.h"
+#include "runtime/kvmove.h"
 #include "sample/accept.h"
 #include "sched/scheduler.h"
 #include "server/adapters.h"
@@ -796,6 +797,12 @@ Engine::~Engine() {
         cvec_views_[(size_t) r->index].dir = nullptr;
     }
     cvec_views_.clear();
+    /* The compaction's events (M-15b), one per rank, made on that rank's device. */
+    for (size_t i = 0; i < compact_.ev.size() && i < ranks_.size(); ++i) {
+        if (!compact_.ev[i] || !ranks_[i] || rad_dev_set(ranks_[i]->device) < 0) continue;
+        rad_event_destroy(compact_.ev[i]);
+        compact_.ev[i] = nullptr;
+    }
     /* --profile-ops prints its final table here, the last point where the program still holds
      * the op table the rows name. */
     if (cfg_.profile_ops) for (auto& r : ranks_) r->ctx.dump_profile();
@@ -2438,6 +2445,10 @@ void Engine::loan_tick(bool idle) {
     const auto lk = sched_.hold();
     Rank& lead = *ranks_[0];
 
+    /* A compaction pass that has landed gives its sources back first, so the spare read below
+     * already reaches the space it freed (M-15b). */
+    (void)compact_tick();
+
     /* tier_tick has already released every entry whose host copy landed, so `spare` counts
      * finished conversations. The loan grows only in steps of at least a prefill chunk, so small
      * fluctuations do not move the boundary; it shrinks at once, the cache regaining blocks as the
@@ -2496,6 +2507,128 @@ void Engine::loan_tick(bool idle) {
         }
     }
     (void)rad_dev_set(ranks_[0]->device);
+}
+
+/* ------------------------------------------------------------------ KV loan compaction (M-15b) */
+/* Under eviction pressure the cache is full and evicts from anywhere in the pool, so its free
+ * blocks end up scattered under entries left high, and the loan, which never crosses a held
+ * block, cannot reach them (M-15 measured 0.5-1.0 GiB of such holes on a pool backing 58 % of the
+ * worst case). A pass moves the highest cache-only blocks down into the holes: nothing is lost,
+ * and the space they leave joins the loan on the next tick.
+ *
+ * Why it is safe without a host wait:
+ *   - the copies go on each rank's compute stream between steps, so every step that reads a moved
+ *     block (a lookup adopts the new id from now on) runs after its copy, and the step that last
+ *     wrote the source ran before it;
+ *   - a source stays reserved until every rank's event says its copy has landed, so it is neither
+ *     handed out nor reachable by the loan, which stops at the highest held block, while it is
+ *     being read; a destination is held, and below a held source, so the loan cannot reach it
+ *     either, even if its entry is evicted meanwhile;
+ *   - only blocks nothing but the cache holds move, so no sequence's block table changes.
+ *
+ * Off when the holes are under RADIANCE_KV_COMPACT_MIB or nothing has been evicted since the
+ * pool was last compact: a pool backing its worst case packs densely from the bottom on its own
+ * (M-15, local lane, under 8 MiB) and never pays for the walk. */
+bool Engine::compact_tick() {
+    CompactState& c = compact_;
+    Rank& lead = *ranks_[0];
+    if (!c.init) {
+        c.init = true;
+        int64_t mib = 256, blocks = 1024;
+        if (const char* v = std::getenv("RADIANCE_KV_COMPACT_MIB"); v && *v)
+            mib = std::strtoll(v, nullptr, 10);
+        if (const char* v = std::getenv("RADIANCE_KV_COMPACT_BLOCKS"); v && *v)
+            blocks = std::strtoll(v, nullptr, 10);
+        c.min_bytes  = mib > 0 ? mib << 20 : 0;
+        c.max_blocks = blocks > 0 ? blocks : 0;
+        c.on = c.min_bytes > 0 && c.max_blocks > 0 && lead.prefix.enabled();
+        c.evictions_seen = lead.prefix.stats().evictions;
+        if (c.on)
+            RAD_INFO("kv loan: compaction on above %lld MiB of holes under eviction pressure, at "
+                     "most %lld blocks a pass", (long long)mib, (long long)c.max_blocks);
+    }
+    if (!c.on) return false;
+
+    /* The pass in flight: its sources go back once every rank's copies have landed. */
+    if (!c.moving.empty()) {
+        for (size_t i = 0; i < ranks_.size() && i < c.ev.size(); ++i) {
+            if (rad_dev_set(ranks_[i]->device) < 0) continue;
+            const int q = rad_event_query(c.ev[i]);
+            if (q == 0) { (void)rad_dev_set(lead.device); return true; }
+            if (q < 0) {
+                /* A device fault: the copies may not have run, and the sources are what the
+                 * entries' bytes may still be in. Keep them reserved and stop compacting. */
+                RAD_ERR("kv loan: a compaction pass failed on rank %zu (%s); compaction stops "
+                        "with %zu source blocks kept reserved", i, rad_strerror(q),
+                        c.moving.size());
+                c.moving.clear();
+                c.on = false;
+                (void)rad_dev_set(lead.device);
+                return false;
+            }
+        }
+        (void)rad_dev_set(lead.device);
+        for (const PrefixCache::Move& mv : c.moving) lead.kv.release_block(mv.group, mv.src);
+        c.moving.clear();
+        ++c.passes;
+    }
+
+    /* Pressure is an eviction since the pool was last compact; it lasts until the holes are
+     * under the bar, or until a pass finds nothing it may move. */
+    const int64_t ev = lead.prefix.stats().evictions;
+    if (ev != c.evictions_seen) { c.evictions_seen = ev; c.pressure = true; }
+    if (!c.pressure) return false;
+    const KVManager::SpareSplit s = lead.kv.spare_split();
+    if (s.group < 0) return false;
+    const int64_t holes = std::max<int64_t>(s.held_top - s.held, 0) * s.block_bytes;
+    if (holes < c.min_bytes) { c.pressure = false; return false; }
+    /* Space the slab has no slot for would sit empty: only a slab that wants more than the loan
+     * can reach now is worth the copies. */
+    int64_t ceiling = 0;
+    for (auto& r : ranks_) ceiling = std::max(ceiling, r->mover.loan_ceiling(Mover::kLendKV));
+    if (ceiling <= s.spare_tokens) return false;
+
+    std::vector<PrefixCache::Move> moves;
+    if (lead.prefix.plan_compaction(c.max_blocks, &moves) <= 0) {
+        c.pressure = false;     /* the blocks above the holes are not the cache's alone */
+        return false;
+    }
+    if (!compact_issue(moves)) {
+        /* Nothing can say which copies ran: drain, forget the moved entries and give every block
+         * back. The entries are prefilled again if their conversations return. */
+        RAD_ERR("kv loan: could not issue a compaction pass of %zu blocks; the moved entries are "
+                "forgotten and compaction stops", moves.size());
+        for (auto& r : ranks_)
+            if (rad_dev_set(r->device) >= 0) (void)rad_stream_sync(r->ctx.stream());
+        (void)rad_dev_set(lead.device);
+        (void)lead.prefix.forget_moved(moves);
+        for (const PrefixCache::Move& mv : moves) lead.kv.release_block(mv.group, mv.src);
+        c.on = false;
+        return false;
+    }
+    c.moving = std::move(moves);
+    return true;
+}
+
+/* The pass's copies on every rank's compute stream (runtime/kvmove.h), then its event. Block
+ * ids are shared across ranks, so every rank copies the same ids in its own pool. */
+bool Engine::compact_issue(const std::vector<PrefixCache::Move>& moves) {
+    CompactState& c = compact_;
+    std::vector<BlockCopy> copies;
+    copies.reserve(moves.size());
+    for (const PrefixCache::Move& mv : moves) copies.push_back(BlockCopy{ mv.group, mv.src, mv.dst });
+    if (c.ev.size() != ranks_.size()) c.ev.resize(ranks_.size(), nullptr);
+    bool ok = true;
+    for (size_t i = 0; i < ranks_.size() && ok; ++i) {
+        Rank& r = *ranks_[i];
+        if (rad_dev_set(r.device) < 0) { ok = false; break; }
+        if (!c.ev[i] && rad_event_create(&c.ev[i]) < 0) { c.ev[i] = nullptr; ok = false; break; }
+        const RadStream st = r.ctx.stream();
+        if (issue_block_copies(r.kv, copies, st) < 0) { ok = false; break; }
+        if (rad_event_record(c.ev[i], st) < 0) ok = false;
+    }
+    (void)rad_dev_set(ranks_[0]->device);
+    return ok;
 }
 
 /* ------------------------------------------------------------------ the arena's level */

@@ -105,6 +105,7 @@ inline SchedMetrics bridge_metrics(const rad::SchedMetrics& m) {
         o.kv_loan.live          = m.kv_spare.live;
         o.kv_loan.spare_tokens  = m.kv_spare.spare_tokens;
         o.kv_loan.loan_tokens   = m.kv_spare.loan_tokens;
+        o.kv_loan.compacted     = m.kv_spare.compacted;
     }
 
     /* vLLM's gpu_prefix_cache_hit_rate means attention caching. The linear-checkpoint hit

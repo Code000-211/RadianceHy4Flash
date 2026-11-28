@@ -83,6 +83,7 @@ struct SchedMetrics {
         int64_t live          = 0;
         int64_t spare_tokens  = 0;
         int64_t loan_tokens   = 0;
+        int64_t compacted     = 0;   /* blocks a compaction moved down since start (M-15b) */
     };
     KvLoan kv_loan;
 

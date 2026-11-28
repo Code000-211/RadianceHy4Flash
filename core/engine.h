@@ -902,6 +902,28 @@ private:
     void loan_tick(bool idle);
     bool     lending_ = false;
     uint64_t loan_last_ns_ = 0;
+    /* KV loan compaction (M-15b), run from loan_tick under the scheduler's lock: under eviction
+     * pressure, when the free holes under rank 0's held top reach RADIANCE_KV_COMPACT_MIB (256 by
+     * default, 0 turns it off), the highest cache-only blocks move down into them
+     * (PrefixCache::plan_compaction) so the loan can reach the space they leave. One pass at a
+     * time: its copies run on every rank's compute stream, ahead of any step that reads the moved
+     * blocks, and the sources go back to the free list only once each rank's event says the
+     * copies have landed. True while a pass is in flight. */
+    bool compact_tick();
+    /* Issues one pass's copies on every rank and records the events; false when one failed. */
+    bool compact_issue(const std::vector<PrefixCache::Move>& moves);
+    struct CompactState {
+        bool    init = false;
+        bool    on = false;
+        bool    pressure = false;           /* latched by an eviction, cleared below the bar */
+        int64_t min_bytes = 0;              /* RADIANCE_KV_COMPACT_MIB */
+        int64_t max_blocks = 0;             /* RADIANCE_KV_COMPACT_BLOCKS: blocks a pass moves */
+        int64_t evictions_seen = 0;
+        std::vector<PrefixCache::Move> moving;   /* the pass in flight; empty when none */
+        std::vector<RadEvent> ev;           /* per rank */
+        int64_t passes = 0;
+    };
+    CompactState compact_;
     /* The activation arena's loan (Engine::arena_step). `arena_rows_[k]` is the largest step Ctx
      * level k serves (level 0 is the full plan); empty when the arena lends nothing. The floor is
      * the largest recent step: the loan grows past it only after no step that large has run for a
