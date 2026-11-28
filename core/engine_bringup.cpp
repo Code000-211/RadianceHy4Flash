@@ -400,7 +400,7 @@ static int64_t lockable_bytes(int64_t still, int64_t margin, std::string* limit)
  * pass is done (B-01). The memory is reserved here, so the pointer is known, and a copy another
  * engine filled is only checked: there is nothing to read. */
 int Engine::copy_table(const uint8_t* src, int64_t n, int64_t foff, bool card, void** out,
-                       std::string* why) {
+                       std::string* why, const std::string& share_dir) {
     for (const auto& c : table_copy_of_)
         if (c.first == src) { *out = c.second; return RAD_OK; }
     const auto t0 = std::chrono::steady_clock::now();
@@ -410,7 +410,7 @@ int Engine::copy_table(const uint8_t* src, int64_t n, int64_t foff, bool card, v
     void* base = nullptr;
     PendingTable p;
     p.bytes = n;
-    if (card && !cfg_.ngram_share_dir.empty() && n >= kTableShareMin) {
+    if (card && !share_dir.empty() && n >= kTableShareMin) {
         const std::string id = table_share_id(file_->path(), foff, n);
         if (id.empty()) {
             *why = fmt("the container %s cannot be stat'ed, which names the shared table",
@@ -418,7 +418,7 @@ int Engine::copy_table(const uint8_t* src, int64_t n, int64_t foff, bool card, v
             return RAD_E_IO;
         }
         TableShare s;
-        int rc = table_share_open(cfg_.ngram_share_dir, id, n, &s, why);
+        int rc = table_share_open(share_dir, id, n, &s, why);
         if (rc != RAD_OK) return rc;
         base = rad_dev_map_file(s.fd, kTableShareHeader, n);
         if (!base) {
@@ -543,14 +543,13 @@ int Engine::join_table_fills() {
  * container's range, which is all the disk gather needs: it finds the file behind the mapping and
  * reads it directly (libavx avx_ngram.cpp, table_file). */
 int Engine::table_file_map(const uint8_t* src, int64_t n, int64_t foff, void** out,
-                           std::string* why) {
+                           std::string* why, const std::string& dir) {
     const auto t0 = std::chrono::steady_clock::now();
     const std::string id = table_share_id(file_->path(), foff, n);
     if (id.empty()) {
         *why = fmt("the container %s cannot be stat'ed, which names the table's file", file_->path());
         return RAD_E_IO;
     }
-    const std::string& dir = cfg_.ngram_disk_dir;
     const std::string path = dir + (dir.back() == '/' ? "" : "/") + "ngram-" + id + ".bin";
     TableCopy c;
     bool filled = false;
@@ -608,7 +607,11 @@ int Engine::resolve_table_placement(const std::vector<VramFacts>& facts,
                                     const std::vector<int64_t>& emb_bytes,
                                     const std::vector<WeightFootprint>& wfs, int64_t kv_floor,
                                     int64_t ngram_bytes, bool ngram_device, bool ngram_host,
-                                    int64_t host_late) {
+                                    int64_t host_late,
+                                    const std::map<int, int64_t>& ngram_layer_bytes) {
+    /* The snapshot the arch prefetch gate reads is this pass's answer, not a running history:
+     * a later resolve without per-layer entries must not keep an earlier engine's. */
+    config_reset_ngram_resolved();
     const int64_t MiB = (int64_t)1 << 20;
     int64_t emb_max = 0;
     for (int64_t b : emb_bytes) emb_max = std::max(emb_max, b);
@@ -617,7 +620,8 @@ int Engine::resolve_table_placement(const std::vector<VramFacts>& facts,
     const bool emb_asked = cfg_.embedding_placement_given;
     std::string emb_why;
     /* Host memory the table would pin (each rank its shard) after the pools and the prefix cache's
-     * host tier still to be allocated; no memlock check, since card-read pins are not charged. */
+     * host tier still to be allocated; no memlock check, since a card-read pin the limit refuses
+     * stays unlocked rather than failing (#272). */
     const int64_t emb_pin = (int64_t)cfg_.tp * align_up(emb_max, (int64_t)MiB);
     const int64_t pools_still = (int64_t)cfg_.tp * cfg_.host_pool_mib * MiB +
                                 cfg_.prefix_cache_mib * MiB + host_late;
@@ -697,6 +701,20 @@ int Engine::resolve_table_placement(const std::vector<VramFacts>& facts,
 
     TablePlacement ng = cfg_.ngram_placement;
     std::string ng_why;
+    /* --ngram-placement-layers: the named layers take their own placement, tested below on
+     * their own bytes; the global value -- auto's fit tests included -- then covers only the
+     * layers the spec left out. Without the flag every byte is unasked and nothing changes. */
+    const int64_t ngram_total = ngram_bytes;
+    int64_t ng_asked_ram = 0, ng_asked_vram = 0, ng_asked_disk = 0;
+    for (const auto& [l, b] : ngram_layer_bytes) {
+        const auto it = cfg_.ngram_layer_asked.find(l);
+        if (it == cfg_.ngram_layer_asked.end()) continue;   /* unasked: stays in ngram_bytes */
+        ngram_bytes -= b;
+        if (it->second == TablePlacement::Ram)       ng_asked_ram  += b;
+        else if (it->second == TablePlacement::Vram) ng_asked_vram += b;
+        else                                         ng_asked_disk += b;
+    }
+    const bool layered = !cfg_.ngram_layer_asked.empty();
     /* The fastest tier with room: the card (every rank holds the whole table), then a RAM copy,
      * then the container. */
     const int64_t still = (int64_t)cfg_.tp * cfg_.host_pool_total_mib() * MiB +
@@ -743,7 +761,14 @@ int Engine::resolve_table_placement(const std::vector<VramFacts>& facts,
         int64_t fixed = 0;
         for (size_t i = 0; i < with.size(); ++i) {
             VramFacts& f = with[i];
-            f.statics += ngram_bytes;
+            /* The unasked layers' bytes reach the card only where the global placement actually
+             * puts them: vram as asked, or auto while this trial is the one deciding. Mirror the
+             * ram check below, which adds the global share only when ng == Ram -- otherwise
+             * `1=vram` under a global disk is fitted as if every table sat on the card. */
+            f.statics += (ng == TablePlacement::Vram || ng == TablePlacement::Auto
+                              ? ngram_bytes
+                              : 0) +
+                         ng_asked_vram;
             if (emb == TablePlacement::Ram) f.statics -= emb_bytes[i];
             if (tw == TablePlacement::Ram) f.statics -= tower_bytes[i];
             fixed = std::max(fixed, f.statics);
@@ -775,7 +800,7 @@ int Engine::resolve_table_placement(const std::vector<VramFacts>& facts,
         return false;
     };
     if (ngram_bytes == 0) {
-        if (ng != TablePlacement::Auto)
+        if (ng != TablePlacement::Auto && !layered)
             RAD_WARN("--ngram-placement %s: this model has no n-gram table, so there is nothing to "
                      "place", table_placement_name(ng));
         ng = TablePlacement::Disk;
@@ -839,12 +864,70 @@ int Engine::resolve_table_placement(const std::vector<VramFacts>& facts,
         }
     }
     cfg_.ngram_resolved = ng;
+    config_note_ngram_resolved(-1, ng);   /* the arch prefetch gate reads the resolved view */
+    ngram_on_card_bytes_ = ng == TablePlacement::Vram ? ngram_bytes : 0;
+
+    /* The asked layers, tested on their own bytes: a named tier that cannot be honoured stops
+     * the server, exactly as a named global tier does. */
+    if (layered) {
+        if (ng_asked_ram > 0) {
+            const int64_t pin = align_up(
+                ng_asked_ram + (ng == TablePlacement::Ram ? ngram_bytes : 0), (int64_t)2 << 20);
+            std::string why;
+            if (!lockable_room(pin, still, host_margin_bytes(), !ngram_device, &why)) {
+                RAD_ERR("--ngram-placement-layers: the layers asking for ram (%s, with the "
+                        "global placement's share of the table) cannot be held in memory as %s: "
+                        "%s", humanb(ng_asked_ram).c_str(), copy, why.c_str());
+                return RAD_E_NOMEM;
+            }
+        }
+        if (ng_asked_vram > 0) {
+            if (!ngram_device) {
+                RAD_ERR("--ngram-placement-layers: a layer asks for vram, but no loaded kernel "
+                        "plugin reads an n-gram table on a card: ram or disk");
+                return RAD_E_INVAL;
+            }
+            std::string why;
+            if (!card_holds(&why)) {
+                RAD_ERR("--ngram-placement-layers: the layers asking for vram (%s, all of it on "
+                        "every card) do not fit: %s", humanb(ng_asked_vram).c_str(),
+                        why.c_str());
+                return RAD_E_NOMEM;
+            }
+            ngram_on_card_bytes_ += ng_asked_vram;
+        }
+        if (ng_asked_disk > 0 && !ngram_host) {
+            RAD_ERR("--ngram-placement-layers: a layer asks for disk, but no loaded kernel "
+                    "plugin gathers an n-gram table on the host, which is what reads it from "
+                    "the container. Use vram or ram.");
+            return RAD_E_INVAL;
+        }
+        for (const auto& [l, p] : cfg_.ngram_layer_asked) {
+            cfg_.ngram_layer_resolved[l] = p;
+            config_note_ngram_resolved(l, p);
+            const auto b = ngram_layer_bytes.find(l);
+            if (b == ngram_layer_bytes.end()) {
+                RAD_WARN("--ngram-placement-layers: layer %d is named, but this model has no "
+                         "n-gram table there", l);
+                continue;
+            }
+            std::string dir_note;
+            if (p == TablePlacement::Ram && !cfg_.ngram_share_dir_for(l).empty())
+                dir_note = fmt(", a shared file in %s", cfg_.ngram_share_dir_for(l).c_str());
+            else if (p == TablePlacement::Disk && !cfg_.ngram_disk_dir_for(l).empty())
+                dir_note = fmt(", read from its own file in %s",
+                               cfg_.ngram_disk_dir_for(l).c_str());
+            RAD_INFO("placement: n-gram table layer %d (%s) %s%s: --ngram-placement-layers",
+                     l, humanb(b->second).c_str(), table_placement_name(p), dir_note.c_str());
+        }
+    }
 
     if (emb_max > 0)
         RAD_INFO("placement: token embedding (%s a rank) %s%s: %s", humanb(emb_max).c_str(),
                  table_placement_name(emb), emb_asked ? "" : " (default)", emb_why.c_str());
     if (ngram_bytes > 0)
-        RAD_INFO("placement: n-gram table (%s) %s%s: %s", humanb(ngram_bytes).c_str(),
+        RAD_INFO("placement: n-gram table (%s%s) %s%s: %s", humanb(ngram_bytes).c_str(),
+                 layered ? ", the layers --ngram-placement-layers leaves" : "",
                  table_placement_name(ng),
                  cfg_.ngram_placement == TablePlacement::Auto ? " (auto)" : "", ng_why.c_str());
     decide("--embedding-placement", table_placement_name(emb),
@@ -859,9 +942,9 @@ int Engine::resolve_table_placement(const std::vector<VramFacts>& facts,
     decide("--vision-tower-placement", tower_max > 0 ? table_placement_name(tw) : "n/a",
            tower_max > 0 ? fmt("the towers are %s a rank", humanb(tower_max).c_str())
                          : std::string("this server declares no encoder tower"));
-    has_ngram_ = ngram_bytes > 0;
-    decide("--ngram-placement", ngram_bytes > 0 ? table_placement_name(ng) : "n/a",
-           ngram_bytes > 0 ? fmt("the table is %s: %s", humanb(ngram_bytes).c_str(), ng_why.c_str())
+    has_ngram_ = ngram_total > 0;
+    decide("--ngram-placement", ngram_total > 0 ? table_placement_name(ng) : "n/a",
+           ngram_total > 0 ? fmt("the table is %s: %s", humanb(ngram_bytes).c_str(), ng_why.c_str())
                            : std::string("this model has no n-gram table"));
     return RAD_OK;
 }
@@ -1962,6 +2045,9 @@ int Engine::plan() {
         std::vector<int64_t> emb_bytes;
         std::vector<WeightFootprint> wfs;
         int64_t ngram_bytes = 0, kv_floor = 0;
+        /* The Engram tables' bytes per layer (--ngram-placement-layers tests each asked layer on
+         * its own): the tables are model-level, identical on every rank, so one rank fills it. */
+        std::map<int, int64_t> ngram_layer_bytes;
         /* One checkpoint slot (every rank's shard) and the ranks' host activation arenas: pinned
          * after the tables are placed, outside every pool. */
         int64_t ck_slot = 0, host_arenas = 0;
@@ -2068,6 +2154,14 @@ int Engine::plan() {
                       (cfg_.placement == "auto" || cfg_.placement == "expert_tiered");
             emb_bytes.push_back(wf.embedding);
             ngram_bytes = std::max(ngram_bytes, wf.ngram);
+            if (ngram_layer_bytes.empty())
+                for (rad_weight w = 1; (size_t)w < r->program.weights.size(); ++w) {
+                    const WeightInfo& wi = r->program.weights[w];
+                    if (!is_ngram_table(r->program, w)) continue;
+                    const int l = ngram_table_layer(wi.name);
+                    if (l < 0) continue;
+                    ngram_layer_bytes[l] += align_up(weight_bytes(wi), (int64_t)RAD_ALIGN_UNIT);
+                }
             ngram_device = ngram_device || wf.ngram_device;
             ngram_host = ngram_host || wf.ngram_host;
             /* The staging region is sized only where the arena lends its top: without smaller
@@ -2275,7 +2369,8 @@ int Engine::plan() {
             }
         }
         RAD_TRY(resolve_table_placement(facts, emb_bytes, wfs, kv_floor, ngram_bytes,
-                                        ngram_device, ngram_host, ck_store + host_arenas));
+                                        ngram_device, ngram_host, ck_store + host_arenas,
+                                        ngram_layer_bytes));
         /* --draft-expert-placement host: the drafter's experts are pinned in the host pool before
          * the strategy runs, so they leave the elastic plane the card must hold and the pool must
          * have room for them on top of the trunk's spill. The pool grows here, before the split,
@@ -2308,9 +2403,11 @@ int Engine::plan() {
                          humanb(draft_max).c_str(), (long long)add);
             }
         }
-        /* The n-gram table was counted off the card; on it, every rank holds the whole table. */
-        if (cfg_.ngram_resolved == TablePlacement::Vram)
-            for (VramFacts& f : facts) f.statics += ngram_bytes;
+        /* The n-gram table was counted off the card; on it, every rank holds the whole table.
+         * ngram_on_card_bytes_ is the resolved share: the whole table on a global vram, only
+         * the asked layers with --ngram-placement-layers. */
+        if (ngram_on_card_bytes_ > 0)
+            for (VramFacts& f : facts) f.statics += ngram_on_card_bytes_;
         if (cfg_.embedding_resolved == TablePlacement::Ram)
             for (size_t i = 0; i < facts.size(); ++i) facts[i].statics -= emb_bytes[i];
         if (cfg_.tower_resolved == TablePlacement::Ram)
@@ -4208,14 +4305,20 @@ int Engine::load_weights() {
                 /* --ngram-placement ram: the gather reads a copy instead of the mapping: pinned
                  * memory for a device kernel on the zero-copy site, or locked memory for the host
                  * gather. If auto's copy fails, the table stays in the container (a card's gather
-                 * moves to the host); if `ram` was asked for, startup fails. */
-                if (cfg_.ngram_resolved == TablePlacement::Ram &&
-                    is_ngram_table(r->program, (rad_weight)i)) {
+                 * moves to the host); if `ram` was asked for, startup fails. A reader-identified
+                 * table the naming does not reach (ng_layer < 0: not blk.<l>.engram_table, e.g.
+                 * rad_block_ple.h's) takes the GLOBAL resolved placement, whose copy the resolver
+                 * budgeted -- the share directory and the asked-for refusal fall back with it. */
+                const int ng_layer = is_ngram_table(r->program, (rad_weight)i)
+                                         ? ngram_table_layer(w.name) : -1;
+                const TablePlacement ng_eff =
+                    ng_layer >= 0 ? cfg_.ngram_effective(ng_layer) : cfg_.ngram_resolved;
+                if (ng_eff == TablePlacement::Ram) {
                     const bool card = w.site == Site::DeviceZeroCopy;
                     void* copy = nullptr;
                     std::string why;
                     const int cs = copy_table((const uint8_t*)w.ptr, n, (int64_t)p0.offset, card,
-                                              &copy, &why);
+                                              &copy, &why, cfg_.ngram_share_dir_for(ng_layer));
                     if (cs == RAD_OK) {
                         void* on_card = card ? rad_dev_device_ptr(copy) : nullptr;
                         w.ptr = on_card ? on_card : copy;
@@ -4224,7 +4327,8 @@ int Engine::load_weights() {
                         continue;   /* reported once, by copy_table, and not as mapped */
                     }
                     const char* into = card ? "pinned" : "locked";
-                    if (cfg_.ngram_placement == TablePlacement::Ram) {
+                    if (cfg_.ngram_placement == TablePlacement::Ram ||
+                        cfg_.ngram_layer_asked.count(ng_layer)) {
                         RAD_ERR("--ngram-placement ram: '%s' could not be copied into %s memory: "
                                 "%s", w.name.c_str(), into, why.c_str());
                         return cs;
@@ -4246,18 +4350,20 @@ int Engine::load_weights() {
                                card ? " by the host gather" : ""));
                 }
                 /* --ngram-placement disk=DIR: the table's own file instead of the container. */
-                if (cfg_.ngram_resolved == TablePlacement::Disk && !cfg_.ngram_disk_dir.empty() &&
-                    is_ngram_table(r->program, (rad_weight)i) && n >= kTableShareMin) {
+                const std::string& ng_disk_dir = ng_layer >= 0 ? cfg_.ngram_disk_dir_for(ng_layer)
+                                                               : cfg_.ngram_disk_dir;
+                if (ng_eff == TablePlacement::Disk && !ng_disk_dir.empty() &&
+                    n >= kTableShareMin) {
                     void* m = nullptr;
                     for (size_t k = 0; k < table_files_.size() && !m; ++k)
                         if (table_file_src_[k] == w.host_ptr) m = table_files_[k].base;
                     std::string why;
                     if (!m) {
                         const int fs = table_file_map((const uint8_t*)w.ptr, n, (int64_t)p0.offset,
-                                                      &m, &why);
+                                                      &m, &why, ng_disk_dir);
                         if (fs != RAD_OK) {
                             RAD_ERR("--ngram-placement disk=%s: '%s': %s",
-                                    cfg_.ngram_disk_dir.c_str(), w.name.c_str(), why.c_str());
+                                    ng_disk_dir.c_str(), w.name.c_str(), why.c_str());
                             return fs;
                         }
                         table_file_src_.push_back(w.host_ptr);

@@ -6,6 +6,7 @@
  */
 #include "engine_priv.h"
 #include "device/device.h"
+#include "device/kfd_evict.h"
 #include "mm/media.h"
 
 #include <algorithm>
@@ -108,6 +109,8 @@ diag::RunFacts Engine::run_facts(bool failed) const {
         rad_dev_alloc_totals(RAD_MEM_HOST_PINNED, &pinned, &n);
         rad_dev_alloc_totals(RAD_MEM_HOST_MAPPED, &mapped, &n);
         r.pinned_bytes = pinned + mapped;
+        r.pinned_unlocked_bytes = std::max<int64_t>(
+            pin_lock_tally().unlocked.load(std::memory_order_relaxed), 0);
     }
     /* The most any rank streams from the host, since each step waits for the slowest rank.
      * Excludes host-placed tables (the embedding, read a few rows per step; the towers, once per
@@ -121,6 +124,8 @@ diag::RunFacts Engine::run_facts(bool failed) const {
     }
     for (const TableCopy& t : table_copies_) r.locked_bytes += (int64_t)t.bytes;
     r.ngram_placement   = has_ngram_ ? table_placement_name(cfg_.ngram_resolved) : "";
+    for (const auto& [l, p] : cfg_.ngram_layer_resolved)   /* --ngram-placement-layers */
+        r.ngram_placement += "," + std::to_string(l) + "=" + table_placement_name(p);
     r.reference_kernels = cfg_.accept_reference_kernels;
     r.profile_ops       = cfg_.profile_ops;
     r.deterministic     = cfg_.deterministic;

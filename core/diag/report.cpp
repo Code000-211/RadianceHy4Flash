@@ -73,11 +73,14 @@ std::string host_lines(const HostFacts& h, const RunFacts& r) {
              h.cgroup_mem_limit == -2 ? "unlimited" : bytes_or_unknown(h.cgroup_mem_limit).c_str(),
              h.memlock_soft == -2 ? "unlimited" : bytes_or_unknown(h.memlock_soft).c_str());
     o += fmt("  memory    huge pages %s (defrag %s, shmem %s) | ttm.pages_limit %s "
-             "| pinned by this process %s\n",
+             "| pinned by this process %s%s\n",
              or_unknown(h.thp_enabled).c_str(), or_unknown(h.thp_defrag).c_str(),
              or_unknown(h.thp_shmem).c_str(),
              h.ttm_pages_limit > 0 ? humanb(h.ttm_pages_limit * h.page_size).c_str() : "unknown",
-             bytes_or_unknown(r.pinned_bytes).c_str());
+             bytes_or_unknown(r.pinned_bytes).c_str(),
+             r.pinned_unlocked_bytes > 0
+                 ? fmt(" (%s not locked against swap)", humanb(r.pinned_unlocked_bytes).c_str()).c_str()
+                 : "");
     o += fmt("  iommu     %s (%s)\n", or_unknown(h.iommu).c_str(), or_unknown(h.iommu_why).c_str());
     o += fmt("  amdgpu    cwsr_enable %s | boot parameters: %s\n",
              h.cwsr_enable < 0 ? "unknown" : std::to_string(h.cwsr_enable).c_str(),
@@ -293,6 +296,7 @@ std::string to_json(const std::vector<ConfigRow>& config, const std::vector<Deci
     run["p2p_blocked"] = r.p2p_blocked;
     run["ignored_devices"] = r.ignored;
     run["pinned_bytes"] = r.pinned_bytes;
+    run["pinned_unlocked_bytes"] = r.pinned_unlocked_bytes;
     run["host_weight_bytes"] = r.host_weight_bytes;
     run["file_weight_bytes"] = r.file_weight_bytes;
     o["hardware"] = { { "host", std::move(host) }, { "cards", std::move(cards) }, { "run", std::move(run) } };

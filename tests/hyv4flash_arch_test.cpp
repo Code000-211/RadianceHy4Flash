@@ -513,6 +513,186 @@ TEST(the_engram_layers_share_one_window) {
     CHECK_EQ(n_adv, 2);         /* the window moves on once a layout, not once a layer */
 }
 
+/* M-18b: the step-start prefetch. A disk-placed Engram layer's row reads (~3 ms a layer at decode)
+ * must not serialize in front of the layers that wait for them: the first Engram layer's step
+ * hashes each later disk-placed layer's ids into that layer's own planes and issues a gather whose
+ * ahead operand names those ids themselves -- the host gather's prefetch signal (avx_ngram.cpp's
+ * prefetch mode: hand the ids to the reader thread, read nothing). The layer's own ids and gather
+ * follow at its position, unchanged: the step's outputs are the parent's byte for byte, only the
+ * cache's timing moves. A device-placed table declares the planes and issues nothing. */
+TEST(the_later_engram_layers_prefetch_at_the_step_start) {
+    Declared d(bf16_encs, 1, 0, false, 128, 0, 0, 0, two_engram_layers);
+    REQUIRE_EQ(d.rc, RAD_OK);
+    const RadBuilder& b = d.b;
+    /* The second of the two layers declares its own planes and the two ops that fill them; the
+     * first, which opens the step, declares none. */
+    const RecBuf* pf_ids = find_b(b, "eg.pf_ids.2");
+    const RecBuf* pf_mask = find_b(b, "eg.pf_mask.2");
+    const RecBuf* pf_rows = find_b(b, "eg.pf_rows.2");
+    REQUIRE(pf_ids != nullptr);
+    REQUIRE(pf_mask != nullptr);
+    REQUIRE(pf_rows != nullptr);
+    CHECK(find_b(b, "eg.pf_ids.0") == nullptr);
+    CHECK_EQ(count_op(b, "engram_ids"), 5);        /* two layouts a layer and the second's early hash */
+    CHECK_EQ(count_op(b, "embed_lookup_q"), 3);    /* a gather a layer and the second's prefetch */
+    /* The prefetch ops are declared last (after the layer's own vocabulary), so they are the last
+     * `engram_ids` op and the last `embed_lookup_q` op. */
+    std::vector<rad_op> ids_ops, gathers;
+    for (size_t i = 0; i < b.ops.size(); ++i) {
+        if (b.ops[i].op == "engram_ids") ids_ops.push_back((rad_op)(i + 1));
+        if (b.ops[i].op == "embed_lookup_q") gathers.push_back((rad_op)(i + 1));
+    }
+    REQUIRE_EQ((int)ids_ops.size(), 5);
+    REQUIRE_EQ((int)gathers.size(), 3);
+    const rad_op pf_ids_op = ids_ops.back(), pf_gather = gathers.back();
+    auto k = kit(b, { 1 }, { 12 }, 0);
+    k->b.positions_h = k->pos.data();
+    const int64_t T = k->b.n_tok;
+    const rad_buf pf_h = (rad_buf)(pf_ids - b.bufs.data() + 1);
+    const rad_buf pm_h = (rad_buf)(pf_mask - b.bufs.data() + 1);
+    const rad_buf pr_h = (rad_buf)(pf_rows - b.bufs.data() + 1);
+    /* The prefetch is off by default and gated on the RESOLVED placement: every case below
+     * says which way RADIANCE_HY4_ENGRAM_PREFETCH and rad_ngram_layer_resolved stand. Layer 2
+     * is the one with prefetch planes; the fake's unset default is Config's own: global disk. */
+    setenv("RADIANCE_HY4_ENGRAM_PREFETCH", "1", 1);
+    radtest_set_ngram_resolved(2, RAD_TABLE_PLACE_DISK);
+    /* A device-placed table: the step is the parent's, nothing hashed or read early. */
+    {
+        RadCtx c{ .b = &d.b, .batch = &k->b };
+        hyv4flash::step(&c, &k->b);
+        CHECK(c.step_fail.empty());
+        CHECK_LINT(b, &c);
+        CHECK_EQ(count_issued(b, c, "engram_ids"), 4);
+        CHECK_EQ(count_issued(b, c, "embed_lookup_q"), 2);
+    }
+    /* A host-placed (disk) table. */
+    {
+        RadCtx c{ .b = &d.b, .batch = &k->b };
+        for (rad_op h : gathers) c.host_ops.push_back(h);
+        hyv4flash::step(&c, &k->b);
+        CHECK(c.step_fail.empty());
+        CHECK_LINT(b, &c);
+        CHECK_EQ(count_issued(b, c, "engram_ids"), 6);
+        CHECK_EQ(count_issued(b, c, "embed_lookup_q"), 3);
+        int pf_hash = 0, first_pf = -1, i = 0;
+        for (const RecIssue& is : c.issues) {
+            if (is.op == pf_ids_op) {
+                ++pf_hash;
+                if (first_pf < 0) first_pf = i;
+                CHECK_EQ((int)pint(b.op_of(is.op), "advance"), 0);   /* the window is not moved */
+                /* The step's own tokens, no ahead tail; the ids land in this layer's plane. */
+                CHECK_EQ(is.opd[0].rows, T);
+                CHECK_EQ(is.opd.back().kind, (uint8_t)RAD_OPK_BUF);
+                CHECK_EQ((int64_t)is.opd.back().handle, (int64_t)pm_h);      /* pf_mask */
+                CHECK_EQ((int64_t)is.opd[is.opd.size() - 2].handle, (int64_t)pf_h);   /* pf_ids */
+                std::string mult;
+                for (const RadOperand& od : is.opd)
+                    if (od.kind == RAD_OPK_WEIGHT && od.handle > 0 &&
+                        (size_t)od.handle <= b.weights.size()) {
+                        const std::string& n = b.weights[(size_t)od.handle - 1].name;
+                        if (n.size() > 4 && n.compare(n.size() - 4, 4, "mult") == 0) mult = n;
+                    }
+                CHECK(mult == "blk.2.engram_mult");   /* the SECOND layer's table */
+            }
+            ++i;
+        }
+        CHECK_EQ(pf_hash, 2);   /* both layouts, as the step's own ids are */
+        /* The prefetch gather: its ahead operand names its own ids (the alias is the signal), its
+         * output is the plane nothing reads, and it rides the step's start -- before the second
+         * layer's own gather. */
+        int ng = 0;
+        const RecIssue* pfg = nullptr;
+        int own2 = -1, pfg_at = -1;
+        for (i = 0, ng = 0; i < (int)c.issues.size(); ++i) {
+            const RecIssue& is = c.issues[(size_t)i];
+            if (b.ops[(size_t)is.op - 1].op != "embed_lookup_q") continue;
+            if (is.op == pf_gather) { pfg = &is; pfg_at = i; }
+            else if (is.op == gathers[1]) own2 = i;   /* declared second: layer 2's own gather */
+            ++ng;
+        }
+        REQUIRE(pfg != nullptr);
+        CHECK_EQ(ng, 3);
+        CHECK_EQ((int64_t)pfg->opd[0].handle, (int64_t)pf_h);          /* ids */
+        CHECK_EQ((int64_t)pfg->opd.back().handle, (int64_t)pf_h);      /* ahead: the same plane */
+        CHECK_EQ(pfg->opd.back().rows, T);
+        bool saw_rows = false;
+        for (const RadOperand& od : pfg->opd)
+            saw_rows = saw_rows || (od.kind == (uint8_t)RAD_OPK_BUF &&
+                                    (int64_t)od.handle == (int64_t)pr_h);
+        CHECK(saw_rows);                                               /* out: pf_rows */
+        CHECK(first_pf >= 0 && first_pf < pfg_at);                     /* hash before the read */
+        CHECK(pfg_at < own2);   /* the step's start, ahead of the layer this read belongs to */
+    }
+    /* The gate is placement, not naming. A layer NAMED 2=ram whose locked copy is host-gathered
+     * passes the domain test and would take a second full gather into pf_rows every step: the
+     * resolved view refuses it, and the step is the parent's byte for byte -- zero prefetch
+     * work issued for the named-ram layer. */
+    {
+        radtest_set_ngram_resolved(2, RAD_TABLE_PLACE_RAM);
+        RadCtx c{ .b = &d.b, .batch = &k->b };
+        for (rad_op h : gathers) c.host_ops.push_back(h);
+        hyv4flash::step(&c, &k->b);
+        CHECK(c.step_fail.empty());
+        CHECK_LINT(b, &c);
+        CHECK_EQ(count_issued(b, c, "engram_ids"), 4);
+        CHECK_EQ(count_issued(b, c, "embed_lookup_q"), 2);
+        radtest_set_ngram_resolved(2, RAD_TABLE_PLACE_DISK);
+    }
+    /* A global ram placement says the same for the layer no spec named: the resolved view is
+     * ram for it too, and the host gather of its locked copy prefetches nothing. */
+    {
+        radtest_set_ngram_resolved(2, -1);              /* layer 2 unnamed */
+        radtest_set_ngram_resolved(-1, RAD_TABLE_PLACE_RAM);
+        RadCtx c{ .b = &d.b, .batch = &k->b };
+        for (rad_op h : gathers) c.host_ops.push_back(h);
+        hyv4flash::step(&c, &k->b);
+        CHECK(c.step_fail.empty());
+        CHECK_LINT(b, &c);
+        CHECK_EQ(count_issued(b, c, "engram_ids"), 4);
+        CHECK_EQ(count_issued(b, c, "embed_lookup_q"), 2);
+    }
+    /* And the other way: the global all-disk step (nothing named at all) IS a disk placement --
+     * the gate reads the placement, so the unnamed layer prefetches exactly as a named-disk
+     * one does. */
+    {
+        radtest_set_ngram_resolved(-1, -1);             /* back to the Config default: disk */
+        RadCtx c{ .b = &d.b, .batch = &k->b };
+        for (rad_op h : gathers) c.host_ops.push_back(h);
+        hyv4flash::step(&c, &k->b);
+        CHECK(c.step_fail.empty());
+        CHECK_LINT(b, &c);
+        CHECK_EQ(count_issued(b, c, "engram_ids"), 6);
+        CHECK_EQ(count_issued(b, c, "embed_lookup_q"), 3);
+        radtest_set_ngram_resolved(2, RAD_TABLE_PLACE_DISK);
+    }
+    /* Off by default: PREFETCH unset leaves the parent's step whatever the knob says. */
+    {
+        unsetenv("RADIANCE_HY4_ENGRAM_PREFETCH");
+        RadCtx c{ .b = &d.b, .batch = &k->b };
+        for (rad_op h : gathers) c.host_ops.push_back(h);
+        hyv4flash::step(&c, &k->b);
+        CHECK(c.step_fail.empty());
+        CHECK_LINT(b, &c);
+        CHECK_EQ(count_issued(b, c, "engram_ids"), 4);
+        CHECK_EQ(count_issued(b, c, "embed_lookup_q"), 2);
+    }
+    /* Only =1 turns it on: =0 (the sync-hybrid A/B arm) and any other value leave the parent's
+     * step. */
+    for (const char* v : {"0", "2"}) {
+        setenv("RADIANCE_HY4_ENGRAM_PREFETCH", v, 1);
+        RadCtx c{ .b = &d.b, .batch = &k->b };
+        for (rad_op h : gathers) c.host_ops.push_back(h);
+        hyv4flash::step(&c, &k->b);
+        CHECK(c.step_fail.empty());
+        CHECK_LINT(b, &c);
+        CHECK_EQ(count_issued(b, c, "engram_ids"), 4);
+        CHECK_EQ(count_issued(b, c, "embed_lookup_q"), 2);
+    }
+    unsetenv("RADIANCE_HY4_ENGRAM_PREFETCH");
+    radtest_set_ngram_resolved(2, -1);    /* the fake back to Config default: global disk */
+    radtest_set_ngram_resolved(-1, -1);
+}
+
 TEST(last_layer_keeps_cache_writers_at_chunk_height_and_queries_at_output_height) {
     RadBuilder b;
     bf16_encs(&b);
@@ -1115,6 +1295,36 @@ TEST(the_debug_taps_are_persistent_buffers_and_lint_clean) {
         CHECK_LINT(d.b, &c);
         CHECK(c.step_fail.empty());
     }
+}
+
+/* X-05's Change line, as a guard rather than as prose. The backlog's X-05 entry asks that `hyv4flash`
+ * set `kv_stream_ok` and that `mla_attn_sel_sink` read a selection of the sparse latent; both shipped
+ * ahead of this card -- the flag at `arch/hyv4flash/hyv4flash.cpp:1603` (`489fd4f4`), the op in
+ * `libavx/avx_hy4.cpp:520` -- and the rows X-05a adds to GUIDE §4.4.1 and ARCHITECTURES state which
+ * of the three latent/index groups streams and which is read whole. That claim now fails a test
+ * instead of a reader's trust: the probe claims the capability, the selection-reading attention is
+ * declared, the indexer's pooled keys are dense-read (the scorer reads every group of the history
+ * every step, so they are never a streamed group), and the two latent groups are not. */
+TEST(x05_which_group_streams_and_which_is_read_whole) {
+    Declared d;
+    REQUIRE_EQ(d.rc, RAD_OK);
+    RadBuilder& b = d.b;
+
+    RadArchProbe pr{};
+    REQUIRE_EQ(hyv4flash::probe(d.mk.meta(), &pr), RAD_OK);
+    CHECK_EQ(pr.kv_stream_ok, 1);                  /* the item's first clause */
+    CHECK(count_op(b, "mla_attn_sel_sink") > 0);    /* and its second: a selection is read */
+
+    for (const char* n : { "kv_latent_sparse", "kv_latent_sliding" }) {
+        const RecKV* k = kv_named(b, n);
+        REQUIRE(k != nullptr);
+        CHECK(!k->dense);                          /* paged; the sparse one is the streamed one */
+    }
+    const RecKV* ix = kv_named(b, "kv_index_keys");
+    REQUIRE(ix != nullptr);
+    CHECK(ix->dense);                              /* `rad_kv_group_dense_read`, never streamed */
+    CHECK_EQ(count_op(b, "kv_store_streamed"), 2);  /* the sparse layers, and nothing else */
+    CHECK_EQ(count_op(b, "kv_resolve"), 2);
 }
 
 /* Streamed KV (docs/KV-STREAMING.md, WP14): the sparse latent group streams like GLM's MLA. A pass
@@ -1940,6 +2150,56 @@ TEST(w2_splits_a_decode_passes_routed_layer_into_the_resident_launches_and_a_tai
     CHECK_EQ(pre.w2_asked, 0);
     for (const RecIssue& i : pre.issues)
         for (const RadOperand& o : i.opd) CHECK(!is_w2(o));
+}
+
+/* Issue #324: W2 only where the routed GEMMs read its operands. Above their decode band
+ * (rad_w2_in_band: 2 x rows x top_k <= 3 x n_expert; the preset's 4 experts at top-2 hold 3 rows)
+ * the GEMMs take a prefill form, which runs every expert on the first launch and again on the tail:
+ * the whole routed layer twice, which cost a DFly2 c16 verify pass (64-96 rows of Hy4-flash's 512
+ * experts at top-16, a band of 48) a fifth of its rate. Such a pass does not ask for the form, and
+ * issues the switch-off step; the band's last row still takes it. */
+TEST(w2_leaves_a_pass_above_the_routed_gemms_decode_band_to_the_one_launch_form) {
+    Declared d(+[](RadBuilder* b) {
+        bf16_encs(b);
+        b->encs[0].second = enc_trellis(RAD_U4, true);
+        b->encs[1].second = enc_nl64(6);
+    });
+    REQUIRE_EQ(d.rc, RAD_OK);
+    static char block[sizeof(RadW2Layer)];
+    auto is_w2 = [&](const RadOperand& o) {
+        return o.kind == RAD_OPK_RAW && o.raw == (void*)block && o.dtype == RAD_U8 &&
+               o.rows == (int64_t)sizeof(RadW2Layer);
+    };
+    CHECK(rad_w2_in_band(3 * 2, 4));
+    CHECK(!rad_w2_in_band(4 * 2, 4));
+
+    /* the band's last row: the form, a tail a routed layer */
+    auto k3 = kit(d.b, { 1, 1, 1 }, {}, 0);
+    RadCtx edge{ .b = &d.b, .batch = &k3->b };
+    edge.w2 = block;
+    hyv4flash::step(&edge, &k3->b);
+    CHECK(edge.step_fail.empty());
+    CHECK(edge.w2_asked >= 2);
+    CHECK_EQ(edge.w2_tails.size(), (size_t)2);
+
+    /* a row past it: not asked, no tail, no W2 operand, the switch-off step's issues */
+    auto k4 = kit(d.b, { 1, 1, 1, 1 }, {}, 0);
+    REQUIRE_EQ(k4->b.phase, (int)RAD_PHASE_DECODE);
+    RadCtx off{ .b = &d.b, .batch = &k4->b };
+    hyv4flash::step(&off, &k4->b);
+    CHECK(off.step_fail.empty());
+    RadCtx wide{ .b = &d.b, .batch = &k4->b };
+    wide.w2 = block;
+    hyv4flash::step(&wide, &k4->b);
+    CHECK(wide.step_fail.empty());
+    CHECK_EQ(wide.w2_asked, 0);
+    CHECK(wide.w2_tails.empty());
+    REQUIRE_EQ(wide.issues.size(), off.issues.size());
+    for (size_t x = 0; x < wide.issues.size(); ++x) {
+        CHECK_EQ(wide.issues[x].op, off.issues[x].op);
+        REQUIRE_EQ(wide.issues[x].opd.size(), off.issues[x].opd.size());
+        for (const RadOperand& o : wide.issues[x].opd) CHECK(!is_w2(o));
+    }
 }
 
 TEST(the_moe_gather_reads_the_sorts_inverse_table) {
@@ -3070,6 +3330,156 @@ TEST(the_pipelined_prefill_pieces_are_the_whole_steps_junctions) {
         CHECK_EQ(l96, 0);
         CHECK_EQ(short96, 0);
     }
+    unsetenv("RADIANCE_HY4_PIPE_MIN");
+    unsetenv("RADIANCE_HY4_PIPE_ROWS");
+    g3_fusions = g3;
+}
+
+/* P-17 (#301): the attention core in the pipeline's two pieces (RADIANCE_HY4_PIPE_ATTN=1), run
+ * card-less at 128 rows cut 64 + 64, fresh (the sliding layer's dense form, the sparse layers'
+ * selection) and behind a 96-token cached prefix (the paged form), at two and four ranks:
+ *  - with the switch the declare is the same with the pipeline on and off, op for op (sizing), and
+ *    without it the bounds and their two launches are not declared at all;
+ *  - every attention launch of the step is a 64-row piece on lane 0, and lane 1 runs exactly what it
+ *    runs without the split (only junction pieces);
+ *  - each piece's bounds, replayed from the step's own integer launches (IntReplay), put its first
+ *    query at its own position: the paged form's `used - qlen` at positions[r0], the dense form's
+ *    `n - m` at key r0 over keys from row 0, the selection form's tables at row r0;
+ *  - no two issues the lanes may run at once touch the same elements with one writing (lane_races),
+ *    with the split and without; every buffer lane 1 touches is named (lane1_unnamed); lint clean;
+ *  - with the switch off the attention runs whole, as before. */
+TEST(the_attention_pieces_bound_each_piece_at_its_own_rows) {
+    const bool g3 = g3_fusions;
+    g3_fusions = true;
+    setenv("RADIANCE_HY4_PIPE_MIN", "64", 1);
+    setenv("RADIANCE_HY4_PIPE_ROWS", "64", 1);
+    auto declare = [](RadBuilder& b, MetaKV& mk, int world, bool pipe) {
+        if (pipe) setenv("RADIANCE_HY4_PIPE", "1", 1);
+        else unsetenv("RADIANCE_HY4_PIPE");
+        setenv("RADIANCE_HY4_PIPE_ATTN", "1", 1);   /* the bounds plane is declared with the switch */
+        pipe_i8_encs(&b);
+        RadBuildCtx ctx = build_ctx(0, world);
+        G3Env g3env;
+        const int rc = hyv4flash::declare(&b, mk.meta(), &ctx);
+        unsetenv("RADIANCE_HY4_PIPE");
+        unsetenv("RADIANCE_HY4_PIPE_ATTN");
+        return rc;
+    };
+    /* the rebased bounds plane's extent: the pieces' eight bounds ride behind its entries */
+    auto cu_rows = [](const RadBuilder& b) {
+        for (const RecBuf& r : b.bufs)
+            if (r.name.size() >= 10 && r.name.compare(r.name.size() - 10, 10, "cu_prefill") == 0)
+                return r.d.shape[0];
+        return (int64_t)0;
+    };
+    auto is_attn = [](const RecOp* o) {
+        return o && (o->op == "mla_attn_paged_sink" || o->op == "mla_attn_sel_sink" ||
+                     o->op == "attn_kv_sink");
+    };
+    auto pitch_of = [](const RadBuilder& b, rad_buf h) {
+        const RadBufDecl& d = b.bufs[h - 1].d;
+        int64_t p = 1;
+        for (uint32_t k = 1; k < d.rank; ++k) p *= d.shape[k];
+        return p;
+    };
+    auto lane1_ops = [](const RadCtx& c) {
+        std::vector<std::pair<rad_op, int64_t>> v;
+        for (const RecIssue& is : c.issues)
+            if (is.lane == 1) v.emplace_back(is.op, is.n);
+        return v;
+    };
+    for (int world : { 2, 4 })
+        for (int32_t prefix : { 0, 96 }) {
+            MetaKV mk = mini_meta(true, 128, 256);
+            RadBuilder whole, piped;
+            REQUIRE_EQ(declare(whole, mk, world, false), RAD_OK);
+            REQUIRE_EQ(declare(piped, mk, world, true), RAD_OK);
+            REQUIRE_EQ(whole.ops.size(), piped.ops.size());
+            REQUIRE_EQ(whole.bufs.size(), piped.bufs.size());
+            REQUIRE(cu_rows(piped) > 8);
+            auto run = [&](bool split) {
+                if (split) setenv("RADIANCE_HY4_PIPE_ATTN", "1", 1);
+                else unsetenv("RADIANCE_HY4_PIPE_ATTN");
+                auto k = kit(piped, {}, { 128 }, prefix);
+                k->b.positions_h = k->pos.data();
+                auto v = run_passes(piped, hyv4flash::step, { k.get() }, 0, world);
+                unsetenv("RADIANCE_HY4_PIPE_ATTN");
+                return std::make_pair(std::move(k), std::move(v));
+            };
+            auto off = run(false);
+            auto on = run(true);
+            CHECK_PASSES(piped, off.second);
+            CHECK_PASSES(piped, on.second);
+            const RadCtx& c0 = *off.second[0];
+            const RadCtx& c1 = *on.second[0];
+            const Kit& kt = *on.first;
+            /* the attention launches: whole without the switch, 64-row pieces on lane 0 with it */
+            int whole_attn = 0, pieces = 0, wrong = 0;
+            for (const RecIssue& is : c0.issues)
+                if (is_attn(piped.op_of(is.op))) whole_attn += is.n == 128;
+            CHECK(whole_attn > 0);
+            IntReplay rep;
+            rep.run(piped, c1, c1.issues.size());
+            std::map<rad_op, int64_t> sel_base;
+            for (const RecIssue& is : c1.issues) {
+                const RecOp* o = piped.op_of(is.op);
+                if (!is_attn(o)) continue;
+                if (is.n != 64 || is.lane != 0) {
+                    ++wrong;
+                    continue;
+                }
+                ++pieces;
+                const RadOperand& out = is.opd.back();
+                const int64_t r0 = out.offset / pitch_of(piped, out.handle);
+                CHECK(r0 == 0 || r0 == 64);
+                const RadOperand& q = is.opd[0];
+                CHECK_EQ(q.offset / pitch_of(piped, q.handle), r0);
+                if (o->op == "mla_attn_paged_sink") {
+                    const int64_t qlen = rep.at(piped, is.opd[5], 1) - rep.at(piped, is.opd[5], 0);
+                    const int64_t first = rep.at(piped, is.opd[4], 0) - qlen;
+                    CHECK_EQ(qlen, (int64_t)64);
+                    if (first != kt.pos[(size_t)r0])
+                        fprintf(stderr, "    world %d prefix %d: paged piece at row %lld sees position %lld, "
+                                "not %d\n", world, prefix, (long long)r0, (long long)first, kt.pos[(size_t)r0]);
+                    CHECK_EQ(first, (int64_t)kt.pos[(size_t)r0]);
+                } else if (o->op == "attn_kv_sink") {
+                    const int64_t m = rep.at(piped, is.opd[3], 1) - rep.at(piped, is.opd[3], 0);
+                    const int64_t nk = rep.at(piped, is.opd[4], 1) - rep.at(piped, is.opd[4], 0);
+                    CHECK_EQ(prefix, 0);
+                    CHECK_EQ(m, (int64_t)64);
+                    CHECK_EQ(nk - m, r0);
+                    CHECK_EQ(is.opd[1].offset, (int64_t)0);
+                    CHECK(is.opd[1].rows >= nk);
+                } else {
+                    /* the selection's tables at the piece's rows: `len` a row each, `sel` at its
+                     * window's base (P-09) plus r0 rows */
+                    CHECK_EQ(is.opd[4].offset, r0);
+                    const int64_t K = pitch_of(piped, is.opd[3].handle);
+                    if (!r0) sel_base[is.op] = is.opd[3].offset;
+                    else CHECK_EQ(is.opd[3].offset, sel_base[is.op] + r0 * K);
+                }
+            }
+            CHECK_EQ(wrong, 0);
+            CHECK_EQ(pieces, 2 * whole_attn);
+            CHECK(lane1_ops(c1) == lane1_ops(c0));
+            CHECK(!lane1_ops(c1).empty());
+            CHECK_EQ(report_lint(lane_races(piped, view(off.second))), (size_t)0);
+            CHECK_EQ(report_lint(lane_races(piped, view(on.second))), (size_t)0);
+            CHECK_EQ(report_lint(lane1_unnamed(piped, view(on.second))), (size_t)0);
+            /* last: a declare replaces the model the step runs */
+            {
+                RadBuilder plain;
+                setenv("RADIANCE_HY4_PIPE", "1", 1);
+                pipe_i8_encs(&plain);
+                RadBuildCtx ctx = build_ctx(0, world);
+                G3Env g3env;
+                REQUIRE_EQ(hyv4flash::declare(&plain, mk.meta(), &ctx), RAD_OK);
+                unsetenv("RADIANCE_HY4_PIPE");
+                CHECK_EQ(cu_rows(plain) + 8, cu_rows(piped));
+                CHECK_EQ(plain.bufs.size(), piped.bufs.size());
+                CHECK_EQ(plain.ops.size() + 2, piped.ops.size());
+            }
+        }
     unsetenv("RADIANCE_HY4_PIPE_MIN");
     unsetenv("RADIANCE_HY4_PIPE_ROWS");
     g3_fusions = g3;
