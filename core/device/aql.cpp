@@ -1145,15 +1145,12 @@ void report_running(int card, uintptr_t fault) {
                 (void*)s->q, rd, wr, run.size(), (size_t)kReportRuns);
         for (uint64_t idx : run) {
             const uint64_t need = slot_need_at(s, idx);
-            report_one(s, idx, "may have run", fault);
+            report_one(s, idx, running_state(need, counter), fault);
             if (need)
                 RAD_ERR("device %d:   packet %" PRIu64 " is chained: it waits for the queue's"
                         " counter to reach %" PRIu64 ", which the card is at %" PRIu64 " (the host"
                         " has read %" PRIu64 ")",
                         card, idx, need, counter, s->chain_seen);
-            else
-                RAD_ERR("device %d:   packet %" PRIu64 " went out without its barrier bit", card,
-                        idx);
         }
         if (run.size() >= kReportRuns)
             RAD_ERR("device %d:   (stopped at %zu; the ring holds more)", card, run.size());

@@ -73,7 +73,8 @@ std::vector<uint64_t> still_running(uint64_t rd, uint64_t wr, uint64_t size, uin
 }
 
 /* One line for a candidate: whether it is chained and what it waits for, in the words the report
- * uses. `need` is that slot's chain_need, `counter` the value the host last read. */
+ * uses. `need` is that slot's chain_need, `counter` the completion counter as the card has it at
+ * the call. */
 inline const char* running_state(uint64_t need, uint64_t counter) {
     return need > counter ? "may still run (chained: its blocks have not all counted)"
                           : "may still run (went out without its barrier bit)";
