@@ -562,13 +562,18 @@ bool row_ahead_case(const Lib& lib, const std::string& dir, bool verbose) {
  *   - the alias matches only in the unit the plugin passes, and only EXACTLY: M = T*H rows and
  *     n_ahead = T*H rows (brows(pf_ids, T) over a [T, heads] plane). n_ahead = M/2, as a
  *     token-counted offer would be, must NOT match, and neither may n_ahead = M+1 -- one row
- *     off: both calls gather their rows themselves and fill out.
+ *     off: both calls gather their rows themselves and fill out. (The M+1 offer is read ahead
+ *     behind the call like any other ahead list, so the two calls read M and M+1 rows.)
  *   - the matching call returns without reading: out keeps its fill value, and the reader thread
  *     reads exactly those rows; the layer's own gather behind it (ahead gone) finds them in the
  *     cache and reads nothing more.
  *   - the queue clamps to kAheadRows (RowCache::kRows/4 = 1<<17, avx_ngram.cpp): an offer of
  *     kAheadRows+64 distinct ids hands over kAheadRows.
- *   - ids outside the table are skipped: neither -1 nor n_vocab+7 reaches the reader. */
+ *   - ids outside the table are skipped: neither -1 nor n_vocab+7 reaches the reader. That skip
+ *     is the gather's, which `embed_lookup_q` reaches only where its own check does not refuse
+ *     the list first -- one rank with no vocab_offset refuses an id past the table outright --
+ *     so the case makes the two-rank call the engine makes at TP2 and the one-rank refusal its
+ *     own check. */
 bool row_prefetch_case(const Lib& lib, const std::string& dir_in, bool verbose) {
     const char* what = "embed_lookup_q's prefetch mode (ahead aliases ids)";
     const RadKernelInfo* r = lib.row("embed_lookup_q");
@@ -625,9 +630,10 @@ bool row_prefetch_case(const Lib& lib, const std::string& dir_in, bool verbose) 
         else if (verbose) std::printf("  %s: %s\n", what, name);
     };
     /* One call: rows gathered, ahead aliases ids when `alias` (n_ahead = M; 2: M/2, a
-     * token-counted offer; 3: M+1, one row off) or no ahead operand at all (`ahead_none`). */
+     * token-counted offer; 3: M+1, one row off) or no ahead operand at all (`ahead_none`).
+     * `world_size` is the call's: the engine's prefetch is the two-rank one at TP2. */
     auto call = [&](std::vector<int32_t>& ids, int64_t M, void* out, int64_t out_n,
-                   int alias, int ahead_none) {
+                   int alias, int ahead_none, int world_size = 1) {
         std::vector<RadTensor> ts = {
             tensor(ids.data(), RAD_I32, {M}),
             tensor(const_cast<uint8_t*>(tab), RAD_F8E4M3, {V, n}),
@@ -643,7 +649,7 @@ bool row_prefetch_case(const Lib& lib, const std::string& dir_in, bool verbose) 
         RadArgs a{};
         a.t = ts.data(); a.n_t = (int)ts.size();
         a.p = ps; a.n_p = 3;
-        a.rank = 0; a.world_size = 1;
+        a.rank = 0; a.world_size = world_size;
         return r->launch(&a, nullptr);
     };
     auto rows_exact = [&](const std::vector<int32_t>& ids, int64_t M, const uint16_t* out) {
@@ -684,8 +690,12 @@ bool row_prefetch_case(const Lib& lib, const std::string& dir_in, bool verbose) 
         const int rc = call(ids, M, out.data(), M, 3, 0);
         const uint64_t read = reads() - before;
         check(rc == RAD_OK, "n_ahead=M+1 call returns RAD_OK");
-        check(read == (uint64_t)M, "n_ahead=M+1 gathers its own rows (the alias needs"
-                                   " n_ahead == M exactly)");
+        /* M rows here and one more behind them: the call gathers its own M rows, then
+         * read_ahead hands the offer's one id past them (ids[M], a row a later call would
+         * gather) to the reader. out being filled is what says the ordinary gather ran -- the
+         * alias writes nothing (case 2). */
+        check(read == (uint64_t)(M + 1), "n_ahead=M+1 gathers its own M rows, and the read-ahead"
+                                         " behind it takes the one id past them");
         check(rows_exact(ids, M, out.data()), "n_ahead=M+1 output is the file's rows");
     }
     /* 2. The alias: n_ahead = M over the same pointer — the reader gets the rows, this call reads
@@ -723,7 +733,8 @@ bool row_prefetch_case(const Lib& lib, const std::string& dir_in, bool verbose) 
         check(read == (uint64_t)kAheadRows,
               "kAheadRows of the kAheadRows+64 offered ids were read");
     }
-    /* 4. Out-of-range ids: -1 and n_vocab+7 never reach the reader. */
+    /* 4. Out-of-range ids: -1 and n_vocab+7 never reach the reader (avx_ngram.cpp's prefetch
+     *    path hands the reader only ids inside the table). */
     {
         const int64_t M = 64;
         std::vector<int32_t> ids((size_t)M);
@@ -737,7 +748,7 @@ bool row_prefetch_case(const Lib& lib, const std::string& dir_in, bool verbose) 
         }
         std::vector<uint16_t> out((size_t)(M * n), 0xdead);
         const uint64_t before = reads();
-        const int rc = call(ids, M, out.data(), M, 1, 0);
+        const int rc = call(ids, M, out.data(), M, 1, 0, 2);   /* TP2, as the engine calls it */
         const uint64_t read = reads() - before;
         check(rc == RAD_OK, "out-of-range call returns RAD_OK");
         char nm[128];
@@ -745,6 +756,16 @@ bool row_prefetch_case(const Lib& lib, const std::string& dir_in, bool verbose) 
                       "the %lld in-range ids were read, the two out-of-range kinds skipped",
                       (long long)valid);
         check(read == (uint64_t)valid, nm);
+        /* One rank and no vocab_offset: `embed_lookup_q` refuses the same list itself, before
+         * any gather (avx_gemm.cpp), so the gather's skip is never reached and nothing is read. */
+        std::vector<uint16_t> out1((size_t)(M * n), 0xdead);
+        const uint64_t before1 = reads();
+        const int rc1 = call(ids, M, out1.data(), M, 1, 0);
+        bool untouched = true;
+        for (uint16_t v : out1) if (v != 0xdead) { untouched = false; break; }
+        check(rc1 == RAD_E_INVAL && untouched && reads() - before1 == 0,
+              "one rank with no vocab_offset refuses the id past the table, reading and"
+              " writing nothing");
     }
 
     ::rmdir(dir.c_str());
