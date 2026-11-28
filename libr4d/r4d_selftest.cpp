@@ -5123,8 +5123,10 @@ static void kv_store_i8_latent_case(const Plugin& pl) {
     const int64_t M = (int64_t)slots.size();
     std::vector<uint16_t> hk((size_t)M * hd, h_to_bf16(2.0f)), hv((size_t)M * hd, h_to_bf16(2.0f));
     for (int64_t d = 0; d < hd; ++d) {
-        hk[(size_t)(2 * hd + d)] = h_to_bf16(0.0f);           /* token 1: zero K */
-        hv[(size_t)(2 * hd + d)] = h_to_bf16(0.0f);           /* and zero V */
+        hk[(size_t)(hd + d)] = h_to_bf16(0.0f);               /* token 1: zero K */
+        hv[(size_t)(hd + d)] = h_to_bf16(0.0f);               /* and zero V */
+        hk[(size_t)(2 * hd + d)] = h_to_bf16(0.0f);           /* the pad token too */
+        hv[(size_t)(2 * hd + d)] = h_to_bf16(0.0f);
     }
     const size_t cbytes = (size_t)(nb * bs * rowb);
     void* d_k = dalloc((size_t)M * hd * 2);
