@@ -17,6 +17,21 @@ uint64_t load(const unsigned char* p, uint32_t n) {
     return v;
 }
 
+/* Whether a parameter's bytes are an address or a number, from the metadata's value_kind. Size
+ * cannot answer it: a `uint64_t *` and a `uint64_t` are both eight bytes, and so is
+ * hidden_global_offset_x, which the backend writes as the value it is (aql.cpp). A kind the
+ * metadata does not name (empty, or one added after this) is printed as the number it may be:
+ * a number shown as "in no range this process holds" is the line this report exists to remove. */
+bool is_address(const KernelArg& a) {
+    if (a.hidden != Hidden::None) {
+        /* The implicit arguments this backend accepts carry a count or an offset, never an address
+         * (`hidden_kind`, aql_code.cpp), and the rest refuse their kernel before it is launched. */
+        return false;
+    }
+    return a.kind == "global_buffer" || a.kind == "dynamic_shared_pointer" ||
+           a.kind == "sampler" || a.kind == "image" || a.kind == "pipe" || a.kind == "queue";
+}
+
 }  /* namespace */
 
 std::vector<std::string> karg_lines(const KargSlot& slot,
@@ -53,7 +68,7 @@ std::vector<std::string> karg_lines(const KargSlot& slot,
         }
         if (a.hidden == Hidden::Pad || a.size == 0) {
             out.push_back(head);
-        } else if (a.size >= 8) {
+        } else if (is_address(a)) {
             const uint64_t v = load(slot.base + a.offset, a.size);
             if (v == 0)
                 out.push_back(head + " = 0 (null)");

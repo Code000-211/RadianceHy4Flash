@@ -219,13 +219,60 @@ TEST(chain_record_is_not_claimed_for_a_plain_launch) {
     CHECK(rec->find("belongs to an earlier launch") != std::string::npos);
 }
 
+/* A 64-bit parameter is a value unless the metadata says it is an address: a `uint64_t` and a
+ * `uint64_t *` are both eight bytes, and `hidden_global_offset_x` is an eight-byte value. The old
+ * dump decided by size, so every one of them printed as "in no range this process holds" -- the
+ * integer-read-as-an-address line issue #337's own dump was chased through. */
+TEST(an_eight_byte_value_is_not_an_address) {
+    std::vector<KernelArg> layout;
+    KernelArg n;
+    n.offset = 0; n.size = 8; n.kind = "by_value"; n.name = "n";
+    layout.push_back(n);
+    KernelArg go;
+    go.offset = 8; go.size = 8; go.kind = "hidden_global_offset_x";
+    go.hidden = Hidden::GlobalOffsetX;
+    layout.push_back(go);
+    KernelArg p;
+    p.offset = 16; p.size = 8; p.kind = "global_buffer"; p.name = "p";
+    layout.push_back(p);
+    KernelArg k;
+    k.offset = 24; k.size = 4; k.kind = "by_value"; k.name = "k";
+    layout.push_back(k);
+
+    std::vector<unsigned char> slot(1024, 0xa5);
+    put64(slot, 0, 0x7ca037295800ull);  /* a count that happens to look like an address */
+    put64(slot, 8, 4096);
+    put64(slot, 16, 0x7ca000001000ull);
+    put32(slot, 24, 7);
+
+    int asked = 0;
+    const std::vector<std::string> lines = karg_lines(
+        KargSlot{slot.data(), (uint32_t)slot.size(), 32, false, &layout},
+        [&asked](uintptr_t) {
+            ++asked;
+            return std::string("in no range this process holds or recently freed");
+        });
+    const std::string want = "argument n (by_value, 8 bytes at +0) = " +
+                             std::to_string(0x7ca037295800ull);
+    CHECK(find_line(lines, want.c_str()) != nullptr);
+    CHECK(find_line(lines, "hidden_global_offset_x (8 bytes at +8) = 4096") != nullptr);
+    CHECK(find_line(lines, "argument k (by_value, 4 bytes at +24) = 7") != nullptr);
+    CHECK(find_line(lines, "argument p (global_buffer, 8 bytes at +16) = 0x7ca000001000: in no "
+                           "range this process holds") != nullptr);
+    /* The address lookup is asked about the address and about nothing else. */
+    CHECK_EQ(asked, 1);
+}
+
 /* A segment shorter than the metadata's parameters: what follows is another launch's, and the
  * report says so instead of printing it as arguments. */
 TEST(past_the_segment_is_not_printed) {
     const std::vector<KernelArg> layout = i8_kpar_layout();
     const std::vector<std::string> lines = lines_of(hy4_slot(), 60, layout);
     CHECK(find_line(lines, "argument sa_ld") != nullptr);
-    CHECK(find_line(lines, "hidden block_count_x") == nullptr);
+    /* The needle is the spelling the report prints (`kind`, the metadata's value_kind), so this
+     * check fails if a hidden slot past the segment is printed after all. */
+    CHECK(find_line(lines, "hidden_block_count_x") == nullptr);
+    CHECK(find_line(lines, "hidden_") == nullptr);
     CHECK(find_line(lines, "this launch's segment ends at +60") != nullptr);
 }
 
