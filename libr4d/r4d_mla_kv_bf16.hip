@@ -43,6 +43,14 @@
 // through the same chain.
 //
 // Chained forms (r4d_chain.h): the aligned path at NC 1, chosen at decode heights (M <= 64).
+// `kv_rot` (X-07, design note §3): `wht128` says the KV cache's latent rows are stored in the
+// rotated frame (r4d_row_i8.h), so the query has to be read in that frame too: the absorb's
+// epilogue rotates each (token, head) row's four 128-column blocks by the same WHT and
+// r4d_row_i8::kRotScale the store folds into its scales, before the one rounding at the store. The
+// scores are then the plain ones, (R q)(R x) = q x. `none` (the default, and `kv_rot` absent) is
+// today's bytes. The expansion reads a latent the sink already un-rotated after the fold (§5), so
+// the flag cannot change its bytes: it is accepted and inert there.
+//
 // mla_kv_split is a copy: k[i,h,0:kd] = kvb[i, h*(kd+vd) : +kd], k[i,h,kd:kd+r] = k_rope[i],
 // v[i,h,:] = kvb[i, h*(kd+vd)+kd : +vd]. One thread a 16 bytes of output.
 #include <hip/hip_runtime.h>
@@ -52,6 +60,7 @@
 #include "r4d_emit.h"
 #include "r4d_fwht.h"
 #include "r4d_q8.h"
+#include "r4d_row_i8_geom.h"
 #include <cstdint>
 
 namespace {
@@ -125,7 +134,7 @@ constexpr int kvp_chunk() {
     return best;
 }
 
-template <bool ABSORB, int MB, int NC, bool VEC, bool GATE, class CH>
+template <bool ABSORB, int MB, int NC, bool VEC, bool GATE, bool ROT, class CH>
 __device__ __forceinline__ void kvp_body(const uint16_t* __restrict__ x,
                                          const uint16_t* __restrict__ w,
                                          const uint16_t* __restrict__ g, uint16_t* __restrict__ y,
@@ -233,6 +242,58 @@ __device__ __forceinline__ void kvp_body(const uint16_t* __restrict__ x,
             }
         }
     }
+    /* X-07: the row's rotation, R = WHT(128) / sqrt(128), over the block the wave holds in acc:
+     * a column p of the block is 16 n + 8 (l / 16) + e, so stages 1, 2 and 4 are within the eight
+     * registers of a column tile, stage 8 pairs lane l with l ^ 16 (the other half of the block a
+     * token has in this wave), and stages 16, 32 and 64 pair the eight column tiles n and n + h.
+     * Staged by ascending stride as r4d_fwht_wave is, so the products are that transform's bits
+     * (see r4d_fwht_part's note on layouts). Unconditional over the tile: the stage-8 exchange
+     * reads its partner lane's register, and a token past M holds the last row's values either
+     * way (xp clamps), so the tail of the launch does the work and only the store skips it. */
+    if constexpr (ROT) {
+        static_assert(ABSORB && S == 1, "the rotation is the absorb's, and it is not split");
+        static_assert(NC == 8, "a wave holds the rotation's 128-column block");
+#pragma unroll
+        for (int r = 0; r < MB; ++r) {
+#pragma unroll
+            for (int h = 1; h < 8; h <<= 1)
+#pragma unroll
+                for (int n = 0; n < NC; ++n)
+#pragma unroll
+                    for (int e = 0; e < 8; ++e)
+                        if ((e & h) == 0) {
+                            const float a = acc[n][r][e], b = acc[n][r][e + h];
+                            acc[n][r][e] = a + b;
+                            acc[n][r][e + h] = a - b;
+                        }
+#pragma unroll
+            for (int n = 0; n < NC; ++n) {
+                /* a vector element has no address: the exchange runs on a copy of the eight */
+                float e8[8];
+#pragma unroll
+                for (int e = 0; e < 8; ++e) e8[e] = acc[n][r][e];
+                r4d_fwht_xstage<8, 16>(e8, lane);
+#pragma unroll
+                for (int e = 0; e < 8; ++e) acc[n][r][e] = e8[e];
+            }
+#pragma unroll
+            for (int h = 1; h < NC; h <<= 1)
+#pragma unroll
+                for (int n = 0; n < NC; ++n)
+                    if ((n & h) == 0)
+#pragma unroll
+                        for (int e = 0; e < 8; ++e) {
+                            const float a = acc[n][r][e], b = acc[n + h][r][e];
+                            acc[n][r][e] = a + b;
+                            acc[n + h][r][e] = a - b;
+                        }
+            /* the normaliser, the same constant the store folds into a block's scale */
+#pragma unroll
+            for (int n = 0; n < NC; ++n)
+#pragma unroll
+                for (int e = 0; e < 8; ++e) acc[n][r][e] *= r4d_row_i8::kRotScale;
+        }
+    }
     /* lane l holds token t0 + 16 r + l % 16 at the output columns o0 + 16 n + 8 (l / 16) + e */
 #pragma unroll
     for (int r = 0; r < MB; ++r) {
@@ -267,12 +328,12 @@ __device__ __forceinline__ void kvp_body(const uint16_t* __restrict__ x,
     }
 }
 
-template <bool ABSORB, int MB, int NC, bool VEC, bool GATE, typename CH>
+template <bool ABSORB, int MB, int NC, bool VEC, bool GATE, bool ROT, typename CH>
 __global__ __launch_bounds__(kvp_threads(ABSORB)) void kv_project_wmma(const uint16_t* __restrict__ x,
                                                        const uint16_t* __restrict__ w,
                                                        const uint16_t* __restrict__ g,
                                                        uint16_t* __restrict__ y, KvProjectMeta m) {
-    kvp_body<ABSORB, MB, NC, VEC, GATE, CH>(x, w, g, y, m);
+    kvp_body<ABSORB, MB, NC, VEC, GATE, ROT, CH>(x, w, g, y, m);
     if constexpr (CH::on) r4d_chain_done();
 }
 
@@ -538,7 +599,7 @@ __global__ __launch_bounds__(kQThreads) void kv_expand_gate_quant(
 }
 
 /* The launch: grid (column blocks, heads, token groups of 16 MB). */
-template <bool ABSORB, int MB, int NC, bool VEC, bool GATE, typename CH>
+template <bool ABSORB, int MB, int NC, bool VEC, bool GATE, bool ROT, typename CH>
 int kvp_emit(RadStream s, unsigned heads, const uint16_t* x, const uint16_t* w, const uint16_t* g,
              uint16_t* y, const KvProjectMeta& m) {
     constexpr int OUT = ABSORB ? kLatent : kVd, PER = 16 * NC * (kvp_split<ABSORB>() == 1 ? 4 : 1);
@@ -549,20 +610,31 @@ int kvp_emit(RadStream s, unsigned heads, const uint16_t* x, const uint16_t* w, 
      * full-card wave count at 0.998-1.001x the padded launch (seven interleaved kbench sessions
      * per arm, 24 shapes): a step here buys nothing measured. The window's exposure is the
      * kernel's, not the wave count's alone -- the 1024-thread quantiser launch below pays it. */
-    return R4D_EMIT(s, (kv_project_wmma<ABSORB, MB, NC, VEC, GATE, CH>),
+    return R4D_EMIT(s, (kv_project_wmma<ABSORB, MB, NC, VEC, GATE, ROT, CH>),
                     dim3(OUT / PER, heads, groups), dim3(kvp_threads(ABSORB)), 0, x, w, g, y, m);
 }
 
 template <bool ABSORB, bool GATE>
-int kvp_pick(RadStream s, unsigned heads, int mb, bool vec, bool chain, bool stage, const uint16_t* x,
-             const uint16_t* w, const uint16_t* g, uint16_t* y, const KvProjectMeta& m) {
-    if (!vec) return kvp_emit<ABSORB, 1, 1, false, GATE, R4dUnchained>(s, heads, x, w, g, y, m);
+int kvp_pick(RadStream s, unsigned heads, int mb, bool vec, bool chain, bool stage, bool rot,
+             const uint16_t* x, const uint16_t* w, const uint16_t* g, uint16_t* y,
+             const KvProjectMeta& m) {
+    /* X-07's rotated frame: the absorb's epilogue rotates a 128-column block, which a wave holds
+     * at eight column tiles (NC 8) and one token tile (MB 1), so it is its own shape -- a workgroup
+     * is the whole 512-column row and 16 tokens, four waves to the four blocks. Not the chained
+     * form: that one is NC 1. The expansion keeps its own shapes (the flag is inert there). */
+    if constexpr (ABSORB) {
+        if (rot) {
+            if (!vec) return kvp_emit<true, 1, 8, false, GATE, true, R4dUnchained>(s, heads, x, w, g, y, m);
+            return kvp_emit<true, 1, 8, true, GATE, true, R4dUnchained>(s, heads, x, w, g, y, m);
+        }
+    }
+    if (!vec) return kvp_emit<ABSORB, 1, 1, false, GATE, false, R4dUnchained>(s, heads, x, w, g, y, m);
     if (chain) {
         switch (mb) {
-            case 1: return kvp_emit<ABSORB, 1, 1, true, GATE, r4dchain>(s, heads, x, w, g, y, m);
-            case 2: return kvp_emit<ABSORB, 2, 1, true, GATE, r4dchain>(s, heads, x, w, g, y, m);
-            case 4: return kvp_emit<ABSORB, 4, 1, true, GATE, r4dchain>(s, heads, x, w, g, y, m);
-            default: return kvp_emit<ABSORB, 8, 1, true, GATE, r4dchain>(s, heads, x, w, g, y, m);
+            case 1: return kvp_emit<ABSORB, 1, 1, true, GATE, false, r4dchain>(s, heads, x, w, g, y, m);
+            case 2: return kvp_emit<ABSORB, 2, 1, true, GATE, false, r4dchain>(s, heads, x, w, g, y, m);
+            case 4: return kvp_emit<ABSORB, 4, 1, true, GATE, false, r4dchain>(s, heads, x, w, g, y, m);
+            default: return kvp_emit<ABSORB, 8, 1, true, GATE, false, r4dchain>(s, heads, x, w, g, y, m);
         }
     }
     /* expand at four token tiles: the workgroup stages the tokens' block once for four column tiles */
@@ -573,19 +645,19 @@ int kvp_pick(RadStream s, unsigned heads, int mb, bool vec, bool chain, bool sta
      * expand's split workgroup takes one */
     if (!ABSORB || m.rows <= 16) {
         switch (mb) {
-            case 1: return kvp_emit<ABSORB, 1, 1, true, GATE, R4dUnchained>(s, heads, x, w, g, y, m);
-            case 2: return kvp_emit<ABSORB, 2, 1, true, GATE, R4dUnchained>(s, heads, x, w, g, y, m);
-            case 4: return kvp_emit<ABSORB, 4, 1, true, GATE, R4dUnchained>(s, heads, x, w, g, y, m);
-            default: return kvp_emit<ABSORB, 8, 1, true, GATE, R4dUnchained>(s, heads, x, w, g, y, m);
+            case 1: return kvp_emit<ABSORB, 1, 1, true, GATE, false, R4dUnchained>(s, heads, x, w, g, y, m);
+            case 2: return kvp_emit<ABSORB, 2, 1, true, GATE, false, R4dUnchained>(s, heads, x, w, g, y, m);
+            case 4: return kvp_emit<ABSORB, 4, 1, true, GATE, false, R4dUnchained>(s, heads, x, w, g, y, m);
+            default: return kvp_emit<ABSORB, 8, 1, true, GATE, false, R4dUnchained>(s, heads, x, w, g, y, m);
         }
     }
     if constexpr (ABSORB) {
         switch (mb) {
-            case 1: return kvp_emit<true, 1, 2, true, GATE, R4dUnchained>(s, heads, x, w, g, y, m);
-            case 2: return kvp_emit<true, 2, 2, true, GATE, R4dUnchained>(s, heads, x, w, g, y, m);
-            case 4: return kvp_emit<true, 4, 2, true, GATE, R4dUnchained>(s, heads, x, w, g, y, m);
+            case 1: return kvp_emit<true, 1, 2, true, GATE, false, R4dUnchained>(s, heads, x, w, g, y, m);
+            case 2: return kvp_emit<true, 2, 2, true, GATE, false, R4dUnchained>(s, heads, x, w, g, y, m);
+            case 4: return kvp_emit<true, 4, 2, true, GATE, false, R4dUnchained>(s, heads, x, w, g, y, m);
             /* eight token tiles take one column tile: two would need 256 VGPRs and spill */
-            default: return kvp_emit<true, 8, 1, true, GATE, R4dUnchained>(s, heads, x, w, g, y, m);
+            default: return kvp_emit<true, 8, 1, true, GATE, false, R4dUnchained>(s, heads, x, w, g, y, m);
         }
     }
     return R4D_NO(RAD_E_INVAL);
@@ -664,10 +736,18 @@ static int kvp_launch(const RadArgs* a, RadStream s, const RadTensor* x, const R
     const bool chain = r4d_geti_or(a, "chain", 0) != 0 && M <= 64;
     /* `stage` 1 keeps kvp_body's expand (the A/B arm); 0 stages wherever the form allows */
     const bool stage = r4d_geti_or(a, "stage", 0) != 1;
+    /* X-07's frame: `wht128` (the rotated latent cache) or `none` (the default). The expansion
+     * takes it and cannot act on it: the sink un-rotated the latent before it wrote it. */
+    const char* kvr = r4d_gets(a, "kv_rot");
+    bool rot = false;
+    if (kvr && *kvr && std::strcmp(kvr, "none")) {
+        if (std::strcmp(kvr, "wht128")) return R4D_NO(RAD_E_SHAPE);
+        rot = true;
+    }
     const unsigned H = (unsigned)h;
-    if (absorb) return kvp_pick<true, false>(s, H, mb, vec, chain, stage, xp, wp, nullptr, yp, m);
-    if (gp) return kvp_pick<false, true>(s, H, mb, vec, chain, stage, xp, wp, gp, yp, m);
-    return kvp_pick<false, false>(s, H, mb, vec, chain, stage, xp, wp, nullptr, yp, m);
+    if (absorb) return kvp_pick<true, false>(s, H, mb, vec, chain, stage, rot, xp, wp, nullptr, yp, m);
+    if (gp) return kvp_pick<false, true>(s, H, mb, vec, chain, stage, false, xp, wp, gp, yp, m);
+    return kvp_pick<false, false>(s, H, mb, vec, chain, stage, false, xp, wp, nullptr, yp, m);
 }
 
 extern "C" int r4d_rad_mla_project_kv(const RadArgs* a, RadStream s) {

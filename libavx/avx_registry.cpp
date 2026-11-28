@@ -214,7 +214,7 @@ static const RadOperandSpec oIhcJunction[] = { INOUT("a"), OPD_O("b"), WGT("w_po
 static const RadParamSpec pIhcPost[] = { P_INT("M"), P_INT("n"), P_INT("hc"), P_STR("dtype") };
 static const RadOperandSpec oIhcPost[] = { OPD("y"), OPD("post"), INOUT("h") };
 static const RadParamSpec pMlaProjectKv[] = { P_INT("M"), P_INT("heads"), P_INT("k_dim"),
-    P_INT("v_dim"), P_INT("latent_dim"), P_STR("mode"), P_STR("dtype") };
+    P_INT("v_dim"), P_INT("latent_dim"), P_STR("mode"), P_STR("dtype"), P_STRO("kv_rot") };
 static const RadParamSpec pMlaAttnPagedSink[] = { P_INT("M"), P_INT("heads"), P_INT("latent_dim"),
     P_INT("rope_dim"), P_INT("block_size"), P_INT("window"), P_F64("scale"), P_STR("dtype"),
     P_INTO("stable"), P_F64O("rope_theta"), P_F64O("rope_scale"), P_STRO("rope_mode"),
@@ -238,7 +238,7 @@ static const RadOperandSpec oAttnKvSink[] = { OPD("q"), OPD("k"), OPD("v"), OPD(
     OPD("cu_k"), WGT("sinks"), OUT("out") };
 static const RadOperandSpec oGateMul[] = { OPD("a"), OPD("g"), OUT("y") };
 static const RadParamSpec pMlaExpandGate[] = { P_INT("M"), P_INT("heads"), P_INT("k_dim"),
-    P_INT("v_dim"), P_INT("latent_dim"), P_STR("dtype") };
+    P_INT("v_dim"), P_INT("latent_dim"), P_STR("dtype"), P_STRO("kv_rot") };
 static const RadOperandSpec oMlaExpandGate[] = { OPD("x"), WGT("w"), OPD("g"), OUT("y") };
 static const RadParamSpec pIdxPoolGated[] = { P_INT("M"), P_INT("n"), P_INT("ratio"),
     P_INT("rotary_dim"), P_F64("eps"), P_F64("theta"), P_STR("mode"), P_STRO("sections"),
