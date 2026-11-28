@@ -120,12 +120,15 @@ def setp(c, k, v):
         if p[0] == k:
             if p[1] == 1: p[2] = v
             else: p[3] = float(v)
-def fresh(c, salt):
+def fresh(c, salt, keep_encodings=False):
     c = copy.deepcopy(c)
     c['seed'] = (c['seed'] * 0x9E3779B97F4A7C15 + salt) & 0xffffffffffffffff
     for o in c['opd']:
         o['have_ref'] = 0; o.pop('ref', None)
-        if o['has_enc']: o['has_enc'] = 0; o.pop('enc', None); o.pop('sel', None)   # drawn plain
+        # Drawn plain, unless the caller keeps the container's encodings: a clone that resizes the
+        # operand an encoding was recorded for must drop it, one that leaves it alone must not.
+        if o['has_enc'] and not keep_encodings:
+            o['has_enc'] = 0; o.pop('enc', None); o.pop('sel', None)
     return c
 
 def heads_clone(c, H2, salt):
@@ -153,7 +156,10 @@ def wide_clone(c, n2, salt):
     return d
 
 def m_clone(c, M2, salt):
-    M = c['m']; d = fresh(c, salt)
+    # The M rows are the only thing this touches, so the weights -- and the affine `fwht128` codes
+    # the container recorded with them -- are still the container's: a quantised row handed a plain
+    # weight answers something else than the reference (tests/kbench_recipe_test.py).
+    M = c['m']; d = fresh(c, salt, keep_encodings=True)
     for o in d['opd']:
         if o['shape'] and o['shape'][0] == M and not (o['flags'] & 4) and o['role'] != 3: o['shape'][0] = M2
         if o['idx_max'] == M and (o['flags'] & 4): o['idx_max'] = M2
@@ -367,5 +373,196 @@ def g3(out, src='data/kernels_hy4.rkb'):
               recorded='2026-11-22', cases=cases)
     save(fx, out); print(len(cases), 'cases ->', out)
 
+# T-04: the Hy4 TP2 shapes the fixture does not hold after T-05's re-record from the container (the
+# container declares the TP1 geometry -- 32 sparse / 64 sliding heads -- and M steps that jump 16 -> 32),
+# and the chunk heights `gemm_nt_q` is launched at (its sweep stops at 512). Written by hand, recorded by
+# libref, appended. The source is the fixture as it was before T-04, never the fixture itself: the clones
+# it writes are trunk cases too, so reading back what was appended would clone the clones.
+#   git show ac66d3a0:data/kernels_hy4.rkb > base_hy4.rkb
+#   python3 data/kernels_hy4.py t04 raw_t04.rkb base_hy4.rkb
+#   rad-kbench --fixture raw_t04.rkb --kernels libref --rerecord t04.rkb
+#   python3 data/kernels_hy4.py append base_hy4.rkb t04.rkb data/kernels_hy4.rkb
+# The trunk's own rows (docs/ARCHITECTURES.md, `hyv4flash`: one layer's chain), which D-10 wants at the
+# verify heights: the embed / engram lines, the junction, the attention linears and their norms, the
+# indexer, the MLA absorb / sink / sel / expand, the MoE router and the lm_head. The M clone keeps the
+# encodings the container recorded with a case's operands -- it resizes the extents a launch at the new
+# height has and nothing else, so the weights are still the container's, and a quantised row handed plain
+# weights answers something else than the reference (tests/kbench_recipe_test.py). Those extents are not
+# all M: `T04_ROW_AXIS` holds the row axes that sit elsewhere in an operand and `T04_M_RULE` the two ops
+# whose other extents their own reference derives from the height and the sequences the batch holds, so a
+# clone is the row a launch at that height really runs, not the M 8 operands M tall. The routed arm is not
+# here because it is not in this fixture at all: gpu-mini declares no expert arm, kernels_moe.rkb is
+# Qwen's 256-expert geometry, and a Hy4 case for `moe_gemm_q`'s rows needs a container that declares the
+# routed arm (its u5-trellis expert weights), not a clone. D-10's 47 % gate_up is a recording of its own.
+TRUNK = ('embed_lookup', 'cast', 'engram_norm', 'engram_gate', 'grid_embed_sf', 'iota', 'sub_i32',
+         'ihc_pre', 'ihc_post', 'rmsnorm', 'rmsnorm_ihc_junction', 'gemm_nt_q', 'gemm_nt', 'gemm_nt_f32',
+         'gemm_nt_bias', 'rope', 'rope_rows', 'kv_store', 'gate_mul', 'mla_kv_split', 'attn_kv_sink',
+         'mla_project_kv', 'mla_attn_paged_sink', 'mla_attn_sel_sink', 'mla_expand_gate',
+         'mla_expand_gate_had_quant_i8g', 'had_quant_act_i8g', 'swiglu_clamped_had_quant_i8g',
+         'router_sigmoid_topk', 'gather_rows', 'qsa_work', 'idx_pool_gated', 'qsa_tail_store', 'idx_score',
+         'qsa_select', 'logits_gemm')
+
+def t04a_sliding(src):
+    """mla_attn_paged_sink: the 30 sliding layers at TP2 (32 heads a rank, window 512), M = 1, `stable` 0
+    and 1 -- the shape K-14's 19 us `merge_sink` bracket is about, which no recorded case reaches (the
+    container's sliding geometry is 64 heads). Its chained form is replayed with `--chain-forms`."""
+    out, salt = [], 0xa04a0000
+    for c in load(src)['cases']:
+        if c['op'] != 'mla_attn_paged_sink' or par(c, 'window') != 512: continue
+        if par(c, 'heads') != 64 or c['m'] != 1: continue
+        out.append(heads_clone(c, 32, salt)); salt += 1
+    return out
+
+def t04b_sel(src):
+    """mla_attn_sel_sink: the 12 sparse layers at TP2 (16 heads a rank), M = 1 and 8, over the recorded
+    512-page cache. The table is a real `qsa_select` one when timed: `timing_input` draws this op's table
+    as each row's own distinct, ascending page ids (block order at M = 1, a sorted draw out of the page
+    range otherwise), not one shuffled run over the whole operand. Every other index table keeps its
+    permutation."""
+    out, salt = [], 0xb04b0000
+    for c in load(src)['cases']:
+        if c['op'] != 'mla_attn_sel_sink' or par(c, 'heads') != 32 or c['m'] not in (1, 8): continue
+        out.append(heads_clone(c, 16, salt)); salt += 1
+    return out
+
+# The row axes that do not sit in shape[0], by op: `(operand, axis, ratio)`, and whether the operand's
+# index range follows the axis. A cu histogram is M + 1 long (the `flags & 4` rule in `t04_clone`), the
+# Engram grid's and the rope's position table are [components, M], and the indexer's pooling reads one
+# row per M * ratio -- one place for the rule instead of a branch per op. An op whose operands are not all
+# M tall names a rule of its own, `(d, c, M2)`, because no single axis describes it: `kv_store` and
+# `qsa_work` are sized by their reference's derivation, below.
+T04_ROW_AXIS = {'grid_embed_sf': (2, 1, False, False), 'rope': (1, 1, False, True),
+                'rope_rows': (1, 1, False, True), 'idx_pool_gated': (0, 0, True, False)}
+
+def t04_kv_store(d, c, M2):
+    """`kv_store`: the cache the store scatters into is `ceil(M / block_size) + 2` blocks deep and the
+    slot table is drawn over every slot of it -- the reference's own derivation, `ref_kv_store_shape`, and
+    the depth a launch at this height has. A clone that keeps the M 8 cache scatters a whole height's
+    tokens onto the handful of slots that height needed."""
+    bs = int(par(c, 'block_size'))
+    nb = (M2 + bs - 1) // bs + 2
+    for o in d['opd']:
+        if o['absent'] or not o['shape']: continue
+        if len(o['shape']) == 4: o['shape'][0] = nb          # the cache: [blocks, kv heads, block, row]
+        elif len(o['shape']) == 1: o['idx_max'] = nb * bs     # the slot table: an id a token, over it all
+
+def t04_qsa_work(d, c, M2):
+    """`qsa_work`: its operands are sized by two different counts, neither of them M. The work list holds
+    `ceil(M / ratio) + seqs` groups -- the arch's `work` at a graph declared for this height
+    (`hyv4flash_common.h`) -- so the stage, the page list and the position list follow it, and its rows are
+    one a sequence, `min(seqs, M)` of them, so the tail, the slot index, the block table and the counts
+    follow those (`ref_qsa_work_shape` derives both). `m_clone` makes every one of them M tall: a tail ring,
+    a block table and a count at a sequence count no launch has."""
+    r, seqs = int(par(c, 'ratio')), int(par(c, 'seqs'))
+    work, S = (M2 + r - 1) // r + seqs, min(seqs, M2)
+    s0, w0 = min(seqs, c['m']), int(par(c, 'work'))
+    n, ring = int(par(c, 'n')), int(par(c, 'ring'))
+    for o, s in zip(d['opd'], c['opd']):
+        sh = tuple(s['shape'])
+        if s['absent'] or not sh: continue
+        if s['role'] == 0 and sh in ((c['m'], n), (c['m'],)): continue   # k and pos: M tall, already moved
+        if sh == (s0 + 1,): o['shape'] = [S + 1]                # cu: one entry a sequence, and the 0
+        elif sh == (s0, 1, ring, n): o['shape'] = [S, 1, ring, n]   # the tail: a ring row a sequence
+        elif sh == (s0, 1): o['shape'] = [S, 1]; o['idx_max'] = S  # the slot index, one a sequence
+        elif sh == (s0, 2): o['shape'] = [S, 2]                 # the block table
+        elif sh == (s0,): o['shape'] = [S]                      # the count: one a sequence
+        elif sh == (w0 * r, n): o['shape'] = [work * r, n]      # the stage: a row a group of the list
+        elif sh == (w0,): o['shape'] = [work]                   # the page and position lists
+        else: raise SystemExit(f'qsa_work: operand {s["shape"]} is not one of the shapes this rule knows')
+    setp(d, 'work', work)
+
+T04_M_RULE = {'kv_store': t04_kv_store, 'qsa_work': t04_qsa_work}
+
+def t04_clone(c, M2, salt):
+    """`m_clone`, plus the row axes that do not sit in shape[0] (`T04_ROW_AXIS`) and the two ops sized by
+    their reference's derivation rather than by M (`T04_M_RULE`). `m_clone` moves shape[0] and leaves the
+    rest, which is the right clone only for a row whose every operand has M first."""
+    d = m_clone(c, M2, salt)
+    for o in d['opd']:
+        if o['flags'] & 4 and o['shape'] and o['shape'][0] == c['m'] + 1: o['shape'][0] = M2 + 1
+    rule = T04_M_RULE.get(c['op'])
+    if rule is not None:
+        rule(d, c, M2); return d
+    rule = T04_ROW_AXIS.get(c['op'])
+    if rule is not None:
+        idx, axis, ratio, follows = rule
+        o = d['opd'][idx]
+        o['shape'][axis] = M2 * par(c, 'ratio') if ratio else M2
+        if follows: o['idx_max'] = o['shape'][axis]
+    return d
+
+def t04c_verify(src):
+    """every trunk row at the c8 verify heights M = 24 / 40 / 48 (D-10), cloned from that row's M = 8 case
+    so it keeps the band it has a decode-class case in (a row whose cases start at 65 is prefill-class and
+    is left)."""
+    fx, out, salt = load(src), [], 0xc04c0000
+    for c in fx['cases']:
+        if c['op'] not in TRUNK or c['m'] != 8: continue
+        for M2 in (24, 40, 48):
+            out.append(t04_clone(c, M2, salt)); salt += 1
+    return out
+
+def t04d_gemm_q(src):
+    """gemm_nt_q at the pipelined chunk heights M = 1024 / 2048 / 3072 (`kPipeMinRows` and the 4096-row
+    chunk's halves) at the trunk's two dense planes (K = 1536, the absorb's rank, and 8192, d_model): the
+    recorded sweep stops at 512, so a chunk's GEMM is timed at a band no case reaches. The expert planes
+    (K = 13824, 16384) keep their recorded sweep at the heights: a full-height expert GEMM is 150 GFLOP
+    of reference per case, and the card-less gate replays every case. q_a's own shape is `t04e` below:
+    every recorded case is N 3072, so the Verify pair's N 1024 / K 3072 had no case at any M."""
+    fx, out, salt = load(src), [], 0xd04d0000
+    for c in fx['cases']:
+        if c['op'] != 'gemm_nt_q' or c['m'] != 512 or par(c, 'K') not in (1536, 8192): continue
+        for M2 in (1024, 2048, 3072):
+            out.append(m_clone(c, M2, salt)); salt += 1
+    return out
+
+def t04e_gemm_q_a(src):
+    """gemm_nt_q at q_a's shape (N 1024, K 3072), M 2048: the Verify pair K-51 and audit F7.1 name,
+    `(2048, 1024, 3072)` against `(2048, 3072, 8192)`, and no case had N 1024 or K 3072 at any M (every
+    recorded `gemm_nt_q` case is the trunk's N 3072 planes). Cloned from the K 1536 dense case with the
+    container's affine `fwht128` encoding kept: an encoding names the group and the transform, not the
+    extents, and 3072 is 24 groups of 128, so it still describes the 1024 x 3072 weight. The container
+    files the trunk's dense planes as i8a8h, so the case reaches the i8a8 rows at q_a's shape, not q_a's
+    own u5-trellis row (`gemm_iqr_tiled`), which no fixture holds (K-06, K-51)."""
+    N, K, M = 3072, 1536, 512
+    base = None
+    for c in load(src)['cases']:
+        if (c['op'] == 'gemm_nt_q' and c['m'] == M and par(c, 'N') == N and par(c, 'K') == K
+                and par(c, 'dtype') == 'i8a8h'):
+            base = c
+            break
+    if base is None:
+        raise SystemExit(f'no gemm_nt_q N {N} K {K} M {M} case to clone q_a from')
+    d = fresh(base, 0xe04e0000, keep_encodings=True)
+    # The one operand axis each shape is, by its exact extents: the weight and its group scales, the
+    # activation and its group scales, the output. A layout the container changed fails here loudly
+    # instead of cloning an operand by its position.
+    axes = {(M, K): (2048, 3072), (M, K // 128): (2048, 3072 // 128),
+            (N, K): (1024, 3072), (N, K // 128): (1024, 3072 // 128),
+            (M, N): (2048, 1024)}
+    for o in d['opd']:
+        if not o['shape']:
+            continue
+        if tuple(o['shape']) not in axes:
+            raise SystemExit(f'gemm_nt_q operand of shape {o["shape"]} is not one of q_a\'s axes')
+        o['shape'] = list(axes[tuple(o['shape'])])
+        if o['has_enc']:
+            # The selected planes' extents in their own elements move with the weight: a kernel reads
+            # them to lay the planes out, and a recorded extent that does not match the operand is a
+            # drop at rerecord ("its plane holds 4718592 elements and the reader wants 3145728").
+            o['sel'] = [(p, *axes[(e0, e1)]) for p, e0, e1 in o['sel']]
+    d['m'] = 2048
+    setp(d, 'M', 2048); setp(d, 'N', 1024); setp(d, 'K', 3072)
+    d['band'] = f"{base['band']} q_a M 2048"
+    return [d]
+
+def t04(out, src):
+    cases = (t04a_sliding(src) + t04b_sel(src) + t04c_verify(src) + t04d_gemm_q(src)
+             + t04e_gemm_q_a(src))
+    fx = dict(version=6, samples=1024, source='hy4-flash TP2 shapes and c8 verify heights (T-04, D-10)',
+              oracle='libref', recorded='2026-11-28', cases=cases)
+    save(fx, out); print(len(cases), 'cases ->', out)
+
 if __name__ == '__main__':
-    {'raw': raw, 'merge': merge, 'vis': vis, 'wp163': wp163, 'junction': junction, 'append': append, 'dfly': dfly, 'g3': g3}[sys.argv[1]](*sys.argv[2:])
+    {'raw': raw, 'merge': merge, 'vis': vis, 'wp163': wp163, 'junction': junction, 'append': append, 'dfly': dfly,
+     'g3': g3, 't04': t04}[sys.argv[1]](*sys.argv[2:])
