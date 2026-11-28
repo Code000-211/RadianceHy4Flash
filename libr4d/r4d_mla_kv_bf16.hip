@@ -408,7 +408,6 @@ int kvp_emit_staged(RadStream s, unsigned heads, const uint16_t* x, const uint16
 // values a lane owns, the wave's absmax, scale amax / 127 and the rounded codes), so the codes are the
 // chain's bytes and, like the expansion's, a token's depend on its own row only (not on M, on the
 // token tile or on the grid). `y`, when given, receives the bf16 product (the plane the chain stores).
-// Above 64 rows (a prefill chunk) kvq_mb_body runs this same chain with kQMB token tiles a workgroup.
 struct KvQuantMeta {
     long xr, wp, gr, qr, sr, yr;
     int rows;
@@ -530,123 +529,11 @@ __device__ __forceinline__ void kvq_body(const uint16_t* __restrict__ x, const u
     }
 }
 
-/* K-50b: the same pass for a block taller than one token tile (a prefill chunk). The block is 32
- * waves and a group has eight column tiles, so here a wave takes a column tile and a token tile
- * both (kQTiles waves a token tile, kQMB token tiles a workgroup) and runs the whole contraction in
- * itself: the four quarters ascend in the same order as the one-tile form's, each from zero, and are
- * added in the same order, ((p0 + p1) + p2) + p3 in f32, so a token's codes are its own row's bytes
- * in either form. What it buys: the weight's fragments of a group are read once for kQMB token tiles
- * instead of once a tile, and a token tile a workgroup means a quarter of the blocks -- which is what
- * let the arch keep the fused launch above its old 64-row cap (the 33.5 MB gated plane is not
- * written and read again). The gate product goes to the token tile's own LDS slice (kQMB x 16 tokens
- * x 128), and the quantiser's phase then walks all of it with all 32 waves (two tokens a wave) -- no
- * wave idles, and a token's codes still come from its own row only. A token tile the block launched
- * past the rows of the step does no work.
- *
- * Registers: a wave's chain is 32 WMMA steps over one accumulator (a quarter at a time), so at 1024
- * threads (64 VGPR a lane) two chunks are in flight (KC 2) beside the running sum. */
-constexpr int kQMB = 4;   // token tiles a prefill workgroup
-
 template <typename CH>
-__device__ __forceinline__ void kvq_mb_body(const uint16_t* __restrict__ x, const uint16_t* __restrict__ w,
-                                            const uint16_t* __restrict__ g, signed char* __restrict__ q,
-                                            float* __restrict__ sc, uint16_t* __restrict__ y,
-                                            const KvQuantMeta& m) {
-    static_assert(!CH::on, "the prefill form is issued unchained: its grid is no chain's");
-    constexpr int S = 4, K = kLatent / S, KS = K / 16, KC = 2, NCH = KS / KC;
-    static_assert(KS % (2 * KC) == 0, "chunks in pairs");
-    if ((int)blockIdx.y >= m.heads) return;  // a head the cliff pad launched (r4d_cliff_rows)
-    __shared__ uint16_t ag[kQMB][16][kQG];
-    const int lane = threadIdx.x & 31, wave = threadIdx.x >> 5, head = blockIdx.y;
-    const int ct = wave % kQTiles, r = wave / kQTiles;
-    const int o0 = (int)blockIdx.x * kQG + ct * 16;
-    const int t0 = (int)blockIdx.z * (16 * kQMB), tb = t0 + 16 * r;
-    if (tb < m.rows) {
-        const int tt = lane & 15, cg = ct * 16 + 8 * (lane >> 4);
-        const long t = tb + tt, tr = min(t, (long)m.rows - 1);
-        const uint16_t* const xp = x + tr * m.xr + (long)head * kLatent + 8 * (lane >> 4);
-        const uint16_t* const wb = w + ((long)head * kRows + kKd) * m.wp;
-        v8f acc, v;
-        v8s a0[KC], b0[KC], a1[KC], b1[KC];
-        auto load = [&](v8s (&a)[KC], v8s (&b)[KC], int kq, int c) {
-#pragma unroll
-            for (int qq = 0; qq < KC; ++qq) {
-                const int k0 = kq + 16 * (c * KC + qq);
-                a[qq] = kvp_wfrag<false, true>(wb, m.wp, o0, k0, lane);
-                b[qq] = kvp_ld8<true>(xp + k0);
-            }
-        };
-        auto step = [&](const v8s (&a)[KC], const v8s (&b)[KC], v8f& dst) {
-#pragma unroll
-            for (int qq = 0; qq < KC; ++qq) dst = kvp_wmma(a[qq], b[qq], dst);
-        };
-        /* kvq_body's chain, a quarter at a time: the same fragments, the same WMMA order, so the
-         * sum is the one the four quarters of a one-tile workgroup add to in LDS. */
-#pragma unroll
-        for (int quarter = 0; quarter < S; ++quarter) {
-            const int kq = quarter * K;
-#pragma unroll
-            for (int e = 0; e < 8; ++e) acc[e] = 0.0f;
-            load(a0, b0, kq, 0);
-#pragma unroll 1
-            for (int c = 0; c < NCH; c += 2) {
-                load(a1, b1, kq, c + 1);
-                step(a0, b0, acc);
-                if (c + 2 < NCH) load(a0, b0, kq, c + 2);
-                step(a1, b1, acc);
-            }
-            if (quarter == 0) {
-                v = acc;
-            } else {
-#pragma unroll
-                for (int e = 0; e < 8; ++e) v[e] += acc[e];
-            }
-        }
-        const v8s gv = kvp_ld8<true>(g + tr * m.gr + (long)head * kVd + (long)blockIdx.x * kQG + cg);
-        uint16_t o[8];
-#pragma unroll
-        for (int e = 0; e < 8; ++e) {
-            o[e] = f32_to_bf16(v[e]);
-            o[e] = f32_to_bf16(bf16_to_f32(o[e]) * kvp_sigmoid(bf16_to_f32((uint16_t)gv[e])));
-            ag[r][tt][cg + e] = o[e];
-        }
-        if (y && t < m.rows) {
-            uint4 u4;
-            u4.x = (uint32_t)o[0] | (uint32_t)o[1] << 16;
-            u4.y = (uint32_t)o[2] | (uint32_t)o[3] << 16;
-            u4.z = (uint32_t)o[4] | (uint32_t)o[5] << 16;
-            u4.w = (uint32_t)o[6] | (uint32_t)o[7] << 16;
-            *(uint4*)(y + t * m.yr + (long)head * kVd + (long)blockIdx.x * kQG + cg) = u4;
-        }
-    }
-    __syncthreads();
-    /* had_quant_act_i8g's pass over the block: kQMB token tiles x 16 tokens, kQG columns a token,
-     * one a wave where there are two. */
-#pragma unroll 1
-    for (int i = wave; i < kQMB * 16; i += 32) {
-        const long t = t0 + i;
-        if (t >= m.rows) continue;
-        float v[4];
-#pragma unroll
-        for (int j = 0; j < 4; ++j) v[j] = bf16_to_f32(ag[i >> 4][i & 15][lane * 4 + j]);
-        r4d_fwht_wave<kQG>(v, lane);
-        float mx = fmaxf(fmaxf(fabsf(v[0]), fabsf(v[1])), fmaxf(fabsf(v[2]), fabsf(v[3])));
-        mx = r4d_wave_max(mx);
-        const float s = mx > 0.0f ? mx * (1.0f / q8_top<true>()) : 1.0f;
-        if (lane == 0) sc[t * m.sr + head * 2 + blockIdx.x] = s;
-        *(uint32_t*)(q + t * m.qr + (long)head * kVd + (long)blockIdx.x * kQG + lane * 4) =
-            q8_pack4<true>(v[0], v[1], v[2], v[3], 1.0f / s);
-    }
-}
-
-template <bool MB, typename CH>
 __global__ __launch_bounds__(kQThreads) void kv_expand_gate_quant(
     const uint16_t* __restrict__ x, const uint16_t* __restrict__ w, const uint16_t* __restrict__ g,
     signed char* __restrict__ q, float* __restrict__ sc, uint16_t* __restrict__ y, KvQuantMeta m) {
-    if constexpr (MB)
-        kvq_mb_body<CH>(x, w, g, q, sc, y, m);
-    else
-        kvq_body<CH>(x, w, g, q, sc, y, m);
+    kvq_body<CH>(x, w, g, q, sc, y, m);
     if constexpr (CH::on) r4d_chain_done();
 }
 
@@ -836,10 +723,7 @@ extern "C" int r4d_rad_mla_expand_gate_had_quant_i8g(const RadArgs* a, RadStream
         return R4D_NO(RAD_E_ALIGN);
     const KvQuantMeta m{ (long)xr, (long)w->stride[0], (long)gr, (long)qr, (long)sr, (long)yr, (int)M,
                          (int)h };
-    /* K-50b: a workgroup takes kQMB token tiles of 16 from 64 rows up (the prefill form), one below
-     * it (a decode step's rows, where the four contraction quarters of 32 waves fill the block). */
-    const bool mb = M > 64;
-    const unsigned zt = (unsigned)((M + (mb ? 16 * kQMB : 16) - 1) / (mb ? 16 * kQMB : 16));
+    const unsigned zt = (unsigned)((M + 15) / 16);
     /* The heads axis stepped past the full-card cliff (r4d_cliff_rows): at 32 heads one token
      * tile is 2048 wavefronts (two tiles at M = 32), a count the K-17 A/B measured here at
      * 1.09-1.26x at 32 heads and 1.01-1.06x at 64 (0.975x at M = 16, the one exception), and
@@ -847,12 +731,9 @@ extern "C" int r4d_rad_mla_expand_gate_had_quant_i8g(const RadArgs* a, RadStream
     const dim3 grid(kVd / kQG, r4d_cliff_rows((unsigned)h, (unsigned)(kVd / kQG) * zt,
                                               (unsigned)(kQThreads / 32)), zt);
     if (r4d_geti_or(a, "chain", 0) != 0 && M <= 64)
-        return R4D_EMIT(s, (kv_expand_gate_quant<false, r4dchain>), grid, dim3(kQThreads), 0, xp, wp, gp,
+        return R4D_EMIT(s, (kv_expand_gate_quant<r4dchain>), grid, dim3(kQThreads), 0, xp, wp, gp,
                         (signed char*)q->data, (float*)sc->data, yp, m);
-    if (mb)
-        return R4D_EMIT(s, (kv_expand_gate_quant<true, R4dUnchained>), grid, dim3(kQThreads), 0, xp, wp,
-                        gp, (signed char*)q->data, (float*)sc->data, yp, m);
-    return R4D_EMIT(s, (kv_expand_gate_quant<false, R4dUnchained>), grid, dim3(kQThreads), 0, xp, wp, gp,
+    return R4D_EMIT(s, (kv_expand_gate_quant<R4dUnchained>), grid, dim3(kQThreads), 0, xp, wp, gp,
                     (signed char*)q->data, (float*)sc->data, yp, m);
 }
 

@@ -4299,7 +4299,7 @@ TEST(dfly2_draft_layers_use_the_trunks_fused_producers) {
     g3_fusions = false;
 }
 
-/* The drafter's fused expansion takes at most kFuseRows rows (its range), which a server with many
+/* The fused expansion takes at most kFuseRows rows (its range), which a server with many
  * sequences a step can exceed: the declare keeps it, and the pass that drafts more rows than that
  * issues the plain expansion, the gate's product and o_proj's own quantiser instead -- the same
  * graph, fused for a block of drafts that fits and plain for one that does not. */
@@ -4310,7 +4310,7 @@ TEST(dfly2_a_block_taller_than_the_fused_expansion_keeps_its_plain_chain) {
     const auto& df = d.df();
     if (!df.served) fprintf(stderr, "%s\n", df.why.c_str());
     REQUIRE(df.served);
-    CHECK(df.Md > 64);   /* the drafter's kFuseRows, its fused expansion's row range */
+    CHECK(df.Md > 64);   /* Hy4Attn::kFuseRows, the expansion's row range */
     const auto& L = df.lay[0];
     CHECK(L.op_expand_q != 0 && L.op_expand != 0 && L.op_gmul != 0);
     /* 8 sequences of 6 rows fit the expansion; 12 do not */
@@ -4386,50 +4386,6 @@ TEST(the_trunk_writes_its_selection_into_the_snapshot_and_clears_it_on_a_dense_s
             CHECK_EQ(c.issues[attn].opd[3].offset, sn.base * m.s.ix_group_topk);
         }
     }
-}
-
-/* K-50b: the trunk's fused expansion takes a step's every row. `kv_expand_gate_quant` runs its
- * prefill form (four 16-row token tiles a workgroup) from 64 rows up, so the cap of 64 rows is
- * gone from the row's declaration and from the pass's choice: a step of 70 rows -- the smallest
- * above the old cap -- issues the fused expansion once over all of them, and no plain expansion,
- * gate or o_proj quantiser. The drafter keeps its own cap (the test above). */
-void fused_trunk_encs(RadBuilder* b) {
-    int8_trunk_encs(b);
-    /* the o_proj that reads rotated int8 codes: the fused expansion's consumer */
-    for (auto& e : b->encs)
-        if (e.first == "attn_output") e.second = enc_i8(true);
-}
-TEST(k50b_the_trunks_fused_expansion_takes_a_step_past_the_old_64_row_cap) {
-    g3_fusions = true;
-    Declared d(fused_trunk_encs, 1, 0, false, 128, 0, 0, 0, [](MetaKV& k) {
-        k.m.n_ctx_train = 256;
-        k.set("n_ctx_train", "256").set("v_head_dim", "64").set("swa_v_head_dim", "64");
-    });
-    REQUIRE_EQ(d.rc, RAD_OK);
-    const RecOp* decl = find_op(d.b, "mla_expand_gate_had_quant_i8g");
-    REQUIRE(decl != nullptr);
-    const RecParam* pm = param(decl, "M");
-    REQUIRE(pm != nullptr);
-    CHECK_EQ(pm->ival, 1);
-    CHECK_EQ(pm->ihi, d.ctx.max_tok);   /* the build's tokens, not the old 64 rows */
-    /* one sequence of 70 rows, continued (its positions start past 0, so every row of the step is
-     * absorbed): the expansion is the fused row's, over the step's rows */
-    auto k = kit(d.b, {}, { 70 }, 5);
-    k->b.positions_h = k->pos.data();
-    auto v = run_passes(d.b, hyv4flash::step, { k.get() }, 0, 1);
-    CHECK_PASSES(d.b, v);
-    const auto& L = hyv4flash::models[0]->layers[1].attn;   /* the sliding layer: it never selects */
-    int q = 0, eg = 0, gm = 0, oq = 0;
-    for (const auto& s : v[0]->issues) {
-        if (s.op == L.op_expand_quant) { ++q; CHECK_EQ(s.n, 70); }
-        if (s.op == L.op_expand_gate) ++eg;
-        if (s.op == L.op_gate) ++gm;
-        if (s.op == L.out.op_q) ++oq;
-    }
-    CHECK_EQ(q, 1);
-    CHECK_EQ(eg, 0);
-    CHECK_EQ(gm, 0);
-    CHECK_EQ(oq, 0);
 }
 
 /* P-09: with taps on, the in-place step still refreshes the tap's group ids in the snapshot (the

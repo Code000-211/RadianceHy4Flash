@@ -15,11 +15,7 @@
  *     the K-17 pad steps (`r4d_cliff_rows`, one head past 32 at every multiple-of-2048 wave
  *     count). The extra head's workgroup must return at once, so every head's bytes equal a
  *     run of the same rows on their own and sit next to libref's, and the padded grid is what
- *     the launcher launches wherever the rule says, and only there;
- *   - the same quantiser above 64 rows, where K-50b's prefill form runs (four token tiles a
- *     workgroup, which of the two forms ran asserted by name): the prefill heights' bytes equal
- *     both the row alone's -- the 16-row form's -- and the chain the 64-row cap used to force,
- *     mla_expand_gate's gated product through had_quant_act_i8g, bit for bit.
+ *     the launcher launches wherever the rule says, and only there.
  *
  * The emulator's WMMA sums in its own order (emu.cpp), not the card's: what is checked is that the
  * kernels compute every output from the same fragments in the same chain, which is what the law
@@ -295,25 +291,6 @@ static QuantOut quant(const Draw& d, int64_t r0, int64_t n, int chain, bool with
     return o;
 }
 
-/* had_quant_act_i8g over a packed [n, H * kVd] bf16 product, through the emulated libr4d row: the
- * second half of the unfused chain -- mla_expand_gate's gated product, then the standalone
- * quantiser the fusion absorbs -- which the fused launch must equal bit for bit. */
-static QuantOut quant_chain(const Draw& d, int64_t n, const std::vector<uint16_t>& prod) {
-    const int64_t W = d.H * kVd, GS = W / 128;
-    QuantOut o;
-    QMat x(n, W, W, 2), q(n, W, W + 8, 1), sc(n, GS, GS + 4, 4);
-    x.load_rows(prod.data());
-    o.rc = run(r4d_rad_had_quant_act_i8g, { x.t(RAD_BF16), q.t(RAD_I8), sc.t(RAD_F32) },
-               { pi("M", n), pi("n", W), pi("group", 128), ps("dtype", "bf16") });
-    const auto qb = q.packed();
-    o.q.assign(qb.begin(), qb.end());
-    const auto sb = sc.packed();
-    o.sc.resize((size_t)n * GS);
-    std::memcpy(o.sc.data(), sb.data(), sb.size());
-    if (!q.tail_untouched() || !sc.tail_untouched()) o.rc = -999;
-    return o;
-}
-
 static bool quant_equal(const QuantOut& a, const QuantOut& b) {
     return a.q == b.q &&
            std::memcmp(a.sc.data(), b.sc.data(), a.sc.size() * sizeof(float)) == 0 &&
@@ -505,77 +482,10 @@ int main() {
                "quant heads 32 M 1: without the optional bf16 output the codes and scales stand");
         }
     }
-    /* ---- K-50b: the prefill form of the fused quantiser, four token tiles a workgroup from 64
-     * rows up. A prefill chunk above 64 rows used to fall back to mla_expand_gate followed by the
-     * standalone quantiser, a 33.5 MB round trip a layer-step; the prefill form keeps it fused. Its
-     * bytes are held to the row alone's -- the 16-row form, a row's bytes being the row's own --
-     * and to that unfused chain, bit for bit. The draw adds 2 to the seed: the codes, scales and y
-     * check's y bound is one bf16 step of the gated product, and at a row whose expansion sits on
-     * libref's rounding boundary the product can land two steps off, which is the reference's
-     * WMMA order and not the form (the bit-for-bit checks below do not depend on the draw). */
-    for (const int64_t H : { 32LL, 2LL })
-        for (const int64_t M : { 65LL, 70LL, 133LL }) {
-            if (H == 32 && M != 65) continue;   /* 32 heads is the K-17 pad's geometry, and its time */
-            const Draw d = draw(H, M, false, (uint32_t)(1500 + H * 1000 + M + 2));
-            const int64_t W = H * kVd, GS = W / 128;
-            char wq[240];
-            const QuantOut all = quant(d, 0, M, 0, true);
-            const bool prefill = std::strstr(emu_last_kernel, "kv_expand_gate_quant<true") != nullptr;
-            const bool rows_only = std::strstr(emu_last_kernel, "kv_expand_gate_quant<false") != nullptr;
-            std::snprintf(wq, sizeof wq,
-                          "quant heads %lld M %lld: the prefill form (four token tiles a workgroup) ran",
-                          (long long)H, (long long)M);
-            ok(all.rc == RAD_OK && prefill && !rows_only, wq);
-            /* across the two forms: a row alone (M 1, the 16-row form) is the row inside the
-             * prefill launch, bit for bit -- the first tile's first, middle and last row, the
-             * seam rows 16 and 64, and the last group's tail */
-            bool law = all.rc == RAD_OK;
-            for (const int64_t t : std::initializer_list<int64_t>{ 0, 7, 15, 16, 17, 47, 63, 64, M - 1 }) {
-                if (t >= M) continue;
-                const QuantOut one = quant(d, t, 1, 0, true);
-                law &= one.rc == RAD_OK &&
-                       std::equal(one.q.begin(), one.q.end(), all.q.begin() + t * W) &&
-                       std::memcmp(one.sc.data(), all.sc.data() + t * GS, (size_t)GS * sizeof(float)) == 0 &&
-                       std::equal(one.y.begin(), one.y.end(), all.y.begin() + t * W);
-            }
-            std::snprintf(wq, sizeof wq,
-                          "quant heads %lld M %lld: every row's bytes equal the row alone's, both forms",
-                          (long long)H, (long long)M);
-            ok(law, wq);
-            /* the item's verify: what the cap used to force, the gated product through the
-             * standalone quantiser, is the fused launch's product, codes and scales bit for bit */
-            int rc_e = 0;
-            const auto prod = project(d, false, true, 0, M, 0, 0, false, &rc_e);
-            const QuantOut ch = quant_chain(d, M, prod);
-            std::snprintf(wq, sizeof wq,
-                          "quant heads %lld M %lld == mla_expand_gate then had_quant_act_i8g, bit for bit",
-                          (long long)H, (long long)M);
-            ok(rc_e == RAD_OK && all.rc == RAD_OK && ch.rc == RAD_OK &&
-                   all.y == prod && all.q == ch.q &&
-                   std::memcmp(all.sc.data(), ch.sc.data(), ch.sc.size() * sizeof(float)) == 0,
-               wq);
-            std::snprintf(wq, sizeof wq, "quant heads %lld M %lld: codes, scales and y next to libref",
-                          (long long)H, (long long)M);
-            std::string why;
-            ok(all.rc == RAD_OK && quant_vs_libref(d, all, &why),
-               std::string(wq) + (why.empty() ? "" : ": " + why));
-            /* a slice across the tile seams, rows 5..M as a launch of their own */
-            const QuantOut tail = quant(d, 5, M - 5, 0, true);
-            std::snprintf(wq, sizeof wq,
-                          "quant heads %lld M %lld: rows 5..%lld as a launch of their own are the same bytes",
-                          (long long)H, (long long)M, (long long)M);
-            ok(tail.rc == RAD_OK &&
-                   std::equal(tail.q.begin(), tail.q.end(), all.q.begin() + 5 * W) &&
-                   std::memcmp(tail.sc.data(), all.sc.data() + 5 * GS,
-                               (size_t)(M - 5) * GS * sizeof(float)) == 0 &&
-                   std::equal(tail.y.begin(), tail.y.end(), all.y.begin() + 5 * W),
-               wq);
-        }
     /* The launcher's own grid math, called as the launcher calls it (per_row = (v_dim / group) *
-     * ceil(M / 16) = 2 zt, waves = 1024 / 32, or ceil(M / 64) from 64 rows up, K-50b): the step at
-     * 32 heads fires at every one of the multiples of 2048 that the token-tile count puts the grid
-     * on, and never on the counts clear of them. The M 1 / 16 / 32 rows of the item's verify are
-     * the zt 1 and 2 lines. */
+     * ceil(M / 16) = 2 zt, waves = 1024 / 32): the step at 32 heads fires at every one of the
+     * multiples of 2048 that ceil(M / 16) puts the grid on, and never on the counts clear of
+     * them. The M 1 / 16 / 32 rows of the item's verify are the zt 1 and 2 lines. */
     for (const int zt : { 1, 2, 3, 4 }) {
         char wg[160];
         std::snprintf(wg, sizeof wg,

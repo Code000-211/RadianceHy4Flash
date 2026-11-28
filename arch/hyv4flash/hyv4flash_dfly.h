@@ -1102,8 +1102,7 @@ struct Dfly {
         return RAD_OK;
     }
 
-    /* D-01: the rows the drafter's mla_expand_gate_had_quant_i8g takes at most (the trunk keeps its
-     * fused expansion at any height, K-50b; a block of drafts is cut here). */
+    /* D-01: the rows mla_expand_gate_had_quant_i8g takes at most (the trunk's kFuseRows). */
     static constexpr int64_t kFuseRows = 64;
 
     /* rmsnorm_had_quant_i8g: the norm of `in` into `out` that writes `q8`/`s8` -- the pair of the
