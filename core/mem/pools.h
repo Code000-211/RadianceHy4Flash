@@ -24,9 +24,6 @@
 
 namespace rad {
 
-/* True for RADIANCE_HOST_POOL_PAGES values that ask for 4 KiB pages ("4k", "4096", "small"). */
-bool host_pool_small_pages(const char* v);
-
 /* ------------------------------------------------------------------ the allocator seam */
 /* Pools allocate through this interface rather than rad_dev_alloc so they run without ROCm: the
  * host backend is a primary target (docs/IMPLEMENTATION.md). The device allocator is the default;
