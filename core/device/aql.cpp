@@ -70,6 +70,7 @@
 
 #include "aql.h"
 #include "directio.h"
+#include "kfd_evict.h"
 #include "rad_format.h"
 #include "../rad_internal.h"
 
@@ -85,6 +86,11 @@ int aql_vmem_device_of(const void* addr, int* dev);
 
 namespace {
 void stamp_hold(hsa_signal_t h, bool on);
+/* Inside a sampled live-issued pass (a_pass_stamp): dispatch() hands each card-0 dispatch to
+ * live_stamp. False for every thread unless RADIANCE_AQL_STAMP is set. */
+thread_local bool t_live_on = false;
+void live_stamp(uint32_t queue, uint64_t kernel, hsa_kernel_dispatch_packet_t* p, bool ordered,
+                bool chained);
 }
 
 namespace aql {
@@ -840,6 +846,13 @@ void dump_queues(const char* where) {
                 (void*)s->q, wr, rd, what.c_str());
         RAD_ERR("    %s", chain_line(s, rd).c_str());
     }
+    /* #272: whether the driver holds the queues. An evicted process's queues all stop together
+     * on every card; the counts growing between dumps say so, where a hung kernel leaves them. */
+    static std::map<uint32_t, int64_t> last_evicted;
+    std::vector<std::pair<int, uint32_t>> cards;
+    for (size_t i = 0; i < G().dev.size(); ++i) cards.emplace_back((int)i, G().dev[i].kfd_id);
+    RAD_ERR("  %s", evict_line("/sys/class/kfd/kfd/proc", "/proc/self/status", (long)::getpid(),
+                               cards, &last_evicted).c_str());
     if (g_dump_lanes) g_dump_lanes();
 }
 
@@ -1575,6 +1588,9 @@ int dispatch(Stream* s, const KernelRec* k, dim3 g, dim3 b, void** args, size_t 
                         !(s->peer_inflight && card_shared(s)));
     /* Without the bit, a kernel that acquires for itself takes none from the packet processor,
      * unless the ring or the host asked for this one. */
+    /* After `keep`, which a completion signal would change: the stamp times the dispatch as the
+     * unstamped pass runs it. Before the header, which lets the packet complete. */
+    if (t_live_on && s->ord == 0) live_stamp(s->id, k->object, p, keep, chain);
     publish(s, idx,
             header(HSA_PACKET_TYPE_KERNEL_DISPATCH,
                    bare && !keep && !asked ? HSA_FENCE_SCOPE_NONE : acq, rel, keep),
@@ -1887,6 +1903,7 @@ void loc_keep(const void* host_base, size_t bytes, intptr_t shift, uint64_t owne
 struct Pinned {
     int64_t len = 0;
     void* pool = nullptr;
+    bool locked = false;          /* held against swap (lock_pinned) */
 };
 std::mutex g_pinned_mu;
 std::map<uintptr_t, Pinned> g_pinned;
@@ -2619,6 +2636,7 @@ struct Stamps {
     bool         out_failed = false;
     bool         full_told = false;
     uint64_t     passes = 0;         /* begun on card 0 */
+    uint64_t     live_passes = 0;    /* live-issued passes stamped (a_pass_stamp) */
     const Tape*  tape = nullptr;     /* the pass being stamped, if one is */
     uint32_t     play = 0;
     std::vector<hsa_signal_t> free;
@@ -2804,6 +2822,111 @@ struct StampRun {
         st.rows.insert(st.rows.end(), rows.begin(), rows.end());
     }
 };
+
+/* The live-issued passes (prefill, mixed, a decode pass issued before its tape exists): the same
+ * stamps for a pass the runtime issues dispatch by dispatch. Ctx brackets each such pass with
+ * pass_stamp(1) / pass_stamp(0); the Nth bracket on a thread is stamped, its card-0 dispatches
+ * each carrying a completion signal exactly as a played dispatch does (the barrier bit and the
+ * chain are decided without it, see dispatch()). Nothing waits: the signals are read later by
+ * stamps_read, in issue order, like the played ones. A live pass is numbered from kLivePass, apart
+ * from the played passes, and its `records` column is its dispatch count on card 0; a pass whose
+ * signals ran out has fewer lines than that, which stampgaps.py counts as partial. */
+constexpr uint64_t kLivePass = 1ull << 40;
+constexpr size_t kLiveBatch = 64;
+
+struct LiveStamp {
+    uint64_t count = 0;              /* brackets this thread has opened */
+    uint64_t pass = 0;
+    uint32_t seq = 0;                /* card-0 dispatches so far in the pass */
+    bool     dry = false;            /* no signal left: the rest of the pass is not stamped */
+    std::vector<hsa_signal_t> sig;
+    size_t   used = 0;
+    std::vector<StampRow> rows;
+
+    void refill() {
+        Stamps& st = stamps();
+        std::lock_guard<std::mutex> lk(st.mu);
+        while (sig.size() - used < kLiveBatch) {
+            hsa_signal_t h{};
+            if (!st.free.empty()) {
+                h = st.free.back();
+                st.free.pop_back();
+            } else if (st.made < kStampSignals &&
+                       hsa_amd_signal_create(1, 0, nullptr, HSA_AMD_SIGNAL_AMD_GPU_ONLY, &h) ==
+                           HSA_STATUS_SUCCESS) {
+                ++st.made;
+            } else {
+                break;
+            }
+            hsa_signal_silent_store_relaxed(h, 1);
+            sig.push_back(h);
+        }
+    }
+};
+thread_local LiveStamp t_live;
+
+void live_stamp(uint32_t queue, uint64_t kernel, hsa_kernel_dispatch_packet_t* p, bool ordered,
+                bool chained) {
+    LiveStamp& l = t_live;
+    const uint32_t seq = l.seq++;
+    if (l.dry) return;
+    StampRow w;
+    if (p->completion_signal.handle) {          /* a ride: stamped from its signal */
+        w.h = p->completion_signal;
+        stamp_hold(w.h, true);
+    } else {
+        if (l.used == l.sig.size()) l.refill();
+        if (l.used == l.sig.size()) {
+            l.dry = true;
+            Stamps& st = stamps();
+            std::lock_guard<std::mutex> lk(st.mu);
+            if (!st.full_told) {
+                st.full_told = true;
+                RAD_WARN("device: RADIANCE_AQL_STAMP: %zu signals are in flight, pass %" PRIu64
+                         " and any pass that finds them so are stamped in part", st.made, l.pass);
+            }
+            return;
+        }
+        w.h = l.sig[l.used++];
+        w.own = true;
+        p->completion_signal = w.h;
+    }
+    w.ordered = ordered;
+    w.chained = chained;
+    w.queue = queue;
+    w.seq = (int)seq;
+    w.pass = l.pass;
+    w.kernel = kernel;
+    l.rows.push_back(w);
+}
+
+void a_pass_stamp(int on) {
+    LiveStamp& l = t_live;
+    Stamps& st = stamps();
+    if (!st.every) return;
+    if (on) {
+        if (t_live_on || ++l.count % (uint64_t)st.every != 0) return;
+        {
+            std::lock_guard<std::mutex> lk(st.mu);
+            stamps_read(st, false);
+            l.pass = kLivePass + ++st.live_passes;
+        }
+        l.seq = 0;
+        l.dry = false;
+        l.used = 0;
+        l.rows.clear();
+        t_live_on = true;
+        return;
+    }
+    if (!t_live_on) return;
+    t_live_on = false;
+    for (StampRow& w : l.rows) w.records = l.seq;
+    std::lock_guard<std::mutex> lk(st.mu);
+    st.free.insert(st.free.end(), l.sig.begin() + (std::ptrdiff_t)l.used, l.sig.end());
+    st.rows.insert(st.rows.end(), l.rows.begin(), l.rows.end());
+    l.sig.clear();
+    l.rows.clear();
+}
 
 int a_tape_play(RadTape rt, int from, int to) {
     Tape* t = tape_of(rt);
@@ -4554,7 +4677,8 @@ int a_props(int device, RadDeviceProps* out) {
  * transparent_hugepage/shmem_enabled (`never` on stock Ubuntu), while private memory follows
  * transparent_hugepage/enabled (`madvise` there). Under IOMMU translation each page is its own
  * translation, and streaming from a 4 KiB-page pool made prefill 10-21% slower. MADV_DONTFORK
- * keeps a forked child from copying the pinned range whole.
+ * keeps a forked child from copying the pinned range whole, and mlock keeps reclaim from swapping
+ * it out, which the lock itself does not (lock_pinned).
  *
  * kPinPiece is a power of two well under the failing size; the cost is one buffer object per
  * piece per card, a few dozen for the largest pools. */
@@ -4718,6 +4842,22 @@ bool lock_pieces(char* p, int64_t len, int64_t bytes, std::vector<hsa_agent_t>& 
     return true;
 }
 
+/* Holds a pinned range's pages against swap (#272, kfd_evict.h). The cards' lock does not: on a
+ * driver with the SVM API it mirrors the range without pinning a page (VmPin stays 0), so reclaim
+ * could swap the pages out, and each swap-out evicts every queue of the process on every card
+ * until they are read back in. MLOCK_ONFAULT takes what is resident and what faults in later. A
+ * refusal (RLIMIT_MEMLOCK, which the soft limit is first raised to the hard one for) leaves the
+ * range as it was and is said once with the fix; it never fails the allocation. */
+bool lock_pinned(char* p, int64_t len) {
+    static const int64_t soft = memlock_soft_to_hard();
+    std::string say;
+    const bool ok = lock_against_swap(
+        p, len, [](void* a, size_t n) { return ::mlock2(a, n, MLOCK_ONFAULT); }, soft,
+        &pin_lock_tally(), &say);
+    if (!say.empty()) RAD_WARN("%s", say.c_str());
+    return ok;
+}
+
 void* pin_pieces(int64_t bytes) {
     std::vector<hsa_agent_t> cards;
     for (const Dev& d : G().dev) cards.push_back(d.agent);
@@ -4746,22 +4886,23 @@ void* pin_pieces(int64_t bytes) {
     }
     (void)::madvise(p, (size_t)len, MADV_DONTFORK);
     prefault(p, len);
+    const bool locked = lock_pinned(p, len);
 
     if (!lock_pieces(p, len, bytes, cards, "rad_dev_alloc")) {
+        pin_lock_forget(len, locked, &pin_lock_tally());
         ::munmap(p, (size_t)len);
         return nullptr;
     }
     std::lock_guard<std::mutex> lk(g_pinned_mu);
-    g_pinned.emplace((uintptr_t)p, Pinned{len, nullptr});
+    g_pinned.emplace((uintptr_t)p, Pinned{len, nullptr, locked});
     return p;
 }
 
 /* pin_pieces over a shared file mapping instead of private anonymous memory: the pages are the
  * file's (a tmpfs file other processes map too) and the lock takes them in place. The file maps
  * onto a 2 MiB boundary inside a reservation made with one alignment extra, then the ends are
- * trimmed. MADV_HUGEPAGE is advised but shmem follows shmem_enabled, not it. A tmpfs page is
- * swappable until the lock pins it, so MLOCK_ONFAULT keeps the pages in memory meanwhile; a
- * refusal (the memlock limit) costs only that. */
+ * trimmed. MADV_HUGEPAGE is advised but shmem follows shmem_enabled, not it. The pages are held
+ * against swap as pin_pieces' are (lock_pinned). */
 void* pin_pieces_file(int64_t bytes, int fd, int64_t foff) {
     std::vector<hsa_agent_t> cards;
     for (const Dev& d : G().dev) cards.push_back(d.agent);
@@ -4796,17 +4937,16 @@ void* pin_pieces_file(int64_t bytes, int fd, int64_t foff) {
 
     if (len >= ((int64_t)2 << 20)) (void)::madvise(p, (size_t)len, MADV_HUGEPAGE);
     (void)::madvise(p, (size_t)len, MADV_DONTFORK);
-    if (::mlock2(p, (size_t)len, MLOCK_ONFAULT) != 0)
-        RAD_WARN("device: the shared file range %p (%s) could not be locked against swap (mlock2: "
-                 "%s)", (void*)p, humanb(len).c_str(), std::strerror(errno));
+    const bool locked = lock_pinned(p, len);
     prefer_numa_node(p, len, current_card_numa_node());
 
     if (!lock_pieces(p, len, bytes, cards, "rad_dev_map_file")) {
+        pin_lock_forget(len, locked, &pin_lock_tally());
         ::munmap(p, (size_t)len);
         return nullptr;
     }
     std::lock_guard<std::mutex> lk(g_pinned_mu);
-    g_pinned.emplace((uintptr_t)p, Pinned{len, nullptr});
+    g_pinned.emplace((uintptr_t)p, Pinned{len, nullptr, locked});
     return p;
 }
 
@@ -4830,6 +4970,7 @@ void unpin_pieces(void* p) {
         return;
     }
     const int64_t len = r.len;
+    pin_lock_forget(len, r.locked, &pin_lock_tally());
     for (int64_t off = 0; off < len; off += kPinPiece) {
         const hsa_status_t st = hsa_amd_memory_unlock((char*)p + off);
         if (st != HSA_STATUS_SUCCESS)
@@ -5098,6 +5239,7 @@ const DeviceBackend* aql_backend_if_present(void) {
         g_aql.tape_begin = a_tape_begin;
         g_aql.tape_mark = a_tape_mark;
         g_aql.tape_pause = a_tape_pause;
+        g_aql.pass_stamp = a_pass_stamp;
         g_aql.tape_end = a_tape_end;
         g_aql.tape_len = a_tape_len;
         g_aql.tape_play = a_tape_play;

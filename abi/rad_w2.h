@@ -179,4 +179,14 @@ static inline uint32_t rad_w2_tail_tiles(uint32_t T) {
     return (uint32_t)RAD_W2_TAIL_EXPERTS + T / 16u;
 }
 
+/* The routed GEMMs' decode band (libr4d's r4d_moe_decode_band is this function): a pass of T sorted
+ * rows (pass rows x top-k) over n_expert experts takes the (tile, run) decode grid while
+ * 2 T <= 3 n_expert, and the prefill forms above it. Only the decode grid reads a W2 operand; the
+ * other forms run every expert on both the first launch and the tail, the whole routed layer twice
+ * (issue #324: Hy4-flash's 512 experts at top-16 leave the band above 48 rows, so a DFly2 c16
+ * verify pass of 64-96 rows lost a fifth of its rate). So a pass outside it does not take the form. */
+RAD_W2_FN int rad_w2_in_band(int64_t T, int64_t n_expert) {
+    return 2 * T <= 3 * n_expert;
+}
+
 #endif /* RAD_W2_H */

@@ -182,6 +182,9 @@ other piece's expert GEMMs. It needs a step of exactly one checkpoint interval, 
 batch is two intervals wide and the span runs them as two steps. A step is cut only when both
 pieces have at least 1024 rows (`RADIANCE_HY4_PIPE_MIN` moves that floor, `RADIANCE_HY4_PIPE_ROWS`
 the cut, `RADIANCE_HY4_PIPE_LANE` the lane).
+`RADIANCE_HY4_PIPE_ATTN=1` (with the pipeline) cuts the attention core into the same two pieces,
+so piece 0's attention junction rides the second lane beside piece 1's attention instead of
+waiting; the output is the same bytes (`notes/backlog/measurements/P-17.md`).
 
 Two bugs of the pipeline are fixed, so it is safe to use with current code. A staged pipelined step
 of 8192 rows could hang the four ranks on a long prompt (issue #2, fixed in #205). The pieces also

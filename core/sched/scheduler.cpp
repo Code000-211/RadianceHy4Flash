@@ -73,6 +73,7 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
      * must use the resolved interval, never the raw flag, so chunks split in one place. */
     if (geo) geo_ = *geo;
     else RAD_TRY(chunk_geometry_resolve(prog, cfg, &geo_));
+    push_exact_keys();
 
     if (cfg_.draft_suffix && cfg_.draft_suffix_global_mib > 0) {
         GlobalSuffix::Config gc;
@@ -1534,8 +1535,26 @@ int64_t Scheduler::tail_checkpoint(int64_t target, bool in_step) const {
 }
 
 /* ------------------------------------------------------------------ a prefill sharing a step */
+/* --prefix-resume exact: the prefix cache keys every block with its cold chunk (exact_keys), and
+ * the chunk's cut depends on whether a lone prefill of the prompt spans, so the cache is told the
+ * grid and this scheduler's span rule (span_now_) whenever either changes. */
+void Scheduler::push_exact_keys() {
+    if (!pc_ || !geo_.exact || geo_.grid <= 0) return;
+    ExactKeys x;
+    x.grid = geo_.grid;
+    x.origin = geo_.grid_origin;
+    x.span_min = cfg_.prefill_span > 1 && geo_.span > 1 ? span_min_ : -1;
+    pc_->set_exact_keys(x);
+}
+
 void Scheduler::set_span_min(int64_t tokens) {
     span_min_ = tokens > 0 ? tokens : 0;
+    log_span_min();
+    /* Last, once the bound is final: the cache's span bit is the bound chunks are cut by. */
+    push_exact_keys();
+}
+
+void Scheduler::log_span_min() const {
     if (geo_.span <= 1) return;
     if (cfg_.prefill_span_min >= 0) {
         /* The deployment's own bound (--prefill-span-min), whatever the experts' placement. */

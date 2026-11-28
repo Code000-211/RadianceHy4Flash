@@ -179,8 +179,9 @@ void Ctx::w2_open(const W2Config& cfg, const uint64_t* lo, const uint64_t* hi, c
     x->thr = std::thread([this, xs] { w2_serve(*xs); });
     uint8_t km[RAD_W2_MAX_EXPERT + 1];
     w2_fill_kmax(cfg, km);
-    RAD_INFO("rank %d: W2 on: resident experts first on passes of %d rows and up, at most %d whole units a "
-             "routed layer by DMA (budget at 50 / 100 / 200 routed experts: %d / %d / %d), ring %s%s", rank_,
+    RAD_INFO("rank %d: W2 on: resident experts first on passes of %d rows and up inside the routed GEMMs' "
+             "decode band, at most %d whole units a routed layer by DMA (budget at 50 / 100 / 200 "
+             "routed experts: %d / %d / %d), ring %s%s", rank_,
              cfg.min_rows, cfg.kmax, (int)km[50], (int)km[100], (int)km[200], humanb(ring).c_str(),
              x->ring_cached ? " of ordinary device memory, read behind a system-scope acquire" : " (uncached)");
     w2_ = std::move(x);

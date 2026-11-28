@@ -194,6 +194,22 @@ struct IKVManager {
  * the whole chain only, left it on the host. */
 enum class RestoreResult : uint8_t { Whole, Cut, Declined };
 
+/* --prefix-resume exact: the cold chunks a block's key carries (exact_keys). A prefill writes a
+ * token's KV in a step with the rest of its chunk, and a kernel may round a row by the rows beside
+ * it (#282: a split chosen from M, the routed GEMMs' rows per expert), so a block holds the bytes
+ * a cold run of this prompt would only if it was computed in the same chunk, with the same tokens,
+ * cut the same way. `grid` and `origin` are ChunkGeometry's resume grid (0, then origin + k * grid);
+ * `span_min` is when a lone prefill spans (Scheduler::set_span_min): -1 never, 0 always, else the
+ * shortest prompt that does. grid 0: not exact, and no key is added. */
+struct ExactKeys {
+    int64_t grid = 0;
+    int64_t origin = 0;
+    int64_t span_min = -1;
+    bool operator==(const ExactKeys& o) const {
+        return grid == o.grid && origin == o.origin && span_min == o.span_min;
+    }
+};
+
 struct IPrefixCache {
     virtual ~IPrefixCache() = default;
 
@@ -224,6 +240,14 @@ struct IPrefixCache {
     /* The drafter's refill window (Scheduler::init): retention keeps a snapshot that deep below a
      * session's tip, so a refill-capped hit has one to end on (PrefixCache::set_drafter_floor). */
     virtual void set_drafter_floor(int64_t) {}
+    /* --prefix-resume exact: the cold chunk grid every key carries (ExactKeys, exact_keys). */
+    virtual void set_exact_keys(const ExactKeys&) {}
+    /* Every key a request's chain carries, for a reader outside the binding (the engine's
+     * disk-store page-in, pcache_page_in_request): what lookup and publish hash with, so a page-in
+     * finds what a lookup looks for. `salt` is the control vector's (media_keys). The default is
+     * media_keys alone; PCBinding adds the exact grid's chunks. */
+    virtual void request_keys(const Request& r, uint64_t salt,
+                              std::vector<MMContentKey>* out) const;
 
     /* Publish what this sequence computed so a later request sharing the prefix can adopt it.
      * `blocks[i]` is the block table of cached_groups()[i]; `n_tokens` is how many tokens are
@@ -556,6 +580,56 @@ inline void media_keys(const Request& r, std::vector<MMContentKey>* out,
     }
 }
 
+/* --prefix-resume exact: one key per chunk of the resume grid the prompt reaches, appended to a
+ * request's media keys (media_keys), so every block of a chunk carries the chunk's context: its
+ * tokens and media from the chunk's start to its end, or to the prompt's end in the prompt's last
+ * chunk, and whether the prompt spans there. Two prompts then share an entry only where a cold
+ * prefill of each wrote the same bytes, and a hit adopts only blocks a cold run of its own prompt
+ * would have written (#236):
+ *   - a head two conversations share inside one chunk is computed with different rows after it,
+ *     so each keeps its own entries, and a hit resumes on its own conversation's chain;
+ *   - a lone prefill spans by its whole length (Scheduler::span_now_), so a first turn under
+ *     --prefill-span-min and its longer next turn cut a chunk past the origin differently; the
+ *     span decision is in the key there (not in [0, origin), which both cut alike).
+ * The prompt's last chunk, when it ends short of the chunk, runs to INT32_MAX, and a prompt that
+ * ends on a chunk's end gets a tail key from there: the reply's blocks (written by decode) never
+ * stand in for a longer prompt's prefill. Without exact (grid
+ * 0) nothing is added, and the keys are those of a build without this. */
+inline void exact_keys(const Request& r, const ExactKeys& x, std::vector<MMContentKey>* out) {
+    const int64_t L = (int64_t)r.prompt.size();
+    if (x.grid <= 0 || L <= 0) return;
+    const size_t n_media = out->size();
+    const bool spans = x.span_min == 0 || (x.span_min > 0 && L >= x.span_min);
+    for (int64_t a = 0; a < L;) {
+        const int64_t e = a < x.origin ? x.origin : a + x.grid;
+        const int64_t c = std::min(e, L);
+        const BlockHash h = chain_block_hash(BlockHash{}, r.prompt.data() + a, (int32_t)(c - a),
+                                             out->data(), (int32_t)n_media, a);
+        uint64_t w = h.lo ^ (h.hi * 0x9e3779b97f4a7c15ull) ^ 0x4558414354ull;   /* "EXACT" */
+        if (c < e) w ^= 0x7061727469616cull * (uint64_t)(c - a + 1);           /* "partial" */
+        if (spans && x.origin > 0 && a >= x.origin) w ^= 0x7370616eull << 17;  /* "span" */
+        MMContentKey k;
+        k.tok_begin = (int32_t)a;
+        k.tok_end = c < e ? INT32_MAX : (int32_t)e;
+        k.hash = w;
+        out->push_back(k);
+        a = e;
+        if (c == L && c == e) {
+            /* The prompt ends on a chunk's end: the reply's blocks get a key of their own. */
+            MMContentKey t;
+            t.tok_begin = (int32_t)L;
+            t.tok_end = INT32_MAX;
+            t.hash = 0x7461696cull * (uint64_t)(L + 1) ^ 0x4558414354ull;          /* "tail" */
+            out->push_back(t);
+        }
+    }
+}
+
+inline void IPrefixCache::request_keys(const Request& r, uint64_t salt,
+                                       std::vector<MMContentKey>* out) const {
+    media_keys(r, out, salt);
+}
+
 template <class PC>
 struct PCBinding final : IPrefixCache {
     PC* m;
@@ -565,13 +639,25 @@ struct PCBinding final : IPrefixCache {
      * the cache stores hidden states' consequences. Per request, not per cache: two sequences of one
      * step may differ. */
     uint64_t salt_id = 0;
+    /* --prefix-resume exact's chunk grid (exact_keys); grid 0 without it. */
+    ExactKeys exact;
     /* Scratch for a request's media keys, reused so a text request's lookup allocates nothing. */
     mutable std::vector<MMContentKey> mm_;
     explicit PCBinding(PC* p) : m(p) {}
 
+    /* Every key a request's chain carries: its media, adapter and control vector (media_keys),
+     * then the exact grid's chunks (exact_keys). Lookup, publish, snapshot keys, restore and the
+     * engine's page-in all take them here, so they cannot drift apart. */
+    void request_keys(const Request& r, uint64_t salt,
+                      std::vector<MMContentKey>* out) const override {
+        media_keys(r, out, salt);
+        exact_keys(r, exact, out);
+    }
+    void set_exact_keys(const ExactKeys& x) override { exact = x; }
+
     CacheHit lookup(const Request& r, std::vector<std::vector<int32_t>>* out,
                     const HitCap* cap, PrefixChain* chain = nullptr) const override {
-        media_keys(r, &mm_, salt_id);
+        request_keys(r, salt_id, &mm_);
         /* A kept chain is only kept for its own request: a SchedReq slot outlives the request, so
          * the stamp is checked before any of its hashes are trusted. */
         if (chain && !chain->mine(r.id, (int64_t)r.prompt.size(), mm_)) {
@@ -599,7 +685,7 @@ struct PCBinding final : IPrefixCache {
     std::vector<BlockHash> restore_plan(const Request& r, uint64_t salt, bool whole_only = false,
                                         RestoreResult* res = nullptr) {
         if (res) *res = RestoreResult::Whole;
-        media_keys(r, &mm_, salt);
+        request_keys(r, salt, &mm_);
         std::vector<BlockHash> want = m->restorable_from(r.prompt, mm_);
         const int64_t need = (int64_t)want.size() - m->restore_room();
         if (need <= 0) return want;
@@ -619,7 +705,7 @@ struct PCBinding final : IPrefixCache {
     }
     void begin_step() override { m->begin_step(); }
     void hold(const Request& r) override {
-        media_keys(r, &mm_, salt_id);
+        request_keys(r, salt_id, &mm_);
         m->hold(r.id, r.prompt, mm_);
     }
     void release(const Request& r) override { m->release(r.id); }
@@ -637,7 +723,7 @@ struct PCBinding final : IPrefixCache {
         if (n_tokens > (int64_t)toks.size()) n_tokens = (int64_t)toks.size();
         /* r.id is the session, the same id reserve_checkpoint keys its snapshots by.
          * The slot rides along so the session row knows which adapter answered last. */
-        media_keys(r, &mm_, salt_id);
+        request_keys(r, salt_id, &mm_);
         /* The chain runs over prompt ++ output, of which a lookup hashed the prompt's blocks: it
          * is this request's, or it is dropped and taken afresh. */
         if (chain && !chain->mine(r.id, (int64_t)r.prompt.size(), mm_)) {
@@ -715,7 +801,7 @@ private:
     /* The chain reserve_checkpoint and commit_checkpoint both key on; shared so they cannot
      * drift apart. */
     BlockHash prefix_hash(const Request& r, int64_t pos) const {
-        media_keys(r, &mm_, salt_id);
+        request_keys(r, salt_id, &mm_);
         const int64_t bs = m->block_size();
         BlockHash h{};
         if (bs <= 0) return h;

@@ -4507,6 +4507,67 @@ TEST(an_ngram_table_a_device_kernel_reads_goes_where_the_placement_says) {
           std::string::npos);
 }
 
+/* Finding 2 (round 4): pin_mapped asks the LAYER for a table the naming reaches, not the
+ * global. A vram layer under a global disk must not go to Tier::Mapped, and a disk layer under
+ * a global vram must. Under the old global `ng` both went the other way. A table the naming
+ * does not reach keeps following the global in both. */
+TEST(an_ngram_layer_takes_its_own_placement_into_the_mapped_tier) {
+    const auto build = [](Fixture& f) {
+        build_dense_lookup(f, /*layers=*/1, /*per_layer=*/4 * MiB);
+        const rad_weight t = f.weight("blk.1.engram_table.weight", 8 * MiB, RAD_ACCESS_VOCAB,
+                                      -1, -1);
+        f.op("embed_lookup_q", { t }, /*host_kernel=*/true);
+        return t;
+    };
+    {   /* Global disk, layer 1 vram: the table sits with the other weights, off the mapped
+         * tier -- the global's disk answer belongs to the layers the spec left out. */
+        Fixture f;
+        const rad_weight t = build(f);
+        Config cfg = base_config();
+        cfg.placement = "all_vram";
+        cfg.ngram_resolved = TablePlacement::Disk;
+        cfg.ngram_layer_resolved = { { 1, TablePlacement::Vram } };
+        Plan plan;
+        PlannerInput in{ &f.prog, &cfg, 0, 1, nullptr, 0 };
+        CHECK_OK(Planner(in).plan(&plan));
+        CHECK(plan.weight[t].tier == Tier::VRAM);
+        CHECK(plan.weight[t].site == Site::Device);
+        CHECK_EQ(plan.ngram_copy_bytes, 0ll);
+    }
+    {   /* Global vram, layer 1 disk: the container's mapping, read by the host gather --
+         * not the card the global put the rest of the table on. */
+        Fixture f;
+        const rad_weight t = build(f);
+        Config cfg = base_config();
+        cfg.placement = "all_vram";
+        cfg.ngram_resolved = TablePlacement::Vram;
+        cfg.ngram_layer_resolved = { { 1, TablePlacement::Disk } };
+        Plan plan;
+        PlannerInput in{ &f.prog, &cfg, 0, 1, nullptr, 0 };
+        CHECK_OK(Planner(in).plan(&plan));
+        CHECK(plan.weight[t].tier == Tier::Mapped);
+        CHECK(plan.weight[t].site == Site::Host);
+        CHECK(std::string(plan.weight[t].reason).find("--ngram-placement disk") !=
+              std::string::npos);
+    }
+    {   /* The unnamed table, layer -1 to the naming: the per-layer vram answers nothing,
+         * the global disk places it. */
+        Fixture f;
+        build_dense_lookup(f, /*layers=*/1, /*per_layer=*/4 * MiB);
+        const rad_weight t = f.weight("ngram.weight", 8 * MiB, RAD_ACCESS_VOCAB, -1, -1);
+        f.op("embed_lookup_q", { t }, /*host_kernel=*/true);
+        Config cfg = base_config();
+        cfg.placement = "all_vram";
+        cfg.ngram_resolved = TablePlacement::Disk;
+        cfg.ngram_layer_resolved = { { 1, TablePlacement::Vram } };   /* names no table here */
+        Plan plan;
+        PlannerInput in{ &f.prog, &cfg, 0, 1, nullptr, 0 };
+        CHECK_OK(Planner(in).plan(&plan));
+        CHECK(plan.weight[t].tier == Tier::Mapped);
+        CHECK(plan.weight[t].site == Site::Host);
+    }
+}
+
 /* Disk needs the host gather kernel: an n-gram table only a device kernel reads has no host site,
  * and the footprint reports that. */
 TEST(an_ngram_table_with_no_host_kernel_cannot_stay_on_disk) {

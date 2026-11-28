@@ -25,6 +25,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <map>
 #include <set>
 #include <sstream>
 #include <sys/stat.h>
@@ -153,6 +154,14 @@ static const Flag g_flags[] = {
     "                                    pinned copy a file in DIR (a tmpfs) mapped shared, so\n"
     "                                    two engines on separate cards hold one table: the\n"
     "                                    first fills it, the last to exit deletes it" },
+    { "--ngram-placement-layers", "SPEC", "L=WHERE,...: per-layer overrides of --ngram-placement\n"
+    "                                    for the named Engram layers (e.g. 1=ram,11=disk,\n"
+    "                                    21=disk,31=disk: layer 1's table pinned, the rest read\n"
+    "                                    from the drive). WHERE is vram, ram, ram=DIR, disk or\n"
+    "                                    disk=DIR; there is no per-layer auto, and layers the\n"
+    "                                    spec does not name take --ngram-placement. The env\n"
+    "                                    RADIANCE_NGRAM_PLACEMENT_LAYERS gives the same spec\n"
+    "                                    when the flag is absent" },
     { "--weights-disk-tier",  nullptr,  "read weights that fit neither VRAM nor the host pool from the\n"
     "                                    container on disk (O_DIRECT) -- the file tier, units on\n"
     "                                    Tier::SSD; a routed expert is read a layer at\n"
@@ -570,6 +579,101 @@ static bool parse_table_placement(const char* v, TablePlacement* out) {
     return true;
 }
 
+/* The placements Engine::resolve_table_placement confirmed for this process: the global one
+ * (layer -1) and the per-layer ones. rad_ngram_layer_resolved answers from it -- the snapshot of
+ * Config::ngram_effective the arch plugins read (abi/rad_runtime.h, hyv4flash_engram.h) -- and
+ * starts at Config's own default (global disk), so an answer exists before any resolve. One
+ * server per process, as the flag's parse recorder was: the last resolve wins. */
+static std::map<int, int> g_ngram_resolved;
+
+/* (Already inside namespace rad.) The resolve records through this; the snapshot answers the
+ * abi/rad_runtime.h accessor below. */
+void config_note_ngram_resolved(int layer, TablePlacement p) {
+    g_ngram_resolved[layer] = static_cast<int>(p);
+}
+
+/* The snapshot belongs to one resolve pass: Engine::resolve_table_placement clears it before
+ * recording its own answers, so a later resolve without per-layer entries does not keep an
+ * earlier engine's per-layer answers (the per-step prefetch gate reads rad_ngram_layer_resolved,
+ * and a stale ram answer there reads a table twice). */
+void config_reset_ngram_resolved() {
+    g_ngram_resolved.clear();
+}
+
+extern "C" int rad_ngram_layer_resolved(int layer) {
+    const auto it = g_ngram_resolved.find(layer);
+    if (it != g_ngram_resolved.end()) return it->second;
+    const auto g = g_ngram_resolved.find(-1);   /* the global resolved placement */
+    return g != g_ngram_resolved.end()
+               ? g->second
+               : static_cast<int>(rad::TablePlacement::Disk);
+}
+
+/* --ngram-placement-layers / RADIANCE_NGRAM_PLACEMENT_LAYERS: the comma list of L=WHERE parsed
+ * into Config's per-layer maps. WHERE splits at the item's first '=', so ram=DIR/disk=DIR keep
+ * their directory. auto is refused: a layer left to fit tests takes the global placement.
+ * False after printing the reason. */
+static bool parse_ngram_layers(const char* spec, Config* c) {
+    const std::string s = spec;
+    size_t at = 0;
+    while (true) {
+        const size_t comma = s.find(',', at);
+        const std::string item =
+            s.substr(at, comma == std::string::npos ? std::string::npos : comma - at);
+        const size_t eq = item.find('=');
+        if (item.empty() || eq == std::string::npos || eq == 0 || eq + 1 >= item.size()) {
+            RAD_ERR("--ngram-placement-layers: '%s' is not L=WHERE -- a layer number, '=', and "
+                    "one of vram, ram, ram=DIR, disk, disk=DIR; the whole spec is a comma list, "
+                    "e.g. 1=ram,11=disk,21=disk,31=disk", item.c_str());
+            return false;
+        }
+        const std::string head = item.substr(0, eq);
+        char* end = nullptr;
+        const long layer = std::strtol(head.c_str(), &end, 10);
+        if (!end || *end || layer < 0 || layer > INT32_MAX) {
+            RAD_ERR("--ngram-placement-layers: '%s' names no layer before '='", item.c_str());
+            return false;
+        }
+        const std::string where = item.substr(eq + 1);
+        TablePlacement p;
+        std::string share_dir, disk_dir;
+        if (!std::strncmp(where.c_str(), "ram=", 4)) {
+            share_dir = where.substr(4);
+            if (share_dir.empty()) {
+                RAD_ERR("--ngram-placement-layers: '%s': ram= needs a directory", item.c_str());
+                return false;
+            }
+            p = TablePlacement::Ram;
+        } else if (!std::strncmp(where.c_str(), "disk=", 5)) {
+            disk_dir = where.substr(5);
+            if (disk_dir.empty()) {
+                RAD_ERR("--ngram-placement-layers: '%s': disk= needs a directory", item.c_str());
+                return false;
+            }
+            p = TablePlacement::Disk;
+        } else if (!parse_table_placement(where.c_str(), &p) || p == TablePlacement::Auto) {
+            RAD_ERR("--ngram-placement-layers: '%s' is not vram, ram, ram=DIR, disk or disk=DIR "
+                    "(no per-layer auto: the layers the spec does not name take "
+                    "--ngram-placement)", item.c_str());
+            return false;
+        }
+        const int l = static_cast<int>(layer);
+        if (!c->ngram_layer_asked.emplace(l, p).second) {
+            RAD_ERR("--ngram-placement-layers: layer %d is named twice", l);
+            return false;
+        }
+        if (!share_dir.empty()) c->ngram_layer_share_dir[l] = share_dir;
+        if (!disk_dir.empty()) c->ngram_layer_disk_dir[l] = disk_dir;
+        if (comma == std::string::npos) break;
+        at = comma + 1;
+        if (at >= s.size()) {
+            RAD_ERR("--ngram-placement-layers: '%s' ends with a comma", spec);
+            return false;
+        }
+    }
+    return true;
+}
+
 /* The whole argument must be a number: atof reads "high" as 0, which for --temp silently means
  * greedy decoding. */
 static bool parse_num(const char* flag, const char* v, double* out) {
@@ -710,6 +814,15 @@ int config_parse(int argc, char** argv, Config* c) {
         if (i + 1 >= argc) { RAD_ERR("%s needs an argument", argv[i]); return nullptr; }
         return argv[++i];
     };
+
+    /* RADIANCE_NGRAM_PLACEMENT_LAYERS gives the per-layer spec when the flag is absent from the
+     * line; the flag is the operator's own hand and wins whole. */
+    bool ngram_layers_flag = false;
+    for (int i = 1; i < argc; ++i)
+        if (!std::strcmp(argv[i], "--ngram-placement-layers")) ngram_layers_flag = true;
+    if (!ngram_layers_flag)
+        if (const char* e = std::getenv("RADIANCE_NGRAM_PLACEMENT_LAYERS"); e && *e)
+            if (!parse_ngram_layers(e, c)) return RAD_E_INVAL;
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -890,6 +1003,10 @@ int config_parse(int argc, char** argv, Config* c) {
             }
             (emb ? c->embedding_placement : c->ngram_placement) = p;
             if (emb) c->embedding_placement_given = true;
+        }
+        else if (S("--ngram-placement-layers")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            if (!parse_ngram_layers(v, c)) return RAD_E_INVAL;
         }
         else if (S("--vision-tower-placement")) {
             if (!(v = need(i))) return RAD_E_INVAL;
@@ -1856,6 +1973,25 @@ const ShowRow kShow[] = {
           std::string v = table_placement_name(c.ngram_placement);
           const std::string& dir = c.ngram_share_dir.empty() ? c.ngram_disk_dir : c.ngram_share_dir;
           return dir.empty() ? v : v + "=" + dir; } },
+    { "--ngram-placement-layers", [](const Config& c) {
+          if (c.ngram_layer_asked.empty())
+              return std::string("none (every layer follows --ngram-placement)");
+          std::string v;
+          for (const auto& [l, p] : c.ngram_layer_asked) {
+              if (!v.empty()) v += ",";
+              v += std::to_string(l) + "=" + table_placement_name(p);
+              /* The directory that layer's copy is made in: its own ram=DIR/disk=DIR when the
+                 spec named one, the global ram=DIR/disk=DIR otherwise (Config's own
+                 ngram_share_dir_for/ngram_disk_dir_for, which the load reads). */
+              if (p == TablePlacement::Ram) {
+                  const std::string& rd = c.ngram_share_dir_for(l);
+                  if (!rd.empty()) v += "=" + rd;
+              } else if (p == TablePlacement::Disk) {
+                  const std::string& dd = c.ngram_disk_dir_for(l);
+                  if (!dd.empty()) v += "=" + dd;
+              }
+          }
+          return v; } },
     { "--vision-tower-placement", [](const Config& c) { return std::string(table_placement_name(c.tower_placement)); } },
     { "--weights-disk-tier",  [](const Config& c) { return onoff(c.weights_disk_tier); } },
     { "--keep-container-cache", [](const Config& c) { return onoff(c.keep_container_cache); } },

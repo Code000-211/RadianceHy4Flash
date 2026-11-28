@@ -429,6 +429,11 @@ struct DeviceBackend {
      * costs the card -- the part of the budget's `already held` a deployment could give back.
      * RAD_E_UNSUPPORTED on a backend that loads no device code. (M-14) */
     int (*code_resident)(int device, int64_t* bytes, int* modules);
+
+    /* `pass_stamp(1)` / `pass_stamp(0)` bracket one live-issued pass on the calling thread, so
+     * RADIANCE_AQL_STAMP can time its dispatches as it times a played one. Null on a backend
+     * without stamps; a no-op while the switch is off. */
+    void    (*pass_stamp)(int on);
     /* rad_dev_acquire_next; null where the backend has no caches of its own. Last: the host
      * backend's table is positional. */
     void    (*acquire_next)(void);
@@ -449,6 +454,7 @@ int     tape_diff(RadTape a, RadTape b, std::string* why);
 void    tape_destroy(RadTape t);
 int     tape_record(RadTape t, int i, int* kind, uint32_t* queue);
 int     tape_set_overlap(RadTape t, int i, bool on);
+void    pass_stamp(bool on);
 
 /* The current backend's DeviceBackend::peer_access. */
 int     dev_peer_access(int self, int peer);

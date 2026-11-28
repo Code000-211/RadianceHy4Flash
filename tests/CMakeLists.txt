@@ -1016,6 +1016,9 @@ if(RAD_PYTHON3)
   add_test(NAME backlog_stamps_test COMMAND ${RAD_PYTHON3} ${CMAKE_CURRENT_SOURCE_DIR}/backlog_stamps_test.py)
   set_tests_properties(backlog_stamps_test PROPERTIES LABELS "unit;fast" SKIP_RETURN_CODE 77
                        TIMEOUT ${RAD_TEST_TIMEOUT})
+  # scripts/stampgaps.py over live-issued passes (T-01): the stamp file a prefill or mixed pass leaves.
+  add_test(NAME stampgaps_live_test COMMAND ${RAD_PYTHON3} ${CMAKE_CURRENT_SOURCE_DIR}/stampgaps_live_test.py)
+  set_tests_properties(stampgaps_live_test PROPERTIES LABELS "unit;fast" TIMEOUT ${RAD_TEST_TIMEOUT})
 endif()
 
 # ================================================================== the shipped plugins, out of tree

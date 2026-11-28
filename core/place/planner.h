@@ -28,6 +28,7 @@
 #include "../rad_core.h"
 #include "rad_format.h"
 
+#include <cstdio>
 #include <string>
 #include <vector>
 
@@ -441,6 +442,15 @@ inline bool is_embedding_table(const Program& prog, rad_weight w) {
 }
 inline bool is_ngram_table(const Program& prog, rad_weight w) {
     return read_only_by(prog, w, "embed_lookup_q");
+}
+
+/* The Engram layer a table weight belongs to: "blk.<l>.engram_table.weight" and
+ * "blk.<l>.engram_table.scale" parse to l, anything else to -1. --ngram-placement-layers keys
+ * its overrides by it. */
+inline int ngram_table_layer(const std::string& name) {
+    int l = -1;
+    if (std::sscanf(name.c_str(), "blk.%d.engram_table", &l) == 1) return l;
+    return -1;
 }
 
 /* "blk.12.ffn_gate_exps.3.weight" -> "blk.*.ffn_gate_exps.*.weight": the report's per-class
