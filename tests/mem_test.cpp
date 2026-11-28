@@ -1067,6 +1067,35 @@ TEST(kv_configure_reports_and_sizes) {
     CHECK_EQ(full->n_blocks, ((1ll << 20) - 8 * 16384 - RAD_ALIGN_UNIT) / 2048);
 }
 
+/* X-07: a group whose page the builder did not size (`bytes_per_block` 0, as a group declared with
+ * no consumer has) is sized here from the declaration, and that path reads the row the group
+ * declares too: the int8 latent row's 656 bytes, not the generic int8 row's 580. The two differ by
+ * one head's 76 missing bytes a token, which no assertion elsewhere would see: the carve would
+ * simply allocate a smaller page than the store writes. */
+TEST(kv_sizes_a_group_from_its_declared_row_when_no_consumer_sized_it) {
+    std::vector<KVGroupInfo> groups;
+    groups.push_back(null_group());
+    {
+        KVGroupInfo k;
+        k.name = "latent";
+        k.decl.kind = RAD_KV_FULL;
+        k.decl.dtype = RAD_I8;
+        k.decl.n_head_kv = 1;
+        k.decl.head_dim = 288;
+        k.decl.row_elems = 656;
+        k.block_size = 16;
+        k.layers = { 0, 1 };
+        groups.push_back(k);          /* page = 2 layers * 16 tokens * 656 B = 20992 B */
+    }
+    Fixture f;
+    REQUIRE_EQ(f.build_groups(groups), 0);
+    const KVGroupPlan* p = f.kv.plan(1);
+    REQUIRE(p != nullptr);
+    CHECK_EQ(p->block_size, 16ll);
+    CHECK_EQ(p->bytes_per_block, (int64_t)(2 * 16 * 656));
+    CHECK_EQ(p->layer_bytes_per_block(), (int64_t)(16 * 656));
+}
+
 TEST(kv_ranks_with_unequal_pools_carve_the_least_ranks_blocks_under_a_cap) {
     /* One block table serves every rank (Engine::serve), so every rank's paged groups hold the
      * same block count. With unequal pools (here 1 MiB and 2 MiB), Engine::configure_kv plans each

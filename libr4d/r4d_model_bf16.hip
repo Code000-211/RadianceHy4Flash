@@ -27,6 +27,7 @@
 #include "r4d_emit.h"
 #include "r4d_common.h"
 #include "r4d_rope.h"
+#include "r4d_row_i8.h"
 #include "rad_yarn.h"
 #include "r4d_fp8_wmma.h"
 #include "r4d_chain.h"
@@ -805,7 +806,9 @@ struct MlaRowFront {
     uint32_t L, R, pitch, block_size, n_blocks, plane;
     float eps, theta, rscale;
     int mode, gptj, s0, s1, s2, n_sec;
-    int pad_;                 // no tail padding: a kernel's by-value struct is audited byte for byte
+    /* X-07: the cache's row is the int8 latent form (r4d_row_i8.h) rather than K then V as bf16.
+     * 0 -- the zero-initialised default of every existing caller -- keeps the bf16 row. */
+    int i8;
 };
 static_assert(sizeof(MlaRowFront) == 104, "MlaRowFront has padding");
 template <bool WF32, class CH>
@@ -822,11 +825,16 @@ __global__ __launch_bounds__(kThreads) void mla_row_front_kernel(MlaRowFront p) 
     const uint32_t half = (p.L + p.R) / 2;   /* the slot's head_dim, and the row's column count */
     const int sec[3] = { p.s0, p.s1, p.s2 };
     uint16_t* __restrict__ yr = p.row + (size_t)m * p.pitch;
-    /* kv_store_body's rule: a negative slot is padding and stores nothing. */
+    /* kv_store_body's rule: a negative slot is padding and stores nothing. Under i8 the slot is a
+     * row of r4d_row_i8::row_bytes instead of 2 * half bf16 columns. */
     uint16_t* __restrict__ c = nullptr;
+    uint8_t* __restrict__ c8 = nullptr;
     if (sl >= 0 && (uint32_t)sl / p.block_size < p.n_blocks) {
         const uint32_t blk = (uint32_t)sl / p.block_size, off = (uint32_t)sl % p.block_size;
-        c = p.kv + ((size_t)blk * p.block_size + (size_t)off) * 2 * half;
+        const size_t base = (size_t)blk * p.block_size + (size_t)off;
+        if (p.i8)
+            c8 = (uint8_t*)p.kv + base * (size_t)r4d_row_i8::row_bytes((int)p.L, (int)p.R);
+        else c = p.kv + base * 2 * half;
     }
     /* A pair of columns is one dword store when the base and the column are both even. */
     const bool row_pk = ((uintptr_t)yr & 3u) == 0;
@@ -863,6 +871,17 @@ __global__ __launch_bounds__(kThreads) void mla_row_front_kernel(MlaRowFront p) 
             }
         }
     }
+    /* X-07: the int8 row, quantised from the bf16 columns this kernel has just written to it and
+     * not from the registers, so the fused store, kv_store and kv_store_streamed write the same
+     * 656 bytes for a row (r4d_row_i8.h). The barrier publishes the columns the block's other
+     * threads normed; the quantiser's waves then take a block each. Every thread reaches it: the
+     * slot mapping is uniform over the block. */
+    if (c8) {
+        __syncthreads();
+        r4d_row_i8::quant_row<kThreads>(yr, c8 + r4d_row_i8::codes_offset(),
+                                       (float*)(c8 + r4d_row_i8::scales_offset((int)p.L)),
+                                       p.L);
+    }
     /* The rotary, from the same pair of registers: rope_body's angle (rope_turn) and its rounding,
      * written to the row in place as rope_kernel writes it, and to the slot columns the pair
      * owns. Every pair of the rotary, at any width: the loop strides over `rhalf` the way
@@ -891,6 +910,13 @@ __global__ __launch_bounds__(kThreads) void mla_row_front_kernel(MlaRowFront p) 
                 d[0] = y0;
                 d[i1 - i0] = y1;
             }
+        }
+        if (c8) {
+            /* Not quantised: the rope columns go in as the row holds them, the values written
+             * above (design note X-07 §2). */
+            uint8_t* __restrict__ d = c8 + r4d_row_i8::rope_offset((int)p.L);
+            *(uint16_t*)(d + 2u * i0) = y0;
+            *(uint16_t*)(d + 2u * i1) = y1;
         }
     }
     if (CH::on) r4d_chain_done();
@@ -1115,6 +1141,86 @@ __global__ __launch_bounds__(1024) void kv_store_streamed_i8_kernel(
     kv_i8_put(host + (size_t)blk * brow + o, head_dim, q);
     const int32_t sl = res[blk];
     if (sl >= 0 && (uint32_t)sl < slots) kv_i8_put(kv + (size_t)sl * brow + o, head_dim, q);
+}
+
+// ---- The int8 latent row (design note X-07, X-07a): `kv_store`'s i8 form when the group carries
+// a row of its own (`rope_dim` given, `RadKVGroupDecl::row_bytes`), one row a workgroup --
+// [L int8 codes][L/128 f32 scales][R rope columns as bf16], the form r4d_row_i8.h writes.
+//
+// The row is one KV head (Hy4-flash's latent cache: kv_rep 1), and its 2 * head_dim columns arrive
+// as kv_store's K and V of that head: the key slot is the row's first `half` columns (its first
+// half of the latent), the value slot the rest, so column c of the row is k[c] for c < half and
+// v[c - half] after. A wave rotates and quantises a block of 128 latent columns, the four
+// contiguous ones a lane holds; the rope columns are copied as the bf16 they arrive as (the
+// writer's rope rounded them; a rope column's angle must not be mixed into a block).
+//
+// One workgroup of 128 threads a token: four waves, one block each, and the rope's 64 columns on
+// the first 64 lanes. A smaller workgroup takes the blocks by stride, with the same bytes.
+struct KvRowI8 {
+    uint32_t L, R;        // the row's latent and rotary columns; 2 * head_dim = L + R
+    uint32_t half;        // head_dim: the columns k holds (v holds the next `half`)
+    uint32_t row_bytes;   // r4d_row_i8::row_bytes(L, R)
+    uint32_t k_ld, v_ld;
+};
+constexpr uint32_t kv_row_i8_threads() { return 128u; }
+
+// The row's `half` columns as they arrive: k's, then v's.
+__device__ __forceinline__ uint16_t kv_row_i8_col(const uint16_t* __restrict__ k,
+                                                  const uint16_t* __restrict__ v, size_t t,
+                                                  const KvRowI8& g, uint32_t c) {
+    return c < g.half ? k[t * g.k_ld + c] : v[t * g.v_ld + c - g.half];
+}
+
+__device__ __forceinline__ void kv_row_i8_store(const uint16_t* __restrict__ k,
+                                                const uint16_t* __restrict__ v, size_t t,
+                                                const KvRowI8& g, uint8_t* __restrict__ d) {
+    constexpr uint32_t THR = kv_row_i8_threads();
+    const uint32_t lane = threadIdx.x & 31u;
+    uint8_t* __restrict__ codes  = d + r4d_row_i8::codes_offset();
+    float* __restrict__ scales   = (float*)(d + r4d_row_i8::scales_offset((int)g.L));
+    uint8_t* __restrict__ rope   = d + r4d_row_i8::rope_offset((int)g.L);
+    for (uint32_t b = threadIdx.x >> 5; b < g.L / r4d_row_i8::kBlock; b += THR / 32u) {
+        const uint32_t c0 = b * r4d_row_i8::kBlock + lane * 4u;
+        float x[4] = {bf16_to_f32(kv_row_i8_col(k, v, t, g, c0)),
+                      bf16_to_f32(kv_row_i8_col(k, v, t, g, c0 + 1u)),
+                      bf16_to_f32(kv_row_i8_col(k, v, t, g, c0 + 2u)),
+                      bf16_to_f32(kv_row_i8_col(k, v, t, g, c0 + 3u))};
+        r4d_row_i8::quant_block<THR>(x, codes, scales, lane, b);
+    }
+    for (uint32_t i = threadIdx.x; i < g.R; i += THR)
+        *(uint16_t*)(rope + 2u * i) = kv_row_i8_col(k, v, t, g, g.L + i);
+}
+
+__global__ __launch_bounds__(kv_row_i8_threads()) void kv_store_i8_row_kernel(
+    const uint16_t* __restrict__ k, const uint16_t* __restrict__ v,
+    const int32_t* __restrict__ slot, uint8_t* __restrict__ kv, uint32_t block_size,
+    uint32_t n_blocks, KvRowI8 g) {
+    const uint32_t t = blockIdx.x;
+    const int32_t s = slot[t];
+    if (s < 0 || (uint32_t)s / block_size >= n_blocks) return;
+    const size_t row = ((size_t)((uint32_t)s / block_size) * block_size +
+                        (uint32_t)s % block_size) * g.row_bytes;
+    kv_row_i8_store(k, v, t, g, kv + row);
+}
+
+// The same row into a streamed group's two planes, as kv_store_streamed_i8_kernel writes the
+// generic one: the host mirror always, the ring at `res[block]` when that block is resident.
+__global__ __launch_bounds__(kv_row_i8_threads()) void kv_store_streamed_i8_row_kernel(
+    const uint16_t* __restrict__ k, const uint16_t* __restrict__ v,
+    const int32_t* __restrict__ slot, uint8_t* __restrict__ kv,
+    const int32_t* __restrict__ res, uint8_t* __restrict__ host, uint32_t block_size,
+    uint32_t blocks, uint32_t slots, KvRowI8 g) {
+    const uint32_t t = blockIdx.x;
+    const int32_t s = slot[t];
+    if (s < 0) return;
+    const uint32_t blk = (uint32_t)s / block_size, off = (uint32_t)s % block_size;
+    if (blk >= blocks) return;
+    const size_t brow = (size_t)block_size * g.row_bytes;   // one block: the group is one head
+    const size_t o = (size_t)off * g.row_bytes;
+    kv_row_i8_store(k, v, t, g, host + (size_t)blk * brow + o);
+    const int32_t sl = res[blk];
+    if (sl >= 0 && (uint32_t)sl < slots)
+        kv_row_i8_store(k, v, t, g, kv + (size_t)sl * brow + o);
 }
 
 }  // namespace
@@ -2739,7 +2845,8 @@ struct KvStoreGeom {
     long long head_dim, block_size, kv_heads, n_blocks, k_ld, v_ld, T;
 };
 
-/* A token's row in a (block, head) page is head_dim * row_per_hd16 / 16 + row_extra elements. */
+/* A token's row in a (block, head) page is head_dim * row_per_hd16 / 16 + row_extra elements;
+ * row_per_hd16 < 0 leaves the row to the caller (the int8 latent form, whose row is its own). */
 static int kv_store_geom(const RadArgs* a, KvStoreGeom* g, long long row_per_hd16 = 32,
                          long long row_extra = 0) {
     g->k  = r4d_opt(a, KS_K);
@@ -2759,8 +2866,9 @@ static int kv_store_geom(const RadArgs* a, KvStoreGeom* g, long long row_per_hd1
     /* The shared paged layout is [n_blocks, kv_heads, block_size, 2*head_dim]; refuse a cache that
      * disagrees. */
     if (g->kv->rank != 4) return R4D_NO(RAD_E_SHAPE);
-    if (g->kv->shape[1] != g->kv_heads || g->kv->shape[2] != g->block_size ||
-        g->kv->shape[3] != g->head_dim * row_per_hd16 / 16 + row_extra) return R4D_NO(RAD_E_SHAPE);
+    if (g->kv->shape[1] != g->kv_heads || g->kv->shape[2] != g->block_size) return R4D_NO(RAD_E_SHAPE);
+    if (row_per_hd16 >= 0 && g->kv->shape[3] != g->head_dim * row_per_hd16 / 16 + row_extra)
+        return R4D_NO(RAD_E_SHAPE);
     g->n_blocks = g->kv->shape[0];
 
     const long long lane = g->kv_heads * g->head_dim;
@@ -2801,7 +2909,9 @@ extern "C" int r4d_rad_mla_row_norm_rope_store(const RadArgs* a, RadStream s) {
     R4D_NEED(dt_bf16(row));
     R4D_NEED(dt_i32(pos));
     R4D_NEED(dt_i32(sm));
-    R4D_NEED(dt_bf16(kv));
+    /* The cache is the bf16 row K then V, or -- X-07 -- the int8 latent row (r4d_row_i8.h). */
+    if (kv->dtype != RAD_BF16 && kv->dtype != RAD_I8) return R4D_NO(RAD_E_DTYPE);
+    const bool kvi8 = kv->dtype == RAD_I8;
     if (w->dtype != RAD_F32 && w->dtype != RAD_BF16) return R4D_NO(RAD_E_DTYPE);
     if (!r4d_contig(w) || !r4d_contig(sm) || !r4d_contig(kv)) return R4D_NO(RAD_E_STRIDE);
     if (pos->rank == 2 ? pos->stride[1] != 1 : pos->stride[0] != 1) return R4D_NO(RAD_E_STRIDE);
@@ -2838,8 +2948,15 @@ extern "C" int r4d_rad_mla_row_norm_rope_store(const RadArgs* a, RadStream s) {
         if (mc != 3 || n_sec != 3 || pos->shape[0] < 3) return R4D_NO(RAD_E_SHAPE);
         plane = (int)(pos->stride[0] >= pos->shape[1] ? pos->stride[0] : pos->shape[1]);
     }
-    if (kv->rank != 4 || kv->shape[1] != 1 || kv->shape[2] != bs || kv->shape[3] != L + R)
-        return R4D_NO(RAD_E_SHAPE);
+    if (kv->rank != 4 || kv->shape[1] != 1 || kv->shape[2] != bs) return R4D_NO(RAD_E_SHAPE);
+    /* The bf16 row is the row's L + R columns; the int8 row is codes, scales and the rope columns
+     * as they are, so its extent is another number and its row must start 16-byte aligned. */
+    if (kvi8) {
+        if (L % (long long)r4d_row_i8::kBlock ||
+            kv->shape[3] != r4d_row_i8::row_bytes((int)L, (int)R))
+            return R4D_NO(RAD_E_SHAPE);
+        if (!r4d_aligned(kv->data, 16)) return R4D_NO(RAD_E_ALIGN);
+    } else if (kv->shape[3] != L + R) return R4D_NO(RAD_E_SHAPE);
     const double theta = r4d_getf(a, "theta", 10000.0), eps = r4d_getf(a, "eps", 1e-6),
                  scale = r4d_getf(a, "scale", 1.0);
     if (!(theta > 0.0) || !(eps >= 0.0) || !(scale > 0.0)) return R4D_NO(RAD_E_INVAL);
@@ -2852,6 +2969,7 @@ extern "C" int r4d_rad_mla_row_norm_rope_store(const RadArgs* a, RadStream s) {
     p.block_size = (uint32_t)bs; p.n_blocks = (uint32_t)kv->shape[0]; p.plane = (uint32_t)plane;
     p.eps = (float)eps; p.theta = (float)theta; p.rscale = (float)scale;
     p.mode = mc; p.gptj = gptj; p.s0 = sec[0]; p.s1 = sec[1]; p.s2 = sec[2]; p.n_sec = n_sec;
+    p.i8 = kvi8 ? 1 : 0;
     const bool ch = r4d_geti_or(a, "chain", 0) != 0 && T <= 64;
 #define R4D_MRF(WF_, CH_)                                                                          \
     R4D_EMIT(s, (mla_row_front_kernel<WF_, CH_>), dim3((uint32_t)T), dim3(kThreads), 0, p)
@@ -2883,9 +3001,44 @@ extern "C" int r4d_rad_kv_store_fp8(const RadArgs* a, RadStream stream) {
                              (float)ks, (float)vs, stream) == 0 ? RAD_OK : RAD_E_DEVICE;
 }
 
-/* The int8 store: the cache's last extent is a token's row, 2 * head_dim + 4 bytes. A workgroup is
- * a head's dims rounded up to whole waves. */
+/* The int8 latent row's geometry (design note X-07): the group's row is r4d_row_i8::row_bytes(L, R)
+ * at L = 2 * head_dim - R, R the row's rotary columns (the `rope_dim` parameter). The row is the
+ * whole group -- Hy4-flash's latent cache is one KV head -- so the store refuses kv_heads > 1. */
+static int kv_row_i8_geom(const RadArgs* a, const KvStoreGeom& g, KvRowI8* o) {
+    const long long R = r4d_geti_or(a, "rope_dim", 0), L = 2 * g.head_dim - R;
+    if (R <= 0 || (R & 1) || L <= 0 || L % (long long)r4d_row_i8::kBlock)
+        return R4D_NO(RAD_E_SHAPE);
+    if (g.kv_heads != 1) return R4D_NO(RAD_E_UNSUPPORTED);
+    o->L = (uint32_t)L; o->R = (uint32_t)R; o->half = (uint32_t)g.head_dim;
+    o->row_bytes = (uint32_t)r4d_row_i8::row_bytes((int)L, (int)R);
+    if (g.kv->shape[3] != o->row_bytes) return R4D_NO(RAD_E_SHAPE);
+    if (!r4d_aligned(g.kv->data, 16)) return R4D_NO(RAD_E_ALIGN);
+    o->k_ld = (uint32_t)(g.k_ld ? g.k_ld : g.head_dim);
+    o->v_ld = (uint32_t)(g.v_ld ? g.v_ld : g.head_dim);
+    return RAD_OK;
+}
+
+/* The int8 latent store: `kv_store`'s i8 form when the group's row is its own (`rope_dim` given). */
+static int kv_store_i8_row_emit(const RadArgs* a, RadStream stream) {
+    KvStoreGeom g{};
+    const int rc = kv_store_geom(a, &g, -1);
+    if (rc != RAD_OK) return rc;
+    if (g.kv->dtype != RAD_I8) return R4D_NO(RAD_E_DTYPE);
+    KvRowI8 o{};
+    const int grc = kv_row_i8_geom(a, g, &o);
+    if (grc != RAD_OK) return grc;
+    return R4D_EMIT(stream, kv_store_i8_row_kernel, dim3((uint32_t)g.T),
+                    dim3(kv_row_i8_threads()), 0, (const uint16_t*)r4d_addr(g.k),
+                    (const uint16_t*)r4d_addr(g.v), (const int32_t*)r4d_addr(g.sm),
+                    (uint8_t*)r4d_addr(g.kv), (uint32_t)g.block_size, (uint32_t)g.n_blocks,
+                    o) == RAD_OK ? RAD_OK : RAD_E_DEVICE;
+}
+
+/* The int8 store: the cache's last extent is a token's row, 2 * head_dim + 4 bytes, or -- X-07 --
+ * the latent row r4d_row_i8::row_bytes(L, R) when the group carries one (`rope_dim` given). A
+ * workgroup is a head's dims rounded up to whole waves. */
 extern "C" int r4d_rad_kv_store_i8(const RadArgs* a, RadStream stream) {
+    if (r4d_geti_or(a, "rope_dim", 0) > 0) return kv_store_i8_row_emit(a, stream);
     KvStoreGeom g{};
     const int rc = kv_store_geom(a, &g, 32, 4);
     if (rc != RAD_OK) return rc;
@@ -2963,8 +3116,34 @@ extern "C" int r4d_rad_kv_store_streamed(const RadArgs* a, RadStream stream) {
 }
 
 /* The same into the int8 cache: kv_store_i8's workgroup, a head's dims one a lane, and a row of
- * 2 * head_dim + 4 bytes in both planes. */
+ * 2 * head_dim + 4 bytes in both planes -- or the latent row (r4d_row_i8.h) when the group carries
+ * one, in both planes at the same offsets. */
 static int kv_store_streamed_i8(const RadArgs* a, RadStream stream) {
+    if (r4d_geti_or(a, "rope_dim", 0) > 0) {
+        KvStoreGeom g{};
+        const int rc = kv_store_geom(a, &g, -1);
+        if (rc != RAD_OK) return rc;
+        KvRowI8 o{};
+        const int grc = kv_row_i8_geom(a, g, &o);
+        if (grc != RAD_OK) return grc;
+        const RadTensor* res  = r4d_opt(a, 4);
+        const RadTensor* host = r4d_opt(a, 5);
+        if (!res || !host) return R4D_NO(RAD_E_INVAL);
+        if (res->dtype != RAD_I32 || !r4d_contig(res)) return R4D_NO(RAD_E_STRIDE);
+        if (host->dtype != RAD_U8 || !r4d_contig(host) || host->rank != 2)
+            return R4D_NO(RAD_E_STRIDE);
+        const long long row    = g.block_size * o.row_bytes;   // the group is one KV head
+        const long long blocks = host->shape[0], slots = g.kv->shape[0];
+        if (blocks <= 0 || slots <= 0 || row <= 0) return R4D_NO(RAD_E_SHAPE);
+        if (host->shape[1] != row || host->stride[0] != row) return R4D_NO(RAD_E_STRIDE);
+        if (r4d_numel(res) < blocks) return R4D_NO(RAD_E_SHAPE);
+        return R4D_EMIT(stream, kv_store_streamed_i8_row_kernel, dim3((uint32_t)g.T),
+                        dim3(kv_row_i8_threads()), 0, (const uint16_t*)r4d_addr(g.k),
+                        (const uint16_t*)r4d_addr(g.v), (const int32_t*)r4d_addr(g.sm),
+                        (uint8_t*)r4d_addr(g.kv), (const int32_t*)r4d_addr(res),
+                        (uint8_t*)r4d_addr(host), (uint32_t)g.block_size, (uint32_t)blocks,
+                        (uint32_t)slots, o) == RAD_OK ? RAD_OK : RAD_E_DEVICE;
+    }
     KvStoreGeom g{};
     const int rc = kv_store_geom(a, &g, 32, 4);
     if (rc != RAD_OK) return rc;

@@ -136,7 +136,7 @@ int32_t heat_down(int32_t h) { return h > 0 ? (h >> 1) : 0; }
  * sweep over the same two-bit heat counter, the same revert of what it could not place, the same
  * copies and rewrite. The fixtures are legal calls, so the refusals are not repeated here. */
 void ref_resolve(Fix& f) {
-    const int64_t M = f.M, blocks = f.blocks, slots = f.slots, pitch = f.pitch, bbytes = f.bbytes;
+    const int64_t M = f.M, slots = f.slots, pitch = f.pitch, bbytes = f.bbytes;
     int32_t* const R = f.res.data();
     int32_t* const SB = f.sblk.data();
     int32_t* const ST = f.sst.data();
@@ -589,6 +589,19 @@ int run_all() {
         f.sel = { 0, 2, 4, 6, 7 };
         f.nsel = { 5 };
         fails += check("identity for every miss, hand untouched", f);
+    }
+    ++cases;
+    {
+        /* The int8 latent group's page (design note X-07): a block is 16 tokens of a 656-byte row,
+         * so a block's copy -- the mirror's row and the ring's slot -- is 10496 bytes, which is no
+         * power of two and not the generic int8 page at those tokens (9280). The resolve's copy and
+         * the second chance must not care, and the ring's untouched bytes stay the marker. */
+        Fix f;
+        f.shape(2, 12, 4, 3, 10496);
+        f.resident(0, 2);
+        f.sel = { 2, 5, 9 };
+        f.nsel = { 3, 0 };
+        fails += check("page: 16 tokens of the int8 latent row (10496 bytes)", f);
     }
     ++cases;
     {

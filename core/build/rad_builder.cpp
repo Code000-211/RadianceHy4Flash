@@ -360,6 +360,21 @@ rad_kvgroup Builder::decl_kv_group(const char* name, const RadKVGroupDecl* d) {
     if (!name || !*name || !d) return err(RAD_E_INVAL, "decl_kv_group: null name or declaration");
     if (d->kind < RAD_KV_FULL || d->kind > RAD_KV_RING)
         return err(RAD_E_INVAL, "kv group '%s': unknown kind %d", name, d->kind);
+    /* A group's own row must hold at least the K-then-V row it replaces, and the cache's rows are
+     * read in 16-byte pieces (spec §7.2): both are refused here rather than at the first store
+     * that overruns its row. The count is in elements of `dtype`, so for the int8 cache the pieces
+     * check is the byte check; a wider dtype is asked for a wider piece than it needs. */
+    if (d->row_elems != 0) {
+        const int64_t least = rad_kv_row_elems(d->dtype, d->head_dim);
+        if (d->row_elems < least)
+            return err(RAD_E_INVAL, "kv group '%s': row_elems %lld is under the %lld elements a "
+                                   "row of %lld x %lld at dtype %u takes",
+                       name, (long long)d->row_elems, (long long)least,
+                       (long long)d->n_head_kv, (long long)d->head_dim, d->dtype);
+        if (d->row_elems % 16)
+            return err(RAD_E_INVAL, "kv group '%s': row_elems %lld is not a multiple of 16",
+                       name, (long long)d->row_elems);
+    }
 
     std::string n = scoped(name);
     for (size_t i = 1; i < prog_.kv_groups.size(); ++i)
@@ -497,7 +512,8 @@ int64_t Builder::kv_layer_bytes(rad_kvgroup g) {
     if (bs <= 0) return 0;
     const int64_t nh = gi.decl.n_head_kv > 0 ? gi.decl.n_head_kv : 1;
     return rad_dtype_bytes(gi.decl.dtype,
-                           bs * nh * rad_kv_row_elems(gi.decl.dtype, gi.decl.head_dim));
+                           bs * nh * rad_kv_group_row_elems(gi.decl.dtype, gi.decl.head_dim,
+                                                         gi.decl.row_elems));
 }
 
 /* ================================================================== ops */
@@ -2588,7 +2604,8 @@ void Builder::finish_kv_groups() {
                 /* One block holds K and V for block_size tokens, the block manager's unit. */
                 gi.bytes_per_block =
                     rad_dtype_bytes(d.dtype, gi.block_size * elem_n_head *
-                                             rad_kv_row_elems(d.dtype, d.head_dim)) * n_bound;
+                                             rad_kv_group_row_elems(d.dtype, d.head_dim,
+                                                                    d.row_elems)) * n_bound;
                 gi.bytes_per_state = 0;
                 break;
             case RAD_KV_LINEAR:

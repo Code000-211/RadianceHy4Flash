@@ -4060,6 +4060,92 @@ TEST(op_kv_store_int8_and_the_attention_that_reads_it) {
     CHECK_NEAR(out.at(0), 31.75f, 1e-3); CHECK_NEAR(out.at(1), 8.0f, 1e-3);
 }
 
+TEST(op_kv_store_int8_latent_row_is_sized_and_written_at_its_own_row) {
+    /* Design note X-07: with `rope_dim` the group's row is L + 4 * (L / 128) + 2 R at
+     * L = 2 * head_dim - R -- [L int8 codes][L / 128 f32 scales][R rope columns as bf16] -- not the
+     * generic int8 row of 2 head_dim + 4. The description is where every harness and every sizing
+     * site reads the row from, so it is checked at the served geometry (656 at head_dim 288,
+     * rope_dim 64) and at a small one it can be run. */
+    const RadKernelInfo* k = kern("kv_store");
+    REQUIRE(k != nullptr && k->opd_shape != nullptr);
+    const int64_t geoms[][2] = { { 72, 16 }, { 288, 64 } };
+    for (const int64_t(&g)[2] : geoms) {
+        const int64_t hd = g[0], R = g[1], L = 2 * hd - R;
+        A p;
+        p.i("M", 1).i("head_dim", hd).i("n_head_kv", 1).i("block_size", 4)
+         .s("kv_dtype", "i8").i("rope_dim", R);
+        const RadArgs* pr = p.get();
+        RadOpdDesc d{};
+        REQUIRE_EQ(k->opd_shape(pr->p, pr->n_p, 3, &d), RAD_OK);   /* kv_cache */
+        CHECK_EQ(d.dtype, (uint32_t)RAD_I8);
+        CHECK_EQ(d.shape[3], L + 4 * (L / 128) + 2 * R);
+    }
+
+    /* A row of ones. The block rotates to 128 at its first column and 0 everywhere else, so the
+     * codes are 127 then 0, the stored scale is 128 / 127 / sqrt(128), and the R rope columns are
+     * the bf16 they arrived as: the row X-07b's reader decodes. */
+    const int64_t hd = 72, R = 16, L = 128, row = 164;
+    T kk(RAD_BF16, { 1, 1, hd }), vv(RAD_BF16, { 1, 1, hd });
+    kk.f(std::vector<float>((size_t)hd, 1.0f));
+    vv.f(std::vector<float>((size_t)hd, 1.0f));
+    T sm(RAD_I32, { 1 }); sm.n({ 0 });
+    T kv(RAD_I8, { 3, 1, 4, row });
+    A a; a.t(kk).t(vv).t(sm).t(kv).i("M", 1).i("head_dim", hd).i("n_head_kv", 1)
+          .i("block_size", 4).s("kv_dtype", "i8").i("rope_dim", R);
+    CHECK_OK(run("kv_store", a));
+    CHECK_EQ(kv.at(0), 127.0f);
+    for (int64_t i = 1; i < L; ++i) CHECK_EQ(kv.at(i), 0.0f);
+    /* The scale: the row's four bytes after the codes. */
+    float sc = 0.0f;
+    std::memcpy(&sc, kv.mem.data() + L, sizeof sc);
+    CHECK_NEAR(sc, 0.08908432f, 1e-7);
+    /* The rope: 16 columns of bf16 1.0 (0x3f80), low byte first. */
+    for (int64_t i = 0; i < R; ++i) {
+        CHECK_EQ((int)kv.mem[(size_t)(L + 4 + 2 * i)], 0x80);
+        CHECK_EQ((int)kv.mem[(size_t)(L + 4 + 2 * i + 1)], 0x3f);
+    }
+    /* The blocks the token does not land in were never written. */
+    for (int64_t i = row; i < row * 4; ++i) CHECK_EQ((int)kv.mem[(size_t)i], 0);
+}
+
+TEST(op_kv_store_int8_latent_row_quantises_a_two_column_block) {
+    /* A block that is not constant, worked out by hand: the latent columns 0 and 1 are 1.0 and 0.5
+     * (k's first two columns; every other latent column is 0), so the block's rotated column i is
+     * x0 + (-1)^popcount(i & 1) x1 = 1.5 at even i and 0.5 at odd i. The absmax is 1.5, the step is
+     * 1.5 / 127, and the codes are 127 at even i (1.5 / (1.5 / 127) = 127) and 42 at odd i
+     * (0.5 / (1.5 / 127) = 42.33, nearest even 42). The stored scale is (1.5 / 127) / sqrt(128) =
+     * 0.0010439568, and the odd columns decode to 42 * scale = 0.496 of the rotated 0.5 -- an error
+     * of 0.00394 against a half step of 1.5 / 254 = 0.0059, which is the quantiser's own bound and
+     * not a rounding of it. */
+    const int64_t hd = 72, R = 16, L = 128, row = 164;
+    T kk(RAD_BF16, { 1, 1, hd }), vv(RAD_BF16, { 1, 1, hd });
+    std::vector<float> kv8((size_t)hd, 0.0f), vv8((size_t)hd, 0.0f), rope((size_t)R);
+    kv8[0] = 1.0f;
+    kv8[1] = 0.5f;
+    for (int64_t i = 0; i < R; ++i) rope[(size_t)i] = 0.25f * (float)(i + 1);   /* exact in bf16 */
+    for (int64_t i = 0; i < R; ++i) vv8[(size_t)(hd - R + i)] = rope[(size_t)i];
+    kk.f(kv8);
+    vv.f(vv8);
+    T sm(RAD_I32, { 1 }); sm.n({ 0 });
+    T kv(RAD_I8, { 3, 1, 4, row });
+    A a; a.t(kk).t(vv).t(sm).t(kv).i("M", 1).i("head_dim", hd).i("n_head_kv", 1)
+          .i("block_size", 4).s("kv_dtype", "i8").i("rope_dim", R);
+    CHECK_OK(run("kv_store", a));
+    for (int64_t i = 0; i < L; ++i) CHECK_EQ(kv.at(i), (i & 1) ? 42.0f : 127.0f);
+    float sc = 0.0f;
+    std::memcpy(&sc, kv.mem.data() + L, sizeof sc);
+    CHECK_NEAR(sc, 0.0010439568f, 1e-9);
+    /* The rope columns are the bf16 they arrived as: v's last R columns, 0.25, 0.5, ... */
+    for (int64_t i = 0; i < R; ++i) {
+        uint16_t got = 0, want = 0;
+        std::memcpy(&got, kv.mem.data() + L + 4 + 2 * i, sizeof got);
+        std::memcpy(&want, (const uint8_t*)vv.t.data + 2 * (size_t)(hd - R + i), sizeof want);
+        CHECK_EQ(got, want);
+    }
+    /* The other blocks hold nothing, and the two blocks the token does not land in are untouched. */
+    for (int64_t i = row; i < row * 4; ++i) CHECK_EQ((int)kv.mem[(size_t)i], 0);
+}
+
 /* The engine hands k and v a column slice, not a dense plane. Without de-interleaving, the KV
  * halves are declared over the fused qkv buffer, [tokens, kv_heads * head_dim] with the whole
  * projection's row stride. Deriving the stride from the shape puts every token after the first

@@ -2067,6 +2067,38 @@ TEST(kv_pools_bind_each_layer_to_its_place_in_the_group) {
     CHECK_EQ(b[3].layer_slot[2], 0);
 }
 
+/* X-07: the binding is where a kernel learns a paged row's width, and for the int8 latent row the
+ * width is the row the group declares (656 bytes at the served geometry), not the generic int8
+ * row for one head of 288 columns (580). A binding that still said 580 would hand every i8 store a
+ * row whose scales and rope columns it could not address. */
+TEST(a_kv_binding_carries_the_row_the_group_declares) {
+    Program P;
+    P.kv_groups.resize(2);
+    rad::KVGroupInfo& latent = P.kv_groups[1];
+    latent.decl.kind = RAD_KV_FULL; latent.decl.dtype = RAD_I8;
+    latent.decl.n_head_kv = 1; latent.decl.head_dim = 288; latent.decl.row_elems = 656;
+    latent.layers = { 0, 1 };
+    std::vector<rad::KVGroupPlan> plans(2);
+    plans[1].kind = RAD_KV_FULL; plans[1].n_layers = 2; plans[1].block_size = 16;
+    plans[1].bytes_per_block = 2 * 16 * 656;
+    plans[1].n_blocks = 8; plans[1].n_slots = 8;
+    plans[1].base = g_kv_pool;
+    plans[1].pool_bytes = 8 * plans[1].bytes_per_block;
+    std::vector<rad::KVPoolBinding> b;
+    rad::bind_kv_pools(P, [&](int32_t g) -> const rad::KVGroupPlan* {
+        return g == 1 ? &plans[1] : nullptr;
+    }, &b);
+    REQUIRE_EQ(b.size(), (size_t)2);
+    CHECK_EQ((int)b[0].rank, 0);                 /* the null sentinel */
+    CHECK_EQ((int)b[1].rank, 4);
+    CHECK_EQ((int)b[1].dtype, (int)RAD_I8);
+    CHECK_EQ(b[1].shape[0], (int64_t)8);
+    CHECK_EQ(b[1].shape[1], (int64_t)1);
+    CHECK_EQ(b[1].shape[2], (int64_t)16);
+    CHECK_EQ(b[1].shape[3], (int64_t)656);
+    CHECK_EQ(b[1].layer_stride, (int64_t)(8 * 16 * 656));
+}
+
 /* A staged pass copies the ranges its own tables occupy (kvstream/stage.h, "Volume"). Every id a
  * table names must lie in a range, or the attention reads another layer's bytes there; the ranges
  * are sorted, disjoint and at most kStageMaxRuns. Over random tables, a range never starts or ends

@@ -38,6 +38,8 @@
 
 using namespace avx;
 
+#include "avx_had.h"   /* fwht: the latent int8 row's rotation (X-07); after `using namespace avx` */
+
 /* Widest supported head. The widest in use is an image VAE's single-head mid-block attention at
  * 1152 (Qwen-Image 2.1); wider heads return RAD_E_UNSUPPORTED. Same bound as libref. */
 enum { AVX_HD_MAX = 2048 };
@@ -112,6 +114,42 @@ static inline void kv_i8_put(void* cache, int64_t row, int64_t head_dim, int hal
 }
 static inline bool kv_i8_shape(const RadTensor* kv, int64_t head_dim) {
     return kv->rank == 4 && kv->shape[3] == 2 * head_dim + 4 && kv->stride[3] == 1;
+}
+
+/* The int8 latent row (design note X-07), as libref's row_i8_put and libr4d's r4d_row_i8.h write
+ * it: [L int8 codes][L/128 f32 scales][R rope columns as bf16] = L + 4 * (L / 128) + 2 * R bytes.
+ * `x` holds the row's L + R columns (the store's K columns, then its V). A block of 128 latent
+ * columns is rotated by the unnormalised Walsh-Hadamard transform; its quantiser scale is
+ * `amax / 127` and the codes are the rotated block over it, rounded to nearest even and clamped to
+ * +-127. The scale the row stores also carries the rotation's 1 / sqrt(128), so a reader's
+ * `scale * code` is the rotated column (design note X-07 § 2: two scales, one to quantise and one
+ * to store). A block whose absmax is zero or not finite stores codes 0 and scale 1. The rope
+ * columns are copied as the bf16 they arrive as. */
+constexpr float kRowRotScale = 0.08838834764831845f;   /* 1 / sqrt(128) */
+static inline int64_t row_i8_bytes(int64_t L, int64_t R) {
+    return L + 4 * (L / 128) + 2 * R;
+}
+static inline void row_i8_put(void* cache, int64_t row, int64_t L, int64_t R, const float* x) {
+    uint8_t* const d = (uint8_t*)cache + row;
+    float* const scales = (float*)(d + L);
+    for (int64_t b = 0; b < L / 128; ++b) {
+        float buf[128];
+        std::memcpy(buf, x + b * 128, sizeof buf);
+        fwht(buf, 128);
+        float am = 0.0f;
+        for (int64_t i = 0; i < 128; ++i) am = std::fmax(am, std::fabs(buf[i]));
+        const bool live = am > 0.0f && am < 3.402823466e38f;   /* FLT_MAX: false for an inf too */
+        const float qs = live ? am * (1.0f / 127.0f) : 1.0f;     /* the quantiser's */
+        scales[b] = live ? qs * kRowRotScale : 1.0f;             /* the stored one */
+        int8_t* const c = (int8_t*)(d + b * 128);
+        const float inv = 1.0f / qs;
+        for (int64_t i = 0; i < 128; ++i) {
+            const float q = live ? buf[i] * inv : 0.0f;
+            c[i] = (int8_t)(int)std::nearbyint(std::fmin(std::fmax(q, -127.0f), 127.0f));
+        }
+    }
+    uint16_t* const rp = (uint16_t*)(d + L + 4 * (L / 128));
+    for (int64_t i = 0; i < R; ++i) rp[i] = rad_f32_to_bf16(x[L + i]);
 }
 
 static inline void axpy(float* acc, const float* v, float w, int64_t n) {
@@ -1135,10 +1173,28 @@ static void kv_scatter(const RadTensor* k, const RadTensor* v, const RadTensor* 
     }
 }
 
+/* The int8 latent scatter: token t's row into its slot, one gather of the row's L + R columns
+ * (K then V; the cache is one KV head) and row_i8_put's bytes. */
+static void kv_scatter_row_i8(const RadTensor* k, const RadTensor* v, const RadTensor* sm,
+                              const RadTensor* kv, const KVView& kvv, int64_t M, int64_t head_dim,
+                              int64_t block_size, int64_t L, int64_t R, int64_t k_rs, int64_t k_hs,
+                              int64_t k_ds, int64_t v_rs, int64_t v_hs, int64_t v_ds) {
+    AVX_PARALLEL_FOR_IF(M * (L + R) >= AVX_PAR_MIN)
+    for (int64_t t = 0; t < M; ++t) {
+        const int64_t slot = ldi(sm, offlin(sm, t));
+        if (slot < 0) continue;
+        float* x = scratch_f32((size_t)(L + R));
+        for (int64_t c = 0; c < L + R; ++c) {
+            x[c] = c < head_dim ? ldt(k, t * k_rs + c * k_ds)
+                                : ldt(v, t * v_rs + (c - head_dim) * v_ds);
+        }
+        row_i8_put(kv->data, (slot / block_size) * kvv.sb + (slot % block_size) * kvv.so, L, R, x);
+    }
+}
+
 AVX_KERNEL(kv_store) {
     if (!rad_args_have(a, 4)) return RAD_E_INVAL;
     const RadTensor *k = &a->t[0], *v = &a->t[1], *sm = &a->t[2], *kv = &a->t[3];
-
     const int64_t head_dim = p_int(a, "head_dim", k->rank >= 3 ? k->shape[k->rank - 1] : 0);
     const int64_t block_size = p_int(a, "block_size", 0);
     const int64_t kv_heads = p_int(a, "n_head_kv", kv->rank == 4 ? kv->shape[1] : 0);
@@ -1161,7 +1217,15 @@ AVX_KERNEL(kv_store) {
     const int64_t v_rs = row_stride(v, kv_heads * head_dim);
     const KVView kvv = kv_view(kv, head_dim, block_size, kv_heads);
     const bool i8 = kv->dtype == RAD_I8;
-    if (i8 && !kv_i8_shape(kv, head_dim)) return RAD_E_SHAPE;
+    /* The int8 latent row (X-07): at `rope_dim` the cache's row is one KV head's row of
+     * row_i8_bytes(L, R) at L = 2 * head_dim - R (row_i8_put above). */
+    const int64_t rope_dim = p_int(a, "rope_dim", 0);
+    const int64_t lat = 2 * head_dim - rope_dim;
+    const bool row_i8 = i8 && rope_dim > 0;
+    if (row_i8 && (kv_heads != 1 || (rope_dim & 1) || lat <= 0 || lat % 128 ||
+                   kv->rank != 4 || kv->shape[3] != row_i8_bytes(lat, rope_dim) ||
+                   kv->stride[3] != 1)) return RAD_E_SHAPE;
+    if (i8 && !row_i8 && !kv_i8_shape(kv, head_dim)) return RAD_E_SHAPE;
     /* An fp8 cache (GLM-5.3's latent attention) stores k / k_scale and v / v_scale, the scales
      * being the reader's descales (default 1.0), as libref and libr4d store it. */
     const bool  fp8 = kv->dtype == RAD_F8E4M3 || kv->dtype == RAD_F8E5M2;
@@ -1174,7 +1238,10 @@ AVX_KERNEL(kv_store) {
         if (slot >= 0 && n_blocks > 0 && slot / block_size >= n_blocks) return RAD_E_SHAPE;
     }
 
-    if (i8)
+    if (row_i8)
+        kv_scatter_row_i8(k, v, sm, kv, kvv, M, head_dim, block_size, lat, rope_dim, k_rs, k_hs,
+                          k_ds, v_rs, v_hs, v_ds);
+    else if (i8)
         kv_scatter<2>(k, v, sm, kv, kvv, M, kv_heads, head_dim, block_size, k_rs, k_hs, k_ds,
                       v_rs, v_hs, v_ds, ks, vs);
     else if (ks != 1.0f || vs != 1.0f)
@@ -1207,7 +1274,16 @@ AVX_KERNEL(kv_store_streamed) {
     if (!i8 && !fp8 && kv->dtype != RAD_BF16) return RAD_E_UNSUPPORTED;
     const float ks = fp8 ? 1.0f / p_f32(a, "k_scale", 1.0f) : 1.0f;
     const float vs = fp8 ? 1.0f / p_f32(a, "v_scale", 1.0f) : 1.0f;
-    const int64_t rowe = i8 ? 2 * head_dim + 4 : 2 * head_dim;   /* a token's row in a head */
+    /* The int8 latent row (X-07), as kv_store's: one KV head's row of row_i8_bytes(L, R) at
+     * L = 2 * head_dim - R, in both planes at the same offsets. */
+    const int64_t rope_dim = p_int(a, "rope_dim", 0);
+    const int64_t lat = 2 * head_dim - rope_dim;
+    const bool row_i8 = i8 && rope_dim > 0;
+    if (row_i8 && (kv_heads != 1 || (rope_dim & 1) || lat <= 0 || lat % 128))
+        return RAD_E_SHAPE;
+    const int64_t rowe = row_i8 ? row_i8_bytes(lat, rope_dim)        /* a token's row in a head */
+                        : i8   ? 2 * head_dim + 4
+                               : 2 * head_dim;
     if (kv->rank != 4 || kv->shape[1] != kv_heads || kv->shape[2] != block_size ||
         kv->shape[3] != rowe || kv->stride[3] != 1) return RAD_E_SHAPE;
     if (host->rank != 2) return RAD_E_SHAPE;
@@ -1256,6 +1332,16 @@ AVX_KERNEL(kv_store_streamed) {
         const int64_t blk = slot / block_size, off = slot % block_size;
         const int64_t hb = blk * hv.sb + off * hv.so;
         const int64_t cb = R[blk] >= 0 ? R[blk] * kvv.sb + off * kvv.so : -1;
+        if (row_i8) {
+            float* x = scratch_f32((size_t)(lat + rope_dim));
+            for (int64_t c = 0; c < lat + rope_dim; ++c) {
+                x[c] = c < head_dim ? ldt(k, t * k_rs + c * k_ds)
+                                    : ldt(v, t * v_rs + (c - head_dim) * v_ds);
+            }
+            row_i8_put(hkv.data, hb, lat, rope_dim, x);
+            if (cb >= 0) row_i8_put(kv->data, cb, lat, rope_dim, x);
+            continue;
+        }
         float* buf = i8 ? scratch_f32((size_t)head_dim) : nullptr;
         for (int64_t h = 0; h < kv_heads; ++h) {
             const int64_t kx = t * k_rs + h * k_hs, vx = t * v_rs + h * v_hs;

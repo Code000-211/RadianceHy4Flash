@@ -573,16 +573,19 @@ static const RadOperandSpec oSamAttn[] = { OPD("q"), OPD("k"), OPD("v"), OPD("cu
 
 /* `k_scale` and `v_scale` are the descales an fp8 cache is read back with, so a store divides by
  * them; optional because a bf16 cache has none. */
+/* `rope_dim`: the int8 latent row's rotary columns (design note X-07), so the row is
+ * L + 4 * (L / 128) + 2 * R at L = 2 * head_dim - R. Absent: the generic int8 cache. */
 static const RadParamSpec pKvStore[] = { P_INT("M"), P_INT("head_dim"), P_INT("n_head_kv"),
                                          P_INT("block_size"), P_STR("kv_dtype"),
-                                         P_F64O("k_scale"), P_F64O("v_scale") };
+                                         P_F64O("k_scale"), P_F64O("v_scale"),
+                                         P_INTO("rope_dim") };
 static const RadOperandSpec oKvStore[] = { OPD("k"), OPD("v"), OPD("slot_mapping"),
                                            INOUT("kv_cache") };
 /* The streamed store: kv_store's parameters, plus the authoritative mirror `host` (always
  * written) and the residency map `res` (read, never written). */
 static const RadParamSpec pKvStoreStreamed[] = {
     P_INT("M"), P_INT("head_dim"), P_INT("n_head_kv"), P_INT("block_size"), P_STR("kv_dtype"),
-    P_F64O("k_scale"), P_F64O("v_scale")
+    P_F64O("k_scale"), P_F64O("v_scale"), P_INTO("rope_dim")   /* as kv_store's */
 };
 static const RadOperandSpec oKvStoreStreamed[] = { OPD("k"), OPD("v"), OPD("slot_mapping"),
                                                    INOUT("kv_cache"), OPD("res"),

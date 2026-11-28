@@ -1027,8 +1027,8 @@ as the weight's GEMM stored them and claims no form. It changes no value.
 | `attn_na3d` | `M`(range) `head_dim` `kt` `kh` `kw` `dtype` `scale`:f64/opt | `q`, `k`, `v`, `geom` → `out` |
 | `attn_local_rel` | `M`(range) `head_dim` `n_head` `left` `right` `softcap`:f64 `cu_div`/opt `dtype` | `q`, `k`, `v`, `relk`, `pds`w, `cu_seqlens` → `out` |
 | `sam_attn` | `M`(range) `head_dim` `n_head` `grid_h` `grid_w` `window` `scale`:f64 `dtype` | `q`, `k`, `v`, `cu_seqlens`, `out`, `rel_pos_h`w, `rel_pos_w`w |
-| `kv_store` | `M`(range) `head_dim` `n_head_kv` `block_size` `kv_dtype` `k_scale`:f64/opt `v_scale`:f64/opt | `k`, `v`, `slot_mapping`, `kv_cache`:inout |
-| `kv_store_streamed` | `M`(range) `head_dim` `n_head_kv` `block_size` `kv_dtype` `k_scale`:f64/opt `v_scale`:f64/opt | `k`, `v`, `slot_mapping`, `kv_cache`:inout, `res`, `host`:inout |
+| `kv_store` | `M`(range) `head_dim` `n_head_kv` `block_size` `kv_dtype` `k_scale`:f64/opt `v_scale`:f64/opt `rope_dim`/opt | `k`, `v`, `slot_mapping`, `kv_cache`:inout |
+| `kv_store_streamed` | `M`(range) `head_dim` `n_head_kv` `block_size` `kv_dtype` `k_scale`:f64/opt `v_scale`:f64/opt `rope_dim`/opt | `k`, `v`, `slot_mapping`, `kv_cache`:inout, `res`, `host`:inout |
 | `rope` | `M`(range) `head_dim` `n_head` `n_head_kv` `theta`:f64 `scale`:f64 `mode` `rotary_dim`/opt `sections`/opt `yarn_factor`:f64/opt `yarn_low`:f64/opt `yarn_high`:f64/opt `yarn_magnitude`:f64/opt `ladder`/opt `llama3_factor`:f64/opt `llama3_low`:f64/opt `llama3_high`:f64/opt `llama3_orig`:f64/opt | `qkv`:inout, `positions` |
 | `rope_rows` | `M`(range) `head_dim` `n_head` `n_head_kv` `theta`:f64 `scale`:f64 `mode` `rotary_dim`/opt `sections`/opt `yarn_factor`:f64/opt `yarn_low`:f64/opt `yarn_high`:f64/opt `yarn_magnitude`:f64/opt `ladder`/opt `llama3_factor`:f64/opt `llama3_low`:f64/opt `llama3_high`:f64/opt `llama3_orig`:f64/opt | `qkv`:inout, `positions` (the same rotation; at 64+ rows and 4+ heads one angle a (token, pair), byte-identical) |
 | `rope_table` | `M`(range) `rot` `theta`:f64 `scale`:f64 `dtype` `yarn_factor`:f64/opt `yarn_low`:f64/opt `yarn_high`:f64/opt `yarn_magnitude`:f64/opt `head_dim`/opt `ladder`/opt | `positions` → `cos_sin` |
@@ -1280,6 +1280,29 @@ magnitude in that token over 127, rounded to f16 and at most 515, and a code is 
 clamped to +-127, so a value is `code * scale`. `kv_store` writes that row and every paged attention
 reads it, in libr4d, libavx and libref alike. An E4M3 group (GLM-5.3's latent cache) holds one code
 an element at `kv_store`'s `k_scale` / `v_scale`, 1 when absent.
+
+**The latent int8 row** (design note X-07) is a group whose row is not a head's columns:
+`RadKVGroupDecl::row_elems` carries its length in elements of the group's `dtype` (`0`: the rows
+above, so a group that does not set it binds the same bytes as before; for the int8 cache an
+element is a byte). At `rope_dim` the int8 store writes one KV head's row of
+
+    [L int8 codes][L / 128 f32 scales][R rope columns as bf16]      L + 4 * (L / 128) + 2 * R
+
+at `L = 2 * head_dim - R`, `L` a multiple of 128, so the rope columns of a head are kept
+unquantised and the L latent columns are one block-scaled int8 group a 128: a block is rotated by
+the unnormalised Walsh-Hadamard transform, and it has two scales. The quantiser's is
+`q = amax / 127` and divides the rotated block: a code is `rint(x / q)` clamped to +-127, and a
+block whose absmax is zero or not finite stores codes `0`. The *stored* scale carries the rotation's `1 / sqrt(128)`
+as well, `s = q * 1/sqrt(128) = amax * (1/127) * 1/sqrt(128)` (`1` for a block whose absmax is
+zero), so a latent column's decoded value is `s * code`. Folding `1/sqrt(128)` into the divisor
+instead would scale every code by `sqrt(128)` and clip most of them. `libr4d/r4d_row_i8.h`
+is the form in one place, and `mla_row_norm_rope_store`, `kv_store` and `kv_store_streamed` all
+write it, one row a workgroup, from the same bf16 columns: the fused store quantises the row it has
+just normed and roped, so the three write the same bytes. `row_elems` must be at least the K-then-V
+row of the group and a multiple of 16 elements (for int8, a wave's 16-byte loads read a row), and
+libref and libavx write the same row (libref builds the rotation as an explicit matrix normalised
+before the quantiser, so its one scale is the stored one; the two agree to a code step, the row's
+own bound).
 
 **A streamed group's cache operand is its ring.** Its pool holds `slots` blocks while the block
 table names up to `blocks` ids, so the sparse path resolves the selected ids to ring slots first
