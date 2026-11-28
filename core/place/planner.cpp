@@ -288,7 +288,6 @@ std::string weight_class_key(const std::string& name) {
  * that groups a host-only weight with a device one collapses the group onto the host, and gets a
  * warning. */
 void Planner::pin_mapped(const Program& prog, Plan* p) {
-    const TablePlacement ng = in_.config->ngram_resolved;
     for (MoveUnit& mu : p->units) {
         /* `stored`: every weight is in the container exactly as its kernel reads it. */
         bool host_only = false, stored = true;
@@ -304,6 +303,12 @@ void Planner::pin_mapped(const Program& prog, Plan* p) {
          * read a few rows a token. */
         const bool ngram = mu.layer < 0 && !mu.weights.empty() &&
                            is_ngram_table(prog, mu.weights.front());
+        /* --ngram-placement-layers: every Engram table takes its own layer's placement; without
+         * the flag ngram_effective is ngram_resolved, exactly what ng used to be. */
+        const TablePlacement ng =
+            ngram ? in_.config->ngram_effective(
+                        ngram_table_layer(prog.weights[mu.weights.front()].name))
+                  : in_.config->ngram_resolved;
         if (!host_only && !(ngram && ng != TablePlacement::Vram)) continue;
 
         mu.tier = Tier::Mapped;
