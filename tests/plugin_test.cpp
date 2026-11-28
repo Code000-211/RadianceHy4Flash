@@ -1195,6 +1195,35 @@ TEST(libr4d_resolves_a_dense_integer_gemm_only_at_its_group) {
     }
 }
 
+/* K-50b: the fused gate-quantiser row takes prefill heights. Above 64 rows its kernel runs four
+ * token tiles a workgroup with the quantiser behind one barrier, so the row's constraint has to
+ * admit them: it read `M <= 64` while the arch issues the op at the step's height, and then every
+ * prefill step above 64 rows resolved no device kernel at all. The geometry is Hy4-flash's o_proj:
+ * 32 heads of k 192 x v 256 over the 512-row latent, 128 codes a group. */
+TEST(libr4d_resolves_the_fused_gate_quantiser_at_prefill_heights) {
+    const std::string so = libr4d();
+    if (so.empty()) return;
+    Registry r;
+    CHECK(r.load_plugin(so, 0) >= 0);
+    Geometry g;
+    g.set_i("heads", 32);
+    g.set_i("k_dim", 192);
+    g.set_i("v_dim", 256);
+    g.set_i("latent_dim", 512);
+    g.set_i("group", 128);
+    g.set_s("dtype", "bf16");
+    /* 64 rows: the decode-class height the cap already served. */
+    g.set_i("M", 64);
+    CHECK_EQ(picked(r.select("mla_expand_gate_had_quant_i8g", g, RAD_DOMAIN_DEVICE)),
+             "mla_expand_gate_had_quant_i8g");
+    /* 70 rows, a step between tiles, and a 512-token chunk: one and several token tiles past it. */
+    for (int64_t m : { 70, 133, 512 }) {
+        g.set_i("M", m);
+        CHECK_EQ(picked(r.select("mla_expand_gate_had_quant_i8g", g, RAD_DOMAIN_DEVICE)),
+                 "mla_expand_gate_had_quant_i8g");
+    }
+}
+
 /* ================================================================== constraints that are not intervals */
 namespace {
 std::string extra_dir()   { return home() + "/testkernels/extra"; }

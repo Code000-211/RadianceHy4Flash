@@ -5528,9 +5528,11 @@ static const RadConstraint cMlaExpandGate[] = {
     C_GE("M", 1), C_LE("M", 65535), C_GE("heads", 1), C_LE("heads", 64), C_EQ("k_dim", 192),
     C_EQ("v_dim", 256), C_EQ("latent_dim", 512), C_IN("dtype", "bf16"),
 };
-/* A workgroup a token tile of 16 reads kv_b's value rows once, so decode-class heights only. */
+/* One token tile a workgroup below 64 rows (the decode-class form), four above it: a workgroup's
+ * waves tile the columns and the tokens, and the quantiser runs behind one barrier over the whole
+ * block, so a prefill step keeps the fusion (K-50b). */
 static const RadConstraint cMlaExpandGateQuant[] = {
-    C_GE("M", 1), C_LE("M", 64), C_GE("heads", 1), C_LE("heads", 64), C_EQ("k_dim", 192),
+    C_GE("M", 1), C_LE("M", 65535), C_GE("heads", 1), C_LE("heads", 64), C_EQ("k_dim", 192),
     C_EQ("v_dim", 256), C_EQ("latent_dim", 512), C_EQ("group", R4D_FP8_BLOCK), C_IN("dtype", "bf16"),
 };
 static const RadConstraint cMlaRowFront[] = {
