@@ -462,44 +462,6 @@ TEST(host_findings) {
     CHECK(has(diag::check(f, run), "thp-never", diag::Finding::Note));
 }
 
-/* A pool the weights are read from whose pages mlock could not lock against swap is a configuration
- * startup refuses (#337): a kernel reading one of those weights faults mid-request instead of
- * stalling for the swap-in, and that is how #337's server died. Pinned memory no weight comes from
- * stays the warning it was (#272). */
-TEST(weights_read_from_an_unlocked_pool_are_refused) {
-    Root r;
-    machine(r);
-    const diag::Facts f = served_machine(r);
-    diag::RunFacts run;
-    run.host_pool_mib = 20000;
-    run.pinned_bytes = (int64_t)10 << 30;
-    run.pinned_unlocked_bytes = (int64_t)10 << 30;
-    run.host_weight_bytes = (int64_t)9 << 30;          /* expert_tiered: routed experts in it */
-    CHECK(has(diag::check(f, run), "pinned-unlocked", diag::Finding::Incompatible));
-    const std::vector<diag::Finding> refused = diag::incompatible_run(f, run);
-    CHECK(has(refused, "pinned-unlocked", diag::Finding::Incompatible));
-    bool named = false;
-    for (const diag::Finding& x : refused) {
-        if (x.id != "pinned-unlocked") continue;
-        named = x.why.find("#337") != std::string::npos &&
-                x.what.find("9.00 GiB of weights from host memory") != std::string::npos &&
-                x.fix.find("memlock") != std::string::npos &&
-                x.fix.find("--host-pool-mib 0") != std::string::npos;
-    }
-    CHECK(named);
-    /* The machine's own refusals are not repeated: startup refused them before it loaded anything. */
-    for (const diag::Finding& m : diag::incompatible(f)) CHECK(!has(refused, m.id.c_str()));
-    /* The same unlocked bytes with no weight crossing from host memory: the warning it was. */
-    run.host_weight_bytes = 0;
-    CHECK(has(diag::check(f, run), "pinned-unlocked", diag::Finding::Warn));
-    CHECK(diag::incompatible_run(f, run).empty());
-    /* All of it locked: nothing to say. */
-    run.host_weight_bytes = (int64_t)9 << 30;
-    run.pinned_unlocked_bytes = 0;
-    CHECK(!has(diag::check(f, run), "pinned-unlocked"));
-    CHECK(diag::incompatible_run(f, run).empty());
-}
-
 /* CWSR off is refused where cards serve, with its fix; the host backend beside a loaded driver is
  * only told. */
 TEST(what_startup_refuses_is_named_with_its_fix) {

@@ -36,46 +36,27 @@ void Engine::print_unsupported_banner() {
     for (const std::string& l : diag::unsupported_banner()) RAD_WARN("%s", l.c_str());
 }
 
-namespace {
-
-/* Each finding on its own line, then the reason the start stopped: shared by the machine's
- * refusals (before the load) and the run's (after it). */
-int refuse_findings(const std::vector<diag::Finding>& found, bool proceed) {
-    int n = 0;
-    for (const diag::Finding& x : found) {
+int Engine::check_configuration(const std::vector<int>& devs) {
+    diag::Facts f = hardware_facts(false);
+    for (int i = 0; i < cfg_.tp && i < (int)devs.size(); ++i)
+        for (diag::CardFacts& c : f.cards)
+            if (c.device == devs[(size_t)i]) c.rank = i;
+    int found = 0;
+    for (const diag::Finding& x : diag::incompatible(f)) {
         if (x.level != diag::Finding::Incompatible) continue;
-        ++n;
-        if (proceed)
+        ++found;
+        if (cfg_.proceed_incompatible)
             RAD_WARN("incompatible configuration, started anyway: %s: %s. Fix: %s", x.id.c_str(),
                      x.what.c_str(), x.fix.c_str());
         else
             RAD_ERR("incompatible configuration: %s: %s -- %s. Fix: %s", x.id.c_str(),
                     x.what.c_str(), x.why.c_str(), x.fix.c_str());
     }
-    if (!n || proceed) return RAD_OK;
+    if (!found || cfg_.proceed_incompatible) return RAD_OK;
     RAD_ERR("radiance does not start on a configuration it does not support: the fix for each is "
             "said above. --proceed-with-incompatible-configuration starts it anyway, unsupported "
             "and without any guarantee");
     return RAD_E_UNSUPPORTED;
-}
-
-}  /* namespace */
-
-int Engine::check_configuration(const std::vector<int>& devs) {
-    diag::Facts f = hardware_facts(false);
-    for (int i = 0; i < cfg_.tp && i < (int)devs.size(); ++i)
-        for (diag::CardFacts& c : f.cards)
-            if (c.device == devs[(size_t)i]) c.rank = i;
-    return refuse_findings(diag::incompatible(f), cfg_.proceed_incompatible);
-}
-
-/* The pools are allocated now, so what a rank reads, and what mlock refused to pin, are known. The
- * one refusal here is a pool the weights are read from that is not locked against swap: a kernel
- * reading one of those weights faults mid-request instead of stalling (#337, #272). */
-int Engine::check_run_configuration() {
-    const std::vector<diag::Finding> found =
-        diag::incompatible_run(hardware_facts(true), run_facts(false));
-    return refuse_findings(found, cfg_.proceed_incompatible);
 }
 
 diag::Facts Engine::hardware_facts(bool serving) const {

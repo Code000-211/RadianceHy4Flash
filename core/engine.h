@@ -1035,11 +1035,6 @@ private:
      * before anything loads: RAD_E_UNSUPPORTED with each one and its fix on an E line, or under
      * --proceed-with-incompatible-configuration each on a W line and the start goes on. */
     int check_configuration(const std::vector<int>& devs);
-    /* And the same for the settings only the run's facts can name (diag::incompatible_run): the
-     * pools are allocated by the time this is asked, so it runs after the load and before serve()
-     * takes a request. RAD_E_UNSUPPORTED with each one and its fix, unless
-     * --proceed-with-incompatible-configuration. */
-    int check_run_configuration();
     /* Syscall-only facts (diag::probe_process), read once at the first report: the memlock limit
      * cannot change under a running process, and the io_uring probe need not repeat per
      * /diagnostics request. */
