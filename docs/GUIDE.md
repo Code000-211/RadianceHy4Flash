@@ -1642,7 +1642,10 @@ budget (an eighth, at least one quantum) for each prefill behind it and for the 
 to start, so a long prompt (a minute or more at 256K) does not starve decode rows or admission. The
 chunk never drops under the smallest step the prefill stager overlaps (one more than the largest
 arena level, named on the startup line `prefill staging: ...`); below that every routed layer reads
-its pooled experts synchronously and the prefill slows far more than sharing saves. Where holding a
+its pooled experts synchronously and the prefill slows far more than sharing saves. (A prompt chunk
+of 640 tokens or more in a smaller step, a prompt's last chunk or a short prompt of its own, is
+staged as well, through a second place for the stager's ring; that is no floor for a shared chunk.)
+Where holding a
 chunk back would leave a short remainder before the checkpoint boundary, the interval is split into
 two staged halves instead. Decode rows alone take only their few tokens: the chunk ends a quantum
 short of the boundary and the next step finishes it. A prompt with nothing beside it is unaffected.

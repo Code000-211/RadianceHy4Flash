@@ -4313,6 +4313,81 @@ TEST(prefill_continues_reads_no_committed_plan) {
     CHECK(!f.sch.prefill_continues());
 }
 
+/* Backlog M-19 (a). Below its smallest pass the prefill stager also arms for a prompt chunk, from
+ * its arm floor (PrefillStager::arm_rows), so that is what prefill_continues() counts a prompt's
+ * remainder against: the step before a last chunk between the two floors now stages its first
+ * layers, and one before a smaller remainder still does not. An arm floor of 0, or one not under
+ * the smallest pass, leaves the smallest pass as the only floor. */
+TEST(prefill_continues_counts_a_remainder_against_the_stagers_arm_rows) {
+    struct Run {
+        std::vector<int64_t> left;         /* the prompt's rows still to prefill after each step */
+        std::string staged;
+    };
+    auto run = [](int64_t rows, int64_t arm) {
+        Fixture f;
+        f.build();
+        CHECK_OK(f.start());
+        f.sch.set_stage_rows(rows, arm);
+        const uint64_t p = f.submit(2000, 4);
+        Run out;
+        for (int k = 0; k < 16; ++k) {
+            if (!f.sch.step()) break;
+            int64_t left = -1;
+            for (const StepEntry& e : f.sch.plan().e)
+                if (e.seq == p && e.is_prefill) left = 2000 - ((int64_t)e.ctx_len + e.n_tokens);
+            if (left < 0) break;                       /* the prompt is in: decode from here */
+            out.left.push_back(left);
+            out.staged += f.sch.prefill_continues() ? '+' : '-';
+            f.commit_plain(12);
+        }
+        return out;
+    };
+    auto expect = [](const Run& r, int64_t floor) {
+        std::string s;
+        for (int64_t left : r.left) s += left >= floor ? '+' : '-';
+        return s;
+    };
+    const Run base = run(1025, 0);
+    REQUIRE(base.left.size() >= 4);
+    /* the prompt leaves remainders on both sides of each floor, or the cases below say nothing */
+    int n_over = 0, n_between = 0, n_under = 0;
+    for (int64_t left : base.left) {
+        if (left >= 1025) ++n_over;
+        else if (left >= 640) ++n_between;
+        else ++n_under;
+    }
+    REQUIRE(n_over > 0 && n_between > 0 && n_under > 0);
+    CHECK_EQ(base.staged, expect(base, 1025));
+
+    const Run arm = run(1025, 640);
+    CHECK(arm.left == base.left);                      /* the chunks are the same ones */
+    CHECK_EQ(arm.staged, expect(arm, 640));
+    CHECK(arm.staged != base.staged);
+
+    /* no arm floor under the smallest pass: the smallest pass */
+    CHECK_EQ(run(1025, 1025).staged, base.staged);
+    CHECK_EQ(run(1025, 4096).staged, base.staged);
+    CHECK_EQ(run(1025, -1).staged, base.staged);
+    /* and no stager, no staging, whatever the arm floor says */
+    const Run none = run(0, 640);
+    CHECK_EQ(none.staged, std::string(none.left.size(), '-'));
+}
+
+/* The arm floor is not a floor for a held-back chunk: --busy-prefill-chunk keeps such a chunk at
+ * the stager's smallest pass as before, and does not re-chunk a busy prefill
+ * (notes/backlog/closed/M-03a.md). */
+TEST(busy_cap_keeps_the_stager_floor_whatever_the_arm_rows) {
+    Fixture f;
+    f.build(/*blocks=*/8192, /*states=*/64, /*max_tok=*/2048, /*max_ctx=*/8192);
+    f.cfg.checkpoint_interval = 2048;
+    CHECK_OK(f.start());
+    f.sch.set_stage_rows(1025, 640);
+    CHECK_EQ(f.sch.busy_cap(0, 100000, 2048, 0), 2048);
+    CHECK_EQ(f.sch.busy_cap(0, 100000, 2048, 272), 1024);
+    CHECK_EQ(f.sch.busy_cap(0, 100000, 2048, 1500), 1024);
+    CHECK_EQ(f.sch.busy_cap(0, 100000, 2048, 8 + 256, false, false), 1024);
+}
+
 TEST(interleave_off_puts_a_chunk_in_every_step) {
     const Interleaved r = interleave_run(0, /*decoder=*/true, 8);
     CHECK_EQ(r.shape, std::string("CCCCCCCC"));

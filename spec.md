@@ -910,7 +910,10 @@ without saving bytes.
 **Prefill stager** (`core/place/stager.h`). A prefill chunk routes to nearly every expert, so
 pinned-pool experts would cross the link inside each layer's GEMMs. For large steps the stager
 copies them, for the layers ahead, into a VRAM ring at the top of the activation arena while
-earlier layers run, and points each layer's ops at the copies. Output is bit-identical.
+earlier layers run, and points each layer's ops at the copies. A prompt chunk of 640 tokens or more
+in a smaller step is staged too: in that ring while the expert slab has not taken the top back
+(right behind a large step), else in the ring's second place just above the smaller arena levels'
+buffers, which the slab gives back for the step. Output is bit-identical.
 
 **Decode prefetch** (`core/runtime/xprefetch.h`). Under expert-tiered placement, each routed layer
 applies the next layer's router to its own router input, copies the likeliest pinned-pool experts

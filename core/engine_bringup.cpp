@@ -1908,6 +1908,14 @@ int Engine::declare() {
  * the stager's ring: what a kernel writes past the rows it was given lands there rather than in
  * an expert's weights. */
 static constexpr int64_t kArenaGuard = 1ll << 20;
+/* The smallest prompt chunk the prefill stager arms for below the size at which every step finds
+ * its ring, in rows (stager.h, "which passes"; M-19, after M-03b's 128). The copies cost the same
+ * whatever the step's rows and reading in place costs by the row, so there is a break-even:
+ * notes/backlog/closed/M-03b.md has steps of 250-380 rows 47-93 ms slower staged and steps of 720
+ * and 723 rows faster, and asks for a floor of 500-700 rows. 640 is inside that, a whole number
+ * of chunk quanta, and under the 720-row last chunk a 6.7K-token prompt leaves behind three
+ * intervals of 1984. */
+static constexpr int64_t kStageArmRows = 640;
 
 /* The activation arena's smaller levels, sized by the plugin itself.
  *
@@ -5433,30 +5441,42 @@ int Engine::start() {
         RAD_TRY(r->mover.bind_compute_stream(r->ctx.stream()));
 
         /* The prefill stager, where the budget made room. Only a step larger than every smaller
-         * arena level finds the region unlent, so that is the smallest pass it arms for. */
+         * arena level always finds the region unlent, so that is the smallest pass it arms for
+         * whatever the pass carries; a smaller one is staged from kStageArmRows rows of prompt,
+         * in the ring's second place when the region is lent. */
         if (r->program.arena_stage_bytes > 0 && r->plan.dynamic && !r->arena_levels.empty()) {
-            /* The smallest pass is one past every level that lends the ring. The span's shared
-             * level does not: it keeps its own place for it, right above its buffers and the
-             * guard, wherever that is below the region at the top (stager.h). */
+            /* The smallest pass is one past every level that lends the ring. The second place is
+             * right above the buffers, and the guard, of the highest level a staged step can run
+             * at -- one that holds a chunk of kStageArmRows rows, or the span's shared level,
+             * which keeps the place for every step -- wherever that is below the region at the
+             * top (stager.h). */
             int64_t top_level = 0;
-            r->arena_low_off = -1;
+            std::vector<ArenaStepLevel> levels;
+            levels.reserve(r->arena_levels.size());
             for (const ArenaLevel& lv : r->arena_levels) {
-                if (lv.rows != arena_span_rows_) { top_level = std::max(top_level, lv.rows); continue; }
-                const int64_t off = (lv.end + kArenaGuard + RAD_ALIGN_UNIT - 1) /
-                                    RAD_ALIGN_UNIT * RAD_ALIGN_UNIT;
-                r->arena_low_off = std::min(off, r->program.arena_stage_off);
+                levels.push_back({ lv.rows, lv.end });
+                if (lv.rows != arena_span_rows_) top_level = std::max(top_level, lv.rows);
             }
+            r->arena_low_off =
+                arena_ring_offset(arena_ring_above(levels, kStageArmRows, arena_span_rows_),
+                                  kArenaGuard, r->program.arena_stage_off);
             char* const base = (char*)r->ctx.arena_base();
             RAD_TRY(r->stager.init(r->program, r->plan, &r->mover,
                                    base + r->program.arena_stage_off,
                                    r->arena_low_off >= 0 ? base + r->arena_low_off : nullptr,
-                                   r->program.arena_stage_bytes, top_level + 1));
+                                   r->program.arena_stage_bytes, top_level + 1, kStageArmRows));
             if (r->stager.enabled() && r->index == 0)
                 RAD_INFO("prefill staging: a %s ring at the top of the arena; a step of more "
                          "than %lld tokens copies the pooled experts of %zu routed layers onto "
-                         "the card up to %d layers ahead of the layers that read them",
+                         "the card up to %d layers ahead of the layers that read them%s",
                          humanb(r->stager.ring_bytes()).c_str(), (long long)top_level,
-                         r->stager.n_layers(), (int)PrefillStager::lead());
+                         r->stager.n_layers(), (int)PrefillStager::lead(),
+                         kStageArmRows <= top_level
+                             ? fmt(", and so does a prompt chunk of %lld tokens or more in a "
+                                   "smaller step, through the ring's second place above the "
+                                   "%lld-token level when the top is lent",
+                                   (long long)kStageArmRows, (long long)top_level).c_str()
+                             : "");
         }
         /* The file stager, wherever a routed expert is on the file tier (static or dynamic plan;
          * such a unit has no other address). Routing-aware reads take this
@@ -5618,18 +5638,24 @@ int Engine::start() {
         for (auto& r : ranks_) {
             RAD_TRY(rad_dev_set(r->device));
             r->arena_lent.assign(1, 0);
+            r->arena_ring_lent = 0;
             const Program& P = r->program;
             const int64_t top = P.arena_bytes;
+            /* A step staged in the ring's second place, and every step of the span's shared
+             * level, lends what is above that place. Any other step lends everything above its
+             * own level, the place included. */
+            const bool low = r->arena_low_off >= 0 && r->stager.enabled();
+            if (low)
+                r->arena_ring_lent =
+                    arena_lent_above_ring(top, r->arena_low_off, P.arena_stage_bytes);
             for (const ArenaLevel& lv : r->arena_levels) {
                 if (r->ctx.add_level(lv.rows, lv.offset, lv.decl) < 0) { ok = false; break; }
-                /* The span's shared level keeps the stager's ring above its buffers: it lends
-                 * what is above the ring. */
-                const bool ring = lv.rows == arena_span_rows_ && r->arena_low_off >= 0 &&
-                                  r->stager.enabled();
-                const int64_t edge = ring
-                    ? (r->arena_low_off + P.arena_stage_bytes + RAD_ALIGN_UNIT - 1) /
-                          RAD_ALIGN_UNIT * RAD_ALIGN_UNIT
-                    : (lv.end + kArenaGuard + RAD_ALIGN_UNIT - 1) / RAD_ALIGN_UNIT * RAD_ALIGN_UNIT;
+                if (lv.rows == arena_span_rows_ && low) {
+                    r->arena_lent.push_back(r->arena_ring_lent);
+                    continue;
+                }
+                const int64_t edge =
+                    (lv.end + kArenaGuard + RAD_ALIGN_UNIT - 1) / RAD_ALIGN_UNIT * RAD_ALIGN_UNIT;
                 r->arena_lent.push_back(top > edge ? top - edge : 0);
             }
             if (!ok) break;

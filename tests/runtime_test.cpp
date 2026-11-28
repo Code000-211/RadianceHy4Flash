@@ -2359,6 +2359,238 @@ TEST(a_step_runs_at_the_smallest_arena_level_that_holds_it) {
     CHECK_EQ(rad::arena_level_for({}, 1), 0);
 }
 
+/* Backlog M-19 (a), after M-03b. Below the size at which every pass finds its ring, the prefill
+ * stager arms for a prompt chunk of at least its floor's rows: a chunk alone in its step or one
+ * that shares it with decode rows. A decode step's rows are one per sequence, a draft pass has no
+ * trunk layer of its own to stage, and a floor of 0 arms for nothing. */
+TEST(the_stager_arms_below_its_smallest_pass_for_a_prompt_chunk_of_its_floor) {
+    RadBatch b{};
+    b.phase = RAD_PHASE_PREFILL;
+    b.n_tok = 639;
+    CHECK(!rad::stage_arms(&b, 640));
+    b.n_tok = 640;
+    CHECK(rad::stage_arms(&b, 640));
+    b.n_tok = 720;
+    CHECK(rad::stage_arms(&b, 640));
+    b.phase = RAD_PHASE_DECODE;
+    CHECK(!rad::stage_arms(&b, 640));               /* decode rows, however many */
+    b.phase = RAD_PHASE_MIXED;
+    CHECK(rad::stage_arms(&b, 640));                /* a chunk sharing its step counts */
+    b.phase = RAD_PHASE_PREFILL;
+    b.draft_pass = 1;
+    CHECK(!rad::stage_arms(&b, 640));
+    b.draft_pass = 0;
+    CHECK(!rad::stage_arms(nullptr, 640));
+    CHECK(!rad::stage_arms(&b, 0));                 /* no floor: none */
+    b.n_tok = 300;                                  /* a resumed turn */
+    CHECK(!rad::stage_arms(&b, 640));
+    CHECK(rad::stage_arms(&b, 1));                  /* a prompt chunk of any size */
+}
+
+/* The ring's second place is right above the highest smaller arena level a staged step can run
+ * at: a level that holds a chunk of the stager's floor, or the span's shared level, which keeps
+ * the place for every step. One place serves them all. A level too small for any staged step
+ * does not count, and with none that qualifies there is no second place. */
+TEST(the_stager_rings_second_place_is_above_the_highest_level_a_staged_step_runs_at) {
+    const int64_t MiB = 1ll << 20;
+    /* the served shape: 256 and 1024-token levels, a 640-row floor, no span */
+    CHECK_EQ(rad::arena_ring_above({ { 256, 186 * MiB }, { 1024, 706 * MiB } }, 640, 0), 706 * MiB);
+    /* M-03b's 128-row floor on the same shape: both levels hold such a step, the same place */
+    CHECK_EQ(rad::arena_ring_above({ { 256, 186 * MiB }, { 1024, 706 * MiB } }, 128, 0), 706 * MiB);
+    /* a larger budget's levels: above the highest */
+    CHECK_EQ(rad::arena_ring_above({ { 256, 186 * MiB }, { 1024, 706 * MiB },
+                                     { 4096, 2790 * MiB } }, 640, 0),
+             2790 * MiB);
+    /* one small level: no staged step runs there, no place */
+    CHECK_EQ(rad::arena_ring_above({ { 256, 186 * MiB } }, 640, 0), int64_t(-1));
+    /* ... unless it is the span's shared level, which kept the place before this card too */
+    CHECK_EQ(rad::arena_ring_above({ { 256, 186 * MiB } }, 640, 256), 186 * MiB);
+    CHECK_EQ(rad::arena_ring_above({ { 256, 186 * MiB }, { 512, 354 * MiB } }, 640, 512),
+             354 * MiB);
+    /* a span level under a level that holds a staged step: one place, above the higher */
+    CHECK_EQ(rad::arena_ring_above({ { 256, 186 * MiB }, { 512, 354 * MiB }, { 1024, 706 * MiB } },
+                                   640, 512),
+             706 * MiB);
+    /* no floor and no span, or no level at all */
+    CHECK_EQ(rad::arena_ring_above({ { 256, 186 * MiB }, { 1024, 706 * MiB } }, 0, 0), int64_t(-1));
+    CHECK_EQ(rad::arena_ring_above({}, 640, 0), int64_t(-1));
+}
+
+/* The second place starts above the level's buffers and the guard, on an alignment unit, and
+ * never past the region's own start; what lies above its end is what a step staged there lends. */
+TEST(the_second_place_sits_above_the_guard_and_lends_what_is_over_it) {
+    const int64_t MiB = 1ll << 20, U = RAD_ALIGN_UNIT;
+    CHECK_EQ(rad::arena_ring_offset(-1, MiB, 1403 * MiB), int64_t(-1));
+    CHECK_EQ(rad::arena_ring_offset(706 * MiB, MiB, 1403 * MiB), 707 * MiB);
+    CHECK_EQ(rad::arena_ring_offset(706 * MiB + 1, MiB, 1403 * MiB), 707 * MiB + U);
+    CHECK_EQ(rad::arena_ring_offset(1403 * MiB, MiB, 1403 * MiB), 1403 * MiB);   /* clamped */
+    /* an arena of 1928 MiB, the place at 707 MiB, a 525 MiB ring: 696 MiB are above it */
+    CHECK_EQ(rad::arena_lent_above_ring(1928 * MiB, 707 * MiB, 525 * MiB), 696 * MiB);
+    CHECK_EQ(rad::arena_lent_above_ring(1928 * MiB, 707 * MiB, 525 * MiB + 1),
+             696 * MiB - U);
+    CHECK_EQ(rad::arena_lent_above_ring(1928 * MiB, 1403 * MiB, 525 * MiB), int64_t(0));
+    CHECK_EQ(rad::arena_lent_above_ring(1928 * MiB, -1, 525 * MiB), int64_t(0));
+}
+
+/* A step staged in the second place copies through it, so the place stays out of the expert
+ * slab's loan for that step whatever level it runs at; every other step lends what its level
+ * does, the place included. */
+TEST(a_step_staged_in_the_second_place_keeps_it_out_of_the_loan) {
+    const int64_t MiB = 1ll << 20;
+    const int64_t level = 1219 * MiB;      /* what the 1024-token level lends: all above itself */
+    const int64_t ring = 694 * MiB;        /* what is above the ring's second place */
+    CHECK_EQ(rad::arena_step_lent(level, ring, true), ring);
+    CHECK_EQ(rad::arena_step_lent(level, ring, false), level);   /* a 300-row turn, a decode step */
+    CHECK_EQ(rad::arena_step_lent(ring, ring, true), ring);      /* the span's level: that anyway */
+    CHECK_EQ(rad::arena_step_lent(0, ring, true), 0);            /* the full plan lends nothing */
+    CHECK_EQ(rad::arena_step_lent(0, ring, false), 0);
+    CHECK_EQ(rad::arena_step_lent(level, 0, true), 0);           /* the place reaches the top */
+}
+
+/* A step below the full plan still finds the stager's ring in the region at the top of the arena
+ * exactly while the arena's floor is the full plan's and the expert slab holds no more of the
+ * arena than the full plan leaves it (nothing): the loan is counted from the top down and the
+ * region is the top, so one lent byte, or one slot the slab has yet to give back, is the
+ * region's. */
+TEST(a_smaller_step_finds_the_region_only_while_the_slab_holds_none_of_the_arena) {
+    const int64_t MiB = 1ll << 20;
+    CHECK(rad::arena_ring_kept(2048, 2048, 0, 0, 0));          /* behind a full-plan step */
+    /* the floor fell and the level's loan is out */
+    CHECK(!rad::arena_ring_kept(1024, 2048, 1206 * MiB, 1206 * MiB, 0));
+    /* nothing lent yet, and no full-plan step behind it either (a server's first step) */
+    CHECK(!rad::arena_ring_kept(0, 2048, 0, 0, 0));
+    CHECK(!rad::arena_ring_kept(1024, 2048, 0, 0, 0));
+    /* the floor holds, and the slab still reaches into the arena */
+    CHECK(!rad::arena_ring_kept(2048, 2048, 1, 0, 0));
+    CHECK(!rad::arena_ring_kept(2048, 2048, 0, 1, 0)); /* recalled, a slot not yet given back */
+    CHECK(!rad::arena_ring_kept(2048, 2048, 0, 700 * MiB, 0));
+    /* behind a step staged in the second place: the floor holds, and above that place is lent */
+    CHECK(!rad::arena_ring_kept(2048, 2048, 694 * MiB, 694 * MiB, 0));
+    /* stated against what the full plan lends, were that ever more than nothing */
+    CHECK(rad::arena_ring_kept(2048, 2048, 4 * MiB, 4 * MiB, 4 * MiB));
+    CHECK(!rad::arena_ring_kept(2048, 2048, 5 * MiB, 4 * MiB, 4 * MiB));
+    CHECK(!rad::arena_ring_kept(2048, 2048, 4 * MiB, 5 * MiB, 4 * MiB));
+}
+
+/* The arena's floor falls to the latest step's size, and the loan grows, only once that step is
+ * under the floor and the floor was last reached more than two seconds ago -- and never while the
+ * latest step is one that was staged below the full plan: its copies are in arena memory the loan
+ * would grow over, as a full-plan step's are, however long ago the floor was reached. */
+TEST(the_arena_floor_holds_while_the_latest_step_is_staged_below_the_full_plan) {
+    const uint64_t hold = rad::kArenaFloorNs;
+    CHECK_EQ(hold, (uint64_t)2000000000ull);
+    /* a decode step behind a full-plan chunk: after the hold, not before */
+    CHECK(!rad::arena_floor_falls(256, 2048, false, 0));
+    CHECK(!rad::arena_floor_falls(256, 2048, false, hold));
+    CHECK(rad::arena_floor_falls(256, 2048, false, hold + 1));
+    /* a step at the floor never lowers it */
+    CHECK(!rad::arena_floor_falls(2048, 2048, false, hold + 1));
+    CHECK(!rad::arena_floor_falls(4096, 2048, false, 10 * hold));
+    /* a staged 720-row chunk: under the floor in rows, and the floor stays */
+    CHECK(!rad::arena_floor_falls(1024, 2048, true, hold + 1));
+    CHECK(!rad::arena_floor_falls(1024, 2048, true, 100 * hold));
+    /* the same step unstaged falls as any small step does */
+    CHECK(rad::arena_floor_falls(1024, 2048, false, hold + 1));
+}
+
+/* Where the ring is for a step, what the step leaves lent and whether it holds the loan back
+ * (Engine::arena_step's decision), on the served shape's numbers: the full plan lends nothing,
+ * the 1024-token level 1219 MiB, the 256-token level 1739 MiB, and 694 MiB is above the ring's
+ * second place. */
+TEST(the_arena_step_decides_where_the_ring_is_and_what_stays_lent) {
+    const int64_t MiB = 1ll << 20;
+    using rad::ArenaRing;
+    auto step = [&](bool arms, int64_t level_lent, int64_t floor, int64_t loan) {
+        rad::ArenaStep s;
+        s.has_low = true;
+        s.arms = arms;
+        s.floor_rows = floor;
+        s.full_rows = 2048;
+        s.loan = s.loan_held = loan;
+        s.level_lent = level_lent;
+        s.ring_lent = 694 * MiB;
+        return s;
+    };
+    /* a full-plan chunk: the region, nothing lent, and the floor is its own */
+    {
+        rad::ArenaStep s = step(true, 0, 2048, 1739 * MiB);
+        s.full_plan = true;
+        const rad::ArenaStepRing r = rad::arena_step_ring(s);
+        CHECK(r.ring == ArenaRing::Top);
+        CHECK_EQ(r.allow, (int64_t)0);
+        CHECK(!r.holds);
+    }
+    /* the 720-row last chunk right behind it: the region still, nothing recalled, the loan held */
+    {
+        const rad::ArenaStepRing r = rad::arena_step_ring(step(true, 1219 * MiB, 2048, 0));
+        CHECK(r.ring == ArenaRing::Top);
+        CHECK_EQ(r.allow, 1219 * MiB);              /* the level's; the loan is 0, under it */
+        CHECK(r.holds);
+    }
+    /* a lone 720-row prompt with the loan out (decode before it): the second place, recalled */
+    {
+        const rad::ArenaStepRing r = rad::arena_step_ring(step(true, 1219 * MiB, 256, 1739 * MiB));
+        CHECK(r.ring == ArenaRing::Low);
+        CHECK_EQ(r.allow, 694 * MiB);
+        CHECK(r.holds);
+    }
+    /* the next such turn within the floor's time: the floor is the full plan's now, what is above
+     * the second place is still lent, so the region is not free -- the second place again, and
+     * nothing more to recall */
+    {
+        const rad::ArenaStepRing r = rad::arena_step_ring(step(true, 1219 * MiB, 2048, 694 * MiB));
+        CHECK(r.ring == ArenaRing::Low);
+        CHECK_EQ(r.allow, 694 * MiB);
+        CHECK(r.holds);
+    }
+    /* a 300-row turn or a decode step, loan out or not: no ring, the level's loan, no hold */
+    for (int64_t loan : { (int64_t)0, 694 * MiB, 1739 * MiB }) {
+        const rad::ArenaStepRing r = rad::arena_step_ring(step(false, 1219 * MiB, 2048, loan));
+        CHECK(r.ring == ArenaRing::None);
+        CHECK_EQ(r.allow, 1219 * MiB);
+        CHECK(!r.holds);
+    }
+    /* ... unless layers are staged ahead for a chunk and the region is still unlent: it has the
+     * region to take them from; with the region lent it has none, and they are withdrawn */
+    {
+        rad::ArenaStep s = step(false, 1219 * MiB, 2048, 0);
+        s.adopts = true;
+        rad::ArenaStepRing r = rad::arena_step_ring(s);
+        CHECK(r.ring == ArenaRing::Top);
+        CHECK_EQ(r.allow, 1219 * MiB);
+        CHECK(r.holds);
+        s.loan = s.loan_held = 694 * MiB;
+        r = rad::arena_step_ring(s);
+        CHECK(r.ring == ArenaRing::None);
+        CHECK_EQ(r.allow, 1219 * MiB);
+        CHECK(!r.holds);
+    }
+    /* the span's shared level keeps the second place for every step, armed for or not, and
+     * lends what is above it either way */
+    for (bool arms : { false, true }) {
+        rad::ArenaStep s = step(arms, 694 * MiB, 2048, 0);
+        s.span_level = true;
+        const rad::ArenaStepRing r = rad::arena_step_ring(s);
+        CHECK(r.ring == ArenaRing::Low);
+        CHECK_EQ(r.allow, 694 * MiB);
+        CHECK(!r.holds);
+    }
+    /* a rank with no second place stages a smaller step only in the region */
+    {
+        rad::ArenaStep s = step(true, 1219 * MiB, 256, 1739 * MiB);
+        s.has_low = false;
+        rad::ArenaStepRing r = rad::arena_step_ring(s);
+        CHECK(r.ring == ArenaRing::None);
+        CHECK_EQ(r.allow, 1219 * MiB);
+        CHECK(!r.holds);
+        s.floor_rows = 2048;
+        s.loan = s.loan_held = 0;
+        r = rad::arena_step_ring(s);
+        CHECK(r.ring == ArenaRing::Top);
+        CHECK(r.holds);
+    }
+}
+
 /* ================================================================== the rank barrier */
 /* abort() releases ranks parked on the barrier and every later arrival returns at once, so a
  * fault on one rank cannot leave the others parked and the engine can exit. */

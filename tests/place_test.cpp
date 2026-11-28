@@ -9,6 +9,7 @@
 
 #include "device/device.h"
 #include "device/directio.h"
+#include "engine_priv.h"
 #include "mem/pools.h"
 #include "mem/vram_budget.h"
 #include "place/heat.h"
@@ -3433,7 +3434,7 @@ TEST(the_stager_ring_laps_without_overwriting_a_published_layer) {
  * seventh, which is never staged. When the next step continues with a prompt, a pass's end stages
  * the next trunk pass's first PrefillStager::lead() layers; a draft pass in between neither arms
  * nor touches them; the next armed trunk pass reads them in place, holding the pool's bytes; and a
- * trunk pass that does not arm returns them home before resolving anything. */
+ * decode step that does not arm returns them home before resolving anything. */
 TEST(the_stager_stages_the_next_steps_first_layers_and_never_the_draft_head) {
     Fixture f;
     const rad_weight emb = f.weight("token_embd.weight", 1 * MiB, RAD_ACCESS_VOCAB, -1, -1);
@@ -3578,12 +3579,15 @@ TEST(the_stager_stages_the_next_steps_first_layers_and_never_the_draft_head) {
     CHECK_OK(st.end_pass(compute));
     for (int l = 0; l < kL; ++l) CHECK(l < lead ? in_ring(l) : at_home(l));
 
-    /* A trunk pass too small to arm returns everything home before resolving a table. */
+    /* A decode step too small to arm returns everything home before resolving a table. (A prompt
+     * chunk that small takes them instead: M-19, the case after the next ones.) */
     b.n_tok = 8;
+    b.phase = RAD_PHASE_DECODE;
     CHECK(!st.begin_pass(&b));
     CHECK(!st.staged());
     for (int l = 0; l < kL; ++l) CHECK(at_home(l));
     CHECK_EQ(m.stats().stage_overflow, (uint64_t)0);
+    b.phase = RAD_PHASE_PREFILL;
 
     /* Inside a chunk group the next pass starts at its slice's first layer (S-02): the early set
      * is [first, first + lead) counted from that layer, and the pass that starts there adopts it
@@ -3634,6 +3638,702 @@ TEST(the_stager_stages_the_next_steps_first_layers_and_never_the_draft_head) {
     CHECK(cold > 0);
     CHECK_OK(rad_stream_sync(m.transfer_stream()));
     rad_stream_destroy(compute);
+}
+
+namespace {
+/* Six routed layers of eight experts and a mover over them, for the stager's cases below: which
+ * of each layer's experts are pooled, where they live, and a ring with its two places, each with
+ * room for every layer at once, so what a ring holds is set by pacing, not by size. */
+struct StagerRig {
+    static constexpr int kL = 6, kE = 8;
+    Fixture f;
+    Plan plan;
+    Mover m;
+    RadStream compute = nullptr;
+    std::vector<std::vector<rad_weight>> pw;
+    std::vector<void*> home;
+    std::vector<char> mem;
+    int64_t ring = 0;
+    char* region = nullptr;
+    char* low = nullptr;
+    const int n_ops = 1 + 2 * kL;
+
+    std::vector<std::vector<rad_weight>> lw;
+
+    /* The program and its plan alone, for a mover built elsewhere. */
+    int build_plan() {
+        const rad_weight emb = f.weight("token_embd.weight", 1 * MiB, RAD_ACCESS_VOCAB, -1, -1);
+        f.op("embed", {emb}, false);
+        lw.assign(kL, {});
+        for (int l = 0; l < kL; ++l)
+            for (int e = 0; e < kE; ++e)
+                lw[(size_t)l].push_back(f.weight("blk." + std::to_string(l) + ".ffn_gate_exps." +
+                                                 std::to_string(e) + ".weight", 1 * MiB,
+                                                 RAD_ACCESS_CONDITIONAL, l, e));
+        for (int l = 0; l < kL; ++l) {
+            f.op("attn" + std::to_string(l), {}, false);
+            f.op("moe" + std::to_string(l), lw[(size_t)l], false);
+        }
+        Config cfg = base_config();
+        cfg.placement = "expert_tiered";
+        cfg.vram_weights_mib = 16;
+        cfg.host_pool_mib = 128;
+        PlannerInput in{&f.prog, &cfg, 0, 1, nullptr, 0};
+        RAD_TRY(Planner(in).plan(&plan));
+        return plan.dynamic ? RAD_OK : RAD_E_STATE;
+    }
+    int build() {
+        RAD_TRY(build_plan());
+        MoverConfig mc;
+        RAD_TRY(m.init(f.prog, plan, mc));
+        RAD_TRY(rad_stream_create(&compute, 0));
+        RAD_TRY(m.bind_compute_stream(compute));
+        pw.assign(kL, {});
+        int64_t most = 0;
+        const int64_t each = align_up(1 * MiB, RAD_ALIGN_UNIT);
+        for (int l = 0; l < kL; ++l) {
+            for (rad_weight w : lw[(size_t)l])
+                if (plan.weight[w].tier == Tier::HostPinned) pw[(size_t)l].push_back(w);
+            if (pw[(size_t)l].empty()) return RAD_E_STATE;
+            most = std::max(most, each * (int64_t)pw[(size_t)l].size());
+        }
+        home.assign(f.prog.weights.size(), nullptr);
+        for (rad_weight w = 1; (size_t)w < f.prog.weights.size(); ++w)
+            home[w] = m.residency()->lookup(w)->ptr;
+        ring = most * 8 / (2 * RAD_ALIGN_UNIT) * (2 * RAD_ALIGN_UNIT);
+        mem.assign((size_t)(2 * ring), 0);
+        region = mem.data();
+        low = mem.data() + ring;
+        return RAD_OK;
+    }
+    ~StagerRig() {
+        if (compute) {
+            (void)rad_stream_sync(m.transfer_stream());
+            rad_stream_destroy(compute);
+        }
+    }
+
+    bool in_place(int l, const char* at) {
+        for (rad_weight w : pw[(size_t)l]) {
+            const char* p = (const char*)m.residency()->lookup(w)->ptr;
+            if (p < at || p >= at + ring) return false;
+        }
+        return true;
+    }
+    bool at_home(int l) {
+        for (rad_weight w : pw[(size_t)l])
+            if (m.residency()->lookup(w)->ptr != home[w]) return false;
+        return true;
+    }
+    bool all_home() {
+        for (int l = 0; l < kL; ++l) if (!at_home(l)) return false;
+        return true;
+    }
+    bool copies_hold_the_pool(int l) {
+        CHECK_OK(rad_stream_sync(m.transfer_stream()));
+        for (rad_weight w : pw[(size_t)l])
+            if (std::memcmp(m.residency()->lookup(w)->ptr, home[w],
+                            (size_t)f.prog.weights[w].logical_bytes) != 0) return false;
+        return true;
+    }
+    /* A trunk pass's ops from `h0` on. With `at`, every layer reads copies there that hold the
+     * pool's bytes. With null it is a pass that only takes what was staged ahead: the first
+     * `taken` layers are read from `from`, and the layers after them where they live. */
+    void run_pass(PrefillStager& st, int h0, const char* at, int taken = 0,
+                  const char* from = nullptr) {
+        for (int h = h0; h < n_ops; ++h) {
+            bool resync = false;
+            CHECK_OK(st.before_op(h, compute, &resync));
+            if (h >= 2 && h % 2 == 0) {
+                const int l = (h - 2) / 2;
+                if (at) {
+                    CHECK(in_place(l, at));
+                    CHECK(copies_hold_the_pool(l));
+                } else if (l < taken) {
+                    CHECK(in_place(l, from));
+                    CHECK(copies_hold_the_pool(l));
+                } else {
+                    CHECK(at_home(l));
+                }
+            }
+            CHECK_OK(st.after_op(h, compute));
+        }
+    }
+};
+
+RadBatch chunk_of(int64_t rows, int32_t phase = RAD_PHASE_PREFILL) {
+    RadBatch b{};
+    b.phase = phase;
+    b.n_tok = rows;
+    return b;
+}
+}  /* namespace */
+
+namespace rad {
+/* Engine::arena_step and arena_tick are private, and so is a rank. The rig is one rank built by
+ * hand on the host backend: a context with the two smaller levels of the served shape, a mover
+ * that lends the top of a stand-in arena, and a stager whose two places are in it. */
+struct EngineArenaTestAccess {
+    struct Shape {
+        int64_t top, stage_off, stage_bytes, low_off;
+        int64_t lent_256, lent_1024, ring_lent;
+    };
+    static int rank(Engine& e, const Program& prog, const Plan& plan, char* arena, const Shape& s) {
+        auto r = std::make_unique<Engine::Rank>();
+        CtxDesc d;
+        d.program = &r->program;
+        RAD_TRY(r->ctx.init(d));              /* binds the (empty) arena: level 0's template */
+        for (int64_t rows : { 256, 1024 })
+            if (const int lv = r->ctx.add_level(rows, {}, {}); lv < 0) return lv;
+        HeatParams hp;
+        RAD_TRY(r->heat.init(plan, hp));
+        MoverConfig mc;
+        mc.turnover_slots = 0;                 /* fill every lent slot: a recall has units to move */
+        RAD_TRY(r->mover.init(prog, plan, mc));
+        RAD_TRY(r->mover.bind_compute_stream(r->ctx.stream()));
+        LoanStrip st;
+        st.top = arena + s.top;
+        st.bytes = s.lent_256;
+        st.unit_bytes = 1;
+        st.unit_tokens = 1;
+        RAD_TRY(r->mover.lend_from(Mover::kLendArena, { st }));
+        r->arena_lent = { 0, s.lent_256, s.lent_1024 };
+        r->arena_low_off = s.low_off;
+        r->arena_ring_lent = s.ring_lent;
+        RAD_TRY(r->stager.init(prog, plan, &r->mover, arena + s.stage_off, arena + s.low_off,
+                               s.stage_bytes, 1025, 640));
+        e.ranks_.push_back(std::move(r));
+        e.arena_rows_ = { 2048, 256, 1024 };
+        return RAD_OK;
+    }
+    static int  step(Engine& e, const RadBatch* b) { return e.arena_step(b, /*ahead=*/false); }
+    static void tick(Engine& e, uint64_t now_ns) { e.arena_tick(now_ns); }
+    static Mover&         mover(Engine& e) { return e.ranks_[0]->mover; }
+    static HeatEngine&    heat(Engine& e) { return e.ranks_[0]->heat; }
+    static PrefillStager& stager(Engine& e) { return e.ranks_[0]->stager; }
+    static RadStream      stream(Engine& e) { return e.ranks_[0]->ctx.stream(); }
+    static int64_t floor(const Engine& e) { return e.arena_floor_; }
+    static bool    ring_step(const Engine& e) { return e.arena_ring_step_; }
+    static void    floors(const Engine& e, int64_t* stage, int64_t* arm) {
+        e.stager_floors(stage, arm);
+    }
+};
+}  /* namespace rad */
+
+/* Backlog M-19 (a): Engine::arena_step and arena_tick themselves, on the served shape's levels
+ * (256 and 1024 tokens under a 2048-token full plan) scaled to a 40 MiB stand-in arena. For each
+ * kind of step, in the order a server sees them: where the stager's ring is, what the expert
+ * slab keeps of the arena, and whether the loan stays back behind the step.
+ *
+ *   a decode step                         no ring; the loan grows to the 256-token level's
+ *   a lone 256-row prompt, a 300-row turn no ring; the 1024-token level's loan for the turn
+ *   a lone 723-row prompt, the loan out   the second place, recalled for it; the loan held
+ *   the next such turn                    the second place again, nothing more recalled
+ *   decode, then two seconds              the loan grows back
+ *   a full-plan chunk                     the region; nothing lent
+ *   the 720-row last chunk behind it      the region still; nothing recalled; the loan held
+ *   a 300-row chunk, layers staged ahead  the region, to take them from
+ *   decode rows, layers staged ahead      no ring */
+TEST(the_engine_hands_a_smaller_step_the_ring_and_holds_the_loan_back_behind_it) {
+    if (!rad::device_is_host()) SKIP("builds an engine rank by hand on the host backend");
+    using A = rad::EngineArenaTestAccess;
+    StagerRig rig;
+    REQUIRE(rig.build_plan() >= 0);
+    /* A 16 MiB ring: a routed layer here pools up to 8 MiB, and a layer is staged ahead only
+     * within half the ring. The second place is [8, 24) MiB, the region [24, 40). */
+    const A::Shape sh = { 40 * MiB, 24 * MiB, 16 * MiB, 8 * MiB, 38 * MiB, 32 * MiB, 16 * MiB };
+    struct Mem {
+        char* p = (char*)rad_dev_alloc(40 * MiB, RAD_MEM_DEVICE);
+        ~Mem() { if (p) rad_dev_free(p, RAD_MEM_DEVICE); }
+    } arena;
+    REQUIRE(arena.p != nullptr);
+    Config cfg = base_config();
+    rad::Engine engine(cfg);
+    rad::EngineScope owner(engine.owner(), "arena-step-test");
+    REQUIRE_EQ(A::rank(engine, rig.f.prog, rig.plan, arena.p, sh), RAD_OK);
+    Mover& m = A::mover(engine);
+    PrefillStager& st = A::stager(engine);
+    REQUIRE(st.enabled());
+    CHECK(st.ring_full() == arena.p + sh.stage_off);
+    CHECK(st.ring_low() == arena.p + sh.low_off);
+    const auto loan = [&] { return m.loan(Mover::kLendArena); };
+    const auto held = [&] { return m.loan_held(Mover::kLendArena); };
+    /* No routed weight lives in [lo, hi) of the stand-in arena. */
+    const auto clear_of = [&](int64_t lo, int64_t hi) {
+        for (rad_weight w = 1; (size_t)w < rig.f.prog.weights.size(); ++w) {
+            const char* p = (const char*)m.residency()->lookup(w)->ptr;
+            if (p >= arena.p + lo && p < arena.p + hi) return false;
+        }
+        return true;
+    };
+    const uint64_t kHold = rad::kArenaFloorNs;
+
+    /* The scheduler's two floors come off the rank's stager. */
+    int64_t stage_rows = -1, arm_rows = -1;
+    A::floors(engine, &stage_rows, &arm_rows);
+    CHECK_EQ(stage_rows, (int64_t)1025);
+    CHECK_EQ(arm_rows, (int64_t)640);
+
+    RadBatch dec = chunk_of(8, RAD_PHASE_DECODE);
+    RadBatch p256 = chunk_of(256), turn = chunk_of(300), p723 = chunk_of(723), t700 = chunk_of(700);
+    RadBatch full = chunk_of(1984), tail = chunk_of(720);
+
+    /* A decode step: no ring, and the loan grows to its level's at the tick behind it. */
+    REQUIRE_EQ(A::step(engine, &dec), RAD_OK);
+    CHECK(st.ring() == nullptr);
+    CHECK(!A::ring_step(engine));
+    CHECK_EQ(loan(), (int64_t)0);
+    A::tick(engine, rad_mono_ns());
+    CHECK_EQ(A::floor(engine), (int64_t)256);
+    CHECK_EQ(loan(), sh.lent_256);
+    for (Deadline dl; (m.flex_used_bytes() == 0 || any_busy(A::heat(engine), rig.plan)) &&
+                      !dl.passed();)
+        CHECK_OK(m.idle_tick(&A::heat(engine)));
+    REQUIRE(held() > sh.lent_1024);                    /* the slab reaches below both edges */
+
+    /* A lone 256-row prompt (tail742) runs at the 256-token level: nothing changes. */
+    REQUIRE_EQ(A::step(engine, &p256), RAD_OK);
+    CHECK(st.ring() == nullptr);
+    CHECK(!st.begin_pass(&p256));
+    CHECK(!A::ring_step(engine));
+    CHECK_EQ(loan(), sh.lent_256);
+
+    /* A 300-row resumed turn runs at the 1024-token level, unstaged: the level's own recall and
+     * no more, the second place still the slab's. */
+    REQUIRE_EQ(A::step(engine, &turn), RAD_OK);
+    CHECK(st.ring() == nullptr);
+    CHECK(!st.begin_pass(&turn));
+    CHECK(!A::ring_step(engine));
+    CHECK_EQ(loan(), sh.lent_1024);
+    CHECK(held() <= sh.lent_1024);
+    CHECK_EQ(A::floor(engine), (int64_t)1024);
+    A::tick(engine, rad_mono_ns() + 10 * kHold);
+    CHECK_EQ(loan(), sh.lent_1024);
+
+    /* A lone 723-row prompt (tail2560) with the loan out: the second place, taken back from the
+     * slab for the step, and the floor is the full plan's behind it. */
+    REQUIRE_EQ(A::step(engine, &p723), RAD_OK);
+    CHECK(st.ring() == st.ring_low());
+    CHECK(A::ring_step(engine));
+    CHECK_EQ(loan(), sh.ring_lent);
+    CHECK(held() <= sh.ring_lent);
+    CHECK(clear_of(sh.low_off, sh.low_off + sh.stage_bytes));
+    CHECK_EQ(A::floor(engine), (int64_t)2048);
+    CHECK(st.begin_pass(&p723));
+    CHECK(st.staged());
+    CHECK_OK(st.end_pass(A::stream(engine)));
+    /* While it is the latest step the floor does not fall, however long it runs. */
+    A::tick(engine, rad_mono_ns() + 10 * kHold);
+    CHECK_EQ(A::floor(engine), (int64_t)2048);
+    CHECK_EQ(loan(), sh.ring_lent);
+
+    /* The next turn of that size finds the place still out of the loan: nothing to recall. */
+    REQUIRE_EQ(A::step(engine, &t700), RAD_OK);
+    CHECK(st.ring() == st.ring_low());
+    CHECK(A::ring_step(engine));
+    CHECK_EQ(loan(), sh.ring_lent);
+
+    /* Decode behind it: no ring; the loan stays back for the floor's time, then grows. */
+    REQUIRE_EQ(A::step(engine, &dec), RAD_OK);
+    CHECK(st.ring() == nullptr);
+    CHECK(!A::ring_step(engine));
+    CHECK_EQ(loan(), sh.ring_lent);
+    A::tick(engine, rad_mono_ns());
+    CHECK_EQ(A::floor(engine), (int64_t)2048);
+    CHECK_EQ(loan(), sh.ring_lent);
+    A::tick(engine, rad_mono_ns() + 2 * kHold);
+    CHECK_EQ(A::floor(engine), (int64_t)256);
+    CHECK_EQ(loan(), sh.lent_256);
+
+    /* A full-plan chunk: everything back, the ring in the region. */
+    REQUIRE_EQ(A::step(engine, &full), RAD_OK);
+    CHECK(st.ring() == st.ring_full());
+    CHECK(!A::ring_step(engine));
+    CHECK_EQ(loan(), (int64_t)0);
+    CHECK_EQ(held(), (int64_t)0);
+    CHECK_EQ(A::floor(engine), (int64_t)2048);
+
+    /* The 720-row last chunk behind it (pf6's): the region still, nothing recalled, and it holds
+     * the floor as the full-plan chunk did. */
+    REQUIRE_EQ(A::step(engine, &tail), RAD_OK);
+    CHECK(st.ring() == st.ring_full());
+    CHECK(A::ring_step(engine));
+    CHECK_EQ(loan(), (int64_t)0);
+    A::tick(engine, rad_mono_ns() + 10 * kHold);
+    CHECK_EQ(A::floor(engine), (int64_t)2048);
+    CHECK_EQ(loan(), (int64_t)0);
+
+    /* A 300-row turn behind that: the region is free, and the turn is still not staged. */
+    REQUIRE_EQ(A::step(engine, &turn), RAD_OK);
+    CHECK(st.ring() == nullptr);
+    CHECK(!A::ring_step(engine));
+    CHECK_EQ(loan(), (int64_t)0);
+    A::tick(engine, rad_mono_ns());
+    CHECK_EQ(loan(), (int64_t)0);                      /* within the floor's time of the chunk */
+
+    /* Layers staged ahead by a full-plan pass: a 300-row chunk behind it is handed the region to
+     * take them from and holds the floor; decode rows are handed nothing. */
+    const auto stage_ahead = [&] {
+        REQUIRE_EQ(A::step(engine, &full), RAD_OK);
+        st.set_next_prefill(true);
+        REQUIRE(st.begin_pass(&full));
+        for (int h = 0; h < rig.n_ops; ++h) {
+            bool resync = false;
+            CHECK_OK(st.before_op(h, A::stream(engine), &resync));
+            CHECK_OK(st.after_op(h, A::stream(engine)));
+        }
+        CHECK_OK(st.end_pass(A::stream(engine)));
+        CHECK(st.adopts(&turn));
+    };
+    stage_ahead();
+    REQUIRE_EQ(A::step(engine, &turn), RAD_OK);
+    CHECK(st.ring() == st.ring_full());
+    CHECK(A::ring_step(engine));
+    CHECK_EQ(loan(), (int64_t)0);
+    CHECK(st.begin_pass(&turn));
+    CHECK(!st.staged());
+    CHECK_OK(st.end_pass(A::stream(engine)));
+    stage_ahead();
+    REQUIRE_EQ(A::step(engine, &dec), RAD_OK);
+    CHECK(st.ring() == nullptr);
+    CHECK(!A::ring_step(engine));
+    CHECK(!st.begin_pass(&dec));
+    CHECK_OK(rad_stream_sync(m.transfer_stream()));
+    CHECK_OK(rad_stream_sync(A::stream(engine)));
+}
+
+/* Backlog M-19 (a), after M-03b. Below min_rows, the pass that always finds the ring, the stager
+ * arms for a prompt chunk of arm_rows or more and for nothing else: a 720-row lone prompt or last
+ * chunk is staged, a 300-row turn and a decode step of any size below min_rows are not, and a
+ * decode step keeps the rule it had at min_rows. Such a chunk runs at a smaller arena level, so
+ * its ring is in the second place: the pass moves the ring there, and the next full-plan pass
+ * moves it back. A stager bound with no floor arms as before. */
+TEST(the_stager_arms_for_a_prompt_chunk_from_arm_rows_in_the_rings_second_place) {
+    StagerRig r;
+    REQUIRE(r.build() >= 0);
+    const int kL = StagerRig::kL;
+    /* The served shape's numbers: a step of more than 1024 rows always finds the ring, and a
+     * prompt chunk is staged from 640. */
+    PrefillStager st;
+    CHECK_OK(st.init(r.f.prog, r.plan, &r.m, r.region, r.low, r.ring, 1025, 640));
+    REQUIRE(st.enabled());
+    CHECK_EQ(st.min_rows(), (int64_t)1025);
+    CHECK_EQ(st.arm_rows(), (int64_t)640);
+    CHECK(st.ring() == nullptr);
+
+    RadBatch full = chunk_of(1984), tail = chunk_of(720), turn = chunk_of(300);
+    RadBatch mixed = chunk_of(720, RAD_PHASE_MIXED), dec = chunk_of(720, RAD_PHASE_DECODE);
+    RadBatch draft = tail;
+    draft.draft_pass = -1;
+
+    /* The predicate the engine asks before it decides where the ring is. */
+    CHECK(st.arms_for(&tail));
+    CHECK(st.arms_for(&mixed));
+    CHECK(st.arms_for(&full));
+    CHECK(!st.arms_for(&turn));
+    CHECK(!st.arms_for(&dec));
+    CHECK(!st.arms_for(&draft));
+    CHECK(!st.arms_for(nullptr));
+    /* The floor, to the row: the resumed turns closed/M-03b.md lost on (252, 305, 379 rows) and
+     * a lone 256-row prompt (tail742) are under it, pf6's 720-row last chunk and a lone 723-row
+     * prompt (tail2560) over it. */
+    struct { int64_t rows; bool arms; } const at[] = {
+        { 252, false }, { 256, false }, { 305, false }, { 379, false }, { 380, false },
+        { 639, false }, { 640, true }, { 720, true }, { 723, true }, { 1024, true },
+    };
+    st.set_ring(st.ring_low());
+    for (const auto& a : at) {
+        const RadBatch b = chunk_of(a.rows);
+        CHECK_EQ(st.arms_for(&b), a.arms);
+        CHECK_EQ(st.begin_pass(&b), a.arms);          /* given a ring, exactly those arm */
+        CHECK_EQ(st.staged(), a.arms);
+        if (a.arms) CHECK_OK(st.end_pass(r.compute));
+        CHECK(r.all_home());
+    }
+    CHECK(!st.adopts(&tail));                         /* nothing is staged ahead */
+
+    /* No ring, no pass. */
+    st.set_ring(nullptr);
+    CHECK(!st.begin_pass(&tail));
+    CHECK(!st.begin_pass(&full));
+
+    /* A lone 720-row prompt: the second place. The ring was last in the region, so the pass moves
+     * it, and every layer reads copies there. */
+    st.set_ring(st.ring_low());
+    CHECK(st.ring() == r.low);
+    CHECK(st.begin_pass(&tail));
+    CHECK(st.staged());
+    r.run_pass(st, 0, r.low);
+    CHECK_OK(st.end_pass(r.compute));
+    CHECK(r.all_home());
+    CHECK_EQ(r.m.stats().stage_layers, (uint64_t)kL);
+    /* A chunk beside decode rows the same, the ring already there. */
+    CHECK(st.begin_pass(&mixed));
+    r.run_pass(st, 0, r.low);
+    CHECK_OK(st.end_pass(r.compute));
+    CHECK(r.all_home());
+
+    /* Given the same ring, a 300-row turn, decode rows and a draft pass do not arm. */
+    CHECK(!st.begin_pass(&turn));
+    CHECK(!st.staged());
+    CHECK(!st.begin_pass(&dec));
+    CHECK(!st.begin_pass(&draft));
+    CHECK(r.all_home());
+    /* A decode step of min_rows arms as it always did, a smaller one not. */
+    dec.n_tok = 1025;
+    st.set_ring(st.ring_full());
+    CHECK(st.begin_pass(&dec));
+    CHECK_OK(st.end_pass(r.compute));
+    dec.n_tok = 1024;
+    CHECK(!st.begin_pass(&dec));
+
+    /* The next full-plan chunk has the region again: the ring moves back. */
+    CHECK(st.begin_pass(&full));
+    r.run_pass(st, 0, r.region);
+    CHECK_OK(st.end_pass(r.compute));
+    CHECK(r.all_home());
+    CHECK_EQ(r.m.stats().stage_overflow, (uint64_t)0);
+
+    /* A stager bound with no floor: min_rows is the whole rule. */
+    CHECK_OK(rad_stream_sync(r.m.transfer_stream()));
+    std::vector<char> mem2((size_t)(2 * r.ring));
+    PrefillStager plain;
+    CHECK_OK(plain.init(r.f.prog, r.plan, &r.m, mem2.data(), mem2.data() + r.ring, r.ring, 1025));
+    REQUIRE(plain.enabled());
+    CHECK_EQ(plain.arm_rows(), (int64_t)0);
+    CHECK(!plain.arms_for(&tail));
+    plain.set_ring(plain.ring_low());
+    CHECK(!plain.begin_pass(&tail));
+    plain.set_ring(plain.ring_full());
+    CHECK(!plain.begin_pass(&tail));
+    CHECK(plain.begin_pass(&full));
+    CHECK_OK(plain.end_pass(r.compute));
+}
+
+/* Backlog M-19 (a), the warm half. A full-plan pass stages the next chunk's first layers ahead,
+ * in the region. While the region is still the stager's, the chunk behind it keeps the ring
+ * there: it adopts those layers and stages only the rest. Moved to the second place instead (the
+ * region lent), the ring starts empty and the layers staged ahead are withdrawn unread: the
+ * chunk stages every layer itself. */
+TEST(a_chunk_behind_a_staged_pass_keeps_the_ring_and_adopts_the_layers_staged_ahead) {
+    StagerRig r;
+    REQUIRE(r.build() >= 0);
+    const int kL = StagerRig::kL;
+    PrefillStager st;
+    CHECK_OK(st.init(r.f.prog, r.plan, &r.m, r.region, r.low, r.ring, 1025, 640));
+    REQUIRE(st.enabled());
+    const int lead = (int)PrefillStager::lead();
+    REQUIRE(lead >= 1 && lead < kL);
+    RadBatch full = chunk_of(1984), tail = chunk_of(720);
+
+    /* Layers the last chunk staged at its first op and over the whole pass, behind a full-plan
+     * pass that expected it, with the ring for it in `place`. */
+    struct Staged { uint64_t first_op, pass; };
+    auto last_chunk = [&](char* place) {
+        st.set_ring(st.ring_full());
+        st.set_next_prefill(true);
+        CHECK(st.begin_pass(&full));
+        r.run_pass(st, 0, r.region);
+        CHECK_OK(st.end_pass(r.compute));
+        for (int l = 0; l < kL; ++l) CHECK(l < lead ? r.in_place(l, r.region) : r.at_home(l));
+        CHECK(st.adopts(&tail));
+
+        st.set_ring(place);
+        st.set_next_prefill(false);
+        const uint64_t before = r.m.stats().stage_layers;
+        CHECK(st.begin_pass(&tail));
+        CHECK(st.staged());
+        if (place != r.region) CHECK(r.all_home());   /* withdrawn before the ring moves */
+        bool resync = false;
+        CHECK_OK(st.before_op(0, r.compute, &resync));
+        const uint64_t first = r.m.stats().stage_layers - before;
+        CHECK_OK(st.after_op(0, r.compute));
+        r.run_pass(st, 1, place);
+        CHECK_OK(st.end_pass(r.compute));
+        CHECK(r.all_home());
+        CHECK(!st.adopts(&tail));
+        return Staged{ first, r.m.stats().stage_layers - before };
+    };
+    const Staged warm = last_chunk(r.region);
+    CHECK_EQ(warm.first_op, (uint64_t)0);             /* its first layers are there already */
+    CHECK_EQ(warm.pass, (uint64_t)(kL - lead));
+    const Staged moved = last_chunk(r.low);
+    CHECK(moved.first_op > 0);
+    CHECK_EQ(moved.pass, (uint64_t)kL);
+    CHECK_EQ(r.m.stats().stage_overflow, (uint64_t)0);
+}
+
+/* Across a turn. A conversation's last chunk has nothing behind it in its own prompt, so its
+ * pass stages nothing ahead; the answer's decode steps and their draft passes follow, and then the
+ * next turn's chunk. While the arena still holds the region the engine hands that chunk the ring
+ * where the last staged pass left it: a turn of arm_rows or more is staged there from its first
+ * layer without the ring moving, and a smaller turn is not staged and has nothing to take. What
+ * a turn finds warm is the ring's place, not layers: none are staged across it. */
+TEST(across_a_turn_the_ring_stays_in_place_and_no_layer_is_staged_for_the_turn) {
+    StagerRig r;
+    REQUIRE(r.build() >= 0);
+    const int kL = StagerRig::kL;
+    PrefillStager st;
+    CHECK_OK(st.init(r.f.prog, r.plan, &r.m, r.region, r.low, r.ring, 1025, 640));
+    REQUIRE(st.enabled());
+    RadBatch last = chunk_of(1453), turn = chunk_of(700), small = chunk_of(305);
+    RadBatch dec = chunk_of(1, RAD_PHASE_DECODE);
+    RadBatch draft = dec;
+    draft.draft_pass = -1;
+
+    auto answer = [&] {                    /* the conversation's last chunk, then its decode */
+        st.set_ring(st.ring_full());
+        st.set_next_prefill(false);
+        CHECK(st.begin_pass(&last));
+        r.run_pass(st, 0, r.region);
+        CHECK_OK(st.end_pass(r.compute));
+        CHECK(r.all_home());
+        for (int k = 0; k < 4; ++k) {
+            st.set_ring(nullptr);                      /* a decode step's level lends both places */
+            CHECK(!st.begin_pass(&dec));
+            CHECK(!st.begin_pass(&draft));
+        }
+        CHECK(!st.staged());
+        CHECK(!st.adopts(&turn));                      /* nothing was staged for the turn */
+        CHECK(r.all_home());
+    };
+
+    /* A 700-row turn, the region still the stager's: staged where the ring is, every layer by
+     * this pass itself (none adopted), and nothing moved. */
+    answer();
+    uint64_t before = r.m.stats().stage_layers;
+    st.set_ring(st.ring_full());
+    CHECK(st.begin_pass(&turn));
+    CHECK(st.staged());
+    r.run_pass(st, 0, r.region);
+    CHECK_OK(st.end_pass(r.compute));
+    CHECK(r.all_home());
+    CHECK_EQ(r.m.stats().stage_layers - before, (uint64_t)kL);
+
+    /* The same turn once the slab has the region back: the second place, the ring moved there. */
+    answer();
+    before = r.m.stats().stage_layers;
+    st.set_ring(st.ring_low());
+    CHECK(st.begin_pass(&turn));
+    r.run_pass(st, 0, r.low);
+    CHECK_OK(st.end_pass(r.compute));
+    CHECK_EQ(r.m.stats().stage_layers - before, (uint64_t)kL);
+
+    /* A 305-row turn: not staged, in either place, and it takes nothing. */
+    answer();
+    before = r.m.stats().stage_layers;
+    for (char* place : { st.ring_full(), st.ring_low(), (char*)nullptr }) {
+        st.set_ring(place);
+        CHECK(!st.begin_pass(&small));
+        CHECK(!st.staged());
+    }
+    CHECK_EQ(r.m.stats().stage_layers, before);
+    CHECK(r.all_home());
+    CHECK_EQ(r.m.stats().stage_overflow, (uint64_t)0);
+}
+
+/* The other case of the warm half: the chunk behind turns out too small to arm. While the ring is
+ * still where the layers staged ahead are, the pass takes them -- its first layers read the
+ * copies, each given back in order -- and stages nothing itself; they are not withdrawn unread.
+ * Decode rows, a moved ring or no ring at all still return them home before the pass. */
+TEST(a_chunk_too_small_to_arm_takes_the_layers_staged_ahead_while_the_ring_is_kept) {
+    StagerRig r;
+    REQUIRE(r.build() >= 0);
+    const int kL = StagerRig::kL;
+    PrefillStager st;
+    CHECK_OK(st.init(r.f.prog, r.plan, &r.m, r.region, r.low, r.ring, 1025, 640));
+    REQUIRE(st.enabled());
+    const int lead = (int)PrefillStager::lead();
+    REQUIRE(lead >= 1 && lead < kL);
+    RadBatch full = chunk_of(1984), small = chunk_of(300), mixed = chunk_of(300, RAD_PHASE_MIXED);
+    RadBatch dec = chunk_of(300, RAD_PHASE_DECODE);
+    RadBatch draft = small;
+    draft.draft_pass = -1;
+
+    auto stage_ahead = [&]() {
+        st.set_ring(st.ring_full());
+        st.set_next_prefill(true);
+        CHECK(st.begin_pass(&full));
+        CHECK(st.staged());
+        r.run_pass(st, 0, r.region);
+        CHECK_OK(st.end_pass(r.compute));
+        for (int l = 0; l < kL; ++l) CHECK(l < lead ? r.in_place(l, r.region) : r.at_home(l));
+    };
+
+    /* Nothing staged ahead: the small chunk has nothing to take, ring or not. */
+    st.set_ring(st.ring_full());
+    CHECK(!st.adopts(&small));
+    CHECK(!st.begin_pass(&small));
+
+    for (const RadBatch* b : { &small, &mixed }) {
+        stage_ahead();
+        CHECK(st.adopts(b));
+        CHECK(!st.arms_for(b));
+        st.set_ring(st.ring_full());                  /* the region is still the stager's */
+        st.set_next_prefill(false);
+        const uint64_t before = r.m.stats().stage_layers;
+        const uint64_t units = r.m.stats().staged_units;
+        CHECK(st.begin_pass(b));                      /* it takes part ... */
+        CHECK(!st.staged());                          /* ... and stages nothing */
+        for (int l = 0; l < lead; ++l) CHECK(r.in_place(l, r.region));
+        r.run_pass(st, 0, nullptr, lead, r.region);
+        CHECK_OK(st.end_pass(r.compute));
+        CHECK(r.all_home());
+        CHECK_EQ(r.m.stats().stage_layers, before);
+        CHECK_EQ(r.m.stats().staged_units, units);
+        CHECK(!st.adopts(b));
+    }
+
+    /* A draft pass in between leaves them, and the small chunk after it still takes them. */
+    stage_ahead();
+    st.set_ring(st.ring_full());
+    CHECK(!st.begin_pass(&draft));
+    for (int l = 0; l < lead; ++l) CHECK(r.in_place(l, r.region));
+    CHECK(st.begin_pass(&small));
+    r.run_pass(st, 0, nullptr, lead, r.region);
+    CHECK_OK(st.end_pass(r.compute));
+    CHECK(r.all_home());
+
+    /* Decode rows: withdrawn, as before. */
+    stage_ahead();
+    CHECK(!st.adopts(&dec));
+    st.set_ring(st.ring_full());
+    CHECK(!st.begin_pass(&dec));
+    CHECK(r.all_home());
+    /* The ring's other place, or none: the layers are not where the pass would read them. */
+    stage_ahead();
+    st.set_ring(st.ring_low());
+    CHECK(!st.begin_pass(&small));
+    CHECK(r.all_home());
+    stage_ahead();
+    st.set_ring(nullptr);
+    CHECK(!st.begin_pass(&small));
+    CHECK(r.all_home());
+
+    /* A pass that starts at another layer than the staged ones (a slice) gives them back at its
+     * first op and reads everything where it lives. */
+    stage_ahead();
+    st.set_ring(st.ring_full());
+    CHECK(st.begin_pass(&small));
+    {
+        bool resync = false;
+        const int h0 = 2 * lead + 1;                  /* attn of layer `lead` */
+        CHECK_OK(st.before_op(h0, r.compute, &resync));
+        CHECK(resync);
+        CHECK(r.all_home());
+        CHECK_OK(st.after_op(h0, r.compute));
+        r.run_pass(st, h0 + 1, nullptr, 0, r.region);
+    }
+    CHECK_OK(st.end_pass(r.compute));
+    CHECK(r.all_home());
+
+    /* And the stager stages a full pass as ever afterwards. */
+    st.set_next_prefill(false);
+    CHECK(st.begin_pass(&full));
+    r.run_pass(st, 0, r.region);
+    CHECK_OK(st.end_pass(r.compute));
+    CHECK(r.all_home());
+    CHECK_EQ(r.m.stats().stage_overflow, (uint64_t)0);
 }
 
 TEST(mover_reserves_from_the_weight_pool_rather_than_beside_it) {

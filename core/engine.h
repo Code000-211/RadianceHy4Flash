@@ -239,6 +239,7 @@ private:
     friend struct TableFillTestAccess;
     friend struct TableResolveTestAccess;
     friend struct LoadGateTestAccess;
+    friend struct EngineArenaTestAccess;
     /* One thread per tensor-parallel rank, each owning one device. Ranks share the address
      * space, so there is no IPC or serialisation and the step batch is shared by pointer rather
      * than broadcast (spec §1). */
@@ -916,6 +917,10 @@ private:
      * while, so a run of prefill chunks does not refill and recall the slab between chunks. */
     int  arena_step(const RadBatch* b, bool ahead);
     void arena_tick(uint64_t now_ns);
+    /* The prefill stagers' two floors over the ranks, for the scheduler (Engine::serve): the
+     * smallest pass every rank's stager arms for, and the smallest prompt chunk below it; 0
+     * where no rank has a stager. */
+    void stager_floors(int64_t* stage_rows, int64_t* arm_rows) const;
     int  arena_level(int64_t rows) const;
     std::vector<int64_t> arena_rows_;
     /* The span's shared level (Engine::probe_arena_levels): the rows of the level a step of one
@@ -925,6 +930,9 @@ private:
     int64_t  arena_floor_ = 0;
     int64_t  arena_last_ = 0;
     uint64_t arena_floor_ns_ = 0;
+    /* The latest step runs below the full plan and is staged all the same (arena_step): the
+     * floor does not fall while it is the latest. */
+    bool     arena_ring_step_ = false;
     /* VRAM the budget reserves for allocations after start(), on top of --gpu-headroom-mib: the
      * step batch's staging (allocated by serve()) and what is built on first use, if ever (the KV
      * tiers' copy staging, the second compute lane's queue). Bring-up's final VRAM reading is

@@ -1571,8 +1571,9 @@ void Scheduler::log_span_min() const {
     }
 }
 
-void Scheduler::set_stage_rows(int64_t rows) {
+void Scheduler::set_stage_rows(int64_t rows, int64_t arm_rows) {
     stage_rows_ = rows > 0 ? rows : 0;
+    stage_arm_rows_ = arm_rows > 0 && arm_rows < stage_rows_ ? arm_rows : stage_rows_;
     const int64_t n = cfg_.busy_prefill_chunk;
     if (n == 0) {
         RAD_INFO("scheduler: --busy-prefill-chunk off: a prefill chunk takes every token the step "
@@ -3232,7 +3233,7 @@ bool Scheduler::prefill_continues(bool next_plan) const {
         if (!e.is_prefill || e.slot < 0 || (size_t)e.slot >= reqs_.size() || !reqs_[(size_t)e.slot])
             continue;
         const int64_t left = reqs_[(size_t)e.slot]->seq_len() - ((int64_t)e.ctx_len + e.n_tokens);
-        if (left >= stage_rows_) return true;
+        if (left >= stage_arm_rows_) return true;
     }
     return false;
 }
