@@ -6510,12 +6510,19 @@ static const RadTunable tAttnSplit[] = {
  * tests/r4d_emu/test_mla_sink.cpp, pinned and by this axis). 0 is the launcher's law: the widest
  * group that still leaves 64 workgroups, two to each of the card's 32 WGPs. A group the shape
  * cannot fill more than half is refused at launch, so a sweep only pays for the points it can use.
- * The planned `rt`, `sw` (F2.2) and `kb` (F2.3) kernels are not in the tree yet; when they land
- * they join this table. */
+ * The planned `rt` and `sw` (F2.2) kernels are not in the tree yet; when they land they join
+ * this table.
+ *
+ * `kb` (K-41): key buffers in LDS. One halves the
+ * LDS (a second workgroup a WGP) and pays a third barrier a chunk; every wave has done with the
+ * chunk before it is overwritten, so the bytes are the two buffers' (tests/r4d_emu/test_mla_sink.cpp
+ * and r4d_selftest walk both). */
 static const int64_t kMlaSinkHg[] = { 0, 1, 2, 4 };
+static const int64_t kMlaSinkKb[] = { 2, 1 };
 static const RadTunable tMlaSink[] = {
   { "hg", kMlaSinkHg, NELEM(kMlaSinkHg), 0,
     "sixteen-head groups a workgroup; 0 = the widest that leaves 64 workgroups" },
+  { "kb", kMlaSinkKb, NELEM(kMlaSinkKb), 2, "key buffers in LDS: 2 double-buffers the fetched chunk, 1 stores it in place for 18.7 KiB less" },
 };
 
 /* ------------------------------------------------------- the MoE rows' forms (moe_gemm_q's op)

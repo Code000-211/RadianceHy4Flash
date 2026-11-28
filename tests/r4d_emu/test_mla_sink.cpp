@@ -55,6 +55,9 @@ RadTensor tens(void* p, uint32_t dt, std::vector<int64_t> shape) {
  * selection form reads `sel_bt` / `sel_len`, one table row a query row. */
 struct Problem {
     int heads = 8, bs = 4, window = 0, pages = 0, blocks = 0;
+    /* The key-buffer axis the launch declares: 0 leaves it out (its default, two buffers), 1 is
+     * the single-buffer form. */
+    int kb = 0;
     std::vector<int> qlen, ctx;
     std::vector<int> bt, used, cu;          /* paged */
     std::vector<int> sel_bt, sel_len;       /* selection */
@@ -219,7 +222,8 @@ struct Rope {
  * `scr` (if given) gets the scratch's words after the call: the split form writes its slots' parts
  * there, the fused form only the accumulator of a row and head (`kAccWords` floats).
  * `rope` passes the optional `rope_pos` operand (and its parameters); `qr` replaces the rotary
- * operand's columns, so a folded launch can be compared with a rotated one. */
+ * operand's columns, so a folded launch can be compared with a rotated one. The key-buffer axis
+ * comes from `p.kb`. */
 int launch(const Problem& p, bool sel, int form, std::vector<uint16_t>& out, int stable = -1,
            int64_t scratch_cut = 0, std::vector<uint32_t>* scr = nullptr,
            const Rope* rope = nullptr, const std::vector<uint16_t>* qr = nullptr, int hg = 0) {
@@ -249,6 +253,7 @@ int launch(const Problem& p, bool sel, int form, std::vector<uint16_t>& out, int
     ps.i("block_size", p.bs);
     ps.f("scale", kScale);
     if (stable >= 0) ps.i("stable", stable);
+    if (p.kb) ps.i("kb", p.kb);
     /* K-59's rad-tune axis: the workgroup's sixteen-head groups (the form pin is the test hook and
      * wins over it; this picks the group where no pin is set). */
     if (hg) ps.i("hg", hg);
@@ -342,7 +347,8 @@ bool close_to(const std::vector<uint16_t>& got, const std::vector<double>& want,
     return bad == 0;
 }
 
-/* Every form against the reference; forms 0..3 (same split count) bit for bit. */
+/* Every form against the reference; forms 0..3 (same split count) bit for bit, and each form with
+ * one LDS key buffer (`kb` 1) bit for bit against the same form's two. */
 void check_forms(const std::string& name, const Problem& p, bool sel) {
     const std::vector<double> want = sel ? ref_sel(p) : ref_paged(p);
     std::vector<uint16_t> first;
@@ -365,7 +371,15 @@ void check_forms(const std::string& name, const Problem& p, bool sel) {
             ok = false;
             note += " (bytes differ from the rule's form)";
         }
-        report(name + (sel ? " sel" : " paged") + " form " + std::to_string(form), ok, note.c_str());
+        Problem single = p;
+        single.kb = 1;
+        std::vector<uint16_t> one;
+        if (launch(single, sel, form, one) != RAD_OK || one != out) {
+            ok = false;
+            note += " (kb 1 differs)";
+        }
+        report(name + (sel ? " sel" : " paged") + " form " + std::to_string(form), ok,
+               note.c_str());
     }
 }
 
@@ -473,14 +487,18 @@ void check_stable(const std::string& name, const Problem& p, bool forms_pins = t
         }
     report(name + " stable 1: every row == its one-row launch (bytes)", same);
     if (forms_pins) {
-        bool forms = true;
+        bool forms = true, kb1 = true;
         for (int form : { 1, 2, 3, 5, 6 }) {
             if ((form == 2 && p.heads <= 16) || (form == 5 && p.heads <= 32)) continue;
-            std::vector<uint16_t> o;
+            Problem single = p;
+            single.kb = 1;
+            std::vector<uint16_t> o, k;
             forms = forms && launch(p, false, form, o, 1) == RAD_OK && o == all;
+            kb1 = kb1 && launch(single, false, form, k, 1) == RAD_OK && k == o;
         }
         report(name + " stable 1: HG 1 / 2 / 4, the element load and the fused form equal (bytes)",
                forms);
+        report(name + " stable 1: every form with one key buffer (kb 1) equal (bytes)", kb1);
         /* K-59: the `hg` axis rad-tune walks takes the same workgroup widths the form pins do, and
          * the bytes do not move. The pin is off here, so only the axis picks the group; a value the
          * shape cannot fill more than half (heads > 16 * (hg / 2), the law's own bound) must be
@@ -852,6 +870,15 @@ int main(int argc, char** argv) {
                     b % 13 == 5 ? -1 : b % 11 == 7 ? p.pages + 1 : (b * 7 + r * 3) % p.pages;
         p.sel_len = { 0, 77, 200 };
         check_forms("sel scattered", p, true);
+    }
+    /* The `kb` axis declares the two values its instances exist for; anything else is refused
+     * there rather than launched at a form that is not compiled. */
+    {
+        Problem p;
+        make_paged(p, { 2 }, { 200 }, 16, 4, 512, false, rng);
+        p.kb = 3;
+        std::vector<uint16_t> o;
+        report("kb 3 refused (RAD_E_SHAPE)", launch(p, false, 0, o) == RAD_E_SHAPE);
     }
     std::printf("%s\n", g_fail ? "FAILED" : "all passed");
     return g_fail ? 1 : 0;

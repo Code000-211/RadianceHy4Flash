@@ -21675,7 +21675,8 @@ static void mla_paged_check(const Plugin& pl, std::vector<int64_t> qlen, std::ve
 /* mla_attn_paged_sink / mla_attn_sel_sink (Hy4-flash) against libref, and their byte promises:
  * verify rows equal the single-row decode at each position, the paged form at window 0 equals the
  * selection form over the same pages, the launch forms (16 or 32 heads a workgroup, element-wise
- * key load) agree bit for bit. Pitched q / q_rope / out with poisoned margins; an unmapped page;
+ * key load) agree bit for bit, and the LDS key-buffer axis (`kb` 1, K-41) agrees with the default
+ * two on every form. Pitched q / q_rope / out with poisoned margins; an unmapped page;
  * sinks from -1000 to 1000. */
 struct SinkOps {
     std::vector<RadTensor> host;
@@ -21690,7 +21691,7 @@ struct SinkOps {
 static SinkOps sink_ops(bool sel, int64_t heads, const std::vector<int64_t>& qlen,
                         const std::vector<int64_t>& ctx, int64_t window, int64_t bs,
                         int64_t sel_keep = 0, uint32_t seed = 1, int stable = -1,
-                        bool fold = false) {
+                        bool fold = false, int kb = 0) {
     SinkOps o;
     const int64_t L = 512, R = 64, S = (int64_t)qlen.size();
     int64_t M = 0, bmax = 1, pages = 0;
@@ -21719,6 +21720,7 @@ static SinkOps sink_ops(bool sel, int64_t heads, const std::vector<int64_t>& qle
     o.ps.push_back(PF("scale", 1 / 16.0));
     o.ps.push_back(PS("dtype", "bf16"));
     if (stable >= 0) o.ps.push_back(PI("stable", stable));
+    if (kb) o.ps.push_back(PI("kb", kb));
     const int n = sel ? 7 : 8;
     o.out = n - 1;
     o.host.assign((size_t)(n + (fold ? 1 : 0)), RadTensor{});
@@ -21931,12 +21933,21 @@ static void mla_sink_check(const Plugin& pl, bool sel, int64_t heads, std::vecto
         ok(fmt("%s max error %.6g", label.c_str(), max_error).c_str(), matches);
         ok(fmt("%s pitched rows and guards", label.c_str()).c_str(), guards);
     }
+    /* K-41's `kb` axis: one key buffer stores each chunk in place, so the barrier in front of the
+     * store must hold out every wave still reading it; the bytes may not move. */
+    {
+        SinkOps k = sink_ops(sel, heads, qlen, ctx, window, bs, sel_keep, 1, stable, fold, 1);
+        std::vector<uint8_t> one;
+        ok(fmt("%s kb 1 == kb 2", label.c_str()).c_str(),
+           sink_device(pl, row, k, 0, one) && one == got);
+    }
     dlclose(ref);
 }
 /* The byte promises on the card. The rows of each sequence against one-row launches at their
  * positions; at window 0 the paged form against the selection form over the same pages; forms
- * 1..3 (5: 64 heads a workgroup; 6: the fused form) against the rule (form 0). With `stable 1`
- * at any row count and number of sequences (WP16 3.4.1: verify == decode at any stream count). */
+ * 1..3 (5: 64 heads a workgroup; 6: the fused form) against the rule (form 0), each also with one
+ * key buffer (`kb` 1). With `stable 1` at any row count and number of sequences (WP16 3.4.1:
+ * verify == decode at any stream count). */
 static void mla_sink_bytes(const Plugin& pl, int64_t heads, std::vector<int64_t> qlen,
                            std::vector<int64_t> ctx, int64_t window, int64_t bs, int stable = -1,
                            bool fold = false) {
@@ -22001,6 +22012,11 @@ static void mla_sink_bytes(const Plugin& pl, int64_t heads, std::vector<int64_t>
         std::vector<uint8_t> g;
         const bool ran = sink_device(pl, paged, all, form, g);
         ok(fmt("%s form %d == rule", label.c_str(), form).c_str(), ran && g == base);
+        /* the same form with one key buffer: the store in place waits for the chunk's readers */
+        SinkOps k = sink_ops(false, heads, qlen, ctx, window, bs, 0, 1, stable, fold, 1);
+        std::vector<uint8_t> g1;
+        const bool ran1 = sink_device(pl, paged, k, form, g1);
+        ok(fmt("%s form %d kb 1 == rule", label.c_str(), form).c_str(), ran1 && g1 == base);
     }
     if (!window) {
         SinkOps s = sink_ops(true, heads, qlen, ctx, 0, bs, 0, 1, stable, fold);

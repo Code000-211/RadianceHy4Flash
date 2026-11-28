@@ -211,6 +211,33 @@ def wp163(src, out):
     x = dict(fx, source='hy4-flash: mla_project_kv at the TP2 / TP4 head shares, WP16.3 heights', cases=new)
     save(x, out); print(len(new), 'cases')
 
+def k41_prefill(src, out):
+    """K-41's points of mla_attn_paged_sink: a 2048-row prefill chunk at the TP2 head shares (16 and
+    32), which the recording only declares up to M 1024 -- the windowed pair (block 16) and the dense
+    one (block 4), cloned from their M 1024 points and recorded again by libref:
+      python3 data/kernels_hy4.py k41_prefill data/kernels_hy4.rkb raw_k41.rkb
+      rad-kbench --fixture raw_k41.rkb --kernels libref --rerecord k41.rkb
+      python3 data/kernels_hy4.py append data/kernels_hy4.rkb k41.rkb data/kernels_hy4.rkb"""
+    fx = load(src)
+    new, salt = [], 41000
+    for c in fx['cases']:
+        if c['op'] != 'mla_attn_paged_sink' or c['m'] != 1024: continue
+        if par(c, 'heads') not in (16, 32): continue
+        new.append(m_clone(c, 2048, salt)); salt += 1
+    # The recording predates the row's optional `rope_pos` operand: the row declares it, the case must
+    # carry it, so the clones hand it over absent (the geometry without positions), as opd_none() does.
+    for c in new:
+        if len(c['opd']) == 8:
+            c['opd'].append(dict(role=0, dtype=11, shape=[c['m']], absent=1, fill=0, flags=0,
+                                 idx_max=0, idx_const=-1, fill_chunk=0, has_enc=0))
+    seen, uniq = set(), []
+    for c in new:
+        k = (c['op'], repr(c['params']), repr([(o['role'], o['dtype'], o['shape']) for o in c['opd']]))
+        if k not in seen: seen.add(k); uniq.append(c)
+    x = dict(fx, source='hy4-flash: mla_attn_paged_sink prefill chunk at M 2048, TP2 head shares (K-41)',
+             cases=uniq)
+    save(x, out); print(len(uniq), 'cases')
+
 def append(base, extra, out):
     """base's cases, then extra's (recorded) ones that base does not have."""
     fx, ex = load(base), load(extra)
@@ -565,4 +592,4 @@ def t04(out, src):
 
 if __name__ == '__main__':
     {'raw': raw, 'merge': merge, 'vis': vis, 'wp163': wp163, 'junction': junction, 'append': append, 'dfly': dfly,
-     'g3': g3, 't04': t04}[sys.argv[1]](*sys.argv[2:])
+     'g3': g3, 't04': t04, 'k41_prefill': k41_prefill}[sys.argv[1]](*sys.argv[2:])
