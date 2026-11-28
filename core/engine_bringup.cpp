@@ -2122,10 +2122,10 @@ int Engine::plan() {
             RadDeviceProps props{};
             rad_dev_props(r->device, &props);
             /* The queue scratch is the code objects', not a constant: the heaviest private
-             * segment the kernels this rank can launch declare, once a card
+             * segment the kernels this rank can launch declare, once per queue this plan opens
              * (core/device/queue_scratch.h). */
             {
-                const RadQueueScratch qs = rad_dev_resident_scratch_bytes(&props);
+                const RadQueueScratch qs = rad_dev_resident_scratch_bytes(&props, f.n_queues);
                 f.queue_scratch    = qs.bytes;
                 f.scratch_private  = qs.largest_private;
                 f.scratch_kernels  = qs.declared;

@@ -72,7 +72,7 @@ struct VramFacts {
      * kernel-argument ring (35.4 MiB per queue on an R9700). */
     int     n_queues    = 0;
     int64_t queue_bytes = 0;
-    int64_t queue_scratch = 0;   /* resident queue scratch (rad_dev_resident_scratch_bytes), once a card */
+    int64_t queue_scratch = 0;   /* resident queue scratch (rad_dev_resident_scratch_bytes), once per queue */
     /* What set `queue_scratch`: the heaviest private_segment_fixed_size among the kernels the
      * registered code objects describe, the kernel that declares it, how many kernels declare one
      * and how many the code objects describe at all, and whether the charge came from those code

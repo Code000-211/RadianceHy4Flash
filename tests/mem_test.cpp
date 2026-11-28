@@ -754,6 +754,18 @@ TEST(queue_scratch_bytes_is_one_wave_a_cu) {
     CHECK_EQ(queue_scratch_bytes(18256, 0, 64), 0);
 }
 
+/* M-09 review: the runtime holds a queue's scratch per queue, so the charge is the per-queue figure
+ * once per queue the plan opens. */
+TEST(queue_scratch_card_charge_is_per_queue) {
+    const int64_t one = queue_scratch_bytes(18256, 96, 64);
+    CHECK_EQ(queue_scratch_card_bytes(18256, 96, 64, 1), one);
+    CHECK_EQ(queue_scratch_card_bytes(18256, 96, 64, 3), 3 * one);
+    /* a plan with no queues charges one rather than zero */
+    CHECK_EQ(queue_scratch_card_bytes(18256, 96, 64, 0), one);
+    /* and nothing declared still charges nothing, however many queues */
+    CHECK_EQ(queue_scratch_card_bytes(0, 96, 64, 3), 0);
+}
+
 /* The fallback the review of #278 asked to see tested: a backend that cannot read code objects
  * keeps the flat 5 MiB a CU bound, and the receipt says which answer it is showing. */
 TEST(queue_scratch_flat_bound_is_five_mib_a_cu_and_zero_for_no_card) {
@@ -773,7 +785,7 @@ TEST(queue_scratch_backend_selection_flats_a_backend_without_metadata) {
     host_props.n_cu = 96;
     host_props.warp_size = 64;
     host_props.is_host_backend = 1;
-    const RadQueueScratch host = rad_dev_resident_scratch_bytes(&host_props);
+    const RadQueueScratch host = rad_dev_resident_scratch_bytes(&host_props, 1);
     CHECK_EQ(host.bytes, 0);
     CHECK(!host.metadata);
     CHECK_EQ(host.largest_private, 0u);
@@ -783,7 +795,7 @@ TEST(queue_scratch_backend_selection_flats_a_backend_without_metadata) {
     unified_props.n_cu = 96;
     unified_props.warp_size = 64;
     unified_props.unified = 1;
-    const RadQueueScratch unified = rad_dev_resident_scratch_bytes(&unified_props);
+    const RadQueueScratch unified = rad_dev_resident_scratch_bytes(&unified_props, 1);
     CHECK_EQ(unified.bytes, 0);
     CHECK(!unified.metadata);
 
@@ -791,7 +803,7 @@ TEST(queue_scratch_backend_selection_flats_a_backend_without_metadata) {
     stub_props.device_id = -1;
     stub_props.n_cu = 96;
     stub_props.warp_size = 64;
-    const RadQueueScratch stub = rad_dev_resident_scratch_bytes(&stub_props);
+    const RadQueueScratch stub = rad_dev_resident_scratch_bytes(&stub_props, 3);
     CHECK_EQ(stub.bytes, queue_scratch_flat_bytes(96));
     CHECK(!stub.metadata);
     CHECK_EQ(stub.largest_private, 0u);
@@ -799,7 +811,7 @@ TEST(queue_scratch_backend_selection_flats_a_backend_without_metadata) {
     CHECK_EQ(stub.total, 0);
     CHECK_EQ(stub.kernel, std::string());
 
-    CHECK_EQ(rad_dev_resident_scratch_bytes(nullptr).bytes, 0);
+    CHECK_EQ(rad_dev_resident_scratch_bytes(nullptr, 3).bytes, 0);
 }
 
 TEST(the_queue_scratch_receipt_names_which_answer_it_shows) {
@@ -9421,19 +9433,19 @@ TEST(a_streamed_op_exists_only_for_a_capable_architecture_and_a_ring) {
 TEST(queue_scratch_is_zero_on_the_host_backend_and_on_unified_memory) {
     RadDeviceProps host{};
     host.is_host_backend = true;
-    RadQueueScratch h = rad_dev_resident_scratch_bytes(&host);
+    RadQueueScratch h = rad_dev_resident_scratch_bytes(&host, 1);
     CHECK_EQ(h.bytes, 0);
     CHECK_EQ(h.largest_private, 0u);
     CHECK(!h.metadata);
 
     RadDeviceProps uni{};
     uni.unified = true;
-    RadQueueScratch u = rad_dev_resident_scratch_bytes(&uni);
+    RadQueueScratch u = rad_dev_resident_scratch_bytes(&uni, 1);
     CHECK_EQ(u.bytes, 0);
     CHECK(!u.metadata);
 
     /* and a null props is the same answer, not a crash */
-    RadQueueScratch n = rad_dev_resident_scratch_bytes(nullptr);
+    RadQueueScratch n = rad_dev_resident_scratch_bytes(nullptr, 1);
     CHECK_EQ(n.bytes, 0);
     CHECK(!n.metadata);
 }

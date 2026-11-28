@@ -912,17 +912,19 @@ int     dev_code_resident(int device, int64_t* bytes, int* modules) {
 }
 
 /* The VRAM the runtime keeps as queue scratch on `p`'s card once kernels with a private segment
- * (spill, or a local array: step_advance's) have been dispatched: the runtime hands a queue ONE
- * scratch allocation at the first such dispatch and grows it when a later one asks for more, so
- * the resident figure is the largest the plan can ask for, once a card. The kernels say what that
- * is: their code object's `private_segment_fixed_size` (kernel_scratch_max in aql.cpp), not a flat
- * bound over every workload. A plan whose modules declare none charges nothing; one whose heaviest
- * declares 18 KiB charges a wave of it on every CU (queue_scratch.h).
+ * (spill, or a local array: step_advance's) have been dispatched: the runtime hands each queue ONE
+ * scratch allocation at the first such dispatch and grows it when a later one asks for more, so the
+ * resident figure is the largest the plan can ask for, once per queue the plan opens. The kernels
+ * say how large: their code object's `private_segment_fixed_size` (kernel_scratch_max in aql.cpp),
+ * not a flat bound over every workload. A plan whose modules declare none charges nothing; one whose
+ * heaviest declares 18 KiB charges a wave of it on every CU, per queue (queue_scratch.h).
  *
- * The flat bound it replaces was 5 MiB a CU (the R9700 reports 32), 160 MiB, over the 114 MiB a
- * speculative step first showed and the 150 MiB a larger segment did. That is still the answer on
- * a backend that cannot read code objects, and the receipt labels it. */
-RadQueueScratch rad_dev_resident_scratch_bytes(const RadDeviceProps* p) {
+ * The flat bound it replaces was 5 MiB a CU (the R9700 reports 32), 160 MiB a card, over the 114 MiB
+ * a speculative step first showed and the 150 MiB a larger segment did -- figures that are three
+ * queues' worth, which is why the per-queue charge is multiplied by the plan's queue count. That
+ * flat bound is still the answer on a backend that cannot read code objects, and the receipt labels
+ * it. */
+RadQueueScratch rad_dev_resident_scratch_bytes(const RadDeviceProps* p, int n_queues) {
     RadQueueScratch out;
     if (!p || p->is_host_backend || p->unified) return out;
     uint32_t largest = 0;
@@ -937,7 +939,15 @@ RadQueueScratch rad_dev_resident_scratch_bytes(const RadDeviceProps* p) {
         out.total = total;
         out.metadata = true;
         out.kernel = std::move(name);
-        out.bytes = queue_scratch_bytes(largest, p->n_cu, p->warp_size);
+        if (out.total == 0) {
+            /* No code object registered yet: the modules load later and their queues keep what
+             * they take then, so nothing is known and the flat bound is the answer, labelled. */
+            out.metadata = false;
+            out.bytes = queue_scratch_flat_bytes(p->n_cu);
+            out.kernel.clear();
+            return out;
+        }
+        out.bytes = queue_scratch_card_bytes(largest, p->n_cu, p->warp_size, n_queues);
         return out;
     }
     /* No metadata: the bound the flat term always was, and the receipt says so (metadata stays

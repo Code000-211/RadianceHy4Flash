@@ -41,7 +41,9 @@ inline uint32_t queue_scratch_align(int wave) {
 }
 
 /* The charge in bytes for one card. `largest_private` is the largest private_segment_fixed_size
- * among the kernels the plan launches, `n_cu` the card's compute units, `wave` its lanes a wave. */
+ * among the kernels the plan launches, `n_cu` the card's compute units, `wave` its lanes a wave.
+ * The runtime holds a queue's scratch per queue (ROCr aql_queue.cpp keeps `device_size` on the
+ * queue), so a plan that opens `n_queues` queues charges the per-queue figure that many times. */
 inline int64_t queue_scratch_bytes(uint32_t largest_private, int n_cu, int wave) {
     if (n_cu <= 0) return 0;
     const uint32_t a = queue_scratch_align(wave);
@@ -49,6 +51,13 @@ inline int64_t queue_scratch_bytes(uint32_t largest_private, int n_cu, int wave)
     if (per_thread > 0) per_thread = (per_thread + a - 1) / a * a;
     const int64_t lanes = wave > 0 && wave <= 1024 ? wave : 1;
     return per_thread * lanes * (int64_t)n_cu;
+}
+
+/* The same, a card: the per-queue charge above, once per queue the plan opens. A plan with no
+ * queues (`n_queues <= 0`) charges one, so the figure cannot go to zero by arithmetic. */
+inline int64_t queue_scratch_card_bytes(uint32_t largest_private, int n_cu, int wave, int n_queues) {
+    const int q = n_queues > 0 ? n_queues : 1;
+    return queue_scratch_bytes(largest_private, n_cu, wave) * (int64_t)q;
 }
 
 /* The bound for a backend that cannot read code objects: what the term always was, 5 MiB a CU.

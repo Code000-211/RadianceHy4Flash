@@ -200,7 +200,7 @@ namespace rad {
 
 /* The queue scratch this card will keep for a plan that loads the modules registered so far: the
  * heaviest private_segment_fixed_size among the kernels those code objects describe, through
- * queue_scratch_bytes() -- one wave a CU, once a card. There is no deployment knob: the item asks
+ * queue_scratch_bytes() -- one wave a CU, once per queue the plan opens. There is no deployment knob: the item asks
  * for the metadata charge, so the metadata is the charge. A module loads whole at its first kernel,
  * so every kernel of it is one the program can launch: `declared` counts the ones with a private
  * segment, `total` every kernel the code objects describe, and `kernel` names the heaviest.
@@ -215,7 +215,7 @@ struct RadQueueScratch {
     bool        metadata = false;      /* the charge came from the code objects */
     std::string kernel;                /* the kernel that carries `largest_private` */
 };
-RadQueueScratch rad_dev_resident_scratch_bytes(const RadDeviceProps* props);
+RadQueueScratch rad_dev_resident_scratch_bytes(const RadDeviceProps* props, int n_queues);
 /* A recorded pass, owned by the backend that recorded it. See DeviceBackend::tape_begin. */
 typedef void* RadTape;
 
