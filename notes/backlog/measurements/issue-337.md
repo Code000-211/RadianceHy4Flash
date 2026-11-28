@@ -209,3 +209,59 @@ no longer printed as "in no range this process holds". In the dump above that wo
 - **The issue's three bench questions**, one command each with the knobs above, on that box.
 - **The decode/TTFT pair** (3 + 3 runs on a ~100k prefix-cache hit) for whichever change fixes it.
   This record's row (section 2) is the same workload at the merge base, for comparison.
+
+## 6. Session 2836 (2026-11-28): the reporter's own tree, and why neither box could arm it
+
+The arm this record has been missing is the reporter's *own* build: section 2's base arm ran `82b82ce8`
+(a merge base), not `e3834473`. This session built `e3834473` itself and tried to arm it.
+
+**The base tree.** `git archive e3834473` into `.base-337/` (gitignored, never committed), configured
+with the repo's own HIP compiler and built whole: `-DCMAKE_HIP_COMPILER=/opt/rocm-repeatable/lib/llvm/bin/clang++`,
+`-DRAD_HIP_VOPD_REPEATABLE=ON -DRAD_WITH_HIP=ON -DRAD_GPU_TARGETS=gfx1201`, 1293 targets, OK
+(`.base-337/build/bin/radiance`). The reporter's tree predates the harness: `scripts/repro-337.sh` is
+not in it, so an arm on that tree needs `scripts/repro-337.sh` and `scripts/agentreplay.py` copied in
+from this tree first (they drive the server over HTTP and know nothing the old engine lacks). That is
+worth knowing before anyone repeats the done criterion's "three runs on `e3834473`".
+
+**This box could not arm either tree.** `fuser -v /dev/kfd` here holds other runs' processes throughout
+this session: `rad-kbench` (pid 3928275, run-2830, from 13:18) and `device_test` (pid 3944264,
+trial-31), then two `radiance` servers (pids 4099659, 4135420) and another `rad-kbench` (4127614).
+Card 1 (rank 0) reported 5.08 GB used when the head arm ran and 31.4 GB later. Consequences:
+
+- The head arm (section 2's workload, this tree) did run, from 12:47, while the box was still nearly
+  free: `already held 341.71 MiB`, 26 requests, largest prompt **129,326** (cache 126,928), **0**
+  `the AQL queue faulted` / `GPU memory fault`, `ttft 1.43-2.68 s`, `69.2-83.6 tok/s` on the requests
+  above 99k, 93 linear checkpoints written. The low end of the decode rates in that log (37.3 tok/s)
+  is the other runs arriving at 13:18-13:20, not the engine.
+- The base arm (`e3834473`) was attempted after those runs had taken the cards and **refused at
+  startup**: `already held 3.80 GiB`, then
+  `W one --max-model-len sequence's cache (3.70 GiB) leaves the experts 18.27 GiB, short of the 19.67 GiB
+  the pinned host pool cannot hold: raise --host-pool-mib or lower --max-model-len`.
+  So that attempt says nothing about the fault: the box was not the reporter's box.
+
+**iks could not give a TP2 pair either.** The `e3834473` tree was delivered (`RadianceHy4Flash-2836-base`)
+and built there. Its TP2 arm printed `gpu2: waiting for 2 free card(s)` and stayed there: one card was
+held for **10 h 15 min** by a leaked `./build/tests/place_test` (pid 1482737, not this run's, left alone)
+and another by run-2830's `rad-kbench` (pid 3920481), so at most one card was ever free. The same tree
+was armed on that one card instead (`TP=1`, `LEN=163840`) and **refused at startup**:
+`W startup report: weights-from-disk: 20.68 GiB of weights a rank are read from the container on disk as
+they are needed. Fix: a larger --host-pool-mib (if RAM allows) or more VRAM for the weights`, then
+`E startup stopped: out of memory`. So the issue's question (c) has no TP1 answer at this config: one
+card cannot serve it, and the engine already refuses it at startup with a named reason.
+
+Bottom line: `e3834473` still has not run on a clean pair of cards in this project. Every arm this
+session was blocked by the machines (other runs' cards), not by the engine.
+
+**Checks run this session (no GPU needed).**
+
+- `python3 tests/chain_scalar_audit.py build /tmp/scalar-audit-head --check`: `chained kernels 2604:
+  keep s_dcache_inv 1696, skip it 908, of those with a scalar load behind the acquire 0` - so no kernel
+  in this tree reads a table scalar-wise behind a vector-only acquire, which is the one way a chained
+  launch could read a stale id and compute a wild address.
+- `ctest --test-dir build -LE 'gpu|oot' -j 16`: 226 of 239 passed. The 13 failures are this box, not
+  this tree (this change touches no code): `bailing_hybrid_arch_test`, `mtp_block_test`,
+  `tokenizer_test` and `hostbench_test_perf` went over `RAD_TEST_CPU_BUDGET` (11.03 s / 10 s,
+  41.70 s / 40 s, 29.55 s / 20 s) under the load of the other runs' builds; `engine_e2e_test` could not
+  read `data/recipes/gemma4-31b-dense-bf16-w4a8-df2.recipe`; `device_test`, `avx_check`,
+  `r4d_emu_mla_sink` (120 s timeout) want an idle card or an idle box. Re-run them on a free box before
+  reading anything into them.

@@ -14,3 +14,6 @@ __pycache__/
 
 # the RDNA4 ISA suite a review clones to lint kernels (AGENTS.md); never part of the tree
 /.radisa/
+
+# the merge-base tree a #337 arm is built from; never part of the tree
+/.base-337/
