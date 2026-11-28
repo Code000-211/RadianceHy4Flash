@@ -241,6 +241,55 @@ Cfg base() {
  * blocks) and a block whose slots none of them names. The row's byte count is a multiple of 16 at
  * these geometries, so every row of a 16-byte-aligned cache starts 16-byte aligned: the test also
  * checks that, since a row is what a wave's 16-byte loads read. */
+/* libref's row_i8_put (libref/ref_attn.cpp) restated over one block of a row's latent columns, the
+ * way ref_select restates ref_qsa_select: the block is rotated by an explicit Hadamard matrix
+ * built from the row's normaliser and multiplied in double, so this reference shares no summation
+ * order with the kernel's wave butterfly; the tree's quantiser after it (unnormalised absmax / 127,
+ * nearest even, the clamp) is the same arithmetic the kernel runs, and the stored scale carries the
+ * normaliser. A block whose absmax is zero or not finite is scale 1 and codes 0. */
+struct RowRef {
+    double rot[128];      /* R x_b: what a decoded column `scale * code` is held to */
+    int8_t code[128];
+    float scale = 1.0f;
+    float amax = 0.0f;    /* the unnormalised block's max |v|, which is a full code step */
+};
+
+void ref_row_block(const float* x, RowRef& r) {
+    constexpr float kRot = 0.08838834764831845f;   /* 1 / sqrt(128) */
+    struct Rot {
+        double m[128 * 128];
+        Rot() {
+            const double k = (double)kRot;
+            for (int i = 0; i < 128; ++i)
+                for (int j = 0; j < 128; ++j)
+                    m[i * 128 + j] = (__builtin_popcount((unsigned)(i & j)) & 1) ? -k : k;
+        }
+    };
+    static const Rot rot;
+    float v[128];
+    float amax = 0.0f;
+    for (int i = 0; i < 128; ++i) {
+        double y = 0.0;
+        for (int j = 0; j < 128; ++j) y += rot.m[i * 128 + j] * (double)x[j];
+        r.rot[i] = y;
+        v[i] = (float)(y / (double)kRot);
+        amax = std::fmax(amax, std::fabs(v[i]));
+    }
+    r.amax = amax;
+    if (!(amax > 0.0f) || !std::isfinite(amax)) {
+        r.scale = 1.0f;
+        std::memset(r.code, 0, sizeof r.code);
+        return;
+    }
+    const float qs = amax * (1.0f / 127.0f);
+    const float inv = 1.0f / qs;
+    r.scale = qs * kRot;
+    for (int i = 0; i < 128; ++i) {
+        const float q = v[i] * inv;
+        r.code[i] = (int8_t)(int)std::nearbyint(std::fmin(std::fmax(q, -127.0f), 127.0f));
+    }
+}
+
 struct I8Cfg {
     int L = 512, R = 64, M = 3, pitch = 576, bs = 8, blocks = 3, slots = 2;
     std::vector<int> slot, pos, res;
@@ -417,7 +466,8 @@ int i8(const I8Cfg& c) {
     }
     /* The row's columns: L codes, L/128 f32 scales, R rope columns. The rope columns are the row's
      * own bf16 (no rotation, no rounding), which is the one column group an oracle can name
-     * without the quantiser: the latent columns are checked against the chain above. */
+     * without the quantiser. The latent columns are checked against the chain above, and then
+     * against the reference form, which is what X-07b's reader has to make sense of. */
     for (int m = 0; m < c.M; ++m) {
         const int s = slot[(size_t)m];
         if (s < 0 || s >= c.blocks * c.bs) continue;
@@ -427,7 +477,8 @@ int i8(const I8Cfg& c) {
                                   R, s, (long long)base);
             ++bad;
         }
-        const uint16_t* const d = (const uint16_t*)(kvF.data() + base + L + 4 * (L / 128));
+        const uint8_t* const row = kvF.data() + base;
+        const uint16_t* const d = (const uint16_t*)(row + L + 4 * (L / 128));
         for (int i = 0; i < R; ++i) {
             const uint16_t want = rowF[(size_t)m * c.pitch + (size_t)(L + i)];
             if (d[i] != want) {
@@ -436,9 +487,127 @@ int i8(const I8Cfg& c) {
                 ++bad;
             }
         }
+        /* The store's own bytes against that reference form. Two things are held per block: the
+         * scale (to 1e-6 relative -- the kernel divides in f32, the reference in double), and
+         * every decoded column `scale * code`, within half a code step of the block's rotated
+         * value (absmax / 254) plus the kernel's own f32 rotation, whose error over a sum of 128
+         * products stays below 1e-6 of the absmax. The second term is kept apart on purpose: the
+         * half step is the quantiser's loss, the rotation has none, and a butterfly in the wrong
+         * order would show up in it. A code may differ by one where the exact ratio sits on a
+         * rounding boundary (the kernel rounds in f32, the reference in double), so the decoded
+         * bound is the contract, not the code byte. */
+        const int8_t* const codes = (const int8_t*)row;
+        const float* const scales = (const float*)(row + L);
+        for (int b = 0; b < L / 128; ++b) {
+            float x[128];
+            for (int i = 0; i < 128; ++i) x[i] = b2f(rowF[(size_t)m * c.pitch + (size_t)(b * 128 + i)]);
+            RowRef r;
+            ref_row_block(x, r);
+            const float sc = scales[b];
+            if (!(std::fabs(sc - r.scale) <= r.scale * 1e-6f)) {
+                if (!bad) std::printf("row i8 L%d R%d: token %d block %d scale %g, the reference %g\n",
+                                      L, R, m, b, (double)sc, (double)r.scale);
+                ++bad;
+                continue;
+            }
+            const double half = r.amax / 254.0 * 1.0001 + r.amax * 1e-6;
+            for (int i = 0; i < 128; ++i) {
+                const double dec = (double)sc * (double)codes[b * 128 + i];
+                if (std::fabs(dec - r.rot[i]) > half) {
+                    if (!bad) std::printf("row i8 L%d R%d: token %d block %d column %d decodes to %g, "
+                                          "the rotated value is %g (half step %g)\n",
+                                          L, R, m, b, i, dec, r.rot[i], half);
+                    ++bad;
+                }
+            }
+        }
     }
     std::printf("row i8 L%-4d R%-3d M%d pitch%-4d bs%d blocks%d: %s\n", L, R, c.M, c.pitch, c.bs,
                 c.blocks, bad ? "FAIL" : "ok");
+    return bad ? 1 : 0;
+}
+
+/* X-07's edge blocks, through kv_store's int8 form at the served geometry (L 512, R 64, a 656-byte
+ * row): a block with one live column, so the rotation is exactly +-1 and the stored scale is the
+ * number `(1/127) * 1/sqrt(128)` and nothing like a tolerance; blocks that are all zero; and a
+ * block holding an inf, whose rotated absmax is not finite. The design note has the store write
+ * scale 1 / codes 0 for an absmax of zero or not finite -- an inf scale would write codes 0 that
+ * decode to NaN -- and the power-of-two block is where the scale itself is compared exactly, as
+ * libref's form computes it. The rope columns are the bf16 the store was handed. */
+int i8_edge() {
+    const int64_t L = 512, R = 64, hd = 288, rowb = 656;
+    const int M = 2, bs = 4, blocks = 2;
+    const float kRot = 0.08838834764831845f;   /* 1 / sqrt(128) */
+    std::vector<uint16_t> k((size_t)M * hd, f2b(0.0f)), v((size_t)M * hd, f2b(0.0f));
+    k[(size_t)0] = f2b(1.0f);                     /* token 0, block 0: one live column */
+    k[(size_t)2 * 128] = f2b(INFINITY);           /* token 1, block 2: not finite */
+    for (int m = 0; m < M; ++m)                   /* v's last R columns are the row's rope */
+        for (int64_t i = 0; i < R; ++i)
+            v[(size_t)m * hd + (size_t)(hd - R + i)] = f2b(0.25f * (float)(m * R + i + 1));
+    std::vector<int32_t> slot{ 0, 5 };            /* token 0 at slot 0, token 1 at block 1's slot 1 */
+    std::vector<uint8_t> kv((size_t)blocks * bs * rowb, 0x5a);
+    {
+        std::vector<RadTensor> t{ tens(k.data(), RAD_BF16, { M, hd }), tens(v.data(), RAD_BF16, { M, hd }),
+                                  tens(slot.data(), RAD_I32, { M }),
+                                  tens(kv.data(), RAD_I8, { blocks, 1, bs, rowb }) };
+        std::vector<RadParam> p{ pi("M", M), pi("head_dim", hd), pi("n_head_kv", 1),
+                                 pi("block_size", bs), ps("kv_dtype", "i8"), pi("rope_dim", R) };
+        RadArgs a = mk(t, p);
+        const int rc = r4d_rad_kv_store_i8(&a, nullptr);
+        if (rc != RAD_OK) {
+            std::printf("row i8 edge: launch failed (%d)\n", rc);
+            return 1;
+        }
+    }
+    int bad = 0;
+    const float onehot = (1.0f / 127.0f) * kRot;   /* amax 1, so the scale is exact */
+    for (int m = 0; m < M; ++m) {
+        const int s = slot[(size_t)m];
+        const uint8_t* const row = kv.data() + ((size_t)(s / bs) * bs + (size_t)(s % bs)) * rowb;
+        const int8_t* const codes = (const int8_t*)row;
+        const float* const scales = (const float*)(row + L);
+        /* Token 0's block 0 is the one-hot one; token 1's block 2 holds the inf. Everything else
+         * in both rows is zero, so it must be scale 1 / codes 0. */
+        for (int b = 0; b < L / 128; ++b) {
+            const bool live = m == 0 && b == 0;
+            const float want = live ? onehot : 1.0f;
+            if (scales[b] != want) {
+                if (!bad)
+                    std::printf("row i8 edge: token %d block %d scale %.9g, want %.9g\n", m, b,
+                                (double)scales[b], (double)want);
+                ++bad;
+            }
+            for (int i = 0; i < 128; ++i) {
+                const int8_t wantc = live ? 127 : 0;   /* the rotation of e_0 is all ones */
+                if (codes[b * 128 + i] != wantc) {
+                    if (!bad)
+                        std::printf("row i8 edge: token %d block %d code %d is %d, want %d\n", m, b, i,
+                                    (int)codes[b * 128 + i], (int)wantc);
+                    ++bad;
+                }
+            }
+        }
+        /* The live block's decoded columns are the rotated one-hot column, +1/sqrt(128). */
+        for (int i = 0; i < 128 && m == 0; ++i) {
+            const double dec = (double)scales[0] * (double)codes[i];
+            if (std::fabs(dec - (double)kRot) > (double)kRot * 1e-6) {
+                if (!bad)
+                    std::printf("row i8 edge: block 0 column %d decodes to %g, want %g\n", i, dec,
+                                (double)kRot);
+                ++bad;
+            }
+        }
+        const uint16_t* const d = (const uint16_t*)(row + L + 4 * (L / 128));
+        for (int64_t i = 0; i < R; ++i) {
+            const uint16_t want = v[(size_t)m * hd + (size_t)(hd - R + i)];
+            if (d[i] != want) {
+                if (!bad) std::printf("row i8 edge: token %d rope column %d is %04x, want %04x\n", m,
+                                      (int)i, d[i], want);
+                ++bad;
+            }
+        }
+    }
+    std::printf("row i8 edge (power of two, zero and inf blocks): %s\n", bad ? "FAIL" : "ok");
     return bad ? 1 : 0;
 }
 
@@ -604,6 +773,7 @@ int main() {
         c.res = { 0 };
         fails += i8(c);
     }
+    fails += i8_edge();
     {   /* D-02: the chain's hoisted gather and norm, at the stream counts and depths served. */
         int h = 0, cases = 0;
         for (int E : { 256, 1000, 1536, 4096 })
