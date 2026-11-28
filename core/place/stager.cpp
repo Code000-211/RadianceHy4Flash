@@ -45,7 +45,7 @@ PrefillStager::~PrefillStager() {
 }
 
 int PrefillStager::init(const Program& prog, const Plan& plan, Mover* mover, char* region,
-                        char* low, int64_t bytes, int64_t min_rows) {
+                        char* low, int64_t bytes, int64_t min_rows, int64_t arm_rows) {
     layers_.clear();
     if (!mover || !region || bytes <= 0) return RAD_OK;
 
@@ -85,6 +85,8 @@ int PrefillStager::init(const Program& prog, const Plan& plan, Mover* mover, cha
     ring_ = bytes / 2 / RAD_ALIGN_UNIT * RAD_ALIGN_UNIT * 2;
     head_ = 0;
     min_rows_ = min_rows;
+    arm_rows_ = arm_rows > 0 ? arm_rows : 0;
+    take_only_ = false;
     n_early_ = 0;
     ring_order_.clear();
     spare_.clear();
@@ -115,13 +117,18 @@ int PrefillStager::init(const Program& prog, const Plan& plan, Mover* mover, cha
     return rad_memcpy_list_async(nullptr, 0, 0, mover_->transfer_stream());
 }
 
-/* Arms only for a trunk pass whose level has a ring and with at least min_rows tokens (see
- * stager.h). Layers the previous pass staged early are kept if it arms with the ring where they
- * are, and withdrawn if not. */
+/* Arms only for a trunk pass that was given a ring and has at least min_rows tokens, or carries a
+ * prompt chunk of at least arm_rows (see stager.h, "which passes"). Layers the previous pass
+ * staged early are kept if it arms with the ring where they are. A prompt chunk too small to arm
+ * takes them too while the ring is still there, staging nothing itself; any other pass that does
+ * not arm, and one whose ring moved, withdraws them. */
 bool PrefillStager::begin_pass(const RadBatch* b) {
     if (!b || b->draft_pass != 0) return false;
-    armed_ = want_ != nullptr && enabled() && b->n_tok >= min_rows_;
+    armed_ = want_ != nullptr && enabled() && (b->n_tok >= min_rows_ || arms_for(b));
     staged_ = armed_;
+    staged_below_min_ = staged_ && b->n_tok < min_rows_;
+    take_only_ = !armed_ && want_ != nullptr && want_ == base_ && enabled() && adopts(b);
+    armed_ = armed_ || take_only_;
     if (!armed_) {
         withdraw_early();
         return false;
@@ -293,7 +300,7 @@ int PrefillStager::before_op(rad_op h, RadStream s, bool* resync) {
                 }
             }
             n_early_ = 0;
-            RAD_TRY(stage_ahead(first_li_ - 1, resync));
+            if (!take_only_) RAD_TRY(stage_ahead(first_li_ - 1, resync));
         }
     }
 
@@ -315,7 +322,8 @@ int PrefillStager::before_op(rad_op h, RadStream s, bool* resync) {
         Place& p = place_[i];
         if (!p.retired && p.li < li && p.read) retire(p);
     }
-    /* Stage further ahead into the freed room. */
+    /* Stage further ahead into the freed room, unless the pass only takes what was staged. */
+    if (take_only_) return RAD_OK;
     if (next_ <= li) next_ = li + 1;
     const bool was = *resync;
     RAD_TRY(stage_ahead(li, resync));
@@ -356,7 +364,7 @@ int PrefillStager::end_pass(RadStream s) {
         retire(p);
     }
     if (rc < 0) return rc;
-    if (!next_prefill_) {
+    if (!next_prefill_ || take_only_) {
         early_first_ = 0;
         n_early_ = 0;
         return rc;

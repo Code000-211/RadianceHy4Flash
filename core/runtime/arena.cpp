@@ -108,4 +108,56 @@ int arena_level_for(const std::vector<int64_t>& level_rows, int64_t rows) {
             level = (int)k;
     return level;
 }
+
+int64_t arena_ring_above(const std::vector<ArenaStepLevel>& levels, int64_t arm_rows,
+                         int64_t span_rows) {
+    int64_t above = -1;
+    for (const ArenaStepLevel& lv : levels)
+        if ((arm_rows > 0 && lv.rows >= arm_rows) || (span_rows > 0 && lv.rows == span_rows))
+            above = std::max(above, lv.end);
+    return above;
+}
+
+int64_t arena_ring_offset(int64_t above, int64_t guard, int64_t stage_off) {
+    if (above < 0) return -1;
+    return std::min(align_up(above + guard, RAD_ALIGN_UNIT), stage_off);
+}
+
+int64_t arena_lent_above_ring(int64_t top, int64_t low_off, int64_t stage_bytes) {
+    if (low_off < 0) return 0;
+    const int64_t edge = align_up(low_off + stage_bytes, RAD_ALIGN_UNIT);
+    return top > edge ? top - edge : 0;
+}
+
+int64_t arena_step_lent(int64_t level_lent, int64_t ring_lent, bool staged) {
+    if (!staged || ring_lent >= level_lent) return level_lent;
+    return ring_lent;
+}
+
+bool arena_ring_kept(int64_t floor_rows, int64_t full_rows, int64_t loan, int64_t loan_held,
+                     int64_t full_lent) {
+    return floor_rows >= full_rows && loan <= full_lent && loan_held <= full_lent;
+}
+
+bool arena_floor_falls(int64_t last_rows, int64_t floor_rows, bool ring_going, uint64_t since_ns) {
+    return last_rows < floor_rows && !ring_going && since_ns > kArenaFloorNs;
+}
+
+ArenaFloor arena_floor_reach(ArenaFloor floor, int64_t rows, uint64_t now_ns) {
+    if (rows >= floor.rows) return { rows, now_ns };
+    return floor;
+}
+
+bool stage_swaps(bool staged, bool below_min) { return !staged || below_min; }
+
+ArenaStepRing arena_step_ring(const ArenaStep& s) {
+    if (s.full_plan) return { ArenaRing::Top, s.level_lent, false };
+    if (s.span_level && s.has_low) return { ArenaRing::Low, s.level_lent, false };
+    if (!s.arms && !s.adopts) return { ArenaRing::None, s.level_lent, false };
+    if (arena_ring_kept(s.floor_rows, s.full_rows, s.loan, s.loan_held, s.full_lent))
+        return { ArenaRing::Top, s.level_lent, true };
+    if (s.arms && s.has_low)
+        return { ArenaRing::Low, arena_step_lent(s.level_lent, s.ring_lent, true), true };
+    return { ArenaRing::None, s.level_lent, false };
+}
 }  /* namespace rad */

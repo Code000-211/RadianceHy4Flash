@@ -3474,7 +3474,9 @@ ihc_pre (hc_head), rmsnorm (output_norm), gather_rows, logits_gemm
   (`RadBuildCtx::shape_probe`) fills a thread-local model of its own, so the core declares again at
   256 and 1024 rows (4x steps below the chunk), lends the arena above a level to the expert slab
   while the steps stay that small, and arms the prefill stager for a step above the largest level
-  (`placement: expert_tiered`). gpu-mini at a 3000-token chunk: 167 MiB at 256 tokens, 658 MiB at
+  (`placement: expert_tiered`) and for a prompt chunk of 640 rows or more below it, whose ring is
+  just above the largest level's buffers unless the top is still unlent. gpu-mini at a 3000-token
+  chunk: 167 MiB at 256 tokens, 658 MiB at
   1024, of 1.88 GiB. `attn_kv_sink`'s `N` (the non-absorbed prefill's keys, which followed the step
   size) is a capacity in all three libraries. A calibration run refuses its sizing declares (no
   loan). The friend's plugin measured the loan at 10.6 -> 24 tok/s on the real model at TP2.

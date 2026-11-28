@@ -579,8 +579,10 @@ public:
 
     /* The smallest step the prefill stager overlaps, in tokens (0 = no stager), set once by the
      * engine after init. --busy-prefill-chunk keeps a held-back chunk at or above it (busy_cap).
-     * Also logs the resolved policy at startup. */
-    void    set_stage_rows(int64_t rows);
+     * `arm_rows`: the smaller prompt chunk the stager arms for below that
+     * (PrefillStager::arm_rows), which prefill_continues() counts from; 0, or a number not under
+     * `rows`, when there is none. Also logs the resolved policy at startup. */
+    void    set_stage_rows(int64_t rows, int64_t arm_rows = 0);
     /* The shortest prefill that spans, in tokens (0: every one alone in its step), set once by
      * the engine after init. Where routed experts are read from host memory, the arena a spanned
      * step takes is room the experts lose for it, which on a short prompt costs more than the span
@@ -590,9 +592,10 @@ public:
      * inside the step (RadArchProbe::ckpt_snap_ok) and the engine holds a stage for it. Set once
      * by the engine after init; false keeps every checkpoint at a chunk's end. */
     void    set_ckpt_inside(bool on) { ckpt_inside_ = on; builder_.set_ckpt_cut(on); }
-    /* Whether the step just planned leaves a prompt with at least the stager's smallest pass still
-     * to prefill, so the next step most likely carries a chunk the stager arms for -- and that next
-     * step is not a held one (--prefill-interleave), which would drop what was staged. With
+    /* Whether the step just planned leaves a prompt with at least the smallest chunk the stager
+     * arms for still to prefill (set_stage_rows' `arm_rows`, else its smallest pass), so the next
+     * step most likely carries a chunk the stager arms for -- and that next step is not a held
+     * one (--prefill-interleave), which would drop what was staged. With
      * `next_plan`, the step issued ahead (`plan_next_`) is the one being released; its hold is
      * counted from its own shape, since promote_next() arms it after the release. */
     bool    prefill_continues(bool next_plan = false) const;
@@ -641,6 +644,8 @@ private:
     bool          has_linear_state_ = false;
     /* set_stage_rows: the prefill stager's smallest pass, 0 when it is not armed. */
     int64_t       stage_rows_ = 0;
+    /* set_stage_rows: the smallest prompt chunk it arms for; stage_rows_ at most. */
+    int64_t       stage_arm_rows_ = 0;
     /* set_span_min: the shortest prefill a span is taken for, 0 for any. */
     int64_t       span_min_ = 0;
     /* set_ckpt_inside */

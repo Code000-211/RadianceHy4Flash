@@ -18,17 +18,52 @@
  * ---- the region --------------------------------------------------------------------------------
  *
  * One region, two layers' share of the experts the budget leaves off the card, at the top of the
- * activation arena (Program::arena_stage_off, sized by vram_budget_resolve). A step smaller than
- * the arena's full plan lends that top to the expert slab, so the region belongs to the stager
- * only in full-plan steps (the ones worth staging for). The scheduler says which, per pass
- * (set_ring).
+ * activation arena (Program::arena_stage_off, sized by vram_budget_resolve). The full plan lends
+ * nothing, so the region is a full-plan step's ring. A step smaller than the full plan lends
+ * that top to the expert slab.
  *
- * Under --prefill-span the ring has a second place. The full plan is sized for a spanned step,
- * and a step of one interval (a chunk that shares its step, a short prompt) runs at the level of
- * that size (Engine::probe_arena_levels). That level keeps the ring right above its own buffers,
- * so everything over it, the span's extra rows included, is lent to the slab while such steps
- * run, and the step is still staged. A pass whose ring is in the other place than the last one's
- * moves it first (rebase).
+ * So the ring has a second place for a smaller step: right above the buffers of the largest
+ * smaller arena level a staged step can run at (arena_ring_above). The engine keeps that place
+ * out of the slab's loan for a step that is staged there, taking it back first where it is lent
+ * (Engine::arena_step, arena_step_lent); every other step at those levels lends it as before. A
+ * pass whose ring is in the other place than the last one's moves it first (rebase). The engine
+ * says where the ring is, per pass (set_ring).
+ *
+ * Under --prefill-span the full plan is sized for a spanned step, and a step of one interval (a
+ * chunk that shares its step, a short prompt) runs at the level of that size
+ * (Engine::probe_arena_levels). That level keeps the second place for every step it holds, so
+ * everything over it, the span's extra rows included, is lent to the slab while such steps run.
+ *
+ * ---- which passes ------------------------------------------------------------------------------
+ *
+ * A pass of min_rows() tokens or more, one past every level that lends the region, always finds
+ * the ring and is staged. Below that a pass is staged when it carries a prompt chunk of
+ * arm_rows() rows or more (stage_arms). The copies cost the same whatever the rows, a routed
+ * layer's whole pooled part, while reading in place costs by the row, so there is a size from
+ * which they pay: on Hy4-flash at TP2 a 720-row last chunk ran its routed GEMMs 58% cheaper
+ * staged and a lone 723-row prompt 41%, while steps of 250-380 rows lost more to the copies than
+ * their GEMMs gained (notes/backlog/closed/M-03b.md). A decode step's rows are one a sequence,
+ * and it is staged only from min_rows().
+ *
+ * ---- a smaller step behind a staged one --------------------------------------------------------
+ *
+ * The slab does not get the top of the arena back the moment steps turn small: the loan regrows
+ * only once no full-plan step has run for a while (Engine::arena_tick). A prompt's last chunk, or
+ * a conversation's next turn, therefore often runs at a smaller level while the region itself is
+ * still unlent. Such a step keeps the ring where it is, in the region, instead of moving it to
+ * the second place: nothing is taken back from the slab, and the first layers the pass before
+ * staged for it (below) are adopted where they lie rather than withdrawn with the move. A step
+ * staged below the full plan keeps the loan off its ring while it copies and no longer: behind
+ * it the loan is what it would be had the step run unstaged (Engine::arena_collected). The
+ * region therefore serves the chunks and turns that arrive while the full-plan step before them
+ * still holds the loan back, and a step staged in the second place gives the place back to the
+ * slab once it is collected; the next such step takes it again.
+ *
+ * Layers staged ahead also outlive a next chunk that turns out too small to arm. While the ring
+ * is still where they are, that pass takes them as they are -- it waits on their copies, reads
+ * them and gives each back in order -- and stages nothing more itself; they are not withdrawn
+ * unread. A decode step still returns them: it is replayed from a tape, and a pass the stager
+ * takes part in is issued live.
  *
  * ---- why a ring, not two buffers ---------------------------------------------------------------
  *
@@ -104,17 +139,22 @@ public:
     ~PrefillStager() override;
 
     /* Binds the routed layers of `plan` and the ops that read them, with `bytes` of device memory
-     * at `region` as the ring -- or at `low`, the ring's place under the span's shared level, when
-     * there is one (null otherwise). `min_rows` is the smallest pass it arms for. Leaves enabled()
-     * false when no routed layer has a pooled unit to stage. */
+     * at `region` as the ring -- or at `low`, the ring's second place above the smaller arena
+     * levels' buffers, when there is one (null otherwise). `min_rows` is the smallest pass it
+     * arms for whatever the pass carries, and `arm_rows` the smallest prompt chunk it arms for
+     * below that (0: none). Leaves enabled() false when no routed layer has a pooled unit to
+     * stage. */
     int init(const Program& prog, const Plan& plan, Mover* mover, char* region, char* low,
-             int64_t bytes, int64_t min_rows);
+             int64_t bytes, int64_t min_rows, int64_t arm_rows = 0);
 
-    /* Per pass, before release: where the ring is for the step -- the region at the full plan,
-     * `low` at the span's shared level -- or null when the step's level lends both. */
+    /* Per pass, before release: where the ring is for the step -- the region or `low`, as the
+     * engine decided (Engine::arena_step, arena_step_ring) -- or null when the step's level lends
+     * both. */
     void set_ring(char* base) { want_ = base; }
-    /* The ring's two places: at the full plan, and at the span's shared level (the same one when
-     * there is no such level). */
+    /* Where set_ring last said it is, or null. */
+    char*   ring() const { return want_; }
+    /* The ring's two places: the region, and above the smaller levels' buffers (the same one
+     * when there is no such place). */
     char*   ring_full() const { return region_; }
     char*   ring_low() const { return low_; }
     /* Per step, before release: whether the next step continues a prompt in a pass this stager
@@ -127,14 +167,28 @@ public:
 
     bool    enabled() const { return !layers_.empty(); }
     int64_t ring_bytes() const { return ring_; }
-    /* The smallest pass, in tokens, the stager arms for; smaller steps read pooled experts in
-     * place. The scheduler keeps a held-back prefill chunk at or above it
+    /* The smallest pass, in tokens, the stager arms for whatever it carries: the smallest that
+     * always finds the ring unlent. The scheduler keeps a held-back prefill chunk at or above it
      * (Scheduler::set_stage_rows). */
     int64_t min_rows() const { return min_rows_; }
+    /* The smallest prompt chunk, in tokens, it arms for below min_rows() (see "which passes"); 0
+     * when it arms for none. Smaller steps read pooled experts in place. */
+    int64_t arm_rows() const { return arm_rows_; }
+    /* Whether it arms for `b` below min_rows(), given a ring: a trunk pass that carries a prompt
+     * chunk of at least arm_rows() tokens. The engine asks before it decides where the ring is
+     * and what the step leaves lent, and begin_pass asks again. */
+    bool    arms_for(const RadBatch* b) const { return enabled() && stage_arms(b, arm_rows_); }
+    /* Whether layers are staged ahead that `b`, a prompt chunk of any size, would take if the
+     * ring is still where they are (see "a smaller step behind a staged one"). */
+    bool    adopts(const RadBatch* b) const { return n_early_ > 0 && stage_arms(b, 1); }
     size_t  n_layers() const { return layers_.size(); }
     /* Whether the last trunk pass armed (copied its pooled experts through the ring). A draft
      * pass leaves it unchanged. */
     bool    staged() const { return staged_; }
+    /* ... and only because it carried a prompt chunk of arm_rows() or more: a pass under
+     * min_rows(), which nothing staged before M-19. The engine proposes swaps behind such a pass
+     * as it did then (stage_swaps). */
+    bool    staged_below_min() const { return staged_below_min_; }
     static constexpr int32_t lead() { return kLead; }
 
     bool begin_pass(const RadBatch* b) override;
@@ -182,6 +236,7 @@ private:
     int64_t  ring_ = 0;
     int64_t  head_ = 0;                /* bytes handed out since bring-up */
     int64_t  min_rows_ = 0;
+    int64_t  arm_rows_ = 0;
 
     /* The pace (see the file header): layer k's copies wait on the compute-stream event recorded
      * at the first op of layer k - kLead. A layer within kLead of the pass's first routed layer
@@ -193,9 +248,13 @@ private:
     int32_t  first_li_ = -1;           /* the pass's first routed layer */
 
     bool     armed_ = false;
-    /* armed_ as the last trunk pass's begin_pass set it; end_pass leaves it, since the engine
-     * asks after the pass has ended. */
+    /* The pass is too small to arm and only takes the layers staged ahead for it: it waits on
+     * them, reads them and retires them as an armed pass does, and stages none itself. */
+    bool     take_only_ = false;
+    /* Whether the last trunk pass armed to stage, as its begin_pass decided; end_pass leaves it,
+     * since the engine asks after the pass has ended. */
     bool     staged_ = false;
+    bool     staged_below_min_ = false;
     bool     next_prefill_ = false;
     bool     first_op_ = false;        /* the pass has issued nothing yet */
     int32_t  next_ = 0;                /* the next layer to stage this pass */

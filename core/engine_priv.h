@@ -69,9 +69,17 @@ struct Engine::Rank {
     /* Per Ctx level (0 is the full plan): the bytes at the top of this rank's arena that level
      * leaves to the expert slab. */
     std::vector<int64_t>    arena_lent;
-    /* Where the prefill stager's ring is at the span's shared level, from the arena's base; -1
-     * without that level. */
+    /* Where the prefill stager's ring has its second place, from the arena's base: above the
+     * smaller levels a staged step can run at (arena_ring_above); -1 without one. */
     int64_t                 arena_low_off = -1;
+    /* The bytes at the top of the arena above that place: what a step staged there leaves lent
+     * (arena_step_lent), and what the span's shared level lends. 0 without the place. */
+    int64_t                 arena_ring_lent = 0;
+    /* What the latest step the arena was set for may leave lent on this rank (arena_step_ring's
+     * `allow`): arena_tick never grows the loan past it, whatever the floor's level lends, since
+     * that step may still be running. Once the step is collected with none issued ahead it is
+     * what the step's level lends (Engine::arena_collected). */
+    int64_t                 arena_allow = INT64_MAX;
     /* Expert flex (docs/MULTIMODEL.md §6.7): address space for the slab slots the fleet may lend,
      * one slot for every expert in the pinned pool, backed from the top as the loan grows. */
     VMem                    xflex;

@@ -1055,17 +1055,20 @@ void Engine::tiering_dispatch(Rank& r, int step) {
         xl.unlock();
     }
 
-    /* No swaps behind a pass the stager armed: that step is bound by its own copies on the same
-     * transfer stream, and the turnover slots are filled for it (below). Histograms are still
-     * credited; the next unstaged step swaps on them. */
+    /* No swaps behind a pass the stager staged from min_rows(): that step is bound by its own
+     * copies on the same transfer stream, and the turnover slots are filled for it (below).
+     * Histograms are still credited; the next step that swaps does so on them. A pass staged only
+     * by the arm floor swaps as it did unstaged (stage_swaps). */
+    const bool swapping = stage_swaps(r.stager.staged(), r.stager.staged_below_min());
     std::vector<Swap> swaps;
-    if (!r.stager.staged() && r.heat.step(&swaps) < 0) return;
+    if (swapping && r.heat.step(&swaps) < 0) return;
     /* X1 (b): this step's promotion copies are held and sent from the next pass's routed layers
-     * (Mover::pace_mark). Not behind a staged pass: the stager's copies share the stream. */
-    r.mover.pace_collect(!r.stager.staged());
-    /* What the turnover slots follow (MoverConfig::turnover_adaptive). A staged step proposes
-     * nothing and holds the turnover filled anyway (below), so it is not a quiet step. */
-    if (!r.stager.staged()) r.mover.swap_demand((int64_t)swaps.size());
+     * (Mover::pace_mark). Not behind a pass staged from min_rows(): the stager's copies share
+     * the stream. */
+    r.mover.pace_collect(swapping);
+    /* What the turnover slots follow (MoverConfig::turnover_adaptive). A step that proposes
+     * nothing here holds the turnover filled anyway (below), so it is not a quiet step. */
+    if (swapping) r.mover.swap_demand((int64_t)swaps.size());
     for (const Swap& s : swaps) {
         /* Contract: every proposed unit is busy until `issue` takes it or `abandon` returns it;
          * a dropped proposal stays busy forever. */
@@ -1075,9 +1078,9 @@ void Engine::tiering_dispatch(Rank& r, int step) {
     /* Fill after the swaps: swaps are the policy's decisions, fills only use spare memory, and a
      * fill must not take a move record the next swap needs.
      *
-     * Behind a staged pass the turnover slots are filled too, since that step swaps nothing; left
-     * free, the stager would copy those residents instead (at TP2 a 160K-token prompt staged 9.6%
-     * more and ran 3-5% slower).
+     * Behind a staged pass the turnover slots are filled too, since from min_rows() that step
+     * swaps nothing; left free, the stager would copy those residents instead (at TP2 a
+     * 160K-token prompt staged 9.6% more and ran 3-5% slower).
      *
      * They stay filled until kTurnoverAfter consecutive unstaged steps (idle ticks included).
      * Otherwise a short answer or a pause drops them and the next prompt's first chunk copies them
@@ -1728,6 +1731,9 @@ int Engine::step_loop() {
         loan_tick(/*idle=*/false);
         xflex_tick(/*busy=*/true);
         const uint64_t now = rad_mono_ns();
+        /* The step collected above has every copy it waited for behind it; with nothing issued
+         * ahead it is also the latest one the arena was set for. */
+        arena_collected(b->step, /*latest=*/ahead == nullptr);
         arena_tick(now);
         expire_tick(now);
         drain_completed();
@@ -2506,7 +2512,16 @@ void Engine::loan_tick(bool idle) {
  * If the level needs memory the slab holds, it is reclaimed synchronously before the step: units
  * in those slots revert to their host copies (an address change, not a copy) and both streams
  * that can read a slot are drained. A prefill pays this on its first chunk only, since the loan
- * does not regrow until steps have been small for a while (arena_tick). */
+ * does not regrow until steps have been small for a while (arena_tick).
+ *
+ * A smaller step the prefill stager arms for is staged too (stager.h): in the region at the top
+ * while the slab has not taken it back, else in the ring's second place, which is recalled for
+ * the step. Either way the step counts as reaching the floor at the full plan until the loop has
+ * collected it, since its copies go into memory the loan would grow over; behind it the floor
+ * is the one the steps would have left without it (arena_collected). So the region stays the
+ * ring's for as long as the full-plan step before it holds the floor, no longer, and the second
+ * place goes back to the slab. Where the ring is and what the step leaves lent is
+ * arena_step_ring's decision. */
 int Engine::arena_step(const RadBatch* b, bool ahead) {
     if (arena_rows_.size() <= 1 || !b) return RAD_OK;
     /* An encoder pass needs the full plan: its activations are sized by the pass, and a plugin
@@ -2516,7 +2531,12 @@ int Engine::arena_step(const RadBatch* b, bool ahead) {
     const int level = arena_level(need);
     const uint64_t now = rad_mono_ns();
     arena_last_ = arena_rows_[(size_t)level];
-    if (arena_last_ >= arena_floor_) { arena_floor_ = arena_last_; arena_floor_ns_ = now; }
+    const ArenaFloor reached =
+        arena_floor_reach({ arena_floor_, arena_floor_ns_ }, arena_last_, now);
+    arena_floor_ = reached.rows;
+    arena_floor_ns_ = reached.since_ns;
+    /* ... and the floor a pinned one hides (below, arena_collected). */
+    if (arena_back_step_ >= 0) arena_back_ = arena_floor_reach(arena_back_, arena_last_, now);
     /* Whether the step after this one continues a prompt, so the stager stages its first layers at
      * this step's end. Released normally, `b` is the step about to run and the scheduler holds its
      * plan; issued ahead, `b` is the step issued ahead and its plan is the one the scheduler plans
@@ -2526,10 +2546,28 @@ int Engine::arena_step(const RadBatch* b, bool ahead) {
     /* Inside a chunk group the next pass starts at its slice's first layer (S-02); 0 everywhere
      * else, a whole trunk. */
     const int32_t first_layer = more ? sched_.next_prefill_first_layer(ahead) : 0;
+    bool ring_step = false;
     for (auto& r : ranks_) {
-        const int64_t allow = r->arena_lent[(size_t)level];
-        if (r->mover.loan(Mover::kLendArena) > allow ||
-            r->mover.loan_held(Mover::kLendArena) > allow) {
+        /* The full plan lends nothing, so its top (the staging region) is the step's ring; the
+         * span's shared level keeps the ring's second place for every step; a smaller step the
+         * stager arms for has the region while it is still unlent, else the second place, taken
+         * back for the step; every other step lends both (stager.h). */
+        ArenaStep as;
+        as.full_plan  = level == 0;
+        as.span_level = level != 0 && arena_last_ == arena_span_rows_;
+        as.has_low    = r->arena_low_off >= 0;
+        as.arms       = r->stager.arms_for(b);
+        as.adopts     = r->stager.adopts(b);
+        as.floor_rows = arena_floor_;
+        as.full_rows  = arena_rows_[0];
+        as.loan       = r->mover.loan(Mover::kLendArena);
+        as.loan_held  = r->mover.loan_held(Mover::kLendArena);
+        as.full_lent  = r->arena_lent[0];
+        as.level_lent = r->arena_lent[(size_t)level];
+        as.ring_lent  = r->arena_ring_lent;
+        const ArenaStepRing sr = arena_step_ring(as);
+        const int64_t allow = sr.allow;
+        if (as.loan > allow || as.loan_held > allow) {
             RAD_TRY(rad_dev_set(r->device));
             const int st = r->mover.reclaim(Mover::kLendArena, allow, &r->heat);
             if (st < 0) {
@@ -2538,39 +2576,90 @@ int Engine::arena_step(const RadBatch* b, bool ahead) {
                 return st;
             }
         }
+        r->arena_allow = allow;
         RAD_TRY(r->ctx.set_level(level));
-        /* The full plan lends nothing, so its top (the staging region) is the step's ring; the
-         * span's shared level keeps a place of its own for it (stager.h); every other level
-         * lends both. */
-        char* const ring = level == 0 ? r->stager.ring_full()
-                         : arena_last_ == arena_span_rows_ && r->arena_low_off >= 0
-                               ? r->stager.ring_low() : nullptr;
-        r->stager.set_ring(ring);
+        r->stager.set_ring(sr.ring == ArenaRing::Top ? r->stager.ring_full()
+                           : sr.ring == ArenaRing::Low ? r->stager.ring_low() : nullptr);
+        ring_step = ring_step || sr.holds;
         /* The next step's first layers go ahead only from the full plan, into the region at the
-         * top that no level's buffers use. At the shared level the ring is memory the full plan
-         * computes in, and a copy still going there when such a step starts would race it; a
-         * pass's own copies are behind its own ops, which wait for them. */
+         * top that no level's buffers use. The second place is memory the full plan computes
+         * in, and a copy still going there when such a step starts would race it; a pass's own
+         * copies are behind its own ops, which wait for them. */
         r->stager.set_next_prefill(more && level == 0, first_layer);
+    }
+    /* A step staged below the full plan reaches the floor as a full-plan step does. Until the
+     * loop has collected it, arena_tick does not lower the floor at all: issued ahead, it is
+     * still copying into the ring when the step before it ends, however long that one ran.
+     * The floor it found, its own level reached, is kept beside the pinned one for
+     * arena_collected to put back; a staged step set while one is pending takes that over, so the
+     * floor goes back behind the last of a run. */
+    arena_ring_step_ = ring_step;
+    if (ring_step) {
+        if (arena_back_step_ < 0) arena_back_ = { arena_floor_, arena_floor_ns_ };
+        arena_back_step_ = b->step;
+        arena_floor_ = arena_rows_[0];
+        arena_floor_ns_ = now;
     }
     if (ranks_.size() > 1) (void)rad_dev_set(ranks_[0]->device);
     return RAD_OK;
 }
 
+/* A step staged below the full plan pins the floor only while its copies may be going. Once the
+ * loop has collected it the floor is again the one the steps would have left without the pin
+ * (arena_step keeps it): the staged step's own level, or the full plan's while the full-plan
+ * step before it still holds the floor. The next tick then lends what that floor lends.
+ *
+ * So a step staged in the second place gives the place back to the expert slab as soon as it
+ * is collected, and one staged in the region at the top does not hold the loan back any
+ * longer than the chunk before it did. Holding it for the floor's time behind the staged step
+ * instead cost the decode behind it what the step had gained: a lone 723-token prompt was level
+ * at its 256th token, and decode behind a 6.7K-token prompt ran 1 % slower over 256 tokens
+ * (notes/backlog/measurements/M-19.md).
+ *
+ * With none issued ahead (`latest`) nothing is running at all, and each rank may lend what the
+ * step's level lends. A later staged step still uncollected has taken the pending floor over
+ * and puts it back itself. */
+void Engine::arena_collected(int step, bool latest) {
+    if (arena_rows_.size() <= 1) return;
+    if (latest) {
+        arena_ring_step_ = false;
+        const int level = arena_level(arena_last_);
+        for (auto& r : ranks_) r->arena_allow = r->arena_lent[(size_t)level];
+    }
+    if (step != arena_back_step_) return;
+    arena_back_step_ = -1;
+    arena_floor_ = arena_back_.rows;
+    arena_floor_ns_ = arena_back_.since_ns;
+}
+
 int Engine::arena_level(int64_t rows) const { return arena_level_for(arena_rows_, rows); }
+
+void Engine::stager_floors(int64_t* stage_rows, int64_t* arm_rows) const {
+    *stage_rows = *arm_rows = 0;
+    for (auto& rk : ranks_)
+        if (rk->stager.enabled()) {
+            *stage_rows = std::max(*stage_rows, rk->stager.min_rows());
+            *arm_rows = std::max(*arm_rows, rk->stager.arm_rows());
+        }
+}
 
 /* The arena loan grows only after large steps stop. A prefill is chunks with decode steps between,
  * and lending after every chunk would refill and recall the slab each time. So the floor (the
  * largest step seen) holds for two seconds after it was last reached, then falls to the latest
- * step's size. */
+ * step's size. A smaller step the stager staged reached it too (arena_step), and it does not
+ * fall at all while that step may still be copying (arena_collected). */
 void Engine::arena_tick(uint64_t now_ns) {
     if (arena_rows_.size() <= 1) return;
-    if (arena_last_ < arena_floor_ && now_ns - arena_floor_ns_ > 2000000000ull) {
+    if (arena_floor_falls(arena_last_, arena_floor_, arena_ring_step_, now_ns - arena_floor_ns_)) {
         arena_floor_ = arena_last_;
         arena_floor_ns_ = now_ns;
     }
     const int level = arena_level(arena_floor_);
     for (auto& r : ranks_) {
-        const int64_t want = r->arena_lent[(size_t)level];
+        /* Never past what the latest step keeps for itself: it may be running (issued ahead),
+         * and a level under the floor's can keep more than the floor's does -- a step staged in
+         * the second place, the span's shared level under a larger one. */
+        const int64_t want = std::min(r->arena_lent[(size_t)level], r->arena_allow);
         if (want <= r->mover.loan(Mover::kLendArena)) continue;
         if (rad_dev_set(r->device) < 0) continue;
         (void)r->mover.set_loan(Mover::kLendArena, want);
@@ -3037,12 +3126,14 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
     /* The smallest step the prefill stager overlaps. A chunk held back for other work
      * (--busy-prefill-chunk) stays at or above it; below it every routed layer reads its pooled
      * experts synchronously, which costs far more than sharing the step saves. The maximum over
-     * ranks, since the step waits for the slowest. */
+     * ranks, since the step waits for the slowest. The smaller prompt chunk the stager arms for
+     * (stager.h, "which passes") is no floor for a held-back chunk -- that would re-chunk a busy
+     * prefill, which notes/backlog/closed/M-03a.md measured and closed -- it is what the
+     * scheduler counts a prompt's remainder against when it says the next step is staged. */
     {
-        int64_t stage_rows = 0;
-        for (auto& rk : ranks_)
-            if (rk->stager.enabled()) stage_rows = std::max(stage_rows, rk->stager.min_rows());
-        sched_.set_stage_rows(stage_rows);
+        int64_t stage_rows = 0, arm_rows = 0;
+        stager_floors(&stage_rows, &arm_rows);
+        sched_.set_stage_rows(stage_rows, arm_rows);
         /* The shortest prompt a span pays for where routed experts are read from host memory: a
          * spanned step runs at the full plan, which lends the expert slab nothing, while every
          * other step runs at the span's shared level and lends it the span's extra rows. On
