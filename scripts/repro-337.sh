@@ -32,6 +32,10 @@ OUT="${OUT:-${RAD_RUNS:-$ROOT/runs}/${RAD_LANE:-local}/repro-337-$TAG}"
 MODEL="${MODEL:-/srv/models/hy4-flash-iqr-v4/hy4-flash-iqr-v4-u3.rad}"
 PORT="${PORT:-8041}"
 TP="${TP:-2}"
+# The issue's two knobs to narrow a fault with: NUM_SPECULATIVE_TOKENS and draft-coupling. Both keep
+# the issue's values unless the environment asks for another, so the default arm is the reported one.
+SPEC="${SPEC:-5}"
+COUPLING="${COUPLING:-on}"
 # The issue's two numbers; this box's budget may not hold both (see exit status 2).
 POOL="${POOL:-20000}"
 LEN="${LEN:-262144}"
@@ -101,6 +105,7 @@ models:
   hy4-flash:
     model: $MODEL
     tp: $TP
+    pin: true
     placement: expert_tiered
     host-pool-mib: $POOL
     ngram-placement: disk
@@ -115,9 +120,9 @@ models:
     busy-prefill-chunk: auto
     kv-cache-dtype: bf16
     control-vector: on
-    num-speculative-tokens: 5
+    num-speculative-tokens: $SPEC
     draft-window: fixed
-    draft-coupling: on
+    draft-coupling: $COUPLING
     draft-verify: traversal
     draft-depth: adaptive
     draft-depth-stop: 0.3
@@ -142,7 +147,7 @@ if [ "$up" != 1 ]; then
   exit 2
 fi
 grep -E 'kv: the cache can grow|activation arena: |[[]0[]] arena: ' "$OUT/server.log" | sed 's/^/repro-337: /' || true
-echo "repro-337: W2 $([ "${RADIANCE_W2:-1}" = 0 ] && echo off || echo on), $TP card(s), server up"
+echo "repro-337: W2 $([ "${RADIANCE_W2:-1}" = 0 ] && echo off || echo on), $TP card(s), $SPEC speculative token(s), draft-coupling $COUPLING, host pool $POOL MiB, max-model-len $LEN, server up"
 
 # A faulting server takes every request down with it, and the replay exits non-zero when that
 # happens: that is the run this script exists for, so its failure is reported and the log is read
