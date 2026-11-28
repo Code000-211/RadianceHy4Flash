@@ -997,9 +997,8 @@ TEST(skewed_routing_places_every_row_within_the_cap) {
 
 /* The timing pass's own inputs: an expert histogram skewed within its contract (offsets from 0 to
  * the row count, non-decreasing, each run at most M), routing ids distinct within a row and
- * concentrated on a few experts, a block table in block order. Anything else keeps the recorded
- * draw. */
-TEST(timing_inputs_skew_routing_and_draw_block_tables_in_block_order_and_leave_the_rest) {
+ * concentrated on a few experts. Anything else keeps the recorded draw. */
+TEST(timing_inputs_skew_routing_and_leave_every_other_operand_alone) {
     Geometry g;
     g.set_i("M", 2048);
     g.set_i("n_expert", 128);
@@ -1008,7 +1007,7 @@ TEST(timing_inputs_skew_routing_and_draw_block_tables_in_block_order_and_leave_t
 
     KfOperand off = index_opd({ 129 }, 2048 * 8 + 1);
     off.idx_prefix = true;
-    REQUIRE(kb::timing_input(off, g, 11, &out));
+    REQUIRE(kb::timing_input(off, g, "", 11, &out));
     const std::vector<int32_t> o = as_i32(out);
     REQUIRE_EQ(o.size(), (size_t)129);
     CHECK_EQ(o.front(), 0);
@@ -1021,7 +1020,7 @@ TEST(timing_inputs_skew_routing_and_draw_block_tables_in_block_order_and_leave_t
     CHECK(widest <= 2048 && widest > 3 * 128);
 
     KfOperand ids = index_opd({ 64, 8 }, 128);
-    REQUIRE(kb::timing_input(ids, g, 12, &out));
+    REQUIRE(kb::timing_input(ids, g, "", 12, &out));
     const std::vector<int32_t> id = as_i32(out);
     REQUIRE_EQ(id.size(), (size_t)512);
     std::vector<int> hist(128, 0);
@@ -1038,48 +1037,47 @@ TEST(timing_inputs_skew_routing_and_draw_block_tables_in_block_order_and_leave_t
     CHECK(*std::max_element(hist.begin(), hist.end()) >= 12);   /* the mean is 4 */
 
     KfOperand table = index_opd({ 1, 1024 }, 1024);
-    REQUIRE(kb::timing_input(table, g, 13, &out));
-    std::vector<int32_t> t = as_i32(out);
-    std::sort(t.begin(), t.end());
-    for (int32_t i = 0; i < 1024; ++i) CHECK_EQ(t[(size_t)i], i);
-
     std::vector<uint8_t> untouched = { 7 };
-    CHECK(!kb::timing_input(index_opd({ 64 }, 64), g, 1, &untouched));     /* positions */
+    CHECK(!kb::timing_input(index_opd({ 64 }, 64), g, "", 1, &untouched));     /* positions */
     KfOperand uniq = index_opd({ 1, 64 }, 64);
     uniq.idx_unique = true;
-    CHECK(!kb::timing_input(uniq, g, 1, &untouched));
+    CHECK(!kb::timing_input(uniq, g, "", 1, &untouched));
     KfOperand cu = index_opd({ 2, 2 }, 4);
     cu.idx_cu = true;
-    CHECK(!kb::timing_input(cu, g, 1, &untouched));
+    CHECK(!kb::timing_input(cu, g, "", 1, &untouched));
     KfOperand written = table;
     written.role = RAD_OPD_INOUT;
-    CHECK(!kb::timing_input(written, g, 1, &untouched));
+    CHECK(!kb::timing_input(written, g, "", 1, &untouched));
     KfOperand act = table;
     act.is_index = false;
-    CHECK(!kb::timing_input(act, g, 1, &untouched));
+    CHECK(!kb::timing_input(act, g, "", 1, &untouched));
     CHECK(untouched == std::vector<uint8_t>{ 7 });
 }
 
 /* The page table a selection writes (`qsa_select`): each row's own pages in block order, the
  * partial page last -- not one shuffled run over the whole operand, an order no selection
- * produces and the attention never sums in. */
-TEST(a_page_table_timing_input_is_each_rows_pages_in_block_order) {
+ * produces and the attention never sums in. Only the selected attention's table is drawn this way:
+ * every other op's index table, and every operand of the op that is not its table, keeps the draw
+ * older fixtures were timed with. */
+TEST(the_selected_attentions_page_table_timing_input_is_each_rows_pages_in_block_order) {
     Geometry g;
     g.set_i("M", 8);
+    g.set_i("blocks", 512);
     std::vector<uint8_t> out;
 
-    /* A block table: every page of the row, 0..nb-1, the cache's own block order. */
-    KfOperand full = index_opd({ 1, 512 }, 512);
-    REQUIRE(kb::timing_input(full, g, 31, &out));
+    /* Every page of every row: 0..blocks-1 per row, the cache's own block order. */
+    KfOperand full = index_opd({ 8, 512 }, 512);
+    REQUIRE(kb::timing_input(full, g, "mla_attn_sel_sink", 31, &out));
     const std::vector<int32_t> f = as_i32(out);
-    REQUIRE_EQ(f.size(), (size_t)512);
-    for (int32_t i = 0; i < 512; ++i) CHECK_EQ(f[(size_t)i], i);
+    REQUIRE_EQ(f.size(), (size_t)(8 * 512));
+    for (int r = 0; r < 8; ++r)
+        for (int32_t j = 0; j < 512; ++j) CHECK_EQ(f[(size_t)(r * 512 + j)], j);
 
     /* A selection: 16 pages out of a 64-page cache for each of 8 rows, ascending and distinct
      * within the row, and not the same 16 for every row. */
     g.set_i("blocks", 16);
     KfOperand sel = index_opd({ 8, 16 }, 64);
-    REQUIRE(kb::timing_input(sel, g, 32, &out));
+    REQUIRE(kb::timing_input(sel, g, "mla_attn_sel_sink", 32, &out));
     const std::vector<int32_t> t = as_i32(out);
     REQUIRE_EQ(t.size(), (size_t)(8 * 16));
     std::vector<int32_t> first;
@@ -1099,14 +1097,54 @@ TEST(a_page_table_timing_input_is_each_rows_pages_in_block_order) {
     }
     CHECK_EQ(differing, 7);
 
-    /* Every page of every row: 0..blocks-1 per row, the full table. */
+    /* A selection of more than half the cache: the first 40 pages of a shuffled 64, sorted, so
+     * still distinct and ascending and not simply 0..39. */
+    g.set_i("blocks", 40);
+    KfOperand most = index_opd({ 4, 40 }, 64);
+    REQUIRE(kb::timing_input(most, g, "mla_attn_sel_sink", 34, &out));
+    const std::vector<int32_t> m = as_i32(out);
+    REQUIRE_EQ(m.size(), (size_t)(4 * 40));
+    bool ordered = true;
+    for (int r = 0; r < 4; ++r) {
+        std::set<int32_t> row;
+        for (int j = 0; j < 40; ++j) {
+            const int32_t page = m[(size_t)(r * 40 + j)];
+            CHECK(page >= 0 && page < 64);
+            if (j) CHECK(page > m[(size_t)(r * 40 + j - 1)]);
+            row.insert(page);
+            if (page != j) ordered = false;
+        }
+        CHECK_EQ(row.size(), (size_t)40);
+    }
+    CHECK(!ordered);
+
+    /* The paged attention's block table has the selection's own extent and is still not drawn as
+     * one: the op is the gate, so one permutation over the whole operand, the draw the fixtures
+     * recorded before the selection's own existed. */
     g.set_i("blocks", 512);
-    KfOperand all = index_opd({ 8, 512 }, 512);
-    REQUIRE(kb::timing_input(all, g, 33, &out));
-    const std::vector<int32_t> a = as_i32(out);
-    REQUIRE_EQ(a.size(), (size_t)(8 * 512));
-    for (int r = 0; r < 8; ++r)
-        for (int32_t j = 0; j < 512; ++j) CHECK_EQ(a[(size_t)(r * 512 + j)], j);
+    KfOperand paged = index_opd({ 1, 512 }, 512);
+    REQUIRE(kb::timing_input(paged, g, "mla_attn_paged_sink", 31, &out));
+    const std::vector<int32_t> p = as_i32(out);
+    REQUIRE_EQ(p.size(), (size_t)512);
+    std::set<int32_t> seen(p.begin(), p.end());
+    CHECK_EQ(seen.size(), (size_t)512);
+    CHECK(*std::min_element(p.begin(), p.end()) == 0);
+    CHECK(*std::max_element(p.begin(), p.end()) == 511);
+    bool block_order = true;
+    for (size_t i = 0; i < p.size(); ++i)
+        if (p[i] != (int32_t)i) block_order = false;
+    CHECK(!block_order);
+
+    /* The selected attention's own index operands that are not its table (a width that is not the
+     * geometry's block count) keep that same permutation. */
+    g.set_i("blocks", 16);
+    KfOperand work = index_opd({ 8, 32 }, 256);
+    REQUIRE(kb::timing_input(work, g, "mla_attn_sel_sink", 35, &out));
+    const std::vector<int32_t> w = as_i32(out);
+    REQUIRE_EQ(w.size(), (size_t)(8 * 32));
+    std::set<int32_t> wseen(w.begin(), w.end());
+    CHECK_EQ(wseen.size(), (size_t)(8 * 32));
+    CHECK(*std::max_element(w.begin(), w.end()) == 255);
 }
 
 /* A v1.3 table (RDNA3/RDNA4 discrete cards) built field by field from the layout cardclock.py

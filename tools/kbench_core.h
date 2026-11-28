@@ -16,6 +16,7 @@
 #include <memory>
 #include <set>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace rad {
@@ -329,12 +330,15 @@ std::vector<int64_t> skewed_counts(int64_t buckets, int64_t total, int64_t cap, 
  *   - an expert histogram's offsets (an index prefix): skewed_counts with the op's M as the cap;
  *   - an index operand ranging over the op's n_expert (routing choices): each row's ids distinct,
  *     drawn from the same skewed weights;
- *   - an index table of rank two that is a page table -- each row's whole range (as many entries as
- *     `idx_max`), or the geometry's `blocks` selections out of a larger cache: each row's own page
- *     ids in block order, distinct and ascending, the last entry the partial page -- not one
- *     shuffled run over the whole operand.
+ *   - `mla_attn_sel_sink`'s page table -- the geometry's `blocks` page ids a row, one row an M
+ *     token: each row's own ids, distinct and ascending, in block order when the row's `blocks` are
+ *     its whole page range and a sorted draw out of the range otherwise, the partial block last, as
+ *     `qsa_select` writes one -- and no other operand. Every other index table keeps the draw it
+ *     had: one shuffled permutation over the whole operand.
+ * `op` is the case's op, because only that op's table is a selection.
  * False, `out` untouched, for every other operand. */
-bool timing_input(const KfOperand& d, const Geometry& g, uint64_t seed, std::vector<uint8_t>* out);
+bool timing_input(const KfOperand& d, const Geometry& g, std::string_view op, uint64_t seed,
+                  std::vector<uint8_t>* out);
 
 /* The SMU's metrics table as the driver exports it (gpu_metrics). */
 struct GpuMetrics {

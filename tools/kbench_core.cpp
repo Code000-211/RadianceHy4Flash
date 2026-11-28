@@ -605,7 +605,8 @@ std::vector<int64_t> skewed_counts(int64_t buckets, int64_t total, int64_t cap, 
     return c;
 }
 
-bool timing_input(const KfOperand& d, const Geometry& g, uint64_t seed, std::vector<uint8_t>* out) {
+bool timing_input(const KfOperand& d, const Geometry& g, std::string_view op, uint64_t seed,
+                  std::vector<uint8_t>* out) {
     if (d.role != RAD_OPD_IN || !d.is_index || d.absent || d.shape.empty()) return false;
     const int64_t n = rad_numel(d.shape);
     if (n <= 0) return false;
@@ -615,11 +616,12 @@ bool timing_input(const KfOperand& d, const Geometry& g, uint64_t seed, std::vec
     g.get_i("blocks", &blocks);
     const bool plain = !d.idx_unique && !d.idx_cu && !d.idx_prefix && !d.idx_history &&
                        d.idx_const < 0;
-    /* A page table: as many entries as its range (a block table), or the geometry's `blocks` rows of
-     * selections out of a larger cache (the selected attention). */
-    const bool table = plain && d.shape.size() >= 2 &&
-                       (d.idx_max == n || (d.shape.size() == 2 && blocks > 0 && d.shape[1] == blocks &&
-                                           d.idx_max >= blocks));
+    /* The selected attention's page table and nothing else: the geometry's `blocks` page ids a row,
+     * one row an M token, as `qsa_select` writes it. Gated on the op and the table's own extent, so
+     * a block table or an index array an older fixture recorded keeps the draw it had and its
+     * timings stay comparable. */
+    const bool page_table = op == "mla_attn_sel_sink" && plain && d.shape.size() == 2 &&
+                            blocks > 0 && d.shape[1] == blocks && d.idx_max >= blocks;
     std::vector<float> v((size_t)n, 0.0f);
     if (d.idx_prefix) {
         /* The histogram kf_draw draws uniformly: n - 1 buckets holding idx_max - 1 rows. */
@@ -654,10 +656,11 @@ bool timing_input(const KfOperand& d, const Geometry& g, uint64_t seed, std::vec
                 v[(size_t)(r * width + j)] = (float)pick;
             }
         }
-    } else if (table) {
-        /* A page table, as `qsa_select` writes one: each row its own distinct page ids in block
-         * order (the partial page last) out of the page range `idx_max`, not one shuffled run over
-         * the whole operand -- an order no selection produces and the attention never sums in. */
+    } else if (page_table) {
+        /* A page table, as `qsa_select` writes one: each row its own distinct page ids out of the
+         * page range `idx_max`, in block order when the row addresses its whole range and sorted
+         * otherwise (the partial block last), not one shuffled run over the whole operand -- an
+         * order no selection produces and the attention never sums in. */
         const int64_t rows = d.shape[0] > 0 ? d.shape[0] : 1, width = n / rows, range = d.idx_max;
         if (range <= 0 || width > range) return false;   /* ids out of the range would not describe */
         for (int64_t r = 0; r < rows; ++r) {
@@ -680,6 +683,11 @@ bool timing_input(const KfOperand& d, const Geometry& g, uint64_t seed, std::vec
             for (int64_t j = 0; j < width; ++j)
                 v[(size_t)(r * width + j)] = (float)picks[(size_t)j];
         }
+    } else if (plain && d.shape.size() >= 2 && d.idx_max == n) {
+        /* Every other index table: one shuffled permutation over the whole operand, as fixtures
+         * recorded before this draw existed were timed. */
+        const std::vector<int64_t> p = seeded_order(n, seed);
+        for (int64_t i = 0; i < n; ++i) v[(size_t)i] = (float)p[(size_t)i];
     } else {
         return false;
     }

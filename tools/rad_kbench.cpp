@@ -586,9 +586,11 @@ int write_report(const std::string& path, const std::vector<Row>& rows,
              "a share of 75% or more, or a time under the launch floor, is noted as an order\n"
              "  of magnitude.\n";
         s += "- The timing pass draws its own **routing and block tables**: expert offsets and "
-             "ids skewed as\n  real routing is (Zipf, exponent 0.5) and each page table's rows "
-             "in block order (distinct\n  ascending page ids, the partial page last), as "
-             "`qsa_select` writes them. The checked launch\n  keeps the recorded draw.\n";
+             "ids skewed as\n  real routing is (Zipf, exponent 0.5), and the selected attention's "
+             "page table\n  (`mla_attn_sel_sink`) as each row's own distinct, ascending page ids "
+             "-- in block order when the\n  row addresses its whole range, otherwise a sorted "
+             "draw out of it -- as `qsa_select` writes them.\n  Every other index operand keeps "
+             "its one permutation. The checked launch keeps the recorded draw.\n";
         s += "- `±%` is the half-width of a distribution-free 95% interval for the median, as a "
              "percent of\n  it (below six batches the range, which covers less); a case is "
              "timed until it is 1% or\n  the rep cap (`--bench-reps`) is reached, so a wide one "
@@ -1800,8 +1802,8 @@ void Replay::run_one(size_t fi, const KfCase& c, const RadOpSchema* schema,
                                                                               : own[k].size());
                 if (d.role == RAD_OPD_INOUT) d.pristine = in[k].bytes->data();
                 if (d.role == RAD_OPD_IN)
-                    kb::timing_input(c.opd[k], g, kf_operand_seed(c.seed, (int)k) ^ kTimingSalt,
-                                     &d.variant);
+                    kb::timing_input(c.opd[k], g, c.op,
+                                     kf_operand_seed(c.seed, (int)k) ^ kTimingSalt, &d.variant);
             }
             tc.opd.push_back(std::move(d));
         }
@@ -3536,7 +3538,7 @@ int main(int argc, char** argv) {
                             if (d.role == RAD_OPD_INOUT && k < inout0.size() && !inout0[k].empty())
                                 d.pristine = inout0[k].data();
                             if (d.role == RAD_OPD_IN)
-                                kb::timing_input(kop[k], g,
+                                kb::timing_input(kop[k], g, o.op,
                                                  kf_operand_seed(case_seed, (int)k) ^ kTimingSalt,
                                                  &d.variant);
                         }

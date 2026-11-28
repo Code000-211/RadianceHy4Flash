@@ -578,9 +578,12 @@ section says how with the calibration it was checked against (`tools/kbench_time
 - **In-place operands are restored** from a pristine copy before every launch. The restores are
   timed alone in the same window and subtracted; their share is in the notes.
 - **Realistic inputs where the time depends on them**: the timing pass draws expert offsets and
-  routing ids skewed (Zipf, exponent 0.5) and each page table's rows in block order (distinct,
-  ascending page ids, the partial page last), as `qsa_select` writes them. The checked launch
-  keeps the recorded draw, so fixtures replay byte for byte.
+  routing ids skewed (Zipf, exponent 0.5), and the selected attention's page table
+  (`mla_attn_sel_sink`) as each row's own distinct, ascending page ids -- in block order when the
+  row addresses its whole range, otherwise a sorted draw out of it -- as `qsa_select` writes them.
+  Every other index operand keeps its permutation, so a fixture's timings stay comparable with
+  those recorded before the page table's own draw. The checked launch keeps the recorded draw, so
+  fixtures replay byte for byte.
 - **Calibration**, printed above the table: the launch floor (the backend's own 4-byte fill, back
   to back and between two events), and streaming-read bandwidth (ranged copies whose writes all
   land in one cache-resident ring) warm and rotated-cold at four sizes up to
