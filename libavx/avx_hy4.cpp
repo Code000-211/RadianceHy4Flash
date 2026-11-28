@@ -25,6 +25,7 @@
 #include <vector>
 
 using namespace avx;
+#include "avx_had.h"   /* fwht_row: the query row's rotation under kv_rot (X-07); after the two above */
 
 /* A dynamic schedule for the attention rows: a causal prefill's late rows cost far more than its
  * early ones, so contiguous blocks would leave one thread with most of the work. A unit's
@@ -295,8 +296,13 @@ AVX_KERNEL(mla_project_kv) {
     const int64_t H = p_int(a, "heads", 0), kd = p_int(a, "k_dim", 0), vd = p_int(a, "v_dim", 0),
                   L = p_int(a, "latent_dim", 0);
     const char* mode = p_str(a, "mode", "");
+    const char* kvr = p_str(a, "kv_rot", "");
+    if (kvr && *kvr && std::strcmp(kvr, "wht128") && std::strcmp(kvr, "none")) return RAD_E_SHAPE;
     const bool absorb = !std::strcmp(mode, "absorb"), expand = !std::strcmp(mode, "expand");
+    /* X-07: the absorb's row is the cache's frame's; the expansion reads an un-rotated latent */
+    const bool rot = absorb && kvr && !std::strcmp(kvr, "wht128");
     if ((!absorb && !expand) || H < 1 || kd < 1 || vd < 1 || L < 1) return RAD_E_SHAPE;
+    if (rot && L % 128 != 0) return RAD_E_SHAPE;
     const int64_t in_w = absorb ? kd : L, out_w = absorb ? L : vd;
     heads_view(x, H, in_w);
     heads_view(y, H, out_w);
@@ -323,6 +329,12 @@ AVX_KERNEL(mla_project_kv) {
                 for (; j + VF_N <= L; j += VF_N)
                     vf_storeu(acc + j, vf_fma(qv, vf_loadu(wr + j), vf_loadu(acc + j)));
                 for (; j < L; ++j) acc[j] += q[c] * wr[j];
+            }
+            /* the cache's frame: each 128-column block by the store's own transform (fwht_row's
+             * ascending strides, the kernel's butterfly order), then the one rounding out_row does */
+            if (rot) {
+                fwht_row(acc, L, 128);
+                for (int64_t j = 0; j < L; ++j) acc[j] *= kRowRotScale;
             }
             out_row(&y, ob, L, acc);
         } else {

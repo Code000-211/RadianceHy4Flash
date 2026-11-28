@@ -125,7 +125,6 @@ static inline bool kv_i8_shape(const RadTensor* kv, int64_t head_dim) {
  * `scale * code` is the rotated column (design note X-07 § 2: two scales, one to quantise and one
  * to store). A block whose absmax is zero or not finite stores codes 0 and scale 1. The rope
  * columns are copied as the bf16 they arrive as. */
-constexpr float kRowRotScale = 0.08838834764831845f;   /* 1 / sqrt(128) */
 static inline int64_t row_i8_bytes(int64_t L, int64_t R) {
     return L + 4 * (L / 128) + 2 * R;
 }
