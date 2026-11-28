@@ -66,8 +66,10 @@ void kvstream_host_add(KVStreamHostUse* use, const KVManager& kv);
  * context of the group per sequence per rank, the largest host allocation after the experts'
  * pool, so it is checked against everything still to be pinned after it (`still`). A refusal
  * names --max-model-len and --max-num-seqs, which size it; --host-pool-mib sizes the experts' pool
- * and cannot make room here. */
-int kvstream_host_gate(const KVStreamHostUse& use, int n_ranks, int64_t still, int64_t headroom);
+ * and cannot make room here. A small shortfall is re-checked for up to `wait_ms` first
+ * (--host-memory-wait-s, wait_for_room). */
+int kvstream_host_gate(const KVStreamHostUse& use, int n_ranks, int64_t still, int64_t headroom,
+                       int64_t wait_ms = 0);
 
 /* After the carve: fill the maps on a bring-up stream and drain it. */
 int kvstream_fill(KVManager& kv);

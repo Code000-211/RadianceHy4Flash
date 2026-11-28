@@ -988,6 +988,17 @@ endif()
 # and safetensors import, and the PEFT comparison where peft and transformers do too.
 find_program(RAD_PYTHON3 NAMES python3)
 
+# The recipe that writes the Hy4 fixture (data/kernels_hy4.py), tested on its own: a case cloned to
+# another M resizes the M tall operands and keeps the container's weight encoding, because the rows
+# a quantised case matches are served encoded only (T-04, tests/kbench_recipe_test.py). This sits
+# after find_program so that a fresh configure registers the test, not the second one.
+if(RAD_PYTHON3 AND EXISTS ${CMAKE_SOURCE_DIR}/data/kernels_hy4.rkb)
+  add_test(NAME kbench_recipe_test
+           COMMAND ${RAD_PYTHON3} ${CMAKE_CURRENT_SOURCE_DIR}/kbench_recipe_test.py)
+  set_tests_properties(kbench_recipe_test PROPERTIES LABELS "unit;fast" SKIP_RETURN_CODE 77
+                       TIMEOUT ${RAD_TEST_TIMEOUT})
+endif()
+
 # core/server/dashboard_page.h is the build of dashboard/, committed because the engine's build has
 # no Node. This fails while the page's sources and the header disagree.
 if(RAD_PYTHON3 AND EXISTS ${CMAKE_SOURCE_DIR}/dashboard/package.json)
@@ -1022,6 +1033,9 @@ if(RAD_PYTHON3)
   add_test(NAME backlog_stamps_test COMMAND ${RAD_PYTHON3} ${CMAKE_CURRENT_SOURCE_DIR}/backlog_stamps_test.py)
   set_tests_properties(backlog_stamps_test PROPERTIES LABELS "unit;fast" SKIP_RETURN_CODE 77
                        TIMEOUT ${RAD_TEST_TIMEOUT})
+  # scripts/stampgaps.py over live-issued passes (T-01): the stamp file a prefill or mixed pass leaves.
+  add_test(NAME stampgaps_live_test COMMAND ${RAD_PYTHON3} ${CMAKE_CURRENT_SOURCE_DIR}/stampgaps_live_test.py)
+  set_tests_properties(stampgaps_live_test PROPERTIES LABELS "unit;fast" TIMEOUT ${RAD_TEST_TIMEOUT})
 endif()
 
 # ================================================================== the shipped plugins, out of tree

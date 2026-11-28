@@ -1,9 +1,13 @@
 /* engine_hostmem.cpp -- see engine_hostmem.h. */
 #include "engine_hostmem.h"
 
+#include "rad_internal.h"
+
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <fstream>
+#include <thread>
 
 namespace rad {
 
@@ -83,6 +87,44 @@ int64_t cgroup_least_room() {
         return true;
     });
     return least;
+}
+
+bool room_short_is_small(int64_t short_by, int64_t want) {
+    return short_by >= 0 && short_by <= std::max<int64_t>((int64_t)2 << 30, want / 8);
+}
+
+bool wait_for_room(const std::function<bool(std::string*, int64_t*)>& probe, int64_t want,
+                   int64_t wait_ms, int64_t step_ms, std::string* why,
+                   const std::function<void(int64_t)>& nap) {
+    int64_t short_by = -1;
+    if (probe(why, &short_by)) return true;
+    if (wait_ms <= 0 || !room_short_is_small(short_by, want)) return false;
+    step_ms = std::max<int64_t>(step_ms, 1);
+    RAD_WARN("host memory: %s short (%s). A process that exited just before this start may still "
+             "be releasing its memory, so startup re-checks every %lld s for up to %lld s "
+             "(--host-memory-wait-s)", humanb(short_by).c_str(), why->c_str(),
+             (long long)(step_ms / 1000), (long long)(wait_ms / 1000));
+    int64_t waited = 0;
+    while (waited < wait_ms) {
+        const int64_t step = std::min(step_ms, wait_ms - waited);
+        if (nap) nap(step);
+        else std::this_thread::sleep_for(std::chrono::milliseconds(step));
+        waited += step;
+        std::string w;
+        if (probe(&w, &short_by)) {
+            RAD_INFO("host memory: the room is there after %.0f s; startup goes on",
+                     (double)waited / 1000.0);
+            return true;
+        }
+        *why = w;
+        if (!room_short_is_small(short_by, want)) return false;
+        RAD_WARN("host memory: still %s short after %.0f s", humanb(short_by).c_str(),
+                 (double)waited / 1000.0);
+    }
+    *why += fmt("; startup waited %.0f s for it (--host-memory-wait-s) and it did not come back: a "
+                "process that exited just before this start may still be releasing its memory, or "
+                "another process holds it", (double)waited / 1000.0);
+    return false;
 }
 
 }  /* namespace rad */

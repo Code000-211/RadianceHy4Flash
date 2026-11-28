@@ -6,7 +6,8 @@
 #
 # The engine writes one line a dispatch of every Nth pass on card 0: pass, seq (its record),
 # queue, kernel, ordered (the packet waited for the one before it on its queue), chained, start_ns,
-# end_ns, play, records. A pass is the plays of one tape from its record 0; its tape length
+# end_ns, play, records. A pass is the plays of one tape from its record 0, or a live-issued pass
+# (prefill, mixed; pass number from 2^40, play 0); its tape length or, live, its dispatch count
 # (`records`) tells kinds of pass apart (draft, verify, each prefill size), so every figure is per
 # kind, the median over that kind's passes.
 #

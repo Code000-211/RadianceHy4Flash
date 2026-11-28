@@ -113,5 +113,15 @@ struct TierPump {
  * still hold the previous step's values when the step loop dumps. */
 void dump_buffers(Ctx& ctx, int step, const char* phase = "");
 
+/* --prefix-cache-dir (Engine::pcache_page_in, engine_pcache.cpp): reads from disk what a request's
+ * chain reaches, keyed by `keys` (IPrefixCache::request_keys: media, adapter, control vector and,
+ * under --prefix-resume exact, the cold chunks), so the page-in finds the entries the scheduler's
+ * lookup and restore look for. `keys` null: the request's media keys alone. */
+struct PcPageIn;
+class PrefixStore;
+class HostArena;
+int pcache_page_in_request(const IPrefixCache* keys, PrefixCache& pc, IdleTiers& t, HostArena* ck,
+                           PrefixStore& st, const Request& req, uint64_t salt, PcPageIn* out);
+
 
 }  /* namespace rad */

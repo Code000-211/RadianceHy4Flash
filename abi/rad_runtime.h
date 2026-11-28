@@ -952,6 +952,20 @@ int rad_lane_join(RadCtx* c, int from, int to);
  * ask at run time. A negative status for a handle that was never declared. Additive export. */
 int rad_op_domain(RadCtx* c, rad_op op);
 
+/* Where this Engram layer's table actually lies: the per-layer RESOLVED placement -- Config's
+ * ngram_effective view (core/rad_core.h): the layer's own once Engine::resolve_table_placement
+ * confirmed one, the global --ngram-placement resolution for every layer the spec left out. The
+ * values mirror TablePlacement. Naming is not placement and the step-start Engram prefetch
+ * (hyv4flash_engram.h) gates on this, not on the flag's text: the overlap serves the tables a
+ * drive reads, and a ram layer's locked copy -- host-gathered like a disk one -- would have
+ * every row read twice. Recorded by the resolve (core/config.cpp); no ctx needed. Additive
+ * export. */
+enum {
+    RAD_TABLE_PLACE_AUTO = 0, RAD_TABLE_PLACE_VRAM = 1,
+    RAD_TABLE_PLACE_RAM  = 2, RAD_TABLE_PLACE_DISK = 3,
+};
+int rad_ngram_layer_resolved(int layer);
+
 /* Same, with the ranged value taken from the batch. */
 #define RAD_ISSUE(c, op, ...) rad_issue((c), (op), RAD_OPD(__VA_ARGS__), RAD_N_BATCH)
 #define RAD_ISSUE_N(c, op, n, ...) rad_issue((c), (op), RAD_OPD(__VA_ARGS__), (n))

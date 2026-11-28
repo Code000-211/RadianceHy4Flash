@@ -9,7 +9,11 @@
 #include "plugin/registry.h"
 #include "rad_builder.h"
 
+#include <dirent.h>
+
+#include <algorithm>
 #include <cstring>
+#include <memory>
 #include <map>
 #include <set>
 #include <string>
@@ -70,6 +74,104 @@ TEST(the_host_kernel_libraries_load_together_through_the_loader) {
         REQUIRE(owner != nullptr);
         if (avx_ops.count(op)) CHECK_EQ(owner->name, avx->name);
     }
+}
+
+/* Every kernel library this tree ships declares each op it shares with another under the same
+ * schema. The loader fixes an op's schema from the first library to declare it and refuses a whole
+ * later library that disagrees, so one stale declaration (#323: #275 made attn_dense's max_seqlen a
+ * capacity in libavx and libr4d, not in libref) stops a server at startup with every op of the
+ * refused library gone. Each library is loaded alone here, so every disagreeing op is named with
+ * both libraries and the slot that differs, whichever library a server would have loaded first;
+ * then the whole set loads together with no refusal. The comparison is the loader's rule (keys,
+ * kinds, requiredness, roles, operand roles and optionality; core/plugin/loader.cpp, schema_same),
+ * restated so a change to either shows up as a difference between them. */
+TEST(every_shipped_kernel_library_declares_a_shared_op_with_one_schema) {
+    const std::string dir = dir_of("kernels");
+    std::vector<std::string> files;
+    if (DIR* d = opendir(dir.c_str())) {
+        while (const dirent* e = readdir(d)) {
+            const std::string n = e->d_name;
+            if (n.size() > 3 && n.compare(n.size() - 3, 3, ".so") == 0) files.push_back(n);
+        }
+        closedir(d);
+    }
+    std::sort(files.begin(), files.end());
+    if (files.empty()) ARTIFACT_MISSING("the kernel libraries under " + dir);
+
+    struct Lib {
+        std::string name;
+        std::unique_ptr<Registry> reg;
+    };
+    std::vector<Lib> libs;
+    for (const std::string& f : files) {
+        auto r = std::make_unique<Registry>();
+        r->set_no_device_code(true);
+        const int st = r->load_plugin(dir + "/" + f, 0);
+        if (!r->load_errors().empty()) fprintf(stderr, "%s", errors(*r).c_str());
+        CHECK(st >= 0);
+        if (st != 0 || r->plugins().empty()) continue;      /* declined this machine */
+        const Plugin& p = r->plugins().front();
+        if (p.kind != RAD_PLUGIN_KERNEL || p.n_schemas == 0) continue;
+        libs.push_back({ p.name, std::move(r) });
+    }
+    std::set<std::string> names;
+    for (const Lib& l : libs) names.insert(l.name);
+    CHECK(names.count("libavx") && names.count("libref"));
+
+    auto kind = [](int k) { return std::string(param_kind_name(k)); };
+    auto differ = [&](const RadOpSchema& a, const RadOpSchema& b) -> std::string {
+        if (a.n_params != b.n_params)
+            return fmt("%d parameters vs %d", a.n_params, b.n_params);
+        for (int i = 0; i < a.n_params; ++i) {
+            const RadParamSpec& x = a.params[i];
+            const RadParamSpec& y = b.params[i];
+            const std::string kx = x.key ? x.key : "", ky = y.key ? y.key : "";
+            if (kx != ky) return fmt("parameter %d is '%s' vs '%s'", i, kx.c_str(), ky.c_str());
+            if (x.type != y.type)
+                return fmt("parameter '%s' is %s vs %s", kx.c_str(), kind(x.type).c_str(),
+                           kind(y.type).c_str());
+            if (x.required != y.required)
+                return fmt("parameter '%s' requiredness %d vs %d", kx.c_str(), x.required,
+                           y.required);
+            if (x.role != y.role)
+                return fmt("parameter '%s' has role %d vs %d", kx.c_str(), x.role, y.role);
+        }
+        if (a.n_operands != b.n_operands)
+            return fmt("%d operands vs %d", a.n_operands, b.n_operands);
+        for (int i = 0; i < a.n_operands; ++i)
+            if (a.operands[i].role != b.operands[i].role ||
+                a.operands[i].optional != b.operands[i].optional)
+                return fmt("operand %d has a different role or optionality", i);
+        return "";
+    };
+
+    int shared = 0, disagree = 0;
+    for (size_t i = 0; i < libs.size(); ++i) {
+        for (size_t j = i + 1; j < libs.size(); ++j) {
+            for (const std::string& op : libs[i].reg->op_names()) {
+                const RadOpSchema* a = libs[i].reg->schema(op);
+                const RadOpSchema* b = libs[j].reg->schema(op);
+                if (!a || !b) continue;
+                ++shared;
+                const std::string why = differ(*a, *b);
+                if (why.empty()) continue;
+                ++disagree;
+                fprintf(stderr, "    op '%s': '%s' and '%s' disagree (%s)\n", op.c_str(),
+                        libs[i].name.c_str(), libs[j].name.c_str(), why.c_str());
+            }
+        }
+    }
+    CHECK(shared > 50);
+    CHECK_EQ(disagree, 0);
+
+    /* The set a server loads: every kernel library at once, refused by nothing. */
+    Registry all;
+    all.set_no_device_code(true);
+    const int st = all.load_dir(dir, {});
+    if (!all.load_errors().empty()) fprintf(stderr, "%s", errors(all).c_str());
+    CHECK_OK(st);
+    CHECK(all.load_errors().empty());
+    for (const Lib& l : libs) CHECK(all.plugin(l.name) != nullptr);
 }
 
 /* Every shipped architecture plugin loads, exports declare and step, and claims its own

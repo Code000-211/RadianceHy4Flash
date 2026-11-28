@@ -8856,6 +8856,287 @@ static void moe_iqr_pack_case(const Plugin& pl, int64_t Mtok, bool down, int B =
     dfree_all();
 }
 
+/* --perfmoeiqr's expert placement (#296), the same for its gate_up and down rows.
+ * R4D_PERF_IQR_POOL=n: about one expert in n (a fixed hash of its index, the same for every routing
+ * and both projections) is read out of pinned host memory through the pointer table, as the
+ * engine's pooled experts were before W2 (fine-grained, so every launch reads them across the link
+ * as the engine's host pool is read); 0 or unset: all resident. R4D_PERF_IQR_ALIAS: every expert
+ * of a class reads the first one's bytes (from cache), what the launch costs without its weight
+ * traffic. R4D_PERF_IQR_ALIAS_N=n: expert j of a class reads expert j % n's bytes, n distinct a
+ * class (cache-resident for small n without one hot address range). */
+struct PerfIqrMode {
+    int64_t pool_n = 0, alias_n = 0;
+    bool alias_one = false;
+    static PerfIqrMode from_env() {
+        PerfIqrMode m;
+        if (const char* v = std::getenv("R4D_PERF_IQR_POOL")) m.pool_n = std::atoll(v);
+        if (const char* v = std::getenv("R4D_PERF_IQR_ALIAS_N")) m.alias_n = std::atoll(v);
+        m.alias_one = std::getenv("R4D_PERF_IQR_ALIAS") != nullptr;
+        return m;
+    }
+    /* expert e (its index over both classes) is read from the host */
+    bool pooled(int64_t e) const {
+        return pool_n >= 2 && ((uint32_t)((uint64_t)(e + 1) * 2654435761ull >> 7) % (uint32_t)pool_n) == 0u;
+    }
+    /* the block a class's j-th expert reads */
+    int64_t alias(int64_t j) const { return alias_one ? 0 : alias_n > 0 ? j % alias_n : j; }
+};
+
+/* A class's j-th expert's pointer-table entry (`e` its index over both classes): block
+ * md.alias(j) of `plane` (blocks `stride` apart), or for a pooled expert a pinned host copy of
+ * that block's `n` bytes, mapped for the card and kept in `hostp` to free. Null if pinning fails. */
+static const void* perf_iqr_place(const PerfIqrMode& md, const uint8_t* plane, size_t stride, size_t n,
+                                  int64_t j, int64_t e, std::vector<void*>& hostp) {
+    const uint8_t* blk = plane + (size_t)md.alias(j) * stride;
+    if (!md.pooled(e)) return blk;
+    void* h = nullptr;
+    void* hd = nullptr;
+    if (hipHostMalloc(&h, n, hipHostMallocMapped | hipHostMallocCoherent) != hipSuccess) return nullptr;
+    hostp.push_back(h);
+    if (hipHostGetDevicePointer(&hd, h, 0) != hipSuccess || !hd) return nullptr;
+    if (st_memcpy(h, blk, n, hipMemcpyDeviceToHost) != hipSuccess) return nullptr;
+    return hd;
+}
+
+/* What --perfmoeiqr's Hy4 down row ran: its output's fnv and, with `check`, what the check saw. */
+struct DnHy4Run {
+    bool ran = false;
+    uint64_t fnv = 0;          /* the first routing's output, launched alone */
+    int64_t host_ptrs = 0;     /* pointer-table entries in host memory (hipPointerGetAttributes) */
+    int64_t distinct = 0;      /* distinct pointer-table entries, both classes */
+    int64_t unwritten = -1;    /* the first routing's outputs left at the poison */
+    int64_t vs_stacked = -1;   /* ...that differ from the same experts' bytes stacked in one plane */
+};
+
+/* --perfmoeiqr's Hy4 down (#296): Hy4-flash's routed down at TP2 -- 1536 rows by K 768, w4nl64
+ * (two E4M3 scales a 128 of K, the u3 container's down), int8 activation in sorted order -- on the
+ * gate_up rows' own routings, taken in turn the same way, through moe_gemm_w4a8i8 (the rule's
+ * decode form in the band is moe_down_dec_kernel). Every expert its own random codes behind a
+ * pointer table, as the engine's experts are, placed by `md`. Timed as the gate_up rows are: 300 ms
+ * of launches, then the median of five stretches of `iters`. `check` times nothing: it launches
+ * the first routing alone over a poisoned output, then the same experts' bytes stacked in one
+ * plane, for perf_moe_iqr_rows_case. */
+static DnHy4Run moe_dn_hy4_perf(const Plugin& pl, const std::vector<std::vector<int32_t>>& sortedR,
+                                const std::vector<std::vector<int32_t>>& offR, int64_t Mtok, int iters,
+                                int64_t E, int64_t top_k, const PerfIqrMode& md, double used_mean,
+                                bool check = false) {
+    DnHy4Run out;
+    const RadKernelInfo* r = find(pl, "moe_gemm_w4a8i8");
+    if (!r) { std::printf("  down (hy4 tp2): row moe_gemm_w4a8i8 absent\n"); return out; }
+    const int64_t rot = (int64_t)sortedR.size(), Tr = Mtok * top_k, N = 1536, K = 768, kb = K / 128;
+    const int64_t nec[2] = { (E + 1) / 2, E / 2 };
+    const size_t cb = (size_t)(N * K / 2), sbs = (size_t)(N * 2 * kb);
+    uint64_t z = 0xD1B54A32D192ED03ull ^ (uint64_t)Mtok;
+    auto rnd = [&]() {
+        z += 0x9E3779B97F4A7C15ull;
+        uint64_t x = z;
+        x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ull;
+        x = (x ^ (x >> 27)) * 0x94D049BB133111EBull;
+        return x ^ (x >> 31);
+    };
+    std::vector<void*> hostp;
+    auto fail = [&](const char* why) {
+        std::printf("  down (hy4 tp2): %s\n", why);
+        for (void* x : hostp) (void)hipHostFree(x);
+        dfree_all();
+        return out;
+    };
+    void* tab[2];
+    void* dws[2];
+    std::vector<const void*> tp[2];
+    std::vector<uint8_t> hb(cb);
+    for (int q = 0; q < 2; ++q) {
+        uint8_t* dw = (uint8_t*)dalloc(cb * (size_t)nec[q]);
+        if (!dw) return fail("allocation failed");
+        for (int64_t j = 0; j < nec[q]; ++j) {
+            for (auto& b : hb) b = (uint8_t)rnd();
+            st_memcpy(dw + (size_t)j * cb, hb.data(), cb, hipMemcpyHostToDevice);
+        }
+        tp[q].resize((size_t)nec[q]);
+        for (int64_t j = 0; j < nec[q]; ++j)
+            if (!(tp[q][(size_t)j] = perf_iqr_place(md, dw, cb, cb, j, 2 * j + q, hostp)))
+                return fail("pinned allocation failed");
+        tab[q] = dalloc(tp[q].size() * sizeof(void*));
+        st_memcpy(tab[q], tp[q].data(), tp[q].size() * sizeof(void*), hipMemcpyHostToDevice);
+        /* two E4M3 scales a (row, 128 of K): positive normal values */
+        std::vector<uint8_t> sc(sbs * (size_t)nec[q]);
+        for (auto& b : sc) b = (uint8_t)(0x28u + (uint8_t)(rnd() % 32));
+        dws[q] = dalloc(sc.size());
+        st_memcpy(dws[q], sc.data(), sc.size(), hipMemcpyHostToDevice);
+    }
+    std::vector<int8_t> ha((size_t)(Tr * K));
+    for (auto& v : ha) v = (int8_t)((int)(rnd() % 255) - 127);
+    std::vector<float> has((size_t)(Tr * kb), 0.01f);
+    void* d_a = dalloc(ha.size());
+    void* d_as = dalloc(has.size() * 4);
+    void* d_y = dalloc((size_t)(Tr * N) * 2);
+    if (!d_a || !d_as || !d_y) return fail("allocation failed");
+    st_memcpy(d_a, ha.data(), ha.size(), hipMemcpyHostToDevice);
+    st_memcpy(d_as, has.data(), has.size() * 4, hipMemcpyHostToDevice);
+    std::vector<void*> d_soR((size_t)rot), d_ofR((size_t)rot);
+    for (int64_t ri = 0; ri < rot; ++ri) {
+        d_soR[(size_t)ri] = dalloc((size_t)Tr * 4);
+        d_ofR[(size_t)ri] = dalloc((size_t)(E + 1) * 4);
+        st_memcpy(d_soR[(size_t)ri], sortedR[(size_t)ri].data(), (size_t)Tr * 4, hipMemcpyHostToDevice);
+        st_memcpy(d_ofR[(size_t)ri], offR[(size_t)ri].data(), (size_t)(E + 1) * 4, hipMemcpyHostToDevice);
+    }
+    std::vector<RadTensor> ts = {
+        T(d_a, RAD_I8, { Tr, K }), T(d_as, RAD_F32, { Tr, kb }),
+        T(tab[0], R4D_DT_MOEW4, { nec[0], N, K }), T(dws[0], RAD_F8E4M3, { nec[0], N, 2 * kb }),
+        T(d_soR[0], RAD_I32, { Tr }), T(d_ofR[0], RAD_I32, { E + 1 }),
+        T(tab[1], R4D_DT_MOEW4, { nec[1], N, K }), T(dws[1], RAD_F8E4M3, { nec[1], N, 2 * kb }),
+        T(d_y, RAD_BF16, { Tr, N }) };
+    ts[2].stride[0] = 0;
+    ts[6].stride[0] = 0;
+    std::vector<RadParam> ps = {
+        PI("M", Mtok), PI("N", N), PI("K", K), PI("N_odd", N), PI("K_odd", K), PI("parts", 1),
+        PI("n_expert", E), PI("top_k", top_k), PI("group", 128), PS("a_order", "sorted"),
+        PS("dtype", "w4nl64a8i8h") };
+    RadArgs a;
+    std::memset(&a, 0, sizeof(a));
+    a.t = ts.data(); a.n_t = (int)ts.size();
+    a.p = ps.data(); a.n_p = (int)ps.size();
+    if (r->scratch) {
+        const int64_t need = r->scratch(&a);
+        if (need > 0) { a.scratch = dalloc((size_t)need); a.scratch_bytes = need; }
+    }
+    std::vector<std::vector<RadTensor>> tsR((size_t)rot, ts);
+    std::vector<RadArgs> aR((size_t)rot, a);
+    for (int64_t ri = 0; ri < rot; ++ri) {
+        tsR[(size_t)ri][4] = T(d_soR[(size_t)ri], RAD_I32, { Tr });
+        tsR[(size_t)ri][5] = T(d_ofR[(size_t)ri], RAD_I32, { E + 1 });
+        aR[(size_t)ri].t = tsR[(size_t)ri].data();
+    }
+    int rc = RAD_OK;
+    for (int i = 0; i < 3 * (int)rot && rc == RAD_OK; ++i) rc = r->launch(&aR[(size_t)(i % rot)], nullptr);
+    if (rc != RAD_OK || st_stream_sync(nullptr) != hipSuccess) {
+        return fail(("launch rc " + std::to_string(rc)).c_str());
+    }
+    std::vector<uint8_t> hy((size_t)(Tr * N) * 2);
+    auto fnv = [&]() {
+        uint64_t h = 1469598103934665603ull;
+        for (uint8_t b8 : hy) { h ^= b8; h *= 1099511628211ull; }
+        return h;
+    };
+    if (check) {
+        /* the table's entries: where they live, and how many distinct */
+        std::vector<const void*> all(tp[0]);
+        all.insert(all.end(), tp[1].begin(), tp[1].end());
+        for (const void* p : all) {
+            hipPointerAttribute_t at;
+            if (hipPointerGetAttributes(&at, p) == hipSuccess && at.type == hipMemoryTypeHost) ++out.host_ptrs;
+        }
+        std::sort(all.begin(), all.end());
+        out.distinct = (int64_t)(std::unique(all.begin(), all.end()) - all.begin());
+        /* the first routing alone, over a poisoned output */
+        const std::vector<uint16_t> poison((size_t)(Tr * N), h_to_bf16(-77.0f));
+        auto run0 = [&](RadArgs& ra) {
+            st_memcpy(d_y, poison.data(), poison.size() * 2, hipMemcpyHostToDevice);
+            const int rr = r->launch(&ra, nullptr);
+            if (rr != RAD_OK || st_stream_sync(nullptr) != hipSuccess) return false;
+            return st_memcpy(hy.data(), d_y, hy.size(), hipMemcpyDeviceToHost) == hipSuccess;
+        };
+        if (!run0(aR[0])) return fail("the check's launch failed");
+        out.fnv = fnv();
+        const uint16_t* y16 = (const uint16_t*)hy.data();
+        out.unwritten = 0;
+        for (size_t i = 0; i < poison.size(); ++i) out.unwritten += y16[i] == poison[i];
+        const std::vector<uint8_t> y0 = hy;
+        /* the same experts' bytes, wherever their entries point, stacked in one plane a class */
+        std::vector<RadTensor> tss = tsR[0];
+        for (int q = 0; q < 2; ++q) {
+            uint8_t* stk = (uint8_t*)dalloc(cb * (size_t)nec[q]);
+            if (!stk) return fail("allocation failed");
+            for (int64_t j = 0; j < nec[q]; ++j)
+                st_memcpy(stk + (size_t)j * cb, tp[q][(size_t)j], cb, hipMemcpyDefault);
+            tss[q ? 6 : 2] = T(stk, R4D_DT_MOEW4, { nec[q], N, K });
+        }
+        RadArgs as = aR[0];
+        as.t = tss.data();
+        if (!run0(as)) return fail("the stacked launch failed");
+        out.vs_stacked = 0;
+        for (size_t i = 0; i < hy.size(); i += 2)
+            out.vs_stacked += hy[i] != y0[i] || hy[i + 1] != y0[i + 1];
+        out.ran = true;
+        for (void* x : hostp) (void)hipHostFree(x);
+        dfree_all();
+        return out;
+    }
+    {
+        const auto w0 = std::chrono::steady_clock::now();
+        while (std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - w0).count() < 300.0) {
+            for (int i = 0; i < 8; ++i) (void)r->launch(&aR[(size_t)(i % rot)], nullptr);
+            (void)st_stream_sync(nullptr);
+        }
+    }
+    double tv[5];
+    for (double& us : tv) {
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < iters; ++i) (void)r->launch(&aR[(size_t)(i % rot)], nullptr);
+        (void)st_stream_sync(nullptr);
+        us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / iters;
+    }
+    std::sort(tv, tv + 5);
+    const double us = tv[2];
+    st_memcpy(hy.data(), d_y, hy.size(), hipMemcpyDeviceToHost);
+    out.fnv = fnv();
+    const double exp_bytes = (double)(cb + sbs);
+    const double cbytes = used_mean * (double)cb;
+    const double rbytes = used_mean * exp_bytes + (double)(Tr * K) + (double)(Tr * kb * 4) + (double)(Tr * N * 2);
+    std::printf("  moe_down_dec down 1536 x 768 (hy4 tp2) w4nl64 pool %lld %8.1f us a launch (%.1f..%.1f)  "
+                "%6.1f GB/s of codes  %6.1f GB/s real (%.1f MB; an expert %.0f bytes)  fnv %016llx\n",
+                (long long)md.pool_n, us, tv[0], tv[4], cbytes / (us * 1e3), rbytes / (us * 1e3), rbytes / 1e6,
+                exp_bytes, (unsigned long long)out.fnv);
+    out.ran = true;
+    for (void* x : hostp) (void)hipHostFree(x);
+    dfree_all();
+    return out;
+}
+
+/* --perfmoeiqr's Hy4 down row and its placement modes (#296), at a tiny height: two tokens over
+ * 16 experts at top 4, two routings. Resident, the row writes every output, its table has an entry
+ * an expert, all on the card, and it gives the bytes of the same experts stacked in one plane.
+ * R4D_PERF_IQR_POOL=2 moves some entries to host memory and gives the resident output to the bit;
+ * R4D_PERF_IQR_ALIAS_N=1 leaves one entry a class, reading other bytes than resident. */
+static void perf_moe_iqr_rows_case(const Plugin& pl) {
+    const int64_t Mtok = 2, E = 16, top_k = 4, rot = 2, Tr = Mtok * top_k;
+    std::vector<std::vector<int32_t>> sortedR((size_t)rot), offR((size_t)rot);
+    for (int64_t ri = 0; ri < rot; ++ri) {
+        std::vector<std::vector<int32_t>> rows_of((size_t)E);
+        for (int64_t t = 0; t < Mtok; ++t)
+            for (int64_t k = 0; k < top_k; ++k)   /* distinct a token: 3k + 5t + ri over 16 */
+                rows_of[(size_t)((3 * k + 5 * t + ri) % E)].push_back((int32_t)(t * top_k + k));
+        offR[(size_t)ri].assign((size_t)E + 1, 0);
+        for (int64_t e = 0; e < E; ++e) {
+            offR[(size_t)ri][(size_t)e] = (int32_t)sortedR[(size_t)ri].size();
+            sortedR[(size_t)ri].insert(sortedR[(size_t)ri].end(), rows_of[(size_t)e].begin(), rows_of[(size_t)e].end());
+        }
+        offR[(size_t)ri][(size_t)E] = (int32_t)Tr;
+    }
+    const char* const head = "--perfmoeiqr's Hy4 down row (T 8, 16 experts)";
+    PerfIqrMode res, pool, ali;
+    pool.pool_n = 2;
+    ali.alias_n = 1;
+    const DnHy4Run a = moe_dn_hy4_perf(pl, sortedR, offR, Mtok, 1, E, top_k, res, 0.0, true);
+    const DnHy4Run b = moe_dn_hy4_perf(pl, sortedR, offR, Mtok, 1, E, top_k, pool, 0.0, true);
+    const DnHy4Run c = moe_dn_hy4_perf(pl, sortedR, offR, Mtok, 1, E, top_k, ali, 0.0, true);
+    if (!a.ran || !b.ran || !c.ran) { ok(head, false, "a launch failed (above)"); return; }
+    int64_t npool = 0;
+    for (int64_t e = 0; e < E; ++e) npool += pool.pooled(e);
+    ok(fmt("%s: resident", head).c_str(), a.unwritten == 0 && a.vs_stacked == 0 && a.host_ptrs == 0 && a.distinct == E,
+       fmt("%lld outputs unwritten, %lld differ from the stacked plane's, %lld of %lld entries on the host, %lld distinct",
+           (long long)a.unwritten, (long long)a.vs_stacked, (long long)a.host_ptrs, (long long)E, (long long)a.distinct));
+    ok(fmt("%s: R4D_PERF_IQR_POOL=2", head).c_str(),
+       npool > 0 && b.host_ptrs == npool && b.unwritten == 0 && b.vs_stacked == 0 && b.fnv == a.fnv,
+       fmt("%lld entries on the host (%lld pooled), %lld unwritten, %lld differ from the stacked plane's, output %s resident's",
+           (long long)b.host_ptrs, (long long)npool, (long long)b.unwritten, (long long)b.vs_stacked,
+           b.fnv == a.fnv ? "==" : "!="));
+    ok(fmt("%s: R4D_PERF_IQR_ALIAS_N=1", head).c_str(),
+       c.distinct == 2 && c.host_ptrs == 0 && c.unwritten == 0 && c.vs_stacked == 0 && c.fnv != a.fnv,
+       fmt("%lld distinct entries, %lld unwritten, %lld differ from the stacked plane's, output %s resident's",
+           (long long)c.distinct, (long long)c.unwritten, (long long)c.vs_stacked, c.fnv != a.fnv ? "!=" : "=="));
+}
+
 /* --perfmoe's IQR rows: moe_gemm_iqr at Qwen3.8-Flash-Next's per-rank shapes (gate_up 768:512 rows
  * by 2560 in two parts, gathered by token; down 2560 rows by 384:256, sorted rows), every expert
  * its own buffer of random codes, at three, four and five bits. R4D_PERF_IQR_SHAPE=hy4 swaps in
@@ -8902,6 +9183,10 @@ static void moe_iqr_perf(const Plugin& pl, int64_t Mtok, int iters, int64_t E, i
      * 16-row token tiles, by class */
     int64_t rows_c[2] = { 0, 0 }, used_c[2] = { 0, 0 }, ent_c[2] = { 0, 0 }, til_c[2] = { 0, 0 };
     int64_t rmax = 0;
+    /* where the experts live: R4D_PERF_IQR_POOL, _ALIAS, _ALIAS_N (PerfIqrMode) */
+    const PerfIqrMode md = PerfIqrMode::from_env();
+    /* every routing's experts used and pooled experts used, for the bytes a launch reads */
+    double used_mean = 0.0, pooled_mean = 0.0;
     for (int64_t ri = 0; ri < rot; ++ri) {
         std::vector<std::vector<int32_t>> rows_of((size_t)E);
         for (int64_t t = 0; t < Mtok; ++t) {
@@ -8930,6 +9215,8 @@ static void moe_iqr_perf(const Plugin& pl, int64_t Mtok, int iters, int64_t E, i
             off[(size_t)e] = (int32_t)sorted.size();
             sorted.insert(sorted.end(), rows_of[(size_t)e].begin(), rows_of[(size_t)e].end());
             const size_t n = rows_of[(size_t)e].size();
+            used_mean += n ? 1.0 / (double)rot : 0.0;
+            pooled_mean += n && md.pooled(e) ? 1.0 / (double)rot : 0.0;
             if (ri == 0) {
                 runs += n ? 1 : 0;
                 runs1 += n == 1 ? 1 : 0;
@@ -8950,6 +9237,8 @@ static void moe_iqr_perf(const Plugin& pl, int64_t Mtok, int iters, int64_t E, i
     std::printf("  runs: longest %lld rows; the run map's entries %lld (64 rows each), 16-row token "
                 "tiles %lld (%.0f %% filled)\n", (long long)rmax, (long long)(ent_c[0] + ent_c[1]),
                 (long long)(til_c[0] + til_c[1]), 100.0 * (double)Tr / (16.0 * (double)(til_c[0] + til_c[1])));
+    std::printf("  experts used a routing: %.1f (mean of %lld), of them pooled %.1f (pool 1 in %lld)\n",
+                used_mean, (long long)rot, pooled_mean, (long long)md.pool_n);
     /* R4D_PERF_IQR_B: one code width instead of three; R4D_PERF_IQR_PROJ: 0 gate_up, 1 down alone;
      * R4D_PERF_IQR_SHAPE: hy4 for Hy4-flash's gate_up at TP2, K 1536 as its container has it;
      * R4D_PERF_IQR_PINS: the prefill maps timed in turn (r4d_moe_iqr_pin_map_tiles's values, comma
@@ -8997,6 +9286,8 @@ static void moe_iqr_perf(const Plugin& pl, int64_t Mtok, int iters, int64_t E, i
             void* stb[2];
             RadLayout lw[2], ls[2];
             bool good = true;
+            std::vector<void*> hostp;     /* pooled experts' pinned blocks */
+            size_t exp_bytes = 0;         /* an expert's codes and scales as stored */
             for (int q = 0; q < 2 && good; ++q) {
                 const int64_t n = Nc[q], k = Kc[q], cnt = (E + 1 - q) / 2;
                 Planes p;
@@ -9031,6 +9322,11 @@ static void moe_iqr_perf(const Plugin& pl, int64_t Mtok, int iters, int64_t E, i
                     good = false;
                     break;
                 }
+                if (q == 0) {
+                    exp_bytes = wq.size() + wsc.size();
+                    std::printf("  %s B=%d: an expert stored as %zu code-plane + %zu scale bytes (codes alone %lld)\n",
+                                P.what, B, wq.size(), wsc.size(), (long long)(n * k * B / 8));
+                }
                 /* every expert its own bytes: one plane a class, an entry a 256-aligned stride */
                 const size_t wb = (wq.size() + 255) / 256 * 256, sb = (wsc.size() + 255) / 256 * 256;
                 uint8_t* dw = (uint8_t*)dalloc(wb * (size_t)cnt);
@@ -9040,18 +9336,24 @@ static void moe_iqr_perf(const Plugin& pl, int64_t Mtok, int iters, int64_t E, i
                 for (int64_t j = 0; j < cnt; ++j) {
                     st_memcpy(dw + (size_t)j * wb, wq.data(), wq.size(), hipMemcpyHostToDevice);
                     st_memcpy(dsc + (size_t)j * sb, wsc.data(), wsc.size(), hipMemcpyHostToDevice);
-                    /* R4D_PERF_IQR_ALIAS: every expert of a class the same bytes (read from cache):
-                     * what the launch costs without its weight traffic */
-                    const size_t ja = std::getenv("R4D_PERF_IQR_ALIAS") ? 0 : (size_t)j;
-                    wp[(size_t)j] = dw + ja * wb;
-                    sp[(size_t)j] = dsc + ja * sb;
                 }
+                for (int64_t j = 0; j < cnt && good; ++j) {
+                    wp[(size_t)j] = perf_iqr_place(md, dw, wb, wb, j, 2 * j + q, hostp);
+                    sp[(size_t)j] = perf_iqr_place(md, dsc, sb, sb, j, 2 * j + q, hostp);
+                    good = wp[(size_t)j] && sp[(size_t)j];
+                }
+                if (!good) break;
                 wt[q] = dalloc(wp.size() * sizeof(void*));
                 stb[q] = dalloc(sp.size() * sizeof(void*));
                 st_memcpy(wt[q], wp.data(), wp.size() * sizeof(void*), hipMemcpyHostToDevice);
                 st_memcpy(stb[q], sp.data(), sp.size() * sizeof(void*), hipMemcpyHostToDevice);
             }
-            if (!good) { std::printf("  %s B=%d: layout or allocation failed\n", P.what, B); dfree_all(); return; }
+            if (!good) {
+                std::printf("  %s B=%d: layout or allocation failed\n", P.what, B);
+                for (void* h : hostp) (void)hipHostFree(h);
+                dfree_all();
+                return;
+            }
             const int64_t Ma = P.srt ? Tr : Mtok;
             std::vector<int8_t> ha((size_t)(Ma * K));
             std::vector<float> has((size_t)(Ma * nkb), 0.01f);
@@ -9164,15 +9466,25 @@ static void moe_iqr_perf(const Plugin& pl, int64_t Mtok, int iters, int64_t E, i
                 uint64_t hsh = 1469598103934665603ull;
                 for (uint8_t b8 : hy) { hsh ^= b8; hsh *= 1099511628211ull; }
                 if (pi == 0) h0 = hsh;
+                /* the bytes a launch reads: its routing's experts as stored, the activation and its
+                 * scales, and the output it writes (mean over the routings) */
+                const double rbytes = used_mean * (double)exp_bytes + (double)(Ma * K) +
+                                      (double)(Ma * nkb * 4) + (double)(Tr * N * 2);
                 std::printf("  moe_gemm_iqr %-24s B=%d tiles %d %8.1f us a launch (%.1f..%.1f)  %6.1f TFLOP/s  "
-                            "%6.1f GB/s of codes  fnv %016llx%s\n", P.what, B, pins[pi], us, tv[0], tv[4],
-                            flop / (us * 1e6), wbytes / (us * 1e3), (unsigned long long)hsh,
+                            "%6.1f GB/s of codes  %6.1f GB/s real (%.1f MB)  fnv %016llx%s\n", P.what, B, pins[pi], us, tv[0], tv[4],
+                            flop / (us * 1e6), wbytes / (us * 1e3), rbytes / (us * 1e3), rbytes / 1e6, (unsigned long long)hsh,
                             pi == 0 ? "" : hsh == h0 ? "  == first" : "  DIFFERS");
             }
             if (pin_long) pin_long(0);
+            for (void* h : hostp) (void)hipHostFree(h);
             dfree_all();
         }
     dfree_all();
+    /* R4D_PERF_IQR_SHAPE=hy4 and R4D_PERF_IQR_PROJ unset or 1 (#296): Hy4-flash's routed down at
+     * TP2 over the same routings, the row the engine serves it with (moe_gemm_w4a8i8, w4nl64a8i8h:
+     * moe_down_dec_kernel in the decode band). */
+    if (hy4 && (onlyP < 0 || onlyP == 1))
+        (void)moe_dn_hy4_perf(pl, sortedR, offR, Mtok, iters, E, top_k, md, used_mean);
 }
 
 /* The rotated int8 trunk against the f32 product it approximates. i8a8_numeric's reference uses
@@ -19867,11 +20179,13 @@ static void moe_perf(const Plugin& pl, int64_t Mtok, int iters, int64_t E = 512,
     int nforms = (pl.pin_moe ? (pl.pin_fk ? 4 : 3) : 1) + (w6_only && pl.pin_moe ? 1 : 0);
     /* R4D_PERF_MOE_ONLY: only the rows whose name it is (e.g. "down g64 i8"), and only their first
      * form and the down tile's M tiles a block (R4D_PERF_MOE_MT: r4d_moe_gemm_pin_down_mt's values,
-     * 2 and 4, comma separated). */
+     * 2 and 4, comma separated; `4:n` also pins the 64-row block's column tiles a block to n, 1 to
+     * 3, r4d_moe_gemm_pin_down_ng's values, e.g. "4:1,4:2,4:3"). */
     const char* only = std::getenv("R4D_PERF_MOE_ONLY");
     typedef void (*PinFn)(int);
     const PinFn pin_dmt = (PinFn)dlsym(pl.h, "r4d_moe_gemm_pin_down_mt");
-    std::vector<int> mts;
+    const PinFn pin_dng = (PinFn)dlsym(pl.h, "r4d_moe_gemm_pin_down_ng");
+    std::vector<int> mts, ngs;
     if (only) {
         nforms = 1;
         const char* ev = std::getenv("R4D_PERF_MOE_MT");
@@ -19880,10 +20194,14 @@ static void moe_perf(const Plugin& pl, int64_t Mtok, int iters, int64_t E = 512,
             size_t j = ps_.find(',', i);
             if (j == std::string::npos) j = ps_.size();
             mts.push_back(std::atoi(ps_.substr(i, j - i).c_str()));
+            const size_t c = ps_.find(':', i);
+            ngs.push_back(c < j ? std::atoi(ps_.substr(c + 1, j - c - 1).c_str()) : 0);
             i = j + 1;
         }
     }
     if (!pin_dmt || mts.empty()) mts.assign(1, 0);
+    if (!pin_dng) ngs.clear();
+    ngs.resize(mts.size(), 0);
     int64_t ent32 = 0, ent64 = 0, ent128 = 0, usedn = 0;
     for (int64_t e = 0; e < E; ++e) {
         const int64_t n = (int64_t)by_e[(size_t)e].size();
@@ -20069,6 +20387,7 @@ static void moe_perf(const Plugin& pl, int64_t Mtok, int iters, int64_t E = 512,
             if (pl.pin_moe) pl.pin_moe(pinned < 0 ? 0 : pinned == 3 ? 2 : pinned + 1);
             if (pl.pin_fk) pl.pin_fk(pinned < 0 ? 0 : pinned == 3 ? 2 : 1);
             if (pin_dmt && mts[mi]) pin_dmt(mts[mi]);
+            if (pin_dng) pin_dng(ngs[mi]);
             const int rc = ra->launch(&a, nullptr);
             if (rc != RAD_OK || st_stream_sync(nullptr) != hipSuccess) {
                 std::printf("  %-12s form %-4s  rc=%d (not served)\n", pname.c_str(), form.c_str(), rc);
@@ -20091,6 +20410,7 @@ static void moe_perf(const Plugin& pl, int64_t Mtok, int iters, int64_t E = 512,
             st_memcpy(got.data(), d_y, got.size() * 2, hipMemcpyDeviceToHost);
             std::string same = "";
             if (mts[mi]) same = "  rows/block pin " + std::to_string(mts[mi]);
+            if (ngs[mi]) same += "  column tiles/block pin " + std::to_string(ngs[mi]);
             if (f == 0 && mi == 0) {
                 first = got;
                 /* A hash of the first form's bytes, to compare builds; the inputs are a fixed
@@ -20113,6 +20433,7 @@ static void moe_perf(const Plugin& pl, int64_t Mtok, int iters, int64_t E = 512,
         if (pl.pin_moe) pl.pin_moe(0);
         if (pl.pin_fk) pl.pin_fk(0);
         if (pin_dmt) pin_dmt(-1);
+        if (pin_dng) pin_dng(0);
     }
 }
 
@@ -20121,7 +20442,8 @@ static void moe_perf(const Plugin& pl, int64_t Mtok, int iters, int64_t E = 512,
  * x 384:256, w4nl64 against an int8 activation), over one routing of `Mtok` tokens at 512 experts
  * and top 10: a measured routing's shape (lognormal run lengths) with every length around the
  * blocks' bounds planted, and a dropped tail. The 32-row block is the form moe_w4_gemm holds
- * against the host decode. */
+ * against the host decode. Then the 64-row block's column tiles a block (g_moe_down_ng_pin): one
+ * and two against the same bytes, and three refused at a width that is not whole triples. */
 static void moe_down_mt_case(const Plugin& pl, int64_t Mtok) {
     if (!sel("moe_gemm_w4a8i8")) return;
     const int64_t E = 512, top_k = 10, Tr = Mtok * top_k, drop = 37, group = 128;
@@ -20270,6 +20592,21 @@ static void moe_down_mt_case(const Plugin& pl, int64_t Mtok) {
                       std::to_string(first / N) + " column " + std::to_string(first % N)
                 : "the 32-row block's bytes");
     }
+    if (const PinFn pin_ng = (PinFn)dlsym(pl.h, "r4d_moe_gemm_pin_down_ng")) {
+        for (const int g : { 1, 2, 3 }) {
+            const std::string what = std::string(nm) + ": pin 4, " + std::to_string(g) + " column tile(s) a block";
+            pin_ng(g);
+            const bool ran = run_pin(4, y);
+            pin_ng(0);
+            if (g == 3) { ok(what.c_str(), !ran, ran ? "launched at a width of five tiles" : "refused"); continue; }
+            if (!ran) { ok(what.c_str(), false, "launch failed"); continue; }
+            int64_t diff = 0;
+            for (size_t i = 0; i < y.size(); ++i) diff += y[i] != y0[i];
+            ok(what.c_str(), diff == 0,
+               diff ? std::to_string(diff) + " elements differ from the 32-row block's" : "the 32-row block's bytes");
+        }
+    } else
+        ok((std::string(nm) + ": column tiles pin").c_str(), false, "r4d_moe_gemm_pin_down_ng absent");
     /* K-59's `dmt` axis (rad-tune's): the two M tiles a block reached by the parameter with the test
      * hook off, over the 32-row block's bytes, and a value that is neither refused rather than taken
      * as the rule. */
@@ -21620,6 +21957,73 @@ static void mla_sink_bytes(const Plugin& pl, int64_t heads, std::vector<int64_t>
         ok(fmt("%s chained selection form == plain bytes", label.c_str()).c_str(),
            ran && g == plain);
     }
+}
+
+/* P-17 (#301): the pipelined prefill's attention pieces, mla_attn_paged_sink. One prefill sequence
+ * of T rows after `pre` cached tokens, launched whole, then as the trunk launches its two pieces
+ * (hyv4flash_attn.h, Attn::core_piece): piece 1 (rows [n0, T)) at bounds {0, n1} and the step's
+ * seqused; piece 0 (rows [0, n0)) at {0, n0} and the seqused less n1; and piece 0 again through the
+ * launch's `row0` argument instead (row0 = -n1 over the step's seqused). Every piece row must be the
+ * whole launch's bytes. A piece 0 at the unshifted seqused must not be: the case sees the bound. */
+static void mla_sink_piece_bytes(const Plugin& pl, int64_t heads, int64_t T, int64_t pre, int64_t n0,
+                                 int64_t window, int64_t bs, int stable) {
+    const auto* paged = find(pl, "mla_attn_paged_sink_bf16");
+    std::string label = fmt("sink pieces H=%lld w=%lld bs=%lld stable=%d %lld+%lld after %lld",
+                            (long long)heads, (long long)window, (long long)bs, stable,
+                            (long long)n0, (long long)(T - n0), (long long)pre);
+    if (!paged) {
+        ok(label.c_str(), false, "kernel missing");
+        return;
+    }
+    const int64_t n1 = T - n0, ctx = pre + T;
+    SinkOps all = sink_ops(false, heads, { T }, { ctx }, window, bs, 0, 1, stable);
+    std::vector<uint8_t> base;
+    if (!sink_device(pl, paged, all, 0, base)) {
+        ok(label.c_str(), false, "device launch failed");
+        return;
+    }
+    const auto& ot = all.host[(size_t)all.out];
+    auto row_bytes = [&](const std::vector<uint8_t>& b, const RadTensor& t, int64_t r) {
+        std::vector<uint16_t> v;
+        for (int64_t h = 0; h < heads; ++h)
+            for (int64_t d = 0; d < 512; ++d)
+                v.push_back(((const uint16_t*)(b.data() + 128))[r * t.stride[0] + h * t.stride[1] + d]);
+        return v;
+    };
+    /* A piece of `n` rows from row r0 at context `used`, with `row0` passed when nonzero; its rows
+     * against the whole launch's rows [r0, r0 + n). */
+    auto piece = [&](int64_t r0, int64_t n, int64_t used, int64_t row0, bool& ran) {
+        SinkOps p = sink_ops(false, heads, { n }, { used }, window, bs, 0, 1, stable);
+        if (row0) p.ps.push_back(PI("row0", row0));
+        p.bytes[2] = all.bytes[2];   /* the whole launch's cache and table */
+        p.host[2] = all.host[2];
+        p.host[2].data = p.bytes[2].data() + 128;
+        const RadTensor& bt = all.host[3];
+        for (int64_t b = 0; b < p.host[3].shape[1]; ++b)
+            ((int32_t*)p.host[3].data)[b] = ((int32_t*)bt.data)[b];
+        for (int k = 0; k < 2; ++k) {
+            const RadTensor &src = all.host[(size_t)k], &dst = p.host[(size_t)k];
+            for (int64_t i = 0; i < n; ++i)
+                for (int64_t h = 0; h < heads; ++h)
+                    for (int64_t d = 0; d < src.shape[2]; ++d)
+                        ((uint16_t*)dst.data)[i * dst.stride[0] + h * dst.stride[1] + d] =
+                            ((uint16_t*)src.data)[(r0 + i) * src.stride[0] + h * src.stride[1] + d];
+        }
+        std::vector<uint8_t> g;
+        ran = sink_device(pl, paged, p, 0, g);
+        bool same = ran;
+        for (int64_t i = 0; same && i < n; ++i)
+            same = row_bytes(g, p.host[(size_t)p.out], i) == row_bytes(base, ot, r0 + i);
+        return same;
+    };
+    bool ran = false;
+    ok(fmt("%s piece 1 == whole rows", label.c_str()).c_str(), piece(n0, n1, ctx, 0, ran) && ran);
+    ok(fmt("%s piece 0 (seqused - n1) == whole rows", label.c_str()).c_str(),
+       piece(0, n0, ctx - n1, 0, ran) && ran);
+    ok(fmt("%s piece 0 (row0 -n1) == whole rows", label.c_str()).c_str(),
+       piece(0, n0, ctx, -n1, ran) && ran);
+    const bool unshifted = piece(0, n0, ctx, 0, ran);
+    ok(fmt("%s piece 0 unshifted != whole rows", label.c_str()).c_str(), ran && !unshifted);
 }
 
 /* An environment variable set (or, with a null value, cleared) for one scope and restored after
@@ -28852,6 +29256,118 @@ static void attn_kv_sink_check(const Plugin& pl, std::vector<int64_t> qlen, std:
         ok(fmt("%s later keys leave a row's bytes", label.c_str()).c_str(), causal);
     }
     dlclose(ref);
+}
+
+/* P-17 (#301): the pipelined prefill's attention pieces on the dense form (attn_kv_sink_h256), a fresh
+ * prompt's sliding layers. One sequence of T rows launched whole, then as the trunk launches its two
+ * pieces over the same planes (hyv4flash_attn.h, Attn::core_piece): piece 0 = queries and keys
+ * [0, n0) at bounds {0, n0}; piece 1 = queries [n0, T) at {0, n1} over keys [0, T) at {0, T} (a query
+ * at key n - m + i). Both pieces' output rows must be the whole launch's bytes, margins included. A
+ * piece 1 over its own keys alone must not be: the case sees the key bound. */
+static void attn_kv_sink_piece_bytes(const Plugin& pl, int64_t rows, int64_t n0, int64_t heads,
+                                     int64_t window, int64_t bq) {
+    const auto* row = find(pl, "attn_kv_sink_h256");
+    const std::string label = fmt("attn_kv_sink pieces %lld+%lld H=%lld window=%lld bq %lld",
+                                  (long long)n0, (long long)(rows - n0), (long long)heads,
+                                  (long long)window, (long long)bq);
+    if (!row) {
+        ok(label.c_str(), false, "kernel missing");
+        return;
+    }
+    const int64_t D = 256, n1 = rows - n0;
+    /* q, k, v, out (whole), out (pieces): pitched, poisoned margins */
+    std::vector<RadTensor> plane(5);
+    plane[0] = T(nullptr, RAD_BF16, { rows, heads, D });
+    plane[0].stride[1] = D + 8;
+    plane[0].stride[0] = heads * (D + 8) + 16;
+    plane[1] = T(nullptr, RAD_BF16, { rows, heads, D });
+    plane[1].stride[1] = D + 16;
+    plane[1].stride[0] = heads * (D + 16) + 8;
+    plane[2] = T(nullptr, RAD_BF16, { rows, heads, D });
+    plane[3] = T(nullptr, RAD_BF16, { rows, heads, D });
+    plane[3].stride[1] = D + 8;
+    plane[3].stride[0] = heads * (D + 8) + 8;
+    plane[4] = plane[3];
+    std::vector<std::vector<uint8_t>> bytes(5);
+    std::vector<void*> mem(5, nullptr);
+    for (int i = 0; i < 5; ++i) {
+        const int64_t elements = plane[(size_t)i].shape[0] * plane[(size_t)i].stride[0];
+        bytes[(size_t)i].assign((size_t)elements * 2 + 256, 0xa5);
+        if (i <= 2)
+            for (int64_t e = 0; e < elements; ++e) {
+                const float v = (float)((int)(st_mix32((uint32_t)(e * 7 + i * 7919 + 31)) % 2001) - 1000) /
+                                (i == 2 ? 250.0f : 500.0f);
+                ((uint16_t*)(bytes[(size_t)i].data() + 128))[e] = h_to_bf16(v);
+            }
+        mem[(size_t)i] = dalloc(bytes[(size_t)i].size());
+        if (!mem[(size_t)i]) {
+            ok(label.c_str(), false, "allocation failed");
+            return;
+        }
+        st_memcpy(mem[(size_t)i], bytes[(size_t)i].data(), bytes[(size_t)i].size(), hipMemcpyHostToDevice);
+        plane[(size_t)i].data = (char*)mem[(size_t)i] + 128;
+    }
+    std::vector<float> sk((size_t)heads);
+    for (int64_t h = 0; h < heads; ++h) sk[(size_t)h] = (float)((h % 7) - 3) * 1.5f;
+    void* skd = dalloc(sk.size() * 4);
+    void* cud = dalloc(8 * 4);
+    if (!skd || !cud) {
+        ok(label.c_str(), false, "allocation failed");
+        return;
+    }
+    st_memcpy(skd, sk.data(), sk.size() * 4, hipMemcpyHostToDevice);
+    /* the bounds: {0, rows} at 0, {0, n0} at 2, {0, n1} at 4 */
+    const int32_t cu[8] = { 0, (int32_t)rows, 0, (int32_t)n0, 0, (int32_t)n1, 0, 0 };
+    st_memcpy(cud, cu, sizeof cu, hipMemcpyHostToDevice);
+    /* One launch: queries [q0, q0 + m) at bounds `cq`, keys [0, nk) at `ck`, into `out`. */
+    auto launch = [&](int64_t q0, int64_t m, int64_t nk, int cq, int ck, int out) {
+        auto view = [&](int i, int64_t r0, int64_t cnt) {
+            RadTensor t = plane[(size_t)i];
+            t.data = (char*)t.data + r0 * t.stride[0] * 2;
+            t.shape[0] = cnt;
+            return t;
+        };
+        std::vector<RadTensor> ts = { view(0, q0, m), view(1, 0, nk), view(2, 0, nk),
+                                      T((int32_t*)cud + cq, RAD_I32, { 2 }),
+                                      T((int32_t*)cud + ck, RAD_I32, { 2 }),
+                                      T(skd, RAD_F32, { heads }), view(out, q0, m) };
+        std::vector<RadParam> ps = { PI("M", m), PI("N", nk), PI("heads", heads), PI("head_dim", D),
+                                     PI("window", window), PF("scale", 1.0 / 16.0), PS("dtype", "bf16"),
+                                     PI("bq", bq) };
+        return run_once(row, ts, ps);
+    };
+    auto fetch = [&](int i) {
+        std::vector<uint8_t> g(bytes[(size_t)i].size());
+        st_memcpy(g.data(), mem[(size_t)i], g.size(), hipMemcpyDeviceToHost);
+        return g;
+    };
+    const bool ran = launch(0, rows, rows, 0, 0, 3) && launch(0, n0, n0, 2, 2, 4) && launch(n0, n1, rows, 4, 0, 4);
+    const std::vector<uint8_t> whole = fetch(3), pieces = fetch(4);
+    ok(fmt("%s == whole bytes", label.c_str()).c_str(), ran && whole == pieces);
+    /* piece 1 over its own keys only (keys [n0, rows) as if they were the sequence) */
+    st_memcpy(mem[4], bytes[4].data(), bytes[4].size(), hipMemcpyHostToDevice);
+    bool ran2 = true;
+    {
+        RadTensor q = plane[0], k = plane[1], v = plane[2], o = plane[4];
+        q.data = (char*)q.data + n0 * q.stride[0] * 2;
+        k.data = (char*)k.data + n0 * k.stride[0] * 2;
+        v.data = (char*)v.data + n0 * v.stride[0] * 2;
+        o.data = (char*)o.data + n0 * o.stride[0] * 2;
+        q.shape[0] = k.shape[0] = v.shape[0] = o.shape[0] = n1;
+        std::vector<RadTensor> ts = { q, k, v, T((int32_t*)cud + 4, RAD_I32, { 2 }),
+                                      T((int32_t*)cud + 4, RAD_I32, { 2 }), T(skd, RAD_F32, { heads }), o };
+        std::vector<RadParam> ps = { PI("M", n1), PI("N", n1), PI("heads", heads), PI("head_dim", D),
+                                     PI("window", window), PF("scale", 1.0 / 16.0), PS("dtype", "bf16"),
+                                     PI("bq", bq) };
+        ran2 = run_once(row, ts, ps);
+    }
+    const std::vector<uint8_t> own = fetch(4);
+    bool differs = false;
+    const RadTensor& t = plane[3];
+    for (int64_t r = n0; r < rows && !differs; ++r)
+        differs = std::memcmp(own.data() + 128 + r * t.stride[0] * 2, whole.data() + 128 + r * t.stride[0] * 2,
+                              (size_t)(heads * t.stride[1] * 2)) != 0;
+    ok(fmt("%s piece 1 over its own keys != whole", label.c_str()).c_str(), ran2 && differs);
 }
 
 /* sam_attn, against a host port of deepencoder.py's attention (get_rel_pos + window_partition).
@@ -37050,6 +37566,12 @@ static void device_phase(const Plugin& pl) {
         attn_kv_sink_check(pl, { 1, 16, 64, 100 }, { 0, 0, 511, 37 }, 32, 512, false, 64);
         attn_kv_sink_check(pl, { 129 }, { 0 }, 32, 0, false, 64);
         attn_kv_sink_check(pl, { 128 }, { 64 }, 32, 128, false, 64);
+        /* P-17: the pipelined prefill's pieces against the whole step, at the sliding window and
+         * none, both bq points, an even and an uneven cut, and the served height. */
+        attn_kv_sink_piece_bytes(pl, 512, 256, 32, 512, 128);
+        attn_kv_sink_piece_bytes(pl, 512, 256, 32, 512, 64);
+        attn_kv_sink_piece_bytes(pl, 448, 192, 16, 0, 128);
+        attn_kv_sink_piece_bytes(pl, 4096, 2048, 16, 512, 128);
     }
     if (sel("attn_vit_h72_bf16")) {
         const RadKernelInfo* r = find(pl, "attn_vit_h72_bf16");
@@ -39275,6 +39797,8 @@ static void device_phase(const Plugin& pl) {
         if ((w4 || w4m || w8 || w8m) && !g_case)
             std::printf("\nthe grouped MoE GEMM against an int8 activation, against a host decode\n");
         if (w4) {
+            /* --perfmoeiqr's Hy4 down row and its expert placement modes (#296) */
+            perf_moe_iqr_rows_case(pl);
             /* One-token routing at the integer grid: the rows kernel beside the pinned forms. */
             moe_w4_gemm(pl, 8, { "HYV3 gate/up", 1536, 2048, 1536, 2048, 2, 128 }, 0, false, false,
                         8, 1);
@@ -39641,6 +40165,15 @@ static void device_phase(const Plugin& pl) {
         mla_sink_bytes(pl, 32, { 6, 6, 6, 6 }, { 2049, 600, 1500, 2100 }, 0, 4, 1);
         mla_sink_bytes(pl, 32, { 16, 16, 8, 1, 1, 1, 1 }, { 2100, 600, 1500, 1, 15, 16, 17 }, 0, 4, 1);
         mla_sink_bytes(pl, 8, { 33, 31 }, { 700, 2000 }, 0, 4, 1);
+        /* P-17: the pipelined prefill's two pieces against the whole step, the prefill instance
+         * (stable 0): fresh and after a cached prefix, at the sliding window and none, an even and
+         * an uneven cut, and the served height (4096 rows cut 2048 + 2048). */
+        mla_sink_piece_bytes(pl, 16, 256, 0, 128, 0, 16, 0);
+        mla_sink_piece_bytes(pl, 16, 256, 300, 128, 512, 16, 0);
+        mla_sink_piece_bytes(pl, 32, 192, 1000, 64, 0, 4, 0);
+        mla_sink_piece_bytes(pl, 64, 160, 37, 96, 512, 4, 0);
+        mla_sink_piece_bytes(pl, 16, 4096, 0, 2048, 512, 16, 0);
+        mla_sink_piece_bytes(pl, 16, 4096, 4096, 2048, 0, 16, 0);
     }
     if (sel("mla_attn_sel_sink_bf16")) {
         /* The indexer's selection: full selections below 2048 keys, a 2048-key subset (512 blocks
@@ -40447,7 +40980,10 @@ static void usage(void) {
                 "             geometry and routing, synthetic resident weights; auto and pinned forms.\n"
                 "  --perfmoeiqr M [iters] [experts] [top_k] [draw] [routings]:  --perfmoe's IQR\n"
                 "             rows alone (moe_gemm_iqr at Qwen3.8-Flash-Next's per-rank shapes;\n"
-                "             R4D_PERF_IQR_SHAPE=hy4 for Hy4-flash's gate_up at TP2, K 1536); the\n"
+                "             R4D_PERF_IQR_SHAPE=hy4 for Hy4-flash's gate_up at TP2, K 1536, and\n"
+                "             its routed down through moe_gemm_w4a8i8 on the same routings;\n"
+                "             R4D_PERF_IQR_POOL=n about one expert in n in pinned host memory,\n"
+                "             R4D_PERF_IQR_ALIAS_N=n expert j reading expert j %% n's bytes); the\n"
                 "             routing draws from `draw` of the experts (0 or default: all), fewer\n"
                 "             giving longer runs of rows an expert, and the launches take\n"
                 "             `routings` different routings in turn (default 1; several read the\n"

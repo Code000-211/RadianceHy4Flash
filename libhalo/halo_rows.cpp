@@ -204,8 +204,10 @@ static const RadParamSpec pAttnDense[] = {
     P_STR("dtype"),
     P_F64O("scale"),
     /* Selects the query-block height; a host-side bound on the cu_seqlens segments. Absent, the
-     * shim passes the total token count, a valid bound that picks the tall arm (speed only). */
-    P_INTO("max_seqlen"),
+     * shim passes the total token count, a valid bound that picks the tall arm (speed only). A
+     * capacity, as libr4d's copy declares it: the sizing declare runs at a smaller max_tok and may
+     * declare a smaller bound than the real one the kernel was chosen with. */
+    { "max_seqlen", RAD_P_INT, RAD_OPTIONAL, RAD_PROLE_CAPACITY },
     /* attn_paged's window over a segment's own positions (docs/OPS.md); 0 is none. */
     P_INTO("window"),
     /* cu_seqlens read in units that many rows apart, and blocks of `block` rows from a segment's

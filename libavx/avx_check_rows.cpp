@@ -554,3 +554,202 @@ bool row_ahead_case(const Lib& lib, const std::string& dir, bool verbose) {
                     (long long)bad[1], (long long)refused[0], (long long)refused[1]);
     return pass;
 }
+
+/* The prefetch mode (M-18b, avx_ngram.cpp): when the ahead operand names the ids themselves and
+ * n_ahead equals M, the gather hands the rows to the reader thread and reads nothing here — the
+ * hyv4flash step-start Engram read rides on that. What this checks, on a table file of its own
+ * (a fresh cache, so the rows read are counted exactly):
+ *   - the alias matches only in the unit the plugin passes, and only EXACTLY: M = T*H rows and
+ *     n_ahead = T*H rows (brows(pf_ids, T) over a [T, heads] plane). n_ahead = M/2, as a
+ *     token-counted offer would be, must NOT match, and neither may n_ahead = M+1 -- one row
+ *     off: both calls gather their rows themselves and fill out.
+ *   - the matching call returns without reading: out keeps its fill value, and the reader thread
+ *     reads exactly those rows; the layer's own gather behind it (ahead gone) finds them in the
+ *     cache and reads nothing more.
+ *   - the queue clamps to kAheadRows (RowCache::kRows/4 = 1<<17, avx_ngram.cpp): an offer of
+ *     kAheadRows+64 distinct ids hands over kAheadRows.
+ *   - ids outside the table are skipped: neither -1 nor n_vocab+7 reaches the reader. */
+bool row_prefetch_case(const Lib& lib, const std::string& dir_in, bool verbose) {
+    const char* what = "embed_lookup_q's prefetch mode (ahead aliases ids)";
+    const RadKernelInfo* r = lib.row("embed_lookup_q");
+    auto reads = (uint64_t (*)())dlsym(lib.h, "avx_ngram_reads");
+    if (!r || !r->launch || !reads) {
+        std::printf("  %s: %s\n", what, !reads ? "no avx_ngram_reads export" : "no row");
+        return false;
+    }
+    if (const int e = ring_probe()) {
+        std::printf("  %s: SKIPPED -- %s\n", what,
+                    e == ENOMEM ? kRingMemory
+                                : (std::string("io_uring is unavailable here (") +
+                                   std::strerror(e) + ")").c_str());
+        return true;
+    }
+    /* A directory of its own under `dir_in`, so row_table() writes a fresh file: the mapping, the
+     * RowCache and the rows read are this case's alone. Same geometry as row_ahead_case. */
+    const std::string dir = dir_in + "/prefetch";
+    if (::mkdir(dir.c_str(), 0777) != 0 && errno != EEXIST) {
+        std::printf("  %s: SKIPPED -- cannot create %s\n", what, dir.c_str());
+        return true;
+    }
+    const int64_t n = 40, V = int64_t(1) << 21, kAheadRows = int64_t(1) << 17;
+    RowTable* rt = row_table(dir, false, V, n);
+    if (rt->state == RowTable::SKIP) {
+        std::printf("  %s: SKIPPED -- %s\n", what, rt->note.c_str());
+        return true;
+    }
+    if (rt->state != RowTable::OK) {
+        std::printf("  %s: %s\n", what, rt->note.c_str());
+        return false;
+    }
+    const uint8_t* tab = rt->tab;
+    const float scale = 0.375f;
+    uint16_t lut[256];
+    for (int b = 0; b < 256; ++b) lut[b] = rad_f32_to_bf16(rad_fp8e4m3_to_f32((uint8_t)b) * scale);
+    uint16_t sc = rad_f32_to_bf16(scale);
+
+    auto tensor = [](void* p, uint32_t dt, std::initializer_list<int64_t> shape) {
+        RadTensor t{};
+        t.data = p;
+        t.dtype = dt;
+        t.rank = (uint32_t)shape.size();
+        int i = 0;
+        for (int64_t s : shape) t.shape[i++] = s;
+        int64_t st = 1;
+        for (int k = (int)t.rank - 1; k >= 0; --k) { t.stride[k] = st; st *= t.shape[k]; }
+        return t;
+    };
+
+    int fails = 0;
+    auto check = [&](bool ok, const char* name) {
+        if (!ok) { ++fails; std::printf("  FAIL %s: %s\n", what, name); }
+        else if (verbose) std::printf("  %s: %s\n", what, name);
+    };
+    /* One call: rows gathered, ahead aliases ids when `alias` (n_ahead = M; 2: M/2, a
+     * token-counted offer; 3: M+1, one row off) or no ahead operand at all (`ahead_none`). */
+    auto call = [&](std::vector<int32_t>& ids, int64_t M, void* out, int64_t out_n,
+                   int alias, int ahead_none) {
+        std::vector<RadTensor> ts = {
+            tensor(ids.data(), RAD_I32, {M}),
+            tensor(const_cast<uint8_t*>(tab), RAD_F8E4M3, {V, n}),
+            tensor(&sc, RAD_BF16, {1}),
+            tensor(out, RAD_BF16, {M, n}),
+            ahead_none
+                ? tensor(nullptr, RAD_I32, {0})
+                : tensor(ids.data(), RAD_I32, {alias == 2 ? M / 2 : (alias == 3 ? M + 1 : M)}) };
+        RadParam ps[3] = {};
+        ps[0].key = "M";      ps[0].kind = RAD_P_INT; ps[0].ival = M;
+        ps[1].key = "n_embd"; ps[1].kind = RAD_P_INT; ps[1].ival = n;
+        ps[2].key = "n_vocab";ps[2].kind = RAD_P_INT; ps[2].ival = V;
+        RadArgs a{};
+        a.t = ts.data(); a.n_t = (int)ts.size();
+        a.p = ps; a.n_p = 3;
+        a.rank = 0; a.world_size = 1;
+        return r->launch(&a, nullptr);
+    };
+    auto rows_exact = [&](const std::vector<int32_t>& ids, int64_t M, const uint16_t* out) {
+        for (int64_t m = 0; m < M; ++m) {
+            const int32_t id = ids[(size_t)m];
+            for (int64_t i = 0; i < n; ++i) {
+                const uint16_t want = id >= 0 && id < V ? lut[tab[(int64_t)id * n + i]] : 0;
+                if (out[(size_t)(m * n + i)] != want) return false;
+            }
+        }
+        return true;
+    };
+
+    /* 1. The unit: the alias points at the ids but n_ahead = M/2, so it does not match and the
+     *    call is the ordinary gather — rows read, out filled. */
+    {
+        const int64_t M = 256;
+        std::vector<int32_t> ids((size_t)M);
+        for (int64_t m = 0; m < M; ++m) ids[(size_t)m] = (int32_t)m;
+        std::vector<uint16_t> out((size_t)(M * n), 0xdead);
+        const uint64_t before = reads();
+        const int rc = call(ids, M, out.data(), M, 2, 0);
+        const uint64_t read = reads() - before;
+        check(rc == RAD_OK, "n_ahead=M/2 call returns RAD_OK");
+        check(read == (uint64_t)M, "n_ahead=M/2 gathers its own rows (the alias needs n_ahead=M,"
+                                   " both counted in rows: M = T*H, brows(pf_ids, T) = T*H ids)");
+        check(rows_exact(ids, M, out.data()), "n_ahead=M/2 output is the file's rows");
+    }
+    /* 1b. The exact boundary: the alias points at the ids and n_ahead is off by ONE row
+     * (M+1), which is still not M — the alias needs the equality exactly, and the call is
+     * again the ordinary gather. */
+    {
+        const int64_t M = 256;
+        std::vector<int32_t> ids((size_t)(M + 1));   /* one more than M: numel(ahead) = M+1 */
+        for (int64_t m = 0; m <= M; ++m) ids[(size_t)m] = (int32_t)(512 + m);
+        std::vector<uint16_t> out((size_t)(M * n), 0xdead);
+        const uint64_t before = reads();
+        const int rc = call(ids, M, out.data(), M, 3, 0);
+        const uint64_t read = reads() - before;
+        check(rc == RAD_OK, "n_ahead=M+1 call returns RAD_OK");
+        check(read == (uint64_t)M, "n_ahead=M+1 gathers its own rows (the alias needs"
+                                   " n_ahead == M exactly)");
+        check(rows_exact(ids, M, out.data()), "n_ahead=M+1 output is the file's rows");
+    }
+    /* 2. The alias: n_ahead = M over the same pointer — the reader gets the rows, this call reads
+     *    nothing, and the layer's own gather behind it finds the cache full. */
+    {
+        const int64_t M = 256;
+        std::vector<int32_t> ids((size_t)M);
+        for (int64_t m = 0; m < M; ++m) ids[(size_t)m] = (int32_t)(1024 + m);
+        std::vector<uint16_t> out((size_t)(M * n), 0xdead);
+        const uint64_t before = reads();
+        const int rc = call(ids, M, out.data(), M, 1, 0);
+        const uint64_t read = reads() - before;   /* reads() waits for the reader to go idle */
+        check(rc == RAD_OK, "prefetch call returns RAD_OK");
+        bool untouched = true;
+        for (uint16_t v : out) if (v != 0xdead) { untouched = false; break; }
+        check(untouched, "prefetch call reads nothing into out (hands the ids to the reader)");
+        check(read == (uint64_t)M, "the reader read exactly the offered rows");
+        const uint64_t before2 = reads();
+        const int rc2 = call(ids, M, out.data(), M, 0, 1);   /* the layer's own gather */
+        const uint64_t read2 = reads() - before2;
+        check(rc2 == RAD_OK && rows_exact(ids, M, out.data()),
+              "the layer's own gather returns the file's rows");
+        check(read2 == 0, "the own gather found every prefetched row, reading nothing again");
+    }
+    /* 3. The clamp: an offer past kAheadRows hands over kAheadRows, no more. */
+    {
+        const int64_t M = kAheadRows + 64;
+        std::vector<int32_t> ids((size_t)M);
+        for (int64_t m = 0; m < M; ++m) ids[(size_t)m] = (int32_t)(2048 + m);
+        std::vector<uint16_t> out((size_t)(M * n), 0xdead);
+        const uint64_t before = reads();
+        const int rc = call(ids, M, out.data(), M, 1, 0);
+        const uint64_t read = reads() - before;
+        check(rc == RAD_OK, "clamp call returns RAD_OK");
+        check(read == (uint64_t)kAheadRows,
+              "kAheadRows of the kAheadRows+64 offered ids were read");
+    }
+    /* 4. Out-of-range ids: -1 and n_vocab+7 never reach the reader. */
+    {
+        const int64_t M = 64;
+        std::vector<int32_t> ids((size_t)M);
+        int64_t valid = 0;
+        for (int64_t m = 0; m < M; ++m) {
+            switch (m % 4) {
+                case 0: ids[(size_t)m] = -1; break;
+                case 1: ids[(size_t)m] = (int32_t)(V + 7); break;
+                default: ids[(size_t)m] = (int32_t)(200000 + m); ++valid; break;
+            }
+        }
+        std::vector<uint16_t> out((size_t)(M * n), 0xdead);
+        const uint64_t before = reads();
+        const int rc = call(ids, M, out.data(), M, 1, 0);
+        const uint64_t read = reads() - before;
+        check(rc == RAD_OK, "out-of-range call returns RAD_OK");
+        char nm[128];
+        std::snprintf(nm, sizeof nm,
+                      "the %lld in-range ids were read, the two out-of-range kinds skipped",
+                      (long long)valid);
+        check(read == (uint64_t)valid, nm);
+    }
+
+    ::rmdir(dir.c_str());
+    if (fails) std::printf("  %s: %d check(s) FAILED\n", what, fails);
+    else std::printf("  %s: alias unit, no-read hand-off, cache hit, kAheadRows clamp and"
+                     " out-of-range skip all hold\n", what);
+    return fails == 0;
+}

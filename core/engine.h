@@ -237,6 +237,8 @@ public:
 private:
     friend struct EngineBaseWeightsTestAccess;
     friend struct TableFillTestAccess;
+    friend struct TableResolveTestAccess;
+    friend struct LoadGateTestAccess;
     /* One thread per tensor-parallel rank, each owning one device. Ranks share the address
      * space, so there is no IPC or serialisation and the step batch is shared by pointer rather
      * than broadcast (spec §1). */
@@ -367,6 +369,10 @@ private:
     /* What a table's or a stream's pin leaves free: the headroom, and in a fleet what the fleet
      * keeps (VramBroker::host_margin). */
     int64_t host_margin_bytes() const;
+    /* lockable_room for a refusal that stops startup: a small shortfall is re-checked for up to
+     * --host-memory-wait-s first (#273, wait_for_room in engine_hostmem.h). */
+    bool host_room(int64_t need, int64_t still, int64_t margin, bool mlocks,
+                   std::string* why) const;
     /* Why a fleet's load put an embedding left to its default on the card; empty if it did not. */
     std::string emb_on_card_why_;
     /* Resolves --embedding-placement, --vision-tower-placement and --ngram-placement into Config
@@ -378,7 +384,8 @@ private:
                                 const std::vector<int64_t>& emb_bytes,
                                 const std::vector<WeightFootprint>& wfs, int64_t kv_floor,
                                 int64_t ngram_bytes, bool ngram_device, bool ngram_host,
-                                int64_t host_late);
+                                int64_t host_late,
+                                const std::map<int, int64_t>& ngram_layer_bytes);
     /* --ngram-placement ram: one copy of the container's [src, src + n) at file offset `foff`,
      * shared by every rank. Locked for the host gather, or pinned for a device kernel to read
      * over the link (`card`); with ram=DIR the pinned copy is a file other engines map too.
@@ -386,7 +393,7 @@ private:
      * join_table_fills joins after the container pass, so the four Engram tables fill beside it
      * (B-01) instead of one after the other before it. */
     int copy_table(const uint8_t* src, int64_t n, int64_t foff, bool card, void** out,
-                   std::string* why);
+                   std::string* why, const std::string& share_dir = std::string());
     /* An Engram table whose bytes are still being read: copy_table has reserved and published its
      * memory, and the load may not use it until join_table_fills has joined it. */
     struct PendingTable {
@@ -419,7 +426,12 @@ private:
      * container's range (table_file_map); unmapped in ~Engine. */
     std::vector<TableCopy> table_files_;
     std::vector<const void*> table_file_src_;   /* the container address each of table_files_ replaces */
-    int table_file_map(const uint8_t* src, int64_t n, int64_t foff, void** out, std::string* why);
+    int table_file_map(const uint8_t* src, int64_t n, int64_t foff, void** out, std::string* why,
+                       const std::string& dir);
+    /* The Engram bytes the resolved placements put on the cards -- the global placement's whole
+     * table, or only the layers --ngram-placement-layers put on vram. Engine::plan adds it back
+     * to every rank's statics after the resolution. */
+    int64_t ngram_on_card_bytes_ = 0;
     /* --expert-profile: the decode ranking loaded once, before any rank plans, and handed to every
      * rank's planner in place of the container's activation profile. */
     std::vector<RadFileProfile> expert_profile_;

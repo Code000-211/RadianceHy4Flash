@@ -818,6 +818,7 @@ int main(int argc, char** argv) {
              * no alignment (like btrfs), so the gather uses the block size. Only the read differs
              * there, so it runs once. */
             if (lvl == top && !row_ahead_case(lib, at, ck.verbose)) rc = 1;
+            if (lvl == top && !row_prefetch_case(lib, at, ck.verbose)) rc = 1;
             if (lvl == top) {
                 const char* tmp = std::getenv("TMPDIR");
                 if (!row_gather_case(lib, tmp && *tmp ? tmp : "/tmp", calls, seed, ck.verbose,
