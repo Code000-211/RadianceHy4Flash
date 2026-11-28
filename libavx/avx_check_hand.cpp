@@ -3696,9 +3696,16 @@ void kvstream_cases(std::vector<Hand>& hs) {
     /* The int8 latent row of Hy4-flash's cache (design note X-07): one KV head's row of
      * [L int8 codes][L/128 f32 scales][R rope columns as bf16] at L = 2 * head_dim - R, so the
      * rotation of a whole block of 128 columns, a block's scale and the rope columns' placement are
-     * all in play. Both libraries must write the same bytes: the rotation, the scale and the int8
-     * rounding are each the same arithmetic, and the row is one workgroup's worth of columns a
-     * token. A slot that is padding writes nothing, so the filler stays. */
+     * all in play. Both libraries must write the same bytes. Their rotations differ on purpose --
+     * this library turns the block with the tree's butterfly in f32, libref multiplies an explicit
+     * Hadamard matrix in double (design note X-07a) -- and they agree bit for bit here because this
+     * fixture is exact in both: the columns are half-integer, so every butterfly partial sum is a
+     * multiple of 0.5 below 2^10 and every matrix product a multiple of 1/sqrt(128) times an
+     * integer, and the quantiser after it is the tree's own arithmetic in both. So the tolerance
+     * stays 0: a rotation rounding difference (a code step on a column that lands on a rounding
+     * boundary) is what a fixture of bf16 values would show, and that is held by the decoded bound
+     * in tests/r4d_emu/test_row.cpp, not here. A slot that is padding writes nothing, so the filler
+     * stays. */
     {
         const int64_t blocks = 2, slots = 2, bs = 2, hd = 68, M = 3, L = 2 * hd - 8, R = 8;
         const int64_t rowb = L + 4 * (L / 128) + 2 * R, row = bs * rowb;

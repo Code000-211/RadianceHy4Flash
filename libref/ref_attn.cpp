@@ -104,16 +104,39 @@ static inline void kv_i8_put(void* cache, int64_t row, int64_t head_dim, int hal
  *
  *     [L int8 codes][L/128 f32 scales][R rope columns as bf16]      L + 4 * (L / 128) + 2 * R
  *
- * The L latent columns are one block-scaled int8 group a 128: the block is rotated by the
- * Walsh-Hadamard transform (unnormalised, each block independent, fwht's butterfly in f32 -- the
- * kernel's wave transform is the same butterfly in the same order, so the two agree bit for bit),
- * the rotation's 1 / sqrt(128) is folded into the block's scale, and the codes are the rotated
- * block over `amax * (1/127) * 1/sqrt(128)`, rounded to nearest even and clamped to +-127. The
- * scale of an all-zero block is 1. The R rope columns are not rotated and not quantised: they go
- * in as the bf16 they arrive as, the writer's own rounding of the angle. */
+ * The L latent columns are one block-scaled int8 group a 128. The block's rotation is built here
+ * as an explicit matrix and multiplied in double (row_rot below), so this form shares no
+ * summation order with the kernel's wave butterfly: where the two disagree it is the rotation's
+ * own f32 rounding (about a code step on a column that lands on a rounding boundary), not a
+ * second reading of the row. The codebook after that is the tree's, the same arithmetic the
+ * kernel runs (design note X-07 D4: unnormalised absmax / 127, the reciprocal, nearest even, the
+ * clamp to +-127), and the *stored* scale is that scale with the rotation's 1 / sqrt(128) folded
+ * in, so a reader's `scale * code` is the rotated column. A block whose absmax is zero or not
+ * finite stores codes 0 and scale 1. The R rope columns are not rotated and not quantised: they
+ * go in as the bf16 they arrive as, the writer's own rounding of the angle. */
 constexpr float kRowRotScale = 0.08838834764831845f;   /* 1 / sqrt(128) */
 static inline int64_t row_i8_bytes(int64_t L, int64_t R) {
     return L + 4 * (L / 128) + 2 * R;
+}
+
+/* The rotation as an explicit matrix: M[i][j] = (-1)^popcount(i & j) * (1/sqrt(128)), the
+ * Walsh-Hadamard transform in the order the tree's butterfly produces it (Sylvester order, no bit
+ * reversal), with the row's own normaliser as its entry so that dividing it back out below gives
+ * the unnormalised block the quantiser takes. Built once; the product accumulates in double, so
+ * this form's own rounding (about 1e-16 a sum) is far below the kernel's f32 butterfly, which is
+ * the difference the comparison sees. */
+struct RowRot {
+    double m[128 * 128];
+    RowRot() {
+        const double k = (double)kRowRotScale;
+        for (int i = 0; i < 128; ++i)
+            for (int j = 0; j < 128; ++j)
+                m[i * 128 + j] = (__builtin_popcount((unsigned)(i & j)) & 1) ? -k : k;
+    }
+};
+static inline const RowRot& row_rot() {
+    static const RowRot r;
+    return r;
 }
 
 /* `col(c)` is the row's column c: the store's K columns first, then its V columns. */
@@ -121,18 +144,34 @@ template <class C>
 static inline void row_i8_put(void* cache, int64_t off, int64_t L, int64_t R, const C& col) {
     uint8_t* const d = (uint8_t*)cache + off;
     float* const scales = (float*)(d + L);
+    const RowRot& rot = row_rot();
     for (int64_t b = 0; b < L / 128; ++b) {
-        float buf[128];
-        for (int64_t i = 0; i < 128; ++i) buf[i] = col(b * 128 + i);
-        fwht(buf, 128);
+        float x[128];
+        for (int64_t i = 0; i < 128; ++i) x[i] = col(b * 128 + i);
+        /* The block rotated and normalised (y), and the same block unnormalised (v), which is
+         * what the quantiser takes. */
+        float v[128];
         float amax = 0.0f;
-        for (int64_t i = 0; i < 128; ++i) amax = std::fmax(amax, std::fabs(buf[i]));
-        const float sc = amax > 0.0f ? amax * (1.0f / 127.0f) * kRowRotScale : 1.0f;
-        const float inv = 1.0f / sc;
-        scales[b] = sc;
+        for (int64_t i = 0; i < 128; ++i) {
+            double y = 0.0;
+            for (int64_t j = 0; j < 128; ++j) y += rot.m[i * 128 + j] * (double)x[j];
+            v[i] = (float)(y / (double)kRowRotScale);
+            amax = std::fmax(amax, std::fabs(v[i]));
+        }
+        if (!(amax > 0.0f) || !std::isfinite(amax)) {
+            scales[b] = 1.0f;
+            std::memset(d + b * 128, 0, 128);
+            continue;
+        }
+        /* Two scales, one to quantise and one to store (design note X-07 §2): the codes are the
+         * rotated block over `amax / 127`, and the row keeps that scale with the rotation's
+         * 1 / sqrt(128) folded in. */
+        const float qs = amax * (1.0f / 127.0f);
+        const float inv = 1.0f / qs;
+        scales[b] = qs * kRowRotScale;
         int8_t* const c = (int8_t*)(d + b * 128);
         for (int64_t i = 0; i < 128; ++i) {
-            const float q = buf[i] * inv;
+            const float q = v[i] * inv;
             c[i] = (int8_t)(int)std::nearbyint(std::fmin(std::fmax(q, -127.0f), 127.0f));
         }
     }
