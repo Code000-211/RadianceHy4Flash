@@ -29,12 +29,6 @@ int HeatEngine::init(const Plan& plan, const HeatParams& params) {
     bytes_.assign(n, 0);
     ever_.assign(n, 0u);
     dem_at_.assign(n, 0u);
-    prob_.assign(n, 0u);
-    prob_at_.assign(n, 0u);
-    prob_sel_.assign(n, 0u);
-    prob_cand_.clear();
-    prob_units_.clear();
-    pass_sel_ = 0;
 
     /* The movable units' slab classes as dense indices (heat.h: `cls_`). File-tier units with a
      * class join them: the hot VRAM cache admits one into a slab slot at run
@@ -58,7 +52,6 @@ int HeatEngine::init(const Plan& plan, const HeatParams& params) {
     n_hot_.assign((size_t)n_cls_, 0);
     n_cold_.assign((size_t)n_cls_, 0);
     m_of_.assign((size_t)n_cls_, 0);
-    prob_cls_.assign((size_t)n_cls_, 0);
 
     n_layer_ = 0;
     for (const MoveUnit& mu : plan.units) n_layer_ = std::max(n_layer_, mu.layer + 1);
@@ -163,12 +156,6 @@ int HeatEngine::init(const Plan& plan, const HeatParams& params) {
              params_.moves_per_step == 1 ? "" : "s",
              (double)params_.decay, (double)params_.hysteresis, (double)params_.min_gain,
              (double)params_.credit_cap, (double)params_.admit_heat);
-    if (probation_on_())
-        RAD_INFO("heat engine: 2Q admission on, probation %d unit%s a class for %d step%s, "
-                 "move budget follows the pass width up to %d x from %d selections a layer",
-                 params_.probation_slots, params_.probation_slots == 1 ? "" : "s",
-                 params_.probation_steps, params_.probation_steps == 1 ? "" : "s",
-                 params_.width_scale, params_.width_ref);
     return RAD_OK;
 }
 
@@ -227,9 +214,6 @@ void HeatEngine::observe(int32_t layer, const int32_t* counts, int32_t n_expert,
     for (int32_t j = 0; j < n; ++j) total += counts[j] > 0 ? counts[j] : 0;
     const float cap = params_.credit_cap;
     const float w = cap > 0.0f && (float)total > cap ? weight * cap / (float)total : weight;
-    /* The pass's width: the move budget of the step that follows follows it (HeatParams::
-     * width_ref / width_scale). Unweighted selections, as routed rows. */
-    pass_sel_ = std::max(pass_sel_, (uint64_t)total);
 
     float* __restrict h = heat_.data() + lo;
     for (int32_t j = 0; j < len; ++j) h[j] *= d;
@@ -251,28 +235,6 @@ void HeatEngine::observe(int32_t layer, const int32_t* counts, int32_t n_expert,
         miss += miss_bytes_[q];
         if (rank_as_[q] == 1) hot = std::max(hot, x);
         else if (rank_as_[q] == 2 && was <= cold && --n_cold <= 0) ends = false;
-        /* 2Q (expert-streaming X2): a probation unit routed again inside its window is promoted
-         * into the main set by an address change, and a first miss of a mirrored unit becomes an
-         * admission candidate for this step. Both change the unit's rank, which set_place keeps. */
-        if (probation_on_()) {
-            const int32_t u = unit_at_[q];
-            if (u >= 0) {
-                const uint8_t ps = prob_[(size_t)u];
-                if (ps == 1u) {
-                    prob_[(size_t)u] = 0u;
-                    const int32_t cl = cls_[(size_t)u];
-                    if (cl >= 0 && prob_cls_[(size_t)cl] > 0) --prob_cls_[(size_t)cl];
-                    ++stats_.probation_promoted;
-                    set_place(u);
-                } else if (ps == 0u && tier_[(size_t)u] == Tier::HostPinned &&
-                           movable_[(size_t)u] && !busy_[(size_t)u] && cls_[(size_t)u] >= 0) {
-                    prob_[(size_t)u] = 3u;
-                    prob_sel_[(size_t)u] = (uint32_t)std::min<int64_t>(65535, (int64_t)c * (int64_t)passes);
-                    prob_cand_.push_back(u);
-                    set_place(u);
-                }
-            }
-        }
     };
     /* Find credited experts a block at a time via a vectorisable mask of positive counts, then
      * visit only the set bits, in increasing order. */
@@ -329,27 +291,6 @@ void HeatEngine::set_tier(int32_t unit, Tier t) {
         ever_[(size_t)unit] |= 2u;
         dem_at_[(size_t)unit] = (uint64_t)stats_.steps;
     }
-
-    /* 2Q: an admission lands (the proposal becomes an area member), or the unit leaves the area
-     * -- expiry's drop, the main set's promotion, a demotion by the mover. The area's count is
-     * kept here so an in-flight admission already counts against probation_slots. */
-    if (probation_on_()) {
-        const uint8_t ps = prob_[(size_t)unit];
-        const int32_t cl = cls_[(size_t)unit];
-        if (ps == 2u && t == Tier::VRAM) {
-            prob_[(size_t)unit] = 1u;
-            prob_at_[(size_t)unit] = (uint32_t)stats_.steps;
-            prob_units_.push_back(unit);
-            ++stats_.probation_admitted;
-        } else if (ps == 3u && t == Tier::VRAM) {
-            /* Fill took the candidate as an ordinary resident: not the area's miss to count. */
-            prob_[(size_t)unit] = 0u;
-        } else if (ps != 0u && t != Tier::VRAM) {
-            prob_[(size_t)unit] = 0u;
-            if (cl >= 0 && prob_cls_[(size_t)cl] > 0) --prob_cls_[(size_t)cl];
-            if (ps == 1u) ++stats_.probation_expired;
-        }
-    }
 }
 
 void HeatEngine::set_busy(int32_t unit, bool busy) {
@@ -385,10 +326,6 @@ void HeatEngine::set_place(int32_t unit) {
         : (!movable_[u] && !evictable_[u]) ? 0u
         : (pinned_[u] && vram) ? 0u
         : vram ? 2u : 1u;
-    /* 2Q: the area's units are not the main set's to trade. An admitted resident leaves only by
-     * expiry, and a first-miss candidate by its admission (or the LFU path once it falls back to
-     * rank 1 in step()), so neither end of the LFU ranking sees it here. */
-    if (probation_on_() && !prob_.empty() && prob_[u]) rank_as_[p] = 0u;
     routed_as_[p] = vram ? 2u : 1u;
     miss_bytes_[p] = vram ? 0 : bytes_[u];
 }
@@ -418,97 +355,6 @@ void HeatEngine::end_rebuild(size_t slot) {
 void HeatEngine::abandon(const Swap& s) {
     set_busy(s.promote, false);
     set_busy(s.demote, false);
-    /* 2Q: a first-miss admission the mover had no slot for goes back to the LFU path this step. */
-    if (probation_on_() && s.promote >= 0 && (size_t)s.promote < prob_.size() &&
-        prob_[(size_t)s.promote] == 2u) {
-        prob_[(size_t)s.promote] = 0u;
-        const int32_t cl = cls_[(size_t)s.promote];
-        if (cl >= 0 && prob_cls_[(size_t)cl] > 0) --prob_cls_[(size_t)cl];
-        ++stats_.probation_refused;
-        set_place(s.promote);
-    }
-    /* An expiry the mover had no record for stays in the area, so the next step retries it. */
-    if (probation_on_() && s.promote < 0 && s.demote >= 0 && (size_t)s.demote < prob_.size() &&
-        prob_[(size_t)s.demote] == 1u)
-        prob_units_.push_back(s.demote);
-}
-
-/* A class's moves for a step: `k` at the pass width the budget was sized for, up to width_scale
- * times that on a wider pass (a step that routes more rows has more slots to turn over at once).
- * The width is the widest pass credited since the last step(), in unweighted selections a layer. */
-int HeatEngine::width_moves(int k) const {
-    if (!probation_on_() || params_.width_ref <= 0 || params_.width_scale <= 1 || k <= 0) return k;
-    if (pass_sel_ == 0) return k;
-    uint64_t scale = (pass_sel_ + (uint64_t)params_.width_ref - 1) / (uint64_t)params_.width_ref;
-    if (scale < 1) scale = 1;
-    if (scale > (uint64_t)params_.width_scale) scale = (uint64_t)params_.width_scale;
-    return k * (int)scale;
-}
-
-/* 2Q's probation area (refs/kernels/experts-streaming.md X2). The area holds first-miss
- * admissions for probation_steps dispatches: a unit routed again inside the window is promoted
- * into the main set by an address change (no copy), and one the window does not route again is
- * dropped for free -- its host copy never left. Both are the area's own traffic, so the main set's
- * LFU ranking (step) does not see these units; only what the area cannot take, a unit it refuses
- * because the area is full or the pass's bar is not met, falls back to the LFU path. */
-void HeatEngine::probation_step(std::vector<Swap>* out, int k, bool wide) {
-    const uint32_t now = (uint32_t)stats_.steps;
-    const uint32_t window = (uint32_t)std::max(1, params_.probation_steps);
-
-    /* Expiry first: the slots it frees are this step's admissions' slots. A drop is a demotion
-     * with no promotion; the mover's issue() takes it as the address change it is. */
-    prob_scratch_.clear();
-    for (int32_t u : prob_units_) {
-        if (prob_[(size_t)u] != 1u) continue;            /* promoted or dropped since it joined */
-        if (now - prob_at_[(size_t)u] < window || busy_[(size_t)u]) {
-            prob_scratch_.push_back(u);
-            continue;
-        }
-        Swap s;
-        s.demote = u;
-        set_busy(u, true);
-        out->push_back(s);
-    }
-    prob_units_.swap(prob_scratch_);
-    if (prob_cand_.empty()) return;
-
-    /* Admissions: the hottest first-miss units of the pass, up to the step's budget a class and the
-     * area's size. A pass wider than the budget's own width also needs the unit routed by
-     * admit_rows_wide rows: an admission copy that competes with such a pass's reads buys less
-     * than the read it delays (experts-streaming.md X2, the DFly2 verify). */
-    const uint32_t bar = wide ? (uint32_t)std::max(1, params_.admit_rows_wide) : 1u;
-    std::sort(prob_cand_.begin(), prob_cand_.end(), [this](int32_t a, int32_t b) {
-        const float ha = heat_[(size_t)pos_[(size_t)a]];
-        const float hb = heat_[(size_t)pos_[(size_t)b]];
-        if (ha != hb) return ha > hb;
-        return a < b;
-    });
-    std::vector<int32_t> cand;
-    cand.swap(prob_cand_);
-    int32_t* made = m_of_.data();          /* reused as this step's admissions a class */
-    for (int c = 0; c < n_cls_; ++c) made[c] = 0;
-    for (int32_t u : cand) {
-        if ((size_t)u >= prob_.size() || prob_[(size_t)u] != 3u) continue;
-        const int32_t c = cls_[(size_t)u];
-        bool take = c >= 0 && prob_sel_[(size_t)u] >= bar && made[c] < k &&
-                    prob_cls_[(size_t)c] < std::max(1, params_.probation_slots) &&
-                    tier_[(size_t)u] == Tier::HostPinned;
-        if (!take) {
-            /* Back to the LFU path in the same step: the area did not take it. */
-            prob_[(size_t)u] = 0u;
-            set_place(u);
-            continue;
-        }
-        Swap s;
-        s.promote = u;
-        s.probation = true;
-        set_busy(u, true);
-        prob_[(size_t)u] = 2u;
-        ++prob_cls_[(size_t)c];
-        ++made[c];
-        ++stats_.proposed;
-        out->push_back(s);
-    }
 }
 
 /* The one-pair pick, kept as the reference definition of the ranking: the hottest movable unit
@@ -604,14 +450,8 @@ int HeatEngine::step(std::vector<Swap>* out) {
     out->clear();
     if (!enabled_) return RAD_OK;
     ++stats_.steps;
-    const int k = width_moves(params_.moves_per_step);
-    pass_sel_ = 0;
+    const int k = params_.moves_per_step;
     if (k <= 0) return RAD_OK;
-
-    /* 2Q (X2) first: its admissions and expiries are the area's decisions, not the LFU path's
-     * guard. Candidates the area refuses fall back to rank 1 here, so the LFU path still takes
-     * what probation cannot (a unit with no host copy, or a pass over the bar). */
-    if (probation_on_()) probation_step(out, k, k > params_.moves_per_step);
 
     /* Test the best pair from the layers' ends first. If it fails the guard, every pair does,
      * and the dispatch proposes nothing after one entry per layer. The ends' counts also give the
@@ -774,14 +614,6 @@ std::string HeatEngine::report() const {
              "something already demoted)\n",
              (unsigned long long)stats_.distinct_promoted, (unsigned long long)stats_.readmits,
              stats_.promotions ? 100.0 * (double)stats_.readmits / (double)stats_.promotions : 0.0);
-    if (probation_on_())
-        s += fmt("  2Q probation: %llu first-miss admissions, %llu promoted by a second use "
-                 "(no copy), %llu left unused (dropped for free), %llu refused for want of a slot "
-                 "or the wide-pass bar\n",
-                 (unsigned long long)stats_.probation_admitted,
-                 (unsigned long long)stats_.probation_promoted,
-                 (unsigned long long)stats_.probation_expired,
-                 (unsigned long long)stats_.probation_refused);
 
     /* The per-layer resident distribution: a layer starved of slots misses on nearly every token
      * however good its internal ranking, so the spread matters more than the mean. */

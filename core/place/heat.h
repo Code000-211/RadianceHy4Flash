@@ -91,27 +91,6 @@ struct HeatParams {
      * MTP-d3, well above an occasional expert's credit of one or two. Eviction is free (the
      * container is ground truth), so the cost of an admission mistake is one future re-read. */
     float admit_heat = 8.0f;
-
-    /* 2Q admission (refs/kernels/experts-streaming.md X2). A unit routed while off the device is
-     * admitted into a probation area on its first miss, into a lent slot whose eviction is an
-     * address change (no copy); a unit routed again inside probation_steps is promoted into the
-     * main set (also no copy), and one that is not is dropped for free. The main set keeps its
-     * ranking and hysteresis and does not trade with the probation's traffic: a probation unit is
-     * not a swap candidate while it is in the area. `probation_slots` is the most a class holds
-     * at once (the free turnover slots the mover keeps are the area; 0 leaves the LFU path alone),
-     * and the move budget follows the pass width: `moves_per_step` 64 is sized for a pass that
-     * credits `width_ref` selections to a layer (c8 decode), and a wider one (DFly2's 8 clients
-     * on one step) scales a class's budget up to `width_scale` times. On a wide pass an admission
-     * also has to be routed by `admit_rows_wide` rows, since its copy would otherwise starve the
-     * reads the pass is making. */
-    /* The area is the free turnover slots the mover keeps (ClassPools::n_turn, three moves'
-     * worth: `shadow * RAD_PLACE_TURNOVER_SLOTS / RAD_PLACE_SHADOW_SLOTS`), so that is what a
-     * class may hold here; more admissions than that would only starve. */
-    int probation_slots = 3 * RAD_PLACE_SHADOW_SLOTS;
-    int probation_steps = 3;
-    int width_ref = 64;
-    int width_scale = 4;
-    int admit_rows_wide = 2;
 };
 
 /* A promotion and its matching demotion. The mover issues two transfers, but they are decided
@@ -119,9 +98,6 @@ struct HeatParams {
 struct Swap {
     int32_t promote = -1;   /* unit index */
     int32_t demote = -1;
-    /* 2Q (HeatParams::probation_slots): this promotion is a first-miss admission, so it takes one
-     * of the lent slots the area turns over -- never a budgeted one, whose eviction copies. */
-    bool    probation = false;
 };
 
 /* One movable unit as step() ranks it: its heat, its layer's resident count, its index. */
@@ -148,12 +124,6 @@ struct HeatStats {
      * traffic, the cost promotions exist to avoid. Weighted by the histogram's `weight`, since a
      * draft head's histogram stands for several routing passes; the hit rate is unaffected. */
     uint64_t routed = 0, routed_resident = 0, stream_bytes = 0;
-    /* 2Q probation (X2): first-miss admissions that landed, units a second use promoted into the
-     * main set (no copy), units that left the area unused (dropped for free), and admissions the
-     * mover had no slot for. A probation miss that is promoted later is a hit the LFU path could
-     * not have taken without evicting a settled resident. */
-    uint64_t probation_admitted = 0, probation_promoted = 0, probation_expired = 0,
-             probation_refused = 0;
 };
 
 /* A counter one thread writes while another reads it (the HTTP thread's /stats and LiveView):
@@ -183,9 +153,7 @@ private:
 struct HeatCounters {
     Relaxed<uint64_t> dispatches, proposed, promotions, demotions, refused, no_candidate,
                       distinct_promoted, readmits, routed, routed_resident, stream_bytes,
-                      readmit_16, readmit_128, readmit_1024, steps,
-                      probation_admitted, probation_promoted, probation_expired,
-                      probation_refused;
+                      readmit_16, readmit_128, readmit_1024, steps;
 
     HeatStats snapshot() const {
         HeatStats s;
@@ -202,10 +170,6 @@ struct HeatCounters {
         s.routed            = routed;
         s.routed_resident   = routed_resident;
         s.stream_bytes      = stream_bytes;
-        s.probation_admitted = probation_admitted;
-        s.probation_promoted = probation_promoted;
-        s.probation_expired  = probation_expired;
-        s.probation_refused  = probation_refused;
         return s;
     }
 };
@@ -336,13 +300,6 @@ public:
     }
     const HeatParams& params() const { return params_; }
 
-    /* 2Q: the unit is in the probation area (admitted, or its admission is in flight). The mover
-     * prefers it when a class runs short of free slots: the area turns over, the main set does
-     * not. */
-    bool probation(int32_t unit) const {
-        return unit >= 0 && (size_t)unit < prob_.size() && prob_[(size_t)unit] != 0;
-    }
-
     /* Exit banner, ending with the per-layer resident counts, which show whether every layer kept
      * its share of slots. */
     std::string report() const;
@@ -402,22 +359,6 @@ private:
     /* Bit 0: promoted before. Bit 1: demoted before. Feeds the readmit counters. */
     std::vector<uint8_t> ever_;
     std::vector<uint64_t> dem_at_;   /* stats_.steps at the unit's last demotion */
-
-    /* 2Q probation, per unit: 0 none, 1 in the area, 2 proposed to the mover this step, 3 a first
-     * miss this step (a candidate for an admission). `prob_at_` is the step an admission landed,
-     * `prob_sel_` this step's selections (the wide-pass bar), and `prob_cls_` the units in the area
-     * per class against probation_slots. `prob_units_` keeps the area in admission order so expiry
-     * walks it instead of every unit. */
-    std::vector<uint8_t>  prob_;
-    std::vector<uint32_t> prob_at_, prob_sel_;
-    std::vector<int32_t>  prob_cls_, prob_cand_, prob_units_, prob_scratch_;
-    /* The widest credited pass since the last step(), in selections a layer: the move budget of
-     * the next step follows it. */
-    uint64_t              pass_sel_ = 0;
-    bool                  probation_on_() const { return params_.probation_slots > 0; }
-    /* Expiries and first-miss admissions; called by step() before the LFU path. */
-    void probation_step(std::vector<Swap>* out, int k, bool wide);
-    int  width_moves(int k) const;
 
     /* Resident units per layer. A layer starved of slots misses on nearly every token however
      * good the ranking inside it is. Most resident units are cold, so exact `heat == 0.0f` ties

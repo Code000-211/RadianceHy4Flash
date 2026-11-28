@@ -4,8 +4,7 @@
  *
  *   rad-heat-replay TRACE [--lat N] [--decay X] [--hysteresis X] [--min-gain X] [--moves N]
  *                         [--credit-cap X] [--presence] [--resident N] [--layer-min N]
- *                         [--probation N] [--probation-steps N] [--width-ref N] [--width-scale N]
- *                         [--admit-rows N] [--slots N] [--from D] [--to D] [--oracle]
+ *                         [--from D] [--to D] [--oracle]
  *
  * The model: one slab class, the trace's first tier snapshot as the starting resident set and its
  * size as the slab (the live run's lent-slot fills and drops are not modelled, so its resident count
@@ -26,14 +25,7 @@
  * on every layer, never above N (the units come from the layers above it, the fullest first,
  * highest expert index first, so the total does not move, and a floor the slab cannot hold is
  * clamped rather than overshot), and a swap whose demotion would take a layer under that floor is
- * abandoned (heat.abandon), the model of a mover that keeps a per-layer floor (M-16, E-M6).
- *
- * With --probation N the engine's 2Q area is on (N units a class, the live default; --probation 0
- * is off and the LFU path alone, as before M-02) and the slab's slot supply is modelled: the
- * starting residents are all the slab holds (--slots N overrides), the reserve the live mover keeps
- * free is not, so an admission is refused (heat.abandon, counted apart) once the residents and the
- * moves in flight fill it. The remaining --probation-steps / --width-ref / --width-scale /
- * --admit-rows are the engine's own knobs. */
+ * abandoned (heat.abandon), the model of a mover that keeps a per-layer floor (M-16, E-M6). */
 #include "place/heat.h"
 #include "place/planner.h"
 
@@ -120,9 +112,6 @@ struct Opt {
     HeatParams hp{};
     bool presence = false, oracle = false;
     int64_t resident = -1, layer_min = 0;
-    /* 2Q (X2) models the slab's slot supply: the residents the plan starts with are the most it
-     * can hold, so an admission is refused when they are all busy. */
-    int64_t slots = -1;
     int32_t from = INT32_MIN, to = INT32_MAX;
 };
 
@@ -156,13 +145,11 @@ int main(int argc, char** argv) {
     if (argc < 2) {
         std::fprintf(stderr, "usage: %s TRACE [--lat N] [--decay X] [--hysteresis X] [--min-gain X] "
                      "[--moves N] [--credit-cap X] [--presence] [--resident N] [--layer-min N] "
-                     "[--probation N] [--probation-steps N] [--width-ref N] [--width-scale N] "
-                     "[--admit-rows N] [--slots N] [--from D] [--to D] [--oracle]\n",
+                     "[--from D] [--to D] [--oracle]\n",
                      argv[0]);
         return 2;
     }
     Opt o;
-    o.hp.probation_slots = 0;   /* --probation turns 2Q on; the LFU path stays the default here */
     for (int i = 2; i < argc; ++i) {
         const std::string a = argv[i];
         auto val = [&]() -> const char* {
@@ -179,12 +166,6 @@ int main(int argc, char** argv) {
         else if (a == "--oracle") o.oracle = true;
         else if (a == "--resident") o.resident = std::atoll(val());
         else if (a == "--layer-min") o.layer_min = std::atoll(val());
-        else if (a == "--probation") o.hp.probation_slots = std::atoi(val());
-        else if (a == "--probation-steps") o.hp.probation_steps = std::atoi(val());
-        else if (a == "--width-ref") o.hp.width_ref = std::atoi(val());
-        else if (a == "--width-scale") o.hp.width_scale = std::atoi(val());
-        else if (a == "--admit-rows") o.hp.admit_rows_wide = std::atoi(val());
-        else if (a == "--slots") o.slots = std::atoll(val());
         else if (a == "--from") o.from = std::atoi(val());
         else if (a == "--to") o.to = std::atoi(val());
         else { std::fprintf(stderr, "unknown option %s\n", a.c_str()); return 2; }
@@ -215,7 +196,6 @@ int main(int argc, char** argv) {
             }
         res0 = have;
     }
-    if (o.slots < 0) o.slots = res0;   /* the plan starts full: that is the slab */
 
     /* --layer-min: no layer under N resident units at any dispatch, at the same total. Every layer
      * is raised to the highest floor this slab can hold, never above N (units come off the layers
@@ -324,14 +304,12 @@ int main(int argc, char** argv) {
     /* --oracle: units admitted for the pass after the one that routed them. */
     std::vector<int32_t> oracle_until(plan.units.size(), INT32_MIN);
     int32_t last_pass = INT32_MIN;
-    int64_t res_now = res0, pend_net = 0, slot_refused = 0;
     auto publish_to = [&](int32_t pass) {
         while (!pend.empty() && pend.front().pass <= pass) {
             const Swap s = pend.front().s;
             pend.pop_front();
             if (s.promote >= 0) {
                 heat.set_tier(s.promote, Tier::VRAM);
-                ++res_now; --pend_net;
                 heat.set_busy(s.promote, false);
                 vram[(size_t)s.promote] = 1;
                 if (ever_demoted[(size_t)s.promote]) ++readmits;
@@ -343,7 +321,6 @@ int main(int argc, char** argv) {
             }
             if (s.demote >= 0) {
                 heat.set_tier(s.demote, Tier::HostPinned);
-                --res_now; ++pend_net;
                 heat.set_busy(s.demote, false);
                 vram[(size_t)s.demote] = 0;
                 ever_demoted[(size_t)s.demote] = 1;
@@ -394,23 +371,13 @@ int main(int argc, char** argv) {
                     continue;
                 }
             }
-            /* 2Q: an admission needs a free slot of the slab; the live mover keeps the turnover
-             * reserve free for it, so a step's admissions cannot outrun the residents it drops
-             * (and the ones still in flight). */
-            if (s.probation && res_now + pend_net >= o.slots) {
-                heat.abandon(s);
-                ++slot_refused;
-                continue;
-            }
             pend.push_back(Pub{ d + o.lat, s });
             if (s.promote >= 0) {
                 ++promos;
-                ++pend_net;
                 promo_bytes += (uint64_t)plan.units[(size_t)s.promote].bytes;
                 if (plan.units[(size_t)s.promote].movable)
                     ++layer_pend[(size_t)plan.units[(size_t)s.promote].layer];
             }
-            if (s.demote >= 0) --pend_net;
             if (s.demote >= 0 && plan.units[(size_t)s.demote].movable)
                 --layer_pend[(size_t)plan.units[(size_t)s.demote].layer];
         }
@@ -443,14 +410,6 @@ int main(int argc, char** argv) {
                 routed / nd, missed / nd, routed ? 1.0 - (double)missed / routed : 0.0,
                 hs.routed ? (double)hs.routed_resident / hs.routed : 0.0, promos / nd,
                 promos ? 100.0 * readmits / promos : 0.0, miss_bytes / nd / 1e6, promo_bytes / nd / 1e6);
-    if (o.hp.probation_slots > 0)
-        std::printf("2Q probation: %llu admitted, %llu promoted by a second use, %llu expired "
-                    "unused, %llu refused (the heat engine's), %lld refused for want of a slot "
-                    "(the slab's)\n",
-                    (unsigned long long)hs.probation_admitted,
-                    (unsigned long long)hs.probation_promoted,
-                    (unsigned long long)hs.probation_expired,
-                    (unsigned long long)hs.probation_refused, (long long)slot_refused);
     if (o.oracle) std::printf("oracle admissions %.1f a dispatch (%.1f MB)\n", oracle_adm / nd,
                               oracle_adm / nd * (plan.units.empty() ? 0 : plan.units[0].bytes) / 1e6);
     if (d0 && d1 && d1 != d0) {

@@ -81,11 +81,6 @@ struct ExpertPlane {
     /* Separate progress from thrash at the same move count; see HeatStats. */
     int64_t distinct_promoted = 0, readmits = 0;
     int64_t readmit_16 = 0, readmit_128 = 0, readmit_1024 = 0, heat_steps = 0;
-    /* 2Q probation (expert streaming X2, rank 0): first-miss admissions that landed, units a
-     * second use promoted into the main set (no copy), units that left the area unused (dropped
-     * for free), and admissions the mover had no lent slot for. */
-    int64_t probation_admitted = 0, probation_promoted = 0, probation_expired = 0,
-            probation_refused = 0;
     /* Why a dispatch moved nothing. `refused` is the guard declining (the healthy steady state);
      * the starved counts mean the mover had nowhere to put the bytes. */
     int64_t dispatches = 0, refused = 0, no_candidate = 0;
