@@ -12,7 +12,12 @@
 # Exit status: 0 if the log holds no `the AQL queue faulted` and no `GPU memory fault` (the shape did
 # not fault here); 1 if it holds one, and then the report lines are printed and kept in the run
 # directory (a reproduction); 2 if the server did not come up -- its startup message names the
-# --host-pool-mib or --max-model-len that would fit this box, and POOL / LEN are the knobs.
+# --host-pool-mib or --max-model-len that would fit this box, and POOL / LEN are the knobs; 3 if the
+# replay failed and the log holds no fault, which is not a reproduction of anything.
+#
+# The replay exits non-zero when the server dies under it, which is what a fault does, so its failure
+# is reported and the log is read anyway: the fault report is the point. `--summarise DIR` prints the
+# same verdict over a run directory without a card, and tests/repro_337_script_test.sh is that.
 #
 # The cards are not chosen here: run it under the card scheduler, as the lane does for a GPU job
 #     scripts/backlog/lane.sh --gpu local scripts/repro-337.sh <tag>
@@ -34,9 +39,53 @@ SYSTEM="${SYSTEM:-95000}"        # system prompt tokens: where the session start
 CONTEXT="${CONTEXT:-130000}"     # a turn stops the session when its prompt would pass this
 TURN="${TURN:-1800,2200}"        # tool result tokens a turn adds, LO,HI
 REPLY="${REPLY:-2048}"           # tokens a turn decodes: past one 1984-token checkpoint
+TOOLS="${TOOLS:-12}"              # the issue's session is a Hermes client with 12 tools: each turn
+                                 # is a chat turn with that tool set, and the call it asks for is
+                                 # answered before the next one
 SUB_EVERY="${SUB_EVERY:-3}"      # a parent runs a subagent every N turns
 SUB_TURNS="${SUB_TURNS:-3}"
 export RADIANCE_HOME="$BUILD/radiance_home"   # absolute: the engine will not find the kernels without it
+
+# The verdict over one run directory: the rows the replay wrote and the fault lines in the log, then
+# the report itself when the log holds one. 0: no fault. 1: a reproduction. Never raises on a run
+# directory a dead server left half written, because that is the interesting one.
+verdict() {
+  local out="$1" faults
+  python3 - "$out/run.jsonl" <<'EOF'
+import json, sys
+rows = []
+try:
+    with open(sys.argv[1]) as h:
+        for line in h:
+            try:
+                rows.append(json.loads(line))
+            except ValueError:
+                pass                 # a row cut short by a server that died mid-request
+except FileNotFoundError:
+    pass
+if not rows:
+    print("repro-337: no requests recorded")
+else:
+    print("repro-337: %d requests, largest prompt %d tokens, %d with a prefix-cache hit"
+          % (len(rows), max(r["prompt_tokens"] for r in rows),
+             sum(1 for r in rows if r.get("cached_tokens"))))
+EOF
+  faults="$(grep -cE 'the AQL queue faulted|GPU memory fault' "$out/server.log" || true)"
+  echo "repro-337: $faults fault line(s) in $out/server.log"
+  if [ "$faults" != 0 ]; then
+    grep -nE -A 24 'the AQL queue faulted|GPU memory fault' "$out/server.log" || true
+    return 1
+  fi
+  return 0
+}
+
+if [ "${1:-}" = "--summarise" ]; then
+  [ -n "${2:-}" ] || { echo "usage: $0 --summarise <run directory>" >&2; exit 2; }
+  vrc=0
+  verdict "$2" || vrc=$?
+  exit "$vrc"
+fi
+
 [ -x "$BIN" ] || { echo "no engine at $BIN (build it first; this script builds nothing)" >&2; exit 2; }
 [ -f "$MODEL" ] || { echo "no model at $MODEL" >&2; exit 2; }
 mkdir -p "$OUT"
@@ -95,28 +144,25 @@ fi
 grep -E 'kv: the cache can grow|activation arena: |[[]0[]] arena: ' "$OUT/server.log" | sed 's/^/repro-337: /' || true
 echo "repro-337: W2 $([ "${RADIANCE_W2:-1}" = 0 ] && echo off || echo on), $TP card(s), server up"
 
+# A faulting server takes every request down with it, and the replay exits non-zero when that
+# happens: that is the run this script exists for, so its failure is reported and the log is read
+# anyway. `|| rrc=$?` keeps `set -e` and `pipefail` from stopping the script here.
+rrc=0
 python3 "$ROOT/scripts/agentreplay.py" --url "http://127.0.0.1:$PORT" --parents 1 \
   --system "$SYSTEM" --context "$CONTEXT" --turn "$TURN" --reply "$REPLY" \
-  --sub-every "$SUB_EVERY" --sub-turns "$SUB_TURNS" --timeout 1800 --out "$OUT/run.jsonl" \
-  2>&1 | tee "$OUT/replay.log"
-echo "repro-337: replay rc=$?"
+  --sub-every "$SUB_EVERY" --sub-turns "$SUB_TURNS" --tools "$TOOLS" --timeout 1800 \
+  --out "$OUT/run.jsonl" 2>&1 | tee "$OUT/replay.log" || rrc=$?
+echo "repro-337: replay rc=$rrc"
 
 kill $PID 2>/dev/null || true
 for _ in $(seq 1 120); do kill -0 $PID 2>/dev/null || break; sleep 1; done
 kill -9 $PID 2>/dev/null || true
 wait $PID 2>/dev/null || true
 
-python3 - "$OUT/run.jsonl" <<'EOF'
-import json, sys
-rows = [json.loads(l) for l in open(sys.argv[1])]
-print("repro-337: %d requests, largest prompt %d tokens, %d with a prefix-cache hit"
-      % (len(rows), max(r["prompt_tokens"] for r in rows),
-         sum(1 for r in rows if r.get("cached_tokens"))))
-EOF
-FAULTS="$(grep -cE 'the AQL queue faulted|GPU memory fault' "$OUT/server.log" || true)"
-echo "repro-337: $FAULTS fault line(s) in $OUT/server.log"
-if [ "$FAULTS" != 0 ]; then
-  grep -nE -A 14 'the AQL queue faulted|GPU memory fault' "$OUT/server.log"
-  exit 1
+vrc=0
+verdict "$OUT" || vrc=$?
+if [ "$vrc" = 0 ] && [ "$rrc" != 0 ]; then
+  echo "repro-337: the replay failed (rc=$rrc) and the log holds no fault: not a reproduction" >&2
+  vrc=3
 fi
-exit 0
+exit "$vrc"

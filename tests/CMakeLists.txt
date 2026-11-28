@@ -507,6 +507,14 @@ if(TARGET rad-kbench AND EXISTS ${CMAKE_SOURCE_DIR}/data/kernels_hy4.rkb)
     ENVIRONMENT "KN=$<TARGET_FILE:rad-kbench>;RADIANCE_HOME=${RAD_PLUGIN_OUT}")
 endif()
 
+# scripts/repro-337.sh reads the run directory a fault left behind, and issue #337's run directory is
+# the one a dead server wrote: the replay it drives exits non-zero exactly then. Its `--summarise`
+# mode is that read over a canned directory, and scripts/agentreplay.py's turn loop (the tool-call
+# turn #337's session is made of) is checked against a fake server. Neither touches a card.
+add_test(NAME repro_337_script COMMAND sh ${CMAKE_SOURCE_DIR}/tests/repro_337_script_test.sh)
+add_test(NAME agentreplay_selftest
+         COMMAND python3 ${CMAKE_SOURCE_DIR}/scripts/agentreplay.py --selftest)
+
 # ================================================================== rad-heat-replay's floor
 #
 # heat_replay_test runs rad-heat-replay itself on a synthetic route trace, so it needs the tool
