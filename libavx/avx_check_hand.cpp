@@ -3693,6 +3693,44 @@ void kvstream_cases(std::vector<Hand>& hs) {
         h.expect_bytes(5, want);
         hs.push_back(std::move(h));
     }
+    /* The int8 latent row of Hy4-flash's cache (design note X-07): one KV head's row of
+     * [L int8 codes][L/128 f32 scales][R rope columns as bf16] at L = 2 * head_dim - R, so the
+     * rotation of a whole block of 128 columns, a block's scale and the rope columns' placement are
+     * all in play. Both libraries must write the same bytes: the rotation, the scale and the int8
+     * rounding are each the same arithmetic, and the row is one workgroup's worth of columns a
+     * token. A slot that is padding writes nothing, so the filler stays. */
+    {
+        const int64_t blocks = 2, slots = 2, bs = 2, hd = 68, M = 3, L = 2 * hd - 8, R = 8;
+        const int64_t rowb = L + 4 * (L / 128) + 2 * R, row = bs * rowb;
+        Hand h("the int8 latent row: rotation, block scale, rope columns", "kv_store_streamed", 0.0);
+        h.view(RAD_BF16, { M, hd }, { hd, 1 }, M * hd,
+               [](int64_t i) { return (float)((int)(i * 7 % 23) - 11) * 0.5f; })
+         .view(RAD_BF16, { M, hd }, { hd, 1 }, M * hd,
+               [](int64_t i) { return (float)((int)(i * 5 % 19) - 9) * 0.25f; })
+         .idx({ 0, 3, -1 })
+         .dense(RAD_I8, { slots, 1, bs, rowb }, [](int64_t) { return 0.0f; }, true)
+         .idx({ 0, -1 })
+         .dense(RAD_U8, { blocks, row }, [](int64_t i) { return (float)(int)(i % 251); }, true)
+         .pi("M", M).pi("head_dim", hd).pi("n_head_kv", 1).pi("block_size", bs)
+         .ps("kv_dtype", "i8").pi("rope_dim", R);
+        hs.push_back(std::move(h));
+    }
+    /* The same row through `kv_store`, whose workgroup is the row rather than a head's dims: the
+     * two must agree byte for byte with the streamed form above and with libref. */
+    {
+        const int64_t blocks = 2, bs = 2, hd = 68, M = 3, L = 2 * hd - 8, R = 8;
+        const int64_t rowb = L + 4 * (L / 128) + 2 * R;
+        Hand h("the int8 latent row through kv_store", "kv_store", 0.0);
+        h.view(RAD_BF16, { M, hd }, { hd, 1 }, M * hd,
+               [](int64_t i) { return (float)((int)(i * 7 % 23) - 11) * 0.5f; })
+         .view(RAD_BF16, { M, hd }, { hd, 1 }, M * hd,
+               [](int64_t i) { return (float)((int)(i * 5 % 19) - 9) * 0.25f; })
+         .idx({ 0, 3, -1 })
+         .dense(RAD_I8, { blocks, 1, bs, rowb }, [](int64_t) { return 0.0f; }, true)
+         .pi("M", M).pi("head_dim", hd).pi("n_head_kv", 1).pi("block_size", bs)
+         .ps("kv_dtype", "i8").pi("rope_dim", R);
+        hs.push_back(std::move(h));
+    }
     /* The default cache dtype: both planes hold the values themselves, two bytes an element. */
     {
         const int64_t blocks = 4, slots = 2, bs = 2, kvh = 2, hd = 4, M = 4;

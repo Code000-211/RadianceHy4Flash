@@ -463,16 +463,18 @@ static const RadParamSpec pSamAttn[] = { P_INT("M"), P_INT("head_dim"), P_INT("n
 static const RadOperandSpec oSamAttn[] = { OPD("q"), OPD("k"), OPD("v"), OPD("cu_seqlens"),
                                            OUT("out"), WGT("rel_pos_h"), WGT("rel_pos_w") };
 
+/* `rope_dim`: the int8 latent row's rotary columns (design note X-07), as libr4d's and libref's. */
 static const RadParamSpec pKvStore[]   = { P_INT("M"), P_INT("head_dim"), P_INT("n_head_kv"),
                                            P_INT("block_size"), P_STR("kv_dtype"),
-                                           P_F64O("k_scale"), P_F64O("v_scale") };
+                                           P_F64O("k_scale"), P_F64O("v_scale"),
+                                           P_INTO("rope_dim") };
 static const RadOperandSpec oKvStore[] = { OPD("k"), OPD("v"), OPD("slot_mapping"),
                                            INOUT("kv_cache") };
 /* The streamed store: kv_store's parameters and the group's two copies beside the ring. `host` is
  * the authoritative mirror and is always written; `res` is the residency map and is read only. */
 static const RadParamSpec pKvStoreStreamed[] = {
     P_INT("M"), P_INT("head_dim"), P_INT("n_head_kv"), P_INT("block_size"), P_STR("kv_dtype"),
-    P_F64O("k_scale"), P_F64O("v_scale")
+    P_F64O("k_scale"), P_F64O("v_scale"), P_INTO("rope_dim")   /* as kv_store's */
 };
 static const RadOperandSpec oKvStoreStreamed[] = { OPD("k"), OPD("v"), OPD("slot_mapping"),
                                                    INOUT("kv_cache"), OPD("res"),
