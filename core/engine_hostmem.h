@@ -33,8 +33,9 @@ int64_t cgroup_least_room();
  * first and `margin` (--host-headroom-mib) stays free, or why not. Checks MemAvailable; every
  * memory cgroup from the process's own up to the visible root (Docker's --memory, enforced by the
  * OOM killer); and, for an mlock()ed copy (`mlocks`), RLIMIT_MEMLOCK unless the process has
- * CAP_IPC_LOCK. Pinned memory a card reads is a driver userptr mapping, which RLIMIT_MEMLOCK does
- * not count. An unreadable limit is ignored, never guessed. */
+ * CAP_IPC_LOCK. Pinned memory a card reads is also mlock()ed where the limit allows (#272), and
+ * VmLck counts it, but a refusal there never fails the start, so it is not checked here. An
+ * unreadable limit is ignored, never guessed. */
 bool lockable_room(int64_t need, int64_t still, int64_t margin, bool mlocks, std::string* why,
                    int64_t* short_by = nullptr);
 
