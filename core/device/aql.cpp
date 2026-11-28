@@ -69,6 +69,7 @@
 #include <vector>
 
 #include "aql.h"
+#include "aql_inflight.h"
 #include "directio.h"
 #include "karg_report.h"
 #include "kfd_evict.h"
@@ -1008,12 +1009,71 @@ hsa_status_t on_system_event(const hsa_amd_event_t* e, void*) {
           "exiting so a restart can bring the server back", card);
 }
 
-/* The running kernel and its arguments. A queue's read index stays on a packet until it
- * completes, so the packet there is in flight. Every parameter of that launch is printed by the
- * name and the size its code object gives it, an address located like the fault address itself,
- * which names the operand that got a stale or short buffer, and the chained-launch record it
- * waited on. Only card `card`'s queues; the host reads the arguments at the packet's
- * kernarg_address. */
+/* One dispatch packet of a queue, printed the way the fault report prints a launch: the packet's
+ * index and `note`, its kernel by name, and every parameter by the name, size and kind its code
+ * object gives it -- an address located exactly like the fault address, so the two lines compare,
+ * and `where_is` names the operand that got a stale or short buffer. A kernel object with no
+ * metadata (a library's own code object, say) prints the pointer-shaped words of the slot, as the
+ * dump always did. The slot's bytes past the launch's segment belong to whatever used the slot
+ * before, and are not printed. */
+void report_one(Stream* s, uint64_t idx, const char* note) {
+    auto* p = static_cast<hsa_kernel_dispatch_packet_t*>(s->q->base_address) + (idx & s->mask);
+    const uint16_t h = __atomic_load_n(&p->header, __ATOMIC_ACQUIRE);
+    if (((h >> HSA_PACKET_HEADER_TYPE) & 0xff) != HSA_PACKET_TYPE_KERNEL_DISPATCH) {
+        RAD_ERR("device %d:   packet %" PRIu64 " %s: the ring holds no kernel dispatch there",
+                s->ord, idx, note);
+        return;
+    }
+    std::string name;
+    KargLayout lay;
+    {
+        std::lock_guard<std::mutex> nl(g_names_mu);
+        auto it = g_names.find(p->kernel_object);
+        name = it != g_names.end() ? it->second : fmt("%#" PRIx64, p->kernel_object);
+        auto li = g_klayout.find(p->kernel_object);
+        if (li != g_klayout.end()) lay = li->second;
+    }
+    RAD_ERR("device %d:   packet %" PRIu64 " %s kernel %s", s->ord, idx, note, name.c_str());
+    const unsigned char* slot = static_cast<const unsigned char*>(p->kernarg_address);
+    if (!slot) return;
+    std::lock_guard<std::mutex> lk(g_alloc_mu);
+    /* Every line names one parameter of this launch, in the code object's order: an address with
+     * the location it lies in, a value as the number it is. */
+    const std::vector<std::string> lines =
+        karg_lines(KargSlot{slot, kKargSlot, lay.kernarg_size, lay.chained, &lay.args},
+                   [](uintptr_t a) { return where_is(a); });
+    if (!lines.empty()) {
+        for (const std::string& l : lines) RAD_ERR("  %s", l.c_str());
+        return;
+    }
+    const uint64_t* ka = static_cast<const uint64_t*>(p->kernarg_address);
+    for (uint32_t i = 0; i < kKargMax / 8; ++i) {
+        const uint64_t w = ka[i];
+        if (!looks_like_pointer(w)) continue;
+        RAD_ERR("  argument +%u = %#" PRIx64 ": %s", i * 8, w, where_is((uintptr_t)w).c_str());
+    }
+}
+
+/* How many dispatches a stopped queue's report prints in full. One chained plan keeps a handful in
+ * the card at a time, and the fault is in the oldest of them. */
+constexpr size_t kReportRuns = 6;
+
+/* The launches a stopped queue may have faulted in, and their parameters (issue #337).
+ *
+ * The read index is not a completion mark: the packet processor moves it on when it has read a
+ * packet, and a chained kernel loses its barrier bit (the chain plan), so the launch that runs can
+ * be many packets behind it -- reserve() below says so, and frontier_open records when a packet
+ * went out without its bit. Issue #337's dump printed the packet at the read index and called it
+ * the kernel that ran; every parameter of it pointed into a live range, which is what a later
+ * launch of the same kernel looks like, and the faulting address was in none of them, so the
+ * report sent readers after a launch that had not faulted.
+ *
+ * So the report names the dispatches that may still be running, oldest first (aql_inflight.h), and
+ * the queue stopped at the first of them: that is the launch to read. The chain record each one
+ * waited on is printed with it, because a stale slot shows up there first. A queue with nothing
+ * recorded as unfinished -- every packet kept its barrier bit -- prints the packet at the read
+ * index, as the dump always did. Only card `card`'s queues; the host reads the arguments at the
+ * packet's kernarg_address. */
 void report_running(int card) {
     std::lock_guard<std::mutex> sl(G().streams_mu);
     for (Stream* s : G().streams) {
@@ -1021,41 +1081,38 @@ void report_running(int card) {
         const uint64_t rd = hsa_queue_load_read_index_scacquire(s->q);
         const uint64_t wr = hsa_queue_load_write_index_scacquire(s->q);
         if (rd >= wr) continue;
-        auto* p = static_cast<hsa_kernel_dispatch_packet_t*>(s->q->base_address) + (rd & s->mask);
-        const uint16_t h = __atomic_load_n(&p->header, __ATOMIC_ACQUIRE);
-        if (((h >> HSA_PACKET_HEADER_TYPE) & 0xff) != HSA_PACKET_TYPE_KERNEL_DISPATCH) continue;
-        std::string name;
-        KargLayout lay;
-        {
-            std::lock_guard<std::mutex> nl(g_names_mu);
-            auto it = g_names.find(p->kernel_object);
-            name = it != g_names.end() ? it->second : fmt("%#" PRIx64, p->kernel_object);
-            auto li = g_klayout.find(p->kernel_object);
-            if (li != g_klayout.end()) lay = li->second;
-        }
-        RAD_ERR("device %d: queue %p packet %" PRIu64 " (of %" PRIu64 " written) ran kernel %s", card,
-                (void*)s->q, rd, wr, name.c_str());
-        const unsigned char* slot = static_cast<const unsigned char*>(p->kernarg_address);
-        if (!slot) continue;
-        std::lock_guard<std::mutex> lk(g_alloc_mu);
-        /* Every line names one parameter of this launch, in the code object's order: an address
-         * with the location it lies in, a value as the number it is. The slot's bytes past the
-         * launch's segment belong to whatever used the slot before, and are not printed. */
-        const std::vector<std::string> lines =
-            karg_lines(KargSlot{slot, kKargSlot, lay.kernarg_size, lay.chained, &lay.args},
-                       [](uintptr_t a) { return where_is(a); });
-        if (!lines.empty()) {
-            for (const std::string& l : lines) RAD_ERR("  %s", l.c_str());
+        const bool open = s->frontier_open || s->plain_inflight || s->peer_inflight;
+        const std::vector<uint64_t> run =
+            aql::still_running(rd, wr, s->mask + 1, s->chain_seen, open,
+                               [s](uint64_t i) {
+                                   return s->slot_need.empty() ? 0 : s->slot_need[i & s->mask];
+                               },
+                               kReportRuns);
+        if (run.empty()) {
+            RAD_ERR("device %d: queue %p packet %" PRIu64 " (of %" PRIu64 " written): no"
+                    " dispatch is recorded as unfinished, so the packet at the read index is"
+                    " printed", card, (void*)s->q, rd, wr);
+            report_one(s, rd, "ran");
             continue;
         }
-        /* No metadata for this kernel object (a library's own code object, say): print the
-         * pointer-shaped words of the slot, as the dump always did. */
-        const uint64_t* ka = static_cast<const uint64_t*>(p->kernarg_address);
-        for (uint32_t i = 0; i < kKargMax / 8; ++i) {
-            const uint64_t w = ka[i];
-            if (!looks_like_pointer(w)) continue;
-            RAD_ERR("  argument +%u = %#" PRIx64 ": %s", i * 8, w, where_is((uintptr_t)w).c_str());
+        RAD_ERR("device %d: queue %p packet %" PRIu64 " (of %" PRIu64 " written): %zu"
+                " dispatch(es) may still be running, oldest first, and the queue stopped at the"
+                " first", card, (void*)s->q, rd, wr, run.size());
+        for (uint64_t idx : run) {
+            const uint64_t need = s->slot_need.empty() ? 0 : s->slot_need[idx & s->mask];
+            report_one(s, idx, "may have run");
+            if (need)
+                RAD_ERR("device %d:   packet %" PRIu64 " is chained: it waits for the queue's"
+                        " counter to reach %" PRIu64 ", which the host has seen at %" PRIu64,
+                        card, idx, need, s->chain_seen);
+            else
+                RAD_ERR("device %d:   packet %" PRIu64 " went out without its barrier bit", card,
+                        idx);
         }
+        if (run.size() >= kReportRuns)
+            RAD_ERR("device %d:   (stopped at %zu; the ring holds more)", card, run.size());
+        RAD_ERR("device %d:   packet %" PRIu64 " (the read index) is written and not read yet",
+                card, rd);
     }
 }
 

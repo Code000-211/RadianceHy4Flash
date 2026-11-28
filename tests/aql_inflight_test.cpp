@@ -1,0 +1,110 @@
+/* aql_inflight_test.cpp -- which dispatches a stopped queue may have faulted in (#337).
+ *
+ * Issue #337's dump printed the packet at the queue's read index and called it "the kernel that
+ * ran". A chained kernel loses its barrier bit, so the read index moves on when the packet is read,
+ * not when it completes, and the launch that faulted can be many packets behind it. That is what
+ * made the dump read as a paradox: every parameter of the packet it printed was in range, and the
+ * faulting address was in none of them.
+ *
+ * These cases are the ring arithmetic of core/device/aql_inflight.h on its own: no queue, no card. */
+#include "rad_test.h"
+
+#include "device/aql_inflight.h"  /* core/ is on the include path */
+
+#include <cstdint>
+#include <string>
+#include <vector>
+
+using namespace rad::aql;
+
+namespace {
+
+/* A ring of `size` packets whose slot `i & (size - 1)` waits for `need[i & mask]`. */
+struct Ring {
+    uint64_t size = 64;
+    std::vector<uint64_t> need = std::vector<uint64_t>(size, 0);
+
+    uint64_t at(uint64_t i) const { return need[i & (size - 1)]; }
+
+    std::vector<uint64_t> run(uint64_t rd, uint64_t wr, uint64_t counter, bool open,
+                              size_t cap = 32) const {
+        return still_running(rd, wr, size, counter, open, [this](uint64_t i) { return at(i); },
+                             cap);
+    }
+};
+
+/* The report's own words for a list of packet indices: "5,6", and "" for none. */
+std::string list(const std::vector<uint64_t>& v) {
+    std::string s;
+    for (uint64_t i : v) { if (!s.empty()) s += ','; s += std::to_string(i); }
+    return s;
+}
+
+std::string range(uint64_t a, uint64_t b) {
+    std::string s;
+    for (uint64_t i = a; i < b; ++i) { if (!s.empty()) s += ','; s += std::to_string(i); }
+    return s;
+}
+
+}  /* namespace */
+
+/* The trap #337 fell into: the read index is 20 packets past a chained dispatch whose blocks have
+ * not all counted. The chained one is the candidate; the packet the read index points at has not
+ * run and is never one. */
+TEST(read_index_past_a_chained_dispatch) {
+    Ring r;
+    r.need[5] = 900;             /* packet 5 is chained and waits for 900 */
+    const uint64_t rd = 26, wr = 40, counter = 880;
+    CHECK_EQ(list(r.run(rd, wr, counter, false)), range(5, 6));
+    /* Once the counter reaches what it waits for, nothing may still be running. */
+    CHECK(r.run(rd, wr, 900, false).empty());
+}
+
+/* A plain dispatch keeps its barrier bit: the read index passing it means it completed. Nothing is
+ * reported, and the caller falls back to printing the packet at the read index itself. */
+TEST(a_plain_dispatch_behind_the_read_index_is_done) {
+    Ring r;
+    const uint64_t rd = 30, wr = 33;
+    CHECK(r.run(rd, wr, 0, false).empty());
+}
+
+/* An unbarriered packet went out (frontier_open, or a plain or collective packet launched since the
+ * last barrier): every packet the ring still holds and the processor has read is a candidate. */
+TEST(an_open_frontier_makes_every_read_packet_a_candidate) {
+    Ring r;                      /* size 64: the ring holds [wr - 64, wr) */
+    const uint64_t rd = 70, wr = 72;
+    CHECK_EQ(list(r.run(rd, wr, 0, true, 100)), range(8, 70));
+}
+
+/* Only what the ring still holds: a slot older than wr - size has been rewritten, so the packet
+ * index it used to carry says nothing about what its arguments are now. */
+TEST(the_window_is_the_last_size_packets) {
+    Ring r;                      /* size 64 */
+    const uint64_t rd = 200, wr = 210;
+    CHECK_EQ(list(r.run(rd, wr, 0, true, 200)), range(wr - r.size, rd));   /* 146 .. 199 */
+    /* Nothing written yet at all: no window, no candidates. */
+    CHECK(r.run(0, 0, 0, true).empty());
+    r.size = 0;
+    CHECK(still_running(4, 4, 0, 0, true, [](uint64_t) { return (uint64_t)0; }, 8).empty());
+}
+
+/* The oldest first, at most `cap` of them: the queue stops at the first launch that faults. */
+TEST(oldest_first_and_capped) {
+    Ring r;
+    for (uint64_t i = 10; i < 20; ++i) r.need[i] = 500;   /* chained, counter at 400 */
+    CHECK_EQ(list(r.run(30, 50, 400, false, 3)), range(10, 13));
+    CHECK(r.run(30, 50, 400, false, 0).empty());
+}
+
+/* The counter as the host reads it can lag the card, so a chained kernel that finished may still be
+ * a candidate. That way round is the safe one: a wrong candidate is printed beside the right one,
+ * where a dropped one is not printed at all. */
+TEST(a_lagging_counter_only_adds_candidates) {
+    Ring r;
+    r.need[3] = 700;
+    r.need[4] = 700;
+    CHECK_EQ(list(r.run(9, 12, 690, false)), range(3, 5));   /* both look unfinished */
+    CHECK(r.run(9, 12, 700, false).empty());
+}
+
+RAD_TEST_MAIN()

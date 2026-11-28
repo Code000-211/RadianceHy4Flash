@@ -1,7 +1,9 @@
-/* karg_report.h -- what the fault report says about the launch it names (issue #337).
+/* karg_report.h -- what the fault report says about a launch (issue #337).
  *
- * A queue's read index stands on a packet until the packet completes, so the packet it points at
- * is the launch that faulted and that launch's argument slot still holds its arguments. The report
+ * A packet's argument slot holds its launch's arguments until the engine reuses the slot, so the
+ * report can print them exactly. Which packet to print is a separate question and aql_inflight.h
+ * answers it: the read index is not a completion mark, so the packet it points at is not
+ * necessarily the launch that faulted. The report
  * used to scan the slot for pointer-shaped words: it printed the leftovers of earlier launches in
  * the same slot as "argument +N" (a slot is 1 KiB, a segment is at most 768 bytes, and only the
  * segment is written), it could not say anything at all about a word it judged not to be a pointer
