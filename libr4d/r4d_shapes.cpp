@@ -68,6 +68,7 @@
 #include <cstring>
 #include <algorithm>
 #include "r4d_plugin.h"
+#include "r4d_row_i8_geom.h"   // the int8 cache's row, both stores' last extent
 
 #include "rad_sample.h"
 
@@ -982,7 +983,7 @@ extern "C" int r4d_shape_rope(const RadParam* p, int n_p, int operand,
  * The int8 cache has two rows: the generic one, 2 * head_dim + 4 elements, and -- design note X-07
  * -- the rotated latent row [L codes][L/128 scales][R rope columns] of libr4d/r4d_row_i8.h,
  * L + 4 * (L / 128) + 2 * R bytes at L = 2 * head_dim - R, selected by the group's `rope_dim` as
- * the kernels select it. */
+ * the kernels select it. `r4d_row_i8::row_elems` is that choice, and both stores ask it. */
 extern "C" int r4d_shape_kv_store(const RadParam* p, int n_p, int operand,
                                   RadOpdDesc* out) {
 
@@ -995,12 +996,8 @@ extern "C" int r4d_shape_kv_store(const RadParam* p, int n_p, int operand,
     if (M <= 0 || bs <= 0) return RAD_E_UNSUPPORTED;
     int64_t rowe = 2 * hd;
     if (KV == (uint32_t)RAD_I8) {
-        rowe = 2 * hd + 4;
-        if (R > 0) {
-            const int64_t L = 2 * hd - R;
-            if ((R & 1) || L <= 0 || L % 128) return RAD_E_UNSUPPORTED;
-            rowe = L + 4 * (L / 128) + 2 * R;
-        }
+        rowe = r4d_row_i8::row_elems(hd, R);
+        if (rowe <= 0) return RAD_E_UNSUPPORTED;
     }
     /* Two blocks of slack, so the slot mapping is not a dense prefix and the block index is
      * actually tested. */
@@ -1036,12 +1033,8 @@ extern "C" int r4d_shape_kv_store_streamed(const RadParam* p, int n_p, int opera
         return RAD_E_UNSUPPORTED;
     int64_t rowe = 2 * hd;
     if (KV == (uint32_t)RAD_I8) {
-        rowe = 2 * hd + 4;
-        if (R > 0) {
-            const int64_t L = 2 * hd - R;
-            if ((R & 1) || L <= 0 || L % 128) return RAD_E_UNSUPPORTED;
-            rowe = L + 4 * (L / 128) + 2 * R;
-        }
+        rowe = r4d_row_i8::row_elems(hd, R);
+        if (rowe <= 0) return RAD_E_UNSUPPORTED;
     }
     const int64_t row = kvh * bs * rowe * (KV == (uint32_t)RAD_BF16 ? 2 : 1);
     const RadOpdDesc l[] = {

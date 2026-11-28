@@ -42,6 +42,7 @@
 #include "r4d_fp8_frag.h"
 #include "r4d_fp8_lm.h"
 #include "r4d_iqr.h"
+#include "r4d_row_i8_geom.h"
 #include "rad_encoding.h"
 #include "rad_philox.h"
 #include "rad_sample.h"
@@ -5114,7 +5115,8 @@ static void kv_store_i8_latent_case(const Plugin& pl) {
     const RadKernelInfo* r = find(pl, name);
     if (!r) { ok(name, false, "row absent"); return; }
     /* The served geometry: head_dim 288, rope_dim 64, so L = 512 and a row of 656 bytes. */
-    const int64_t hd = 288, R = 64, L = 2 * hd - R, bs = 4, nb = 3, rowb = L + 4 * (L / 128) + 2 * R;
+    const int64_t hd = 288, R = 64, L = 2 * hd - R, bs = 4, nb = 3,
+                   rowb = r4d_row_i8::row_elems(hd, R);
     if (rowb != 656) { ok(name, false, fmt("row %lld, not 656", (long long)rowb)); return; }
     /* Two tokens on the first block, one whose K and V columns are the constant 2.0 (a power of
      * two, so the scale is exact and the rotation of a constant block is 128 c at its first column
@@ -5157,14 +5159,12 @@ static void kv_store_i8_latent_case(const Plugin& pl) {
     /* Token 0's latent row is 512 columns of the constant 2.0 (K then V), so every block's
      * rotation is 128 * 2 at the block's first column and 0 elsewhere: code 127 then zeroes, and
      * every block's scale is (256 / 127) / sqrt(128). Token 1 is all zero, so scale 1 / codes 0. */
-    /* r4d_row_i8.h's kRotScale, restated: this file is host code and the header's device code
-     * cannot compile here. A change to it must be made in both. */
-    const float want = (256.0f * (1.0f / 127.0f)) * 0.08838834764831845f;
+    const float want = (256.0f * (1.0f / 127.0f)) * r4d_row_i8::kRotScale;
     for (int64_t t = 0; t < 2; ++t) {
         const uint8_t* row = &got[(size_t)(slots[(size_t)t] * rowb)];
-        for (int64_t b = 0; b < L / 128 && bad < 4; ++b) {
+        for (int64_t b = 0; b < L / r4d_row_i8::kBlock && bad < 4; ++b) {
             float sc = 0.0f;
-            std::memcpy(&sc, row + L + 4 * b, 4);
+            std::memcpy(&sc, row + r4d_row_i8::scales_offset(L) + 4 * b, 4);
             if (sc != (t == 0 ? want : 1.0f)) {
                 if (!bad) first = fmt("t%lld block %lld scale %g, want %g", (long long)t,
                                       (long long)b, (double)sc, (double)(t == 0 ? want : 1.0f));
@@ -5173,7 +5173,7 @@ static void kv_store_i8_latent_case(const Plugin& pl) {
         }
         for (int64_t i = 0; i < L && bad < 4; ++i) {
             const int8_t code = (int8_t)row[i];
-            const int wantc = t == 0 && i % 128 == 0 ? 127 : 0;
+            const int wantc = t == 0 && i % r4d_row_i8::kBlock == 0 ? 127 : 0;
             if ((int)code != wantc) {
                 if (!bad) first = fmt("t%lld code %lld is %d, want %d", (long long)t, (long long)i,
                                       (int)code, wantc);
@@ -5182,7 +5182,7 @@ static void kv_store_i8_latent_case(const Plugin& pl) {
         }
         for (int64_t i = 0; i < R && bad < 4; ++i) {
             uint16_t got16 = 0;
-            std::memcpy(&got16, row + L + 4 * (L / 128) + 2 * i, 2);
+            std::memcpy(&got16, row + r4d_row_i8::rope_offset(L) + 2 * i, 2);
             const uint16_t want16 = t == 0 ? h_to_bf16(2.0f) : h_to_bf16(0.0f);
             if (got16 != want16) {
                 if (!bad) first = fmt("t%lld rope column %lld is %04x, want %04x", (long long)t,

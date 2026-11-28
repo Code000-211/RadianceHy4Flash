@@ -26,7 +26,7 @@
  *
  * libref does not borrow this header (its form builds the rotation as an explicit matrix, and its
  * block is normalised before it is quantised); the kernels of the three store rows and the
- * readers of X-07b share it. */
+ * readers of X-07b share it. The geometry it and the host sites agree on is r4d_row_i8_geom.h. */
 #ifndef R4D_ROW_I8_H
 #define R4D_ROW_I8_H
 
@@ -34,25 +34,9 @@
 #include <cstdint>
 
 #include "r4d_q8.h"       // q8_pack4, q8_top, and the r4d_fwht.h wave it rotates with
+#include "r4d_row_i8_geom.h"   // kBlock, kRotScale, the row's layout
 
 namespace r4d_row_i8 {
-
-/* The columns of one quantised block: a wave holds a block, four columns a lane. */
-constexpr uint32_t kBlock = 128;
-
-/* 1 / sqrt(kBlock): the rotation's normaliser, folded into the block's scale so the reader's
- * dequantisation is one multiply (design note X-07 §2). */
-constexpr float kRotScale = 0.08838834764831845f;
-
-/* The row's byte count at L latent columns and R rotary ones. */
-__host__ __device__ __forceinline__ constexpr int row_bytes(int L, int R) {
-    return L + 4 * (L / (int)kBlock) + 2 * R;
-}
-
-/* Where the row's three parts start, in bytes. */
-__host__ __device__ __forceinline__ constexpr int codes_offset() { return 0; }
-__host__ __device__ __forceinline__ constexpr int scales_offset(int L) { return L; }
-__host__ __device__ __forceinline__ constexpr int rope_offset(int L) { return L + 4 * (L / (int)kBlock); }
 
 /* Whether a block has any code worth writing: a finite, positive absmax. An all-zero block and a
  * block whose absmax is inf or NaN are stored as scale 1 / codes 0 (design note X-07 §2), and the
