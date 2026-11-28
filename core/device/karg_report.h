@@ -48,11 +48,12 @@ struct KargSlot {
     bool                          chained = false;  /* the code object reads the record at +992 */
     const std::vector<KernelArg>* args = nullptr;   /* the code object's layout, in order */
 
-    /* The fault address this dump is about, and the live range it is nearest to (the caller numbers
-     * the ranges it knows; 0 means none). With `range_of`, a parameter that points into that same
-     * range gets the distance named on its line -- that parameter is the launch the fault address
-     * points at, which the ring's order can only guess at (issue #337). Zero and empty for a stall
-     * dump, which has no fault address. */
+    /* The fault address this dump is about, and the live range it can have run off (the caller
+     * numbers the ranges it knows; 0 means none). fault_ran_off is the test: the address lies in
+     * that range, or no more than the range's own length past its end. With `range_of`, a parameter
+     * that points into that same range gets the distance named on its line -- that parameter is the
+     * launch the fault address points at, which the ring's order can only guess at (issue #337).
+     * Zero and empty for a stall dump, which has no fault address. */
     uintptr_t                     fault = 0;
     uint64_t                      fault_rec = 0;
     std::function<KargRange(uintptr_t)> range_of;

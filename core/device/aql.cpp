@@ -1051,7 +1051,7 @@ hsa_status_t on_system_event(const hsa_amd_event_t* e, void*) {
  * dump always did. The slot's bytes past the launch's segment belong to whatever used the slot
  * before, and are not printed. `fault` is the address the memory-fault event named, or 0 for a
  * queue the runtime stopped for another reason: with it, a parameter that points into the same live
- * range the fault address is nearest to says so, which names the launch that read off that range. */
+ * range the fault address ran off says so, which names the launch that read off that range. */
 void report_one(Stream* s, uint64_t idx, const char* note, uintptr_t fault) {
     auto* p = static_cast<hsa_kernel_dispatch_packet_t*>(s->q->base_address) + (idx & s->mask);
     const uint16_t h = __atomic_load_n(&p->header, __ATOMIC_ACQUIRE);
@@ -1111,8 +1111,8 @@ constexpr size_t kReportRuns = 6;
  * So the report names the dispatches that may still be running (aql_inflight.h) -- the newest
  * few, since the ring is long and the launch that faulted is one of the last to go out -- oldest
  * first among those, because the queue stops at the first launch that faults: that is the launch
- * to read first. With a fault address, the operand that points into the range that address is
- * nearest to says so, and that line names the launch outright instead of leaving it to the order
+ * to read first. With a fault address, the operand that points into the live range that address ran
+ * off says so, and that line names the launch outright instead of leaving it to the order
  * (report_one). The chain record each one waited on is printed with it, because a stale slot
  * shows up there first. A queue with nothing recorded as unfinished -- every packet kept its
  * barrier bit -- prints the packet at the read index, as the dump always did. Only card `card`'s
