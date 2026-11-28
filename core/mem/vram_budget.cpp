@@ -175,8 +175,8 @@ static int resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudg
                                b.scratch_plan);
     } else if (b.scratch_metadata) {
         scratch_note = fmt("  queue scratch      %10s   %d of the %d kernels the code objects describe declare a private\n"
-                           "                                  segment; the largest is %u B (%s), charged once a card at a\n"
-                           "                                  wave on every CU\n",
+                           "                                  segment; the largest is %u B (%s), charged a wave on\n"
+                           "                                  every CU once per queue\n",
                            humanb(b.queue_scratch).c_str(), b.scratch_kernels, b.scratch_plan,
                            (unsigned)b.scratch_private, b.scratch_kernel.c_str());
     } else {
