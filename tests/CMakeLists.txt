@@ -679,6 +679,9 @@ list(APPEND R4D_EMU_TESTS attn_kv_sink hy4 mla_sink mla_kv idxpool qsafront row 
 # serial host oracle, so a result that depends on the order threads reach an LDS atomic in fails.
 list(APPEND R4D_EMU_HIP ${R4D_DIR}/r4d_sample_chain_f32.hip ${R4D_DIR}/r4d_sample_stages_f32.hip)
 list(APPEND R4D_EMU_TESTS sample)
+# logits_topk (K-21): the head's matvec with row_topk's stage 1 in its epilogue, against
+# logits_gemm_i8 + cast_row_topk in the same unit (test_topk.cpp).
+list(APPEND R4D_EMU_HIP ${R4D_DIR}/r4d_gemm_fp8a16_nt_m1.hip)
 set(R4D_EMU_BUILT OFF)
 if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$")
   # No fiber switch for this ISA.

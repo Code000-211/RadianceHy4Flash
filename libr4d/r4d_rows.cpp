@@ -1363,6 +1363,16 @@ static const RadParamSpec pLogitRerank[] = {
     { "vocab_off", RAD_P_INT, RAD_OPTIONAL },
     { "dtype",     RAD_P_STR, RAD_REQUIRED },
 };
+/* The head's shape and the output width, as `logit_rerank` has them: the same rank slice of the
+ * vocabulary (`vocab_off`) and the same R a row reports. */
+static const RadParamSpec pLogitsTopk[] = {
+    { "M",         RAD_P_INT, RAD_REQUIRED },
+    { "R",         RAD_P_INT, RAD_REQUIRED },
+    { "n_vocab",   RAD_P_INT, RAD_REQUIRED },
+    { "n_embd",    RAD_P_INT, RAD_REQUIRED },
+    { "vocab_off", RAD_P_INT, RAD_OPTIONAL },
+    { "dtype",     RAD_P_STR, RAD_REQUIRED },
+};
 static const RadOperandSpec oLogitRerank[] = {
     { "x",      RAD_OPD_IN,     0 },
     { "head",   RAD_OPD_WEIGHT, 0 },
@@ -1376,6 +1386,17 @@ static const RadOperandSpec oRowTopkMerge[] = {
     { "gathered", RAD_OPD_IN,  0 },
     { "idx",      RAD_OPD_OUT, 0 },
     { "val",      RAD_OPD_OUT, 0 },
+};
+/* K-21, the head's matvec with `row_topk`'s ranking fused into its epilogue: `logit_rerank`'s
+ * parameters and operands less `idx_in` (it proposes its own candidates), so a drafter swaps
+ * `logits_gemm` + `cast` + `row_topk` for this row and keeps the same outputs. `lm_head` is
+ * `logits_gemm`'s weight and `vocab_off`/`pairs` are row_topk's, absent on a single rank. */
+static const RadOperandSpec oLogitsTopk[] = {
+    { "x",       RAD_OPD_IN,     0 },
+    { "lm_head", RAD_OPD_WEIGHT, 0 },
+    { "idx",     RAD_OPD_OUT,    0 },
+    { "val",     RAD_OPD_OUT,    0 },
+    { "pairs",   RAD_OPD_OUT,    1 },
 };
 
 /* ------------------------------------------------------- quantisation, norms and the fusions */
@@ -4188,6 +4209,13 @@ static const RadOpSchema kSchemas[] = {
            "row_topk reports them, `vocab_off` is this rank's first column, and an id outside its "
            "rows becomes a pad. Ties break on the LOWER id, the rule row_topk and row_topk_merge "
            "use, so a tie inside a shard and one between shards resolve alike."),
+    SCHEMA("logits_topk", pLogitsTopk, oLogitsTopk,
+           "logits_gemm and row_topk in one launch: the head's matvec, whose epilogue keeps each "
+           "token row's top-R over the columns the block covers, and stage 2 over the blocks' "
+           "candidates. Outputs, order, tie rule and padding are row_topk's, and the values are "
+           "logits_gemm's rounded as `cast` f32 -> bf16 rounds them, so the pair (logits_gemm, "
+           "cast_row_topk) is byte-identical without its f32 plane or its launches. The matvec "
+           "band only (M <= 2) and R <= 8; `vocab_off` and `pairs` are row_topk's."),
     SCHEMA("rmsnorm_quant_fp8", pRmsNormQuantFp8, oRmsNormQuantFp8,
            "RMS norm and the fp8 activation quantiser in one pass over the row. The bf16 norm "
            "output the unfused pair wrote is still written, and the codes are taken over it."),
@@ -6729,6 +6757,13 @@ static const RadConstraint cLogitsGemmCols[] = { C_EQ("n_embd", 4096), C_IN("dty
  * 2560 the row would win selection and then fail at layout with no fallback. r4d_fp8_lm.h pads the
  * stored row to 16 bytes instead (under 0.3% at K = 2560), so every multiple of 128 is served. */
 static const RadConstraint cLogitsGemmFp8[] = { C_DIV("n_embd", 128), C_IN("dtype", "bf16") };
+/* K-21: the head's matvec band and row_topk's R. The matvec is the decode form's (rows_dot_mt,
+ * RB = 1), which the head takes at M <= 2; a block hands stage 2 kTopkRc = 8 candidates, so a row
+ * cannot report more than eight. */
+static const RadConstraint cLogitsTopk[] = {
+    C_DIV("n_embd", 128), C_IN("dtype", "bf16"),
+    C_GE("M", 1), C_LE("M", 2), C_GE("R", 1), C_LE("R", 8),
+};
 static const RadConstraint cLogitsVocab[] = { C_DIV("n_embd", 256), C_IN("dtype", "bf16") };
 
 /* No tunable axes. */
@@ -7790,6 +7825,27 @@ static const RadKernelInfo kKernels[] = {
   nullptr, nullptr, r4d_rad_logits_gemm_iqr, nullptr,
   r4d_rad_layout_iqr_logits, r4d_rad_relayout_iqr_logits,
   nullptr, r4d_rad_unrelayout_iqr_logits },
+
+/* K-21: the head with row_topk's ranking in its epilogue (r4d_gemm_fp8a16_nt_m1.hip). A draft
+ * round ran logits_gemm (242 KB a row of f32 plane), a `cast` and row_topk's stage 1 over that
+ * plane; this row is the same matvec with the ranking fused, and its outputs are the pair's bytes
+ * (the values `cast` would have written, ranked by row_topk's key). One row, for the int8 head; an
+ * E4M3 head would be a second row on r4d_rad_layout_fp8_logits, the family r4d_fp8_layout.cpp does
+ * not have yet. */
+{ "logits_topk_i8", "logits_topk", "vocab",
+  "logits_gemm_i8 with row_topk's top-R in its epilogue: each block keeps its slice of every token "
+  "row's vocabulary, hands stage 2 the top 8, and the block that arrives last for a row ranks "
+  "them -- the outputs of (logits_gemm_i8, cast_row_topk), byte for byte, with no f32 plane, no "
+  "cast and no stage 1",
+  "M <= 2 (the head's matvec form); n_embd a multiple of 128; 1 <= R <= 8; n_vocab any",
+  "bf16 x, an int8 head (r4d_fp8_lm.h's stored row: n_embd i8 codes, a bf16 scale per 128 in the "
+  "row's tail), INT32 IDX OUT [M][R], F32 VAL OUT [M][R] (cast_row_topk's order and padding), an "
+  "optional F32 PAIRS OUT [M][R][2]; fp32 accumulate rounded to bf16 a candidate",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_LOGITS_FP8,
+  ROW(cLogitsTopk), NOTUNE,
+  nullptr, nullptr, r4d_rad_logits_topk_i8, r4d_rad_logits_topk_scratch,
+  r4d_rad_layout_i8_logits, r4d_rad_relayout_i8_logits,
+  r4d_shape_logits_topk, r4d_rad_unrelayout_i8_logits },
 
 /* ---------------------------- the decomposed sampler chain (r4d_sample_stages_f32.hip) ------
  *

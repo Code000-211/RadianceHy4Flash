@@ -14,7 +14,7 @@ namespace r4d {
 
 /* Which row's blocks: rows keep blocks of different sizes and protocols for the same output, so
  * each has its own. */
-enum class Keyed : int { SplitFp8 = 1, GdnConv, MxDecode, M2xDecode, MxGemv, RowTopk };
+enum class Keyed : int { SplitFp8 = 1, GdnConv, MxDecode, M2xDecode, MxGemv, RowTopk, LogitsTopk };
 
 /* The zeroed block of `bytes` for (row, owner, out), made on first use. `owner` is the stream for
  * a row whose launches overlap across streams, or null for one block per device. Null when it

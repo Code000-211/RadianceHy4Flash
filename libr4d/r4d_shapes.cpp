@@ -1046,6 +1046,25 @@ extern "C" int r4d_shape_logits_gemm(const RadParam* p, int n_p, int operand,
     R4D_PICK(l);
 }
 
+/* logits_topk: the head's matvec with row_topk's ranking fused into its epilogue (K-21). The head
+ * is logits_gemm's operand and its plane the row's own (see the note above), and the ranking
+ * outputs are cast_row_topk's, so the pair plane is optional as there. */
+extern "C" int r4d_shape_logits_topk(const RadParam* p, int n_p, int operand,
+                                     RadOpdDesc* out) {
+    const int64_t M  = pi(p, n_p, "M");
+    const int64_t Rr = pi(p, n_p, "R");
+    const int64_t nv = pi(p, n_p, "n_vocab");
+    const int64_t ne = pi(p, n_p, "n_embd");
+    const RadOpdDesc l[] = {
+        opd((uint32_t)RAD_BF16, M, ne),
+        opd((uint32_t)RAD_BF16, nv, ne),
+        opd((uint32_t)RAD_I32, M, Rr),
+        opd((uint32_t)RAD_F32, M, Rr),
+        opd_none(),          /* pairs: an all-gather's plane, the caller's to pass */
+    };
+    R4D_PICK(l);
+}
+
 /* ==========================================================================================
  * The decomposed sampler chain (shims in r4d_sample_stages_f32.hip). `sample_merge_topk` is declined (below).
  * See opd_sample_params on the limits: `sample_penalties`, `sample_dry` and `sample_mask` take
