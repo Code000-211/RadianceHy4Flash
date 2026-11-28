@@ -586,8 +586,9 @@ int write_report(const std::string& path, const std::vector<Row>& rows,
              "a share of 75% or more, or a time under the launch floor, is noted as an order\n"
              "  of magnitude.\n";
         s += "- The timing pass draws its own **routing and block tables**: expert offsets and "
-             "ids skewed as\n  real routing is (Zipf, exponent 0.5) and block tables as "
-             "permutations. The checked launch\n  keeps the recorded draw.\n";
+             "ids skewed as\n  real routing is (Zipf, exponent 0.5) and each page table's rows "
+             "in block order (distinct\n  ascending page ids, the partial page last), as "
+             "`qsa_select` writes them. The checked launch\n  keeps the recorded draw.\n";
         s += "- `±%` is the half-width of a distribution-free 95% interval for the median, as a "
              "percent of\n  it (below six batches the range, which covers less); a case is "
              "timed until it is 1% or\n  the rep cap (`--bench-reps`) is reached, so a wide one "

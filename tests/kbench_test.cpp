@@ -997,9 +997,9 @@ TEST(skewed_routing_places_every_row_within_the_cap) {
 
 /* The timing pass's own inputs: an expert histogram skewed within its contract (offsets from 0 to
  * the row count, non-decreasing, each run at most M), routing ids distinct within a row and
- * concentrated on a few experts, a block table as a permutation. Anything else keeps the recorded
+ * concentrated on a few experts, a block table in block order. Anything else keeps the recorded
  * draw. */
-TEST(timing_inputs_skew_routing_and_permute_block_tables_and_leave_the_rest) {
+TEST(timing_inputs_skew_routing_and_draw_block_tables_in_block_order_and_leave_the_rest) {
     Geometry g;
     g.set_i("M", 2048);
     g.set_i("n_expert", 128);
@@ -1058,6 +1058,55 @@ TEST(timing_inputs_skew_routing_and_permute_block_tables_and_leave_the_rest) {
     act.is_index = false;
     CHECK(!kb::timing_input(act, g, 1, &untouched));
     CHECK(untouched == std::vector<uint8_t>{ 7 });
+}
+
+/* The page table a selection writes (`qsa_select`): each row's own pages in block order, the
+ * partial page last -- not one shuffled run over the whole operand, an order no selection
+ * produces and the attention never sums in. */
+TEST(a_page_table_timing_input_is_each_rows_pages_in_block_order) {
+    Geometry g;
+    g.set_i("M", 8);
+    std::vector<uint8_t> out;
+
+    /* A block table: every page of the row, 0..nb-1, the cache's own block order. */
+    KfOperand full = index_opd({ 1, 512 }, 512);
+    REQUIRE(kb::timing_input(full, g, 31, &out));
+    const std::vector<int32_t> f = as_i32(out);
+    REQUIRE_EQ(f.size(), (size_t)512);
+    for (int32_t i = 0; i < 512; ++i) CHECK_EQ(f[(size_t)i], i);
+
+    /* A selection: 16 pages out of a 64-page cache for each of 8 rows, ascending and distinct
+     * within the row, and not the same 16 for every row. */
+    g.set_i("blocks", 16);
+    KfOperand sel = index_opd({ 8, 16 }, 64);
+    REQUIRE(kb::timing_input(sel, g, 32, &out));
+    const std::vector<int32_t> t = as_i32(out);
+    REQUIRE_EQ(t.size(), (size_t)(8 * 16));
+    std::vector<int32_t> first;
+    int differing = 0;
+    for (int r = 0; r < 8; ++r) {
+        std::set<int32_t> row;
+        for (int j = 0; j < 16; ++j) {
+            const int32_t page = t[(size_t)(r * 16 + j)];
+            CHECK(page >= 0 && page < 64);
+            if (j) CHECK(page > t[(size_t)(r * 16 + j - 1)]);
+            row.insert(page);
+        }
+        CHECK_EQ(row.size(), (size_t)16);
+        const std::vector<int32_t> rowv(t.begin() + r * 16, t.begin() + (r + 1) * 16);
+        if (r == 0) first = rowv;
+        else if (rowv != first) ++differing;
+    }
+    CHECK_EQ(differing, 7);
+
+    /* Every page of every row: 0..blocks-1 per row, the full table. */
+    g.set_i("blocks", 512);
+    KfOperand all = index_opd({ 8, 512 }, 512);
+    REQUIRE(kb::timing_input(all, g, 33, &out));
+    const std::vector<int32_t> a = as_i32(out);
+    REQUIRE_EQ(a.size(), (size_t)(8 * 512));
+    for (int r = 0; r < 8; ++r)
+        for (int32_t j = 0; j < 512; ++j) CHECK_EQ(a[(size_t)(r * 512 + j)], j);
 }
 
 /* A v1.3 table (RDNA3/RDNA4 discrete cards) built field by field from the layout cardclock.py

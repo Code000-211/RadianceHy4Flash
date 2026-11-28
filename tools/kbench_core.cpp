@@ -14,6 +14,7 @@
 #include <elf.h>
 #include <fcntl.h>
 #include <link.h>
+#include <set>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -608,11 +609,17 @@ bool timing_input(const KfOperand& d, const Geometry& g, uint64_t seed, std::vec
     if (d.role != RAD_OPD_IN || !d.is_index || d.absent || d.shape.empty()) return false;
     const int64_t n = rad_numel(d.shape);
     if (n <= 0) return false;
-    const bool plain = !d.idx_unique && !d.idx_cu && !d.idx_prefix && !d.idx_history &&
-                       d.idx_const < 0;
-    long long ne = 0, M = 0;
+    long long ne = 0, M = 0, blocks = 0;
     g.get_i("n_expert", &ne);
     g.get_i("M", &M);
+    g.get_i("blocks", &blocks);
+    const bool plain = !d.idx_unique && !d.idx_cu && !d.idx_prefix && !d.idx_history &&
+                       d.idx_const < 0;
+    /* A page table: as many entries as its range (a block table), or the geometry's `blocks` rows of
+     * selections out of a larger cache (the selected attention). */
+    const bool table = plain && d.shape.size() >= 2 &&
+                       (d.idx_max == n || (d.shape.size() == 2 && blocks > 0 && d.shape[1] == blocks &&
+                                           d.idx_max >= blocks));
     std::vector<float> v((size_t)n, 0.0f);
     if (d.idx_prefix) {
         /* The histogram kf_draw draws uniformly: n - 1 buckets holding idx_max - 1 rows. */
@@ -647,9 +654,32 @@ bool timing_input(const KfOperand& d, const Geometry& g, uint64_t seed, std::vec
                 v[(size_t)(r * width + j)] = (float)pick;
             }
         }
-    } else if (plain && d.shape.size() >= 2 && d.idx_max == n) {
-        const std::vector<int64_t> p = seeded_order(n, seed);
-        for (int64_t i = 0; i < n; ++i) v[(size_t)i] = (float)p[(size_t)i];
+    } else if (table) {
+        /* A page table, as `qsa_select` writes one: each row its own distinct page ids in block
+         * order (the partial page last) out of the page range `idx_max`, not one shuffled run over
+         * the whole operand -- an order no selection produces and the attention never sums in. */
+        const int64_t rows = d.shape[0] > 0 ? d.shape[0] : 1, width = n / rows, range = d.idx_max;
+        if (range <= 0 || width > range) return false;   /* ids out of the range would not describe */
+        for (int64_t r = 0; r < rows; ++r) {
+            uint64_t t = seed ^ (0xD6E8FEB86659FD93ull * (uint64_t)(r + 1));
+            const uint64_t s = rad_splitmix(t);
+            std::vector<int64_t> picks;
+            if (width >= range) {
+                for (int64_t i = 0; i < width; ++i) picks.push_back(i);
+            } else if (width > range / 2) {
+                const std::vector<int64_t> p = seeded_order(range, s);
+                picks.assign(p.begin(), p.begin() + width);
+                std::sort(picks.begin(), picks.end());
+            } else {
+                std::set<int64_t> seen;
+                uint64_t u = s;
+                while ((int64_t)seen.size() < width)
+                    seen.insert((int64_t)(rad_splitmix(u) % (uint64_t)range));
+                picks.assign(seen.begin(), seen.end());
+            }
+            for (int64_t j = 0; j < width; ++j)
+                v[(size_t)(r * width + j)] = (float)picks[(size_t)j];
+        }
     } else {
         return false;
     }

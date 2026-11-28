@@ -329,8 +329,10 @@ std::vector<int64_t> skewed_counts(int64_t buckets, int64_t total, int64_t cap, 
  *   - an expert histogram's offsets (an index prefix): skewed_counts with the op's M as the cap;
  *   - an index operand ranging over the op's n_expert (routing choices): each row's ids distinct,
  *     drawn from the same skewed weights;
- *   - an index table of rank two or more with as many entries as its range (a block table, drawn
- *     with repeats): a permutation, as an allocator hands out distinct blocks.
+ *   - an index table of rank two that is a page table -- each row's whole range (as many entries as
+ *     `idx_max`), or the geometry's `blocks` selections out of a larger cache: each row's own page
+ *     ids in block order, distinct and ascending, the last entry the partial page -- not one
+ *     shuffled run over the whole operand.
  * False, `out` untouched, for every other operand. */
 bool timing_input(const KfOperand& d, const Geometry& g, uint64_t seed, std::vector<uint8_t>* out);
 
