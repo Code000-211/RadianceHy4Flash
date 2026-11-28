@@ -919,11 +919,13 @@ int     dev_code_resident(int device, int64_t* bytes, int* modules) {
  * not a flat bound over every workload. A plan whose modules declare none charges nothing; one whose
  * heaviest declares 18 KiB charges a wave of it on every CU, per queue (queue_scratch.h).
  *
- * The flat bound it replaces was 5 MiB a CU (the R9700 reports 32), 160 MiB a card, over the 114 MiB
- * a speculative step first showed and the 150 MiB a larger segment did -- figures that are three
- * queues' worth, which is why the per-queue charge is multiplied by the plan's queue count. That
- * flat bound is still the answer on a backend that cannot read code objects, and the receipt labels
- * it. */
+ * The flat bound it replaces was 5 MiB a CU (the R9700 reports 32), 160 MiB a card. Two earlier
+ * runs measured the card holding +114 MiB after the first speculative step and +150 MiB with a
+ * larger segment; those are the recorded holds, not a multiple of this formula's per-queue figure
+ * (3 x 17.84 MiB = 53.5 MiB), so the floor is below them and DFly2's warm-up Verify is still owed
+ * before it can replace the bound as the general answer. The flat bound is held until then on a
+ * backend that cannot read code objects, and when code objects exist but none is registered at the
+ * plan; the receipt labels both cases. */
 RadQueueScratch rad_dev_resident_scratch_bytes(const RadDeviceProps* p, int n_queues) {
     RadQueueScratch out;
     if (!p || p->is_host_backend || p->unified) return out;
@@ -940,9 +942,10 @@ RadQueueScratch rad_dev_resident_scratch_bytes(const RadDeviceProps* p, int n_qu
         out.metadata = true;
         out.kernel = std::move(name);
         if (out.total == 0) {
-            /* No code object registered yet: the modules load later and their queues keep what
-             * they take then, so nothing is known and the flat bound is the answer, labelled. */
-            out.metadata = false;
+            /* The backend read the code objects successfully but none is registered yet: the
+             * modules load later and their queues keep what they take then. The flat bound is
+             * held until then, but metadata stays true -- this backend CAN read code objects;
+             * the receipt names this case rather than claiming the backend cannot. */
             out.bytes = queue_scratch_flat_bytes(p->n_cu);
             out.kernel.clear();
             return out;

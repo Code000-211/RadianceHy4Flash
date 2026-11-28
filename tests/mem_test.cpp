@@ -838,8 +838,13 @@ TEST(the_queue_scratch_receipt_names_which_answer_it_shows) {
         CHECK_OK(vram_budget_resolve(c, { f }, &b));
         return b.report;
     };
-    /* no code object registered yet: the metadata answer with nothing to charge */
-    CHECK(report(true, 0, 0, 0, 0, "").find("no code object registered yet") != std::string::npos);
+    /* no code object registered yet: the real total==0 path from rad_dev_resident_scratch_bytes
+     * returns metadata=true (the backend read the code objects) with the flat bound held, so the
+     * receipt must name that case, not claim the backend cannot read code objects. */
+    const std::string noobj = report(true, 160LL << 20, 0, 0, 0, "");
+    CHECK(noobj.find("no code object registered yet") != std::string::npos);
+    CHECK(noobj.find("flat") != std::string::npos);
+    CHECK(noobj.find("does not read code objects") == std::string::npos);
     /* metadata, nothing declares a segment */
     CHECK(report(true, 0, 12, 0, 0, "").find("none of the 12 kernels") != std::string::npos);
     /* the flat bound: the backend does not read code objects */
@@ -853,7 +858,7 @@ TEST(the_queue_scratch_receipt_names_which_answer_it_shows) {
 }
 
 
-/* The queue scratch is the plan's heaviest private segment once a card, and 0 when nothing the
+/* The queue scratch is the plan's heaviest private segment once per queue, and 0 when nothing the
  * plan launches declares one -- the answer the flat 5 MiB a CU never asked the kernels for. The
  * heaviest segment any library here declares is 18,256 B (spechub's couple_verify_wide), so at a
  * wave of 32 lanes on 64 CUs the charge is 18,272 * 32 * 64 = 37,421,056 B, against the 160 MiB

@@ -168,7 +168,12 @@ static int resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudg
      * read them. */
     std::string scratch_note;
     if (b.scratch_metadata && b.scratch_plan == 0) {
-        scratch_note = "  queue scratch            0 B   no code object registered yet: nothing to charge\n";
+        /* The backend read the code objects (metadata is true) but none was registered when the
+         * plan ran: the flat bound is held until the modules load. This is the real path from
+         * rad_dev_resident_scratch_bytes's total==0 answer, not a dead branch. */
+        scratch_note = fmt("  queue scratch      %10s   no code object registered yet: holding the flat\n"
+                           "                                  5 MiB a CU bound until the modules load\n",
+                           humanb(b.queue_scratch).c_str());
     } else if (b.queue_scratch <= 0) {
         if (b.scratch_metadata)
             scratch_note = fmt("  queue scratch            0 B   none of the %d kernels the code objects describe declares a private segment\n",
