@@ -73,13 +73,13 @@ static inline int64_t rad_kv_row_elems(uint32_t dtype, int64_t head_dim) {
 }
 
 /* Elements of a token's row in one head of a paged group: the row the group's declaration gives,
- * else the form above. A group may carry its own row (`RadKVGroupDecl::row_bytes`) because one
+ * else the form above. A group may carry its own row (`RadKVGroupDecl::row_elems`) because one
  * cache layout is not the K-then-V one -- Hy4-flash's rotated int8 latent, whose row is
  * [L int8 codes][L/128 f32 scales][R rope columns as bf16] at L = 2 * head_dim - R (design
  * note X-07, `--kv-cache-dtype i8`). The count is in elements of `dtype`, so an int8 row's is
  * its bytes. */
-static inline int64_t rad_kv_group_row_elems(uint32_t dtype, int64_t head_dim, int64_t row_bytes) {
-    return row_bytes > 0 ? row_bytes : rad_kv_row_elems(dtype, head_dim);
+static inline int64_t rad_kv_group_row_elems(uint32_t dtype, int64_t head_dim, int64_t row_elems) {
+    return row_elems > 0 ? row_elems : rad_kv_row_elems(dtype, head_dim);
 }
 
 /* RadArchProbe::chain_pays. */
@@ -513,13 +513,16 @@ typedef struct RadKVGroupDecl {
      * is not the K-then-V layout rad_kv_row_elems gives (docs/OPS.md, "The KV cache operand").
      * 0 -- the zero-initialised default -- keeps that layout, so every existing declaration
      * reads the same as before. Nonzero must be at least rad_kv_row_elems(dtype, head_dim) and a
-     * multiple of 16; the group's pool slot and its host mirror row are sized from it, and the
-     * attention op reads it as the cache operand's last extent.
+     * multiple of 16 elements; the group's pool slot and its host mirror row are sized from it,
+     * and the attention op reads it as the cache operand's last extent. It is a count of elements
+     * of `dtype`, not of bytes: the two are the same only for the int8 cache this exists for, and a
+     * wider dtype is held to a multiple of 16 elements, which is more bytes than the 16-byte piece
+     * the readers actually need.
      *
      * Hy4-flash's rotated int8 latent is the case it exists for: a row of L int8 codes, the
      * L/128 f32 block scales behind them and R rope columns as they are (bf16), so
      * L + 4 * (L / 128) + 2 * R bytes at L = 2 * head_dim - R. */
-    int64_t  row_bytes;
+    int64_t  row_elems;
     /* Block size is not declared. It is taken from the resolved attention kernel's constraints at
      * declare, so the core needs no edit when a kernel changes (spec §7.2). Read it back with
      * rad_kv_block_size() after declaring the attention op that consumes this group. */

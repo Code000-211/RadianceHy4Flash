@@ -533,7 +533,7 @@
 { "RadKVGroupDecl", "head_dim", 24, 8 },
 { "RadKVGroupDecl", "state_dim", 32, 16 },
 { "RadKVGroupDecl", "conv_width", 48, 8 },
-{ "RadKVGroupDecl", "row_bytes", 56, 8 },
+{ "RadKVGroupDecl", "row_elems", 56, 8 },
 { "RadKVStream", "", 0, 72 },
 { "RadKVStream", "host", 0, 8 },
 { "RadKVStream", "res", 8, 8 },

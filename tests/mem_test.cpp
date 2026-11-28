@@ -855,7 +855,7 @@ TEST(kv_sizes_a_group_from_its_declared_row_when_no_consumer_sized_it) {
         k.decl.dtype = RAD_I8;
         k.decl.n_head_kv = 1;
         k.decl.head_dim = 288;
-        k.decl.row_bytes = 656;
+        k.decl.row_elems = 656;
         k.block_size = 16;
         k.layers = { 0, 1 };
         groups.push_back(k);          /* page = 2 layers * 16 tokens * 656 B = 20992 B */

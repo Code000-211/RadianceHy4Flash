@@ -2076,7 +2076,7 @@ TEST(a_kv_binding_carries_the_row_the_group_declares) {
     P.kv_groups.resize(2);
     rad::KVGroupInfo& latent = P.kv_groups[1];
     latent.decl.kind = RAD_KV_FULL; latent.decl.dtype = RAD_I8;
-    latent.decl.n_head_kv = 1; latent.decl.head_dim = 288; latent.decl.row_bytes = 656;
+    latent.decl.n_head_kv = 1; latent.decl.head_dim = 288; latent.decl.row_elems = 656;
     latent.layers = { 0, 1 };
     std::vector<rad::KVGroupPlan> plans(2);
     plans[1].kind = RAD_KV_FULL; plans[1].n_layers = 2; plans[1].block_size = 16;

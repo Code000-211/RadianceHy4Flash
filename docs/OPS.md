@@ -1264,8 +1264,9 @@ reads it, in libr4d, libavx and libref alike. An E4M3 group (GLM-5.3's latent ca
 an element at `kv_store`'s `k_scale` / `v_scale`, 1 when absent.
 
 **The latent int8 row** (design note X-07) is a group whose row is not a head's columns:
-`RadKVGroupDecl::row_bytes` carries its byte count (`0`: the rows above, so a group that does not
-set it binds the same bytes as before). At `rope_dim` the int8 store writes one KV head's row of
+`RadKVGroupDecl::row_elems` carries its length in elements of the group's `dtype` (`0`: the rows
+above, so a group that does not set it binds the same bytes as before; for the int8 cache an
+element is a byte). At `rope_dim` the int8 store writes one KV head's row of
 
     [L int8 codes][L / 128 f32 scales][R rope columns as bf16]      L + 4 * (L / 128) + 2 * R
 
@@ -1279,10 +1280,11 @@ zero), so a latent column's decoded value is `s * code`. Folding `1/sqrt(128)` i
 instead would scale every code by `sqrt(128)` and clip most of them. `libr4d/r4d_row_i8.h`
 is the form in one place, and `mla_row_norm_rope_store`, `kv_store` and `kv_store_streamed` all
 write it, one row a workgroup, from the same bf16 columns: the fused store quantises the row it has
-just normed and roped, so the three write the same bytes. `row_bytes` must be a multiple of 16 (a
-wave's 16-byte loads read a row), and libref and libavx write the same row (libref builds the
-rotation as an explicit matrix normalised before the quantiser, so its one scale is the stored
-one; the two agree to a code step, the row's own bound).
+just normed and roped, so the three write the same bytes. `row_elems` must be at least the K-then-V
+row of the group and a multiple of 16 elements (for int8, a wave's 16-byte loads read a row), and
+libref and libavx write the same row (libref builds the rotation as an explicit matrix normalised
+before the quantiser, so its one scale is the stored one; the two agree to a code step, the row's
+own bound).
 
 **A streamed group's cache operand is its ring.** Its pool holds `slots` blocks while the block
 table names up to `blocks` ids, so the sparse path resolves the selected ids to ring slots first

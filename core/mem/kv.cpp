@@ -165,7 +165,7 @@ int KVManager::plan_groups(const std::vector<KVGroupInfo>& groups, const Config&
             p.bytes_per_block = g.bytes_per_block > 0
                 ? g.bytes_per_block
                 : p.block_size * g.decl.n_head_kv *
-                      rad_kv_group_row_elems(g.decl.dtype, g.decl.head_dim, g.decl.row_bytes) *
+                      rad_kv_group_row_elems(g.decl.dtype, g.decl.head_dim, g.decl.row_elems) *
                       elt * p.n_layers;
             if (p.bytes_per_block <= 0) {
                 RAD_ERR("KV group '%s': page size computes to 0 (n_head_kv=%lld head_dim=%lld)",
