@@ -158,6 +158,24 @@ TEST(arguments_are_named_and_typed) {
     CHECK(find_line(lines, "hidden_group_size_x (4 bytes at +76) = 128") != nullptr);
     CHECK(find_line(lines, "hidden_dynamic_lds_size (4 bytes at +92) = 0") != nullptr);
 
+    /* The three words #337's dump printed, byte for byte: 0x100000000c00, 0x100000000006 and
+     * 0x1000000c0. Read as a pair of 32-bit arguments in little-endian order they are (3072, 4096)
+     * and (6, 4096) -- rows, cols, M, a_ld -- and (192, 1) -- block_count_x, y. Their high halves
+     * are 0x1000, not 0x100: the printed value is 2^44 + 3072, which is what the dump's own
+     * "108.63 TiB before #298" says of it (0x7ca0fb000000 - 2^44 = 108.63 TiB; 2^40 would be
+     * 123.63), so the launch named in the report is a K=4096 one and its arguments agree with the
+     * kernel's name. */
+    const std::vector<unsigned char> raw = hy4_slot();
+    uint64_t w40 = 0, w48 = 0, w64 = 0;
+    std::memcpy(&w40, raw.data() + 40, 8);
+    std::memcpy(&w48, raw.data() + 48, 8);
+    std::memcpy(&w64, raw.data() + 64, 8);
+    CHECK_EQ(w40, 0x100000000c00ull);
+    CHECK_EQ(w48, 0x100000000006ull);
+    CHECK_EQ(w64, 0x1000000c0ull);
+    CHECK_EQ((uint32_t)(w40 & 0xffffffffu), 3072u);
+    CHECK_EQ((uint32_t)(w40 >> 32), 4096u);
+
     /* Not one line is the slot's leftovers: the segment ends at +96 and the rest is 0xa5. */
     for (const std::string& l : lines) {
         CHECK(l.find("a5a5a5a5") == std::string::npos);
@@ -317,9 +335,9 @@ TEST(the_parameter_the_fault_address_ran_off_is_named) {
     const uintptr_t arena_lo = 0x7ca036d84000ull, arena_hi = 0x7ca038000000ull;
     auto ranges = [&](uintptr_t a) {
         KargRange r;
-        if (a >= arena_lo && a < arena_hi) { r.rec = 12; r.lo = arena_lo; r.hi = arena_hi; }
+        if (a >= arena_lo && a < arena_hi) { r.rec = 12; r.hi = arena_hi; }
         else if (a >= 0x7cc1d6c36000ull && a < 0x7cc1d7837000ull) {
-            r.rec = 7; r.lo = 0x7cc1d6c36000ull; r.hi = 0x7cc1d7837000ull;
+            r.rec = 7; r.hi = 0x7cc1d7837000ull;
         }
         return r;
     };
