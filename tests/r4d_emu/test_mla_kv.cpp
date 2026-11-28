@@ -8,6 +8,12 @@
  *     (16-byte fragments and global_load_tr_b128, or the element-by-element path a pitched operand
  *     takes) -- every row of every run equal to the same token run alone, at M 1, through the
  *     plain aligned path;
+ *   - `kv_rot` (X-07's rotated latent cache): the absorb at `wht128` is R(q_lat) -- its row's
+ *     128-column blocks by the store's WHT and 1/sqrt(128) -- held to libref's rotated absorb
+ *     within one bf16 ulp and to the transform laid out from its own plain bytes, under the same
+ *     law (every mb, chained, off the grid, a slice); `none` is the plain bytes, an unknown
+ *     spelling is refused, and the expansion and mla_expand_gate (which cannot act on it, the sink
+ *     having un-rotated the latent) are byte-identical at either value;
  *   - mla_expand_gate byte-equal to mla_project_kv's expand followed by gate_mul (its fusion
  *     claim, r4d_fuse.cpp), on both paths, every `mb` and both `stage` arms;
  *   - the staged kernel on aligned operands whose pitches are wider than their widths;
@@ -107,11 +113,13 @@ static int run(RadLaunchFn fn, std::vector<RadTensor> t, std::vector<RadParam> p
     a.t = t.data(); a.n_t = (int)t.size(); a.p = p.data(); a.n_p = (int)p.size(); a.world_size = 1;
     return fn(&a, nullptr);
 }
-static std::vector<RadParam> params(int64_t M, int64_t H, const char* mode, int mb, int chain, int stage = 0) {
+static std::vector<RadParam> params(int64_t M, int64_t H, const char* mode, int mb, int chain, int stage = 0,
+                                     const char* kv_rot = nullptr) {
     std::vector<RadParam> p = { pi("M", M), pi("heads", H), pi("k_dim", kKd), pi("v_dim", kVd),
                                 pi("latent_dim", kL), ps("dtype", "bf16"), pi("mb", mb), pi("chain", chain),
                                 pi("stage", stage) };
     if (mode) p.push_back(ps("mode", mode));
+    if (kv_rot) p.push_back(ps("kv_rot", kv_rot));
     return p;
 }
 
@@ -137,7 +145,8 @@ static Draw draw(int64_t H, int64_t M, bool absorb, uint32_t seed) {
  * operand off the 16-byte grid (odd pitches, a one-element offset), the element-by-element path;
  * `wide` elements (a multiple of 8) widen every pitch and keep the operands on the grid. */
 static std::vector<uint16_t> project(const Draw& d, bool absorb, bool gate, int64_t r0, int64_t n, int mb,
-                                     int chain, bool skew, int* rc, int stage = 0, int64_t wide = 0) {
+                                     int chain, bool skew, int* rc, int stage = 0, int64_t wide = 0,
+                                     const char* kv_rot = nullptr) {
     const int64_t H = d.H, xw = absorb ? kKd : kL, yw = absorb ? kL : kVd;
     const int64_t o = skew ? 1 : 0, sp = skew ? 3 : wide;
     Mat x(n, H * xw, H * xw + sp, o), w(H * (kKd + kVd), kL, kL + sp, o), y(n, H * yw, H * yw + sp, o),
@@ -149,10 +158,11 @@ static std::vector<uint16_t> project(const Draw& d, bool absorb, bool gate, int6
     for (int64_t i = 0; i < n; ++i)
         for (int64_t j = 0; j < H * kVd; ++j) g.at(i, j) = d.g[(size_t)((r0 + i) * H * kVd + j)];
     if (gate)
-        *rc = run(r4d_rad_mla_expand_gate, { x.t(), w.t(), g.t(), y.t() }, params(n, H, nullptr, mb, chain, stage));
+        *rc = run(r4d_rad_mla_expand_gate, { x.t(), w.t(), g.t(), y.t() },
+                  params(n, H, nullptr, mb, chain, stage, kv_rot));
     else
         *rc = run(r4d_rad_mla_project_kv, { x.t(), w.t(), y.t() },
-                  params(n, H, absorb ? "absorb" : "expand", mb, chain, stage));
+                  params(n, H, absorb ? "absorb" : "expand", mb, chain, stage, kv_rot));
     std::vector<uint16_t> out((size_t)(n * H * yw));
     bool pad_ok = true;
     for (int64_t i = 0; i < n; ++i) {
@@ -181,14 +191,16 @@ static std::vector<uint16_t> gate_chain(const Draw& d, int64_t r0, int64_t n, st
 }
 
 /* libref's mla_project_kv on the whole draw, for the bound */
-static bool vs_libref(const Draw& d, bool absorb, const std::vector<uint16_t>& got, std::string* why) {
+static bool vs_libref(const Draw& d, bool absorb, const std::vector<uint16_t>& got, std::string* why,
+                      const char* kv_rot = nullptr) {
     const RadKernelInfo* ref = libref_op("mla_project_kv");
     if (!ref) { *why = "libref's mla_project_kv not loadable (set RADIANCE_HOME)"; return false; }
     const int64_t H = d.H, M = d.M, xw = absorb ? kKd : kL, yw = absorb ? kL : kVd;
     Mat x(M, H * xw, H * xw, 0), w(H * (kKd + kVd), kL, kL, 0), y(M, H * yw, H * yw, 0);
     std::memcpy(x.data(), d.x.data(), d.x.size() * 2);
     std::memcpy(w.data(), d.w.data(), d.w.size() * 2);
-    if (run(ref->launch, { x.t(), w.t(), y.t() }, params(M, H, absorb ? "absorb" : "expand", 0, 0)) != RAD_OK) {
+    if (run(ref->launch, { x.t(), w.t(), y.t() },
+            params(M, H, absorb ? "absorb" : "expand", 0, 0, 0, kv_rot)) != RAD_OK) {
         *why = "libref refused";
         return false;
     }
@@ -205,6 +217,26 @@ static bool vs_libref(const Draw& d, bool absorb, const std::vector<uint16_t>& g
         }
     }
     return bad == 0;
+}
+
+/* X-07's frame written out from the plain bytes: R(x) over each 128-column block of a row,
+ * R = WHT(128) / sqrt(128) as an explicit matrix (its order is the butterfly's, Sylvester, no bit
+ * reversal -- docs/OPS.md, `mla_project_kv`), in double, one rounding to bf16. It reads the
+ * UNROTATED row's bf16 bytes, so its inputs are rounded where the kernel's are the f32 products
+ * (a 2^-9 relative difference a sum of 128 carries to the frame's own rows, well inside the bf16
+ * ulp bound below); it holds the kernel's layout -- blocks 128 apart, ascending -- which is what
+ * a comparison against libref's own matrix cannot see. */
+static std::vector<uint16_t> rotate_row(const uint16_t* v, int64_t n) {
+    const double k = 1.0 / std::sqrt(128.0);
+    std::vector<uint16_t> out((size_t)n);
+    for (int64_t b = 0; b + 128 <= n; b += 128)
+        for (int64_t i = 0; i < 128; ++i) {
+            double y = 0.0;
+            for (int64_t j = 0; j < 128; ++j)
+                y += ((__builtin_popcount((unsigned)(i & j)) & 1) ? -k : k) * (double)b2f(v[b + j]);
+            out[(size_t)(b + i)] = f2b((float)y);
+        }
+    return out;
 }
 
 /* ---- mla_expand_gate_had_quant_i8g, the quantiser the K-17 pad steps ---- */
@@ -433,6 +465,86 @@ int main() {
                               mode, (long long)g.H, (long long)g.M);
                 ok(rc == RAD_OK && std::equal(tail.begin(), tail.end(), alone.begin() + 5 * yw), w);
             }
+            /* ---- X-07: the latent cache's rotated frame, `kv_rot` ---- */
+            if (absorb) {
+                /* absorb is the reader the frame changes: its rows are R(q_lat), one rounding */
+                std::vector<uint16_t> rot((size_t)(g.M * yw));
+                bool rot_ok = true;
+                for (int64_t t = 0; t < g.M; ++t) {
+                    const auto r = project(d, absorb, false, t, 1, 0, 0, false, &rc, 0, 0, "wht128");
+                    rot_ok &= rc == RAD_OK;
+                    std::memcpy(&rot[(size_t)(t * yw)], r.data(), r.size() * 2);
+                }
+                std::snprintf(w, sizeof w, "absorb heads %lld: every token alone launches at kv_rot wht128",
+                              (long long)g.H);
+                ok(rot_ok, w);
+                std::string why_rot;
+                std::snprintf(w, sizeof w, "absorb heads %lld M %lld at kv_rot wht128 within one bf16 ulp of "
+                              "libref's rotated absorb", (long long)g.H, (long long)g.M);
+                ok(vs_libref(d, absorb, rot, &why_rot, "wht128"),
+                   std::string(w) + (why_rot.empty() ? "" : ": " + why_rot));
+                /* the transform itself, laid out from the plain bytes (rotate_row). It is held to
+                 * the kernel's one rounding plus the plain row's own carried through: rotate_row
+                 * starts from the bf16 bytes the op stores, the kernel from the f32 products, so a
+                 * block's bound is its plain row's l1 times the half ulp of bf16 (2^-9) times
+                 * 1/sqrt(128) -- the largest a sum of 128 such roundings can become. */
+                int64_t bad = 0;
+                char first[160];
+                for (int64_t i = 0; i < g.M; ++i) {
+                    const auto want = rotate_row(&alone[(size_t)(i * yw)], yw);
+                    for (int64_t b = 0; b < yw; b += 128) {
+                        double l1 = 0.0;
+                        for (int64_t j = 0; j < 128; ++j) l1 += std::fabs(b2f(alone[(size_t)(i * yw + b + j)]));
+                        const double carried = l1 * (1.0 / std::sqrt(128.0)) * std::ldexp(1.0, -9);
+                        for (int64_t j = 0; j < 128; ++j) {
+                            const double e = b2f(want[(size_t)(b + j)]), got = b2f(rot[(size_t)(i * yw + b + j)]);
+                            if (!std::isfinite(got) || std::fabs(got - e) > 2e-5 + 0.0079 * std::fabs(e) + carried) {
+                                if (!bad) std::snprintf(first, sizeof first,
+                                                        "token %lld column %lld: %.9g want %.9g (carried %.3g)",
+                                                        (long long)i, (long long)(b + j), got, e, carried);
+                                ++bad;
+                            }
+                        }
+                    }
+                }
+                std::snprintf(w, sizeof w,
+                              "absorb heads %lld M %lld at kv_rot wht128 is R of its plain row (WHT128 / sqrt(128), "
+                              "blocks 128 apart)", (long long)g.H, (long long)g.M);
+                ok(bad == 0, std::string(w) + (bad ? std::string(": ") + first : ""));
+                /* the same law: no byte depends on M, mb, the chained form, the layout or the slice */
+                bool law = true;
+                for (const bool skew : { false, true })
+                    for (const int chain : { 0, 1 })
+                        for (const int mb : { 0, 1, 2, 4, 8 }) {
+                            if (skew && (chain || mb > 1)) continue;   /* one form off the grid */
+                            const auto all = project(d, absorb, false, 0, g.M, mb, chain, skew, &rc, 0, 0,
+                                                     "wht128");
+                            law &= rc == RAD_OK && all == rot;
+                        }
+                if (g.M > 5) {
+                    const auto tail = project(d, absorb, false, 5, g.M - 5, 0, 0, false, &rc, 0, 0, "wht128");
+                    law &= rc == RAD_OK && std::equal(tail.begin(), tail.end(), rot.begin() + 5 * yw);
+                }
+                std::snprintf(w, sizeof w,
+                              "absorb heads %lld M %lld at kv_rot wht128: every row's bytes equal the row alone "
+                              "(every mb, chained, off the grid, a slice)", (long long)g.H, (long long)g.M);
+                ok(law, w);
+            } else {
+                /* the expansion reads the latent after the sink un-rotated it (design note §5): the
+                 * flag reaches the row and cannot move a byte, with and without the fused gate */
+                const auto plain = project(d, absorb, false, 0, g.M, 0, 0, false, &rc);
+                int rc_r = 0;
+                const auto with = project(d, absorb, false, 0, g.M, 0, 0, false, &rc_r, 0, 0, "wht128");
+                std::snprintf(w, sizeof w, "expand heads %lld M %lld: kv_rot wht128 is its plain bytes, bit for bit",
+                              (long long)g.H, (long long)g.M);
+                ok(rc == RAD_OK && rc_r == RAD_OK && with == plain, w);
+                const auto plain_g = project(d, absorb, true, 0, g.M, 0, 0, false, &rc);
+                const auto with_g = project(d, absorb, true, 0, g.M, 0, 0, false, &rc_r, 0, 0, "wht128");
+                std::snprintf(w, sizeof w,
+                              "mla_expand_gate heads %lld M %lld: kv_rot wht128 is its plain bytes, bit for bit",
+                              (long long)g.H, (long long)g.M);
+                ok(rc == RAD_OK && rc_r == RAD_OK && with_g == plain_g, w);
+            }
         }
     /* ---- the quantiser the K-17 pad stepped: 32 heads, a grid that steps to 33 ---- */
     for (const int64_t M : { 1LL, 16LL, 32LL }) {
@@ -480,6 +592,25 @@ int main() {
             ok(ny.rc == RAD_OK && ny.y.empty() && ny.q == all.q &&
                std::memcmp(ny.sc.data(), all.sc.data(), all.sc.size() * sizeof(float)) == 0,
                "quant heads 32 M 1: without the optional bf16 output the codes and scales stand");
+        }
+    }
+    /* ---- kv_rot's own contract: `none` is every byte the row had, another spelling is refused ---- */
+    {
+        const Draw d = draw(2, 3, true, 991);
+        int rc = 0;
+        const auto plain = project(d, true, false, 0, 3, 0, 0, false, &rc);
+        int rc_n = 0;
+        const auto anone = project(d, true, false, 0, 3, 0, 0, false, &rc_n, 0, 0, "none");
+        ok(rc == RAD_OK && rc_n == RAD_OK && anone == plain,
+           "absorb: kv_rot none is the row's plain bytes, bit for bit");
+        const Draw de = draw(2, 3, false, 992);
+        for (const bool absorb : { true, false }) {
+            int rc_b = 0;
+            project(absorb ? d : de, absorb, false, 0, 3, 0, 0, false, &rc_b, 0, 0, "wht64");
+            char wc[160];
+            std::snprintf(wc, sizeof wc, "%s: kv_rot other than none / wht128 is refused (RAD_E_SHAPE)",
+                          absorb ? "absorb" : "expand");
+            ok(rc_b == RAD_E_SHAPE, wc);
         }
     }
     /* The launcher's own grid math, called as the launcher calls it (per_row = (v_dim / group) *
