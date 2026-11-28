@@ -943,18 +943,23 @@ std::string rec_str(const AllocRec& r, uintptr_t a) {
                humanb(r.bytes).c_str(), r.base, humanb((int64_t)(a - r.base)).c_str());
 }
 
+/* The live allocation with the greatest base at or below `a`, or nullptr when there is none: the
+ * one range that can hold `a` or that `a` ran off the end of. Called with g_alloc_mu held. */
+const AllocRec* rec_below(uintptr_t a) {
+    auto it = g_live.upper_bound(a);
+    return it == g_live.begin() ? nullptr : &std::prev(it)->second;
+}
+
 /* The live range an address lies in, numbered by the alloc record's sequence: equal for two
  * addresses in one allocation, which is what the fault report compares an operand's range with the
  * fault address's (karg_report.h). Called with g_alloc_mu held. */
 KargRange live_range_at(uintptr_t a) {
     KargRange r;
-    auto it = g_live.upper_bound(a);
-    if (it == g_live.begin()) return r;
-    const AllocRec& rec = std::prev(it)->second;
-    if (a >= rec.base + (uintptr_t)rec.bytes) return r;
-    r.rec = rec.seq;
-    r.lo = rec.base;
-    r.hi = rec.base + (uintptr_t)rec.bytes;
+    const AllocRec* rec = rec_below(a);
+    if (!rec || a >= rec->base + (uintptr_t)rec->bytes) return r;
+    r.rec = rec->seq;
+    r.lo = rec->base;
+    r.hi = rec->base + (uintptr_t)rec->bytes;
     return r;
 }
 
@@ -964,21 +969,17 @@ KargRange live_range_at(uintptr_t a) {
  * this process held, and the range below it, 108 TiB down, was not its. Called with g_alloc_mu
  * held. */
 uint64_t fault_range_at(uintptr_t a) {
-    auto it = g_live.upper_bound(a);
-    if (it == g_live.begin()) return 0;
-    const AllocRec& rec = std::prev(it)->second;
-    return fault_ran_off(rec.base, rec.bytes, a) ? rec.seq : 0;
+    const AllocRec* rec = rec_below(a);
+    if (!rec) return 0;
+    return fault_ran_off(rec->base, rec->bytes, a) ? rec->seq : 0;
 }
 
 /* Where address `a` lies: inside a live range, inside a freed one (newest first; a reallocated
  * range also holds it live), or in neither, with the live ranges on either side. Called with
  * g_alloc_mu held. */
 std::string where_is(uintptr_t a) {
-    auto it = g_live.upper_bound(a);
-    if (it != g_live.begin()) {
-        const AllocRec& r = std::prev(it)->second;
-        if (a < r.base + (uintptr_t)r.bytes) return "inside live " + rec_str(r, a);
-    }
+    if (const AllocRec* r = rec_below(a))
+        if (a < r->base + (uintptr_t)r->bytes) return "inside live " + rec_str(*r, a);
     const uint64_t now = mono_ns();
     for (auto f = g_freed.rbegin(); f != g_freed.rend(); ++f)
         if (a >= f->base && a < f->base + (uintptr_t)f->bytes)
@@ -986,16 +987,15 @@ std::string where_is(uintptr_t a) {
                        (double)(now - f->freed_ns) * 1e-9);
     if (const std::string paged = dev_fault_where((const void*)a); !paged.empty()) return "in " + paged;
     std::string s = "in no range this process holds or recently freed";
-    if (it != g_live.begin()) {
-        const AllocRec& r = std::prev(it)->second;
+    if (const AllocRec* r = rec_below(a))
         s += fmt("; %s past the end of #%" PRIu64 " %s %s at %#" PRIxPTR,
-                 humanb((int64_t)(a - (r.base + (uintptr_t)r.bytes))).c_str(), r.seq,
-                 mem_kind(r.kind), humanb(r.bytes).c_str(), r.base);
-    }
-    if (it != g_live.end())
+                 humanb((int64_t)(a - (r->base + (uintptr_t)r->bytes))).c_str(), r->seq,
+                 mem_kind(r->kind), humanb(r->bytes).c_str(), r->base);
+    auto up = g_live.upper_bound(a);
+    if (up != g_live.end())
         s += fmt("; %s before #%" PRIu64 " %s %s at %#" PRIxPTR,
-                 humanb((int64_t)(it->second.base - a)).c_str(), it->second.seq,
-                 mem_kind(it->second.kind), humanb(it->second.bytes).c_str(), it->second.base);
+                 humanb((int64_t)(up->second.base - a)).c_str(), up->second.seq,
+                 mem_kind(up->second.kind), humanb(up->second.bytes).c_str(), up->second.base);
     return s;
 }
 
