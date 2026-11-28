@@ -914,6 +914,7 @@ Unit arithmetic: a u3 unit is 1,499,904 B a rank; **100 MiB = 70 units = 0.33 po
 - Verify: exit report d2h / starved; `/stats experts`; `ctest place_*`; greedy identity (`work/xs1/xs.py`, `cmp.py`).
 
 #### M-02 Admission for many streams (X2): admit on first miss into copy-free slots, replay first
+- [closed] Built and measured on the `iks-A` lane, then closed: 32 % (no spec) / 45 % (DFly2) of the admissions are routed again inside their window and 73 % / 57 % expire, so an admission is a copy the LFU path makes once anyway; link h2d +9 % / +58 %, `starved_pool` 1.7x / 6.6x, DFly2 c8 406.2 -> 394.2 tok/s, nospec TTFT 70 -> 280 ms. notes/backlog/closed/M-02.md
 - Area core/place · PL · Gain bounded by the replay oracle: -18 % (no spec) / -29 % (DFly2) of misses = c8 +1-2 %, DFly2 c8 +2-4 % · Conf medium-low · Effort M · Deps M-01; `bin/rad-heat-replay` variants on the `work/xs1` traces before code
 - Change: `core/place/heat.h` (`HeatParams`), `HeatEngine::step` / `observe`, `Mover::balance` / `fill` / `drop`: 2Q probation area of lent slots, move budget following the pass width (64 swaps a step and class today).
 - Verify: replay misses per dispatch vs lat 2; then `/stats` in the levers-tp2 §1.3 table.
