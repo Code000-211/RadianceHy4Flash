@@ -99,6 +99,18 @@ static const char* gs(const RadParam* p, int n_p, const char* k) {
  * The ABI's parser, so a dtype added to the ABI is understood here too. */
 static uint32_t dt_parse(const char* n) { return rad_dtype_parse(n); }
 
+/* A paged group's row in elements: the int8 latent row's own layout when the store names
+ * `rope_dim` (design note X-07: [L int8 codes][L/128 f32 scales][2R bytes of rope], at
+ * L = 2 * head_dim - R), else the generic row of `rad_kv_row_elems`. At the served geometry
+ * (head_dim 288, rope_dim 64) that is 512 + 16 + 128 = 656 elements, not the generic 580. */
+static int64_t ref_kv_row_elems(uint32_t dt, int64_t hd, int64_t R) {
+    if (dt == (uint32_t)RAD_I8 && R > 0) {
+        const int64_t L = 2 * hd - R;
+        if (L > 0 && L % 128 == 0) return L + 4 * (L / 128) + 2 * R;
+    }
+    return rad_kv_row_elems(dt, hd);
+}
+
 /* The activation dtype: `dtype`, else attention's `q_dtype` / `kv_dtype`, else bf16. Some ops
  * (e.g. `rope`) carry no dtype parameter, and an f32 fallback would make a bf16-only kernel fail on
  * dtype. A quantisation-scheme string ("w4a8", "fp8a8") also lands on bf16. */
@@ -2111,7 +2123,7 @@ int ref_kv_store_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out)
     o.t(D, { M, kvh, hd });                          /* v */
     /* A scatter destination: distinct (see the file header), over the whole cache in slots. */
     o.t_idx({ M }, nb * bs, -1, (uint32_t)RAD_OPD_F_IDX_UNIQUE);   /* slot_mapping */
-    o.t(KV, { nb, kvh, bs, rad_kv_row_elems(KV, hd) });   /* kv_cache, INOUT */
+    o.t(KV, { nb, kvh, bs, ref_kv_row_elems(KV, hd, gi(p, n_p, "rope_dim", 0)) });   /* kv_cache */
     return o.finish("kv_store", operand, out);
 }
 
@@ -2128,7 +2140,7 @@ int ref_kv_store_streamed_shape(const RadParam* p, int n_p, int operand, RadOpdD
     if (M <= 0 || hd <= 0 || kvh <= 0 || bs <= 0 || M > bs) return RAD_E_UNSUPPORTED;
     const uint32_t kv = dt_parse(gs(p, n_p, "kv_dtype"));
     const uint32_t KV = kv == (uint32_t)RAD_DT_INVALID ? (uint32_t)RAD_I8 : kv;
-    const int64_t rowe = rad_kv_row_elems(KV, hd);
+    const int64_t rowe = ref_kv_row_elems(KV, hd, gi(p, n_p, "rope_dim", 0));
     const int64_t row = kvh * bs * rowe * (KV == (uint32_t)RAD_BF16 ? 2 : 1);
 
     Opd o;

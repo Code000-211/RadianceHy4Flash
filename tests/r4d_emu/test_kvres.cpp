@@ -495,6 +495,19 @@ int run_all() {
         f.nsel = { 5 };
         fails += check("identity for every miss, hand untouched", f);
     }
+    ++cases;
+    {
+        /* The int8 latent group's page (design note X-07): a block is 16 tokens of a 656-byte row,
+         * so a block's copy -- the mirror's row and the ring's slot -- is 10496 bytes, which is no
+         * power of two and not the generic int8 page at those tokens (9280). The resolve's copy and
+         * the second chance must not care, and the ring's untouched bytes stay the marker. */
+        Fix f;
+        f.shape(2, 12, 4, 3, 10496);
+        f.resident(0, 2);
+        f.sel = { 2, 5, 9 };
+        f.nsel = { 3, 0 };
+        fails += check("page: 16 tokens of the int8 latent row (10496 bytes)", f);
+    }
     std::printf("%d of %d fixtures match libref\n", cases - fails, cases);
     return fails ? 1 : 0;
 }

@@ -5100,6 +5100,103 @@ static void kv_store_i8_case(const Plugin& pl) {
        bad ? first : fmt("every live row decodes exactly; %d bytes of other rows touched", touched));
 }
 
+/* kv_store_i8 at `rope_dim`: Hy4-flash's rotated latent row (design note X-07, [L int8 codes]
+ * [L / 128 f32 scales][R rope columns as bf16] at L = 2 * head_dim - R). The fixture is exact so
+ * the check is equality: a constant block rotates to 128 c at its first column and 0 everywhere
+ * else whatever the Hadamard order, so the codes are 127 then 0 and the stored scale is
+ * (128 / 127) / sqrt(128) * c, which the kernel's f32 arithmetic hits exactly for a power-of-two
+ * c; the rope columns are the bf16 they arrived as and the blocks a token does not name keep the
+ * sentinel. The rotation's column order is not this case's business (a constant survives every
+ * order): tests/r4d_emu/test_row.cpp holds the per-column form against libref's explicit matrix. */
+static void kv_store_i8_latent_case(const Plugin& pl) {
+    const char* name = "kv_store_i8";
+    if (!sel(name)) return;
+    const RadKernelInfo* r = find(pl, name);
+    if (!r) { ok(name, false, "row absent"); return; }
+    /* The served geometry: head_dim 288, rope_dim 64, so L = 512 and a row of 656 bytes. */
+    const int64_t hd = 288, R = 64, L = 2 * hd - R, bs = 4, nb = 3, rowb = L + 4 * (L / 128) + 2 * R;
+    if (rowb != 656) { ok(name, false, fmt("row %lld, not 656", (long long)rowb)); return; }
+    /* Two tokens on the first block, one whose K and V columns are the constant 2.0 (a power of
+     * two, so the scale is exact and the rotation of a constant block is 128 c at its first column
+     * and 0 everywhere else) and one all zero, which stores scale 1 / codes 0, plus a pad slot. */
+    const std::vector<int32_t> slots = { 0, 1, -1 };
+    const int64_t M = (int64_t)slots.size();
+    std::vector<uint16_t> hk((size_t)M * hd, h_to_bf16(2.0f)), hv((size_t)M * hd, h_to_bf16(2.0f));
+    for (int64_t d = 0; d < hd; ++d) {
+        hk[(size_t)(2 * hd + d)] = h_to_bf16(0.0f);           /* token 1: zero K */
+        hv[(size_t)(2 * hd + d)] = h_to_bf16(0.0f);           /* and zero V */
+    }
+    const size_t cbytes = (size_t)(nb * bs * rowb);
+    void* d_k = dalloc((size_t)M * hd * 2);
+    void* d_v = dalloc((size_t)M * hd * 2);
+    void* d_sm = dalloc((size_t)M * 4);
+    void* d_c = dalloc(cbytes);
+    if (!d_k || !d_v || !d_sm || !d_c) { ok(name, false, "hipMalloc failed"); return; }
+    st_memcpy(d_k, hk.data(), (size_t)M * hd * 2, hipMemcpyHostToDevice);
+    st_memcpy(d_v, hv.data(), (size_t)M * hd * 2, hipMemcpyHostToDevice);
+    st_memcpy(d_sm, slots.data(), M * 4, hipMemcpyHostToDevice);
+    st_memset(d_c, 0x7f, cbytes);
+    std::vector<RadTensor> ts = {
+        T(d_k, RAD_BF16, { M, hd }),
+        T(d_v, RAD_BF16, { M, hd }),
+        T(d_sm, RAD_I32, { M }),
+        T(d_c, RAD_I8, { nb, 1, bs, rowb }),
+    };
+    std::vector<RadParam> ps = {
+        PI("M", M), PI("head_dim", hd), PI("n_head_kv", 1),
+        PI("block_size", bs), PS("kv_dtype", "i8"), PI("rope_dim", R),
+    };
+    run_case(r, ts, ps);
+    std::vector<uint8_t> got(cbytes);
+    st_memcpy(got.data(), d_c, cbytes, hipMemcpyDeviceToHost);
+
+    int bad = 0;
+    std::string first;
+    /* Token 0's latent row is 512 columns of the constant 2.0 (K then V), so every block's
+     * rotation is 128 * 2 at the block's first column and 0 elsewhere: code 127 then zeroes, and
+     * every block's scale is (256 / 127) / sqrt(128). Token 1 is all zero, so scale 1 / codes 0. */
+    /* r4d_row_i8.h's kRotScale, restated: this file is host code and the header's device code
+     * cannot compile here. A change to it must be made in both. */
+    const float want = (256.0f * (1.0f / 127.0f)) * 0.08838834764831845f;
+    for (int64_t t = 0; t < 2; ++t) {
+        const uint8_t* row = &got[(size_t)(slots[(size_t)t] * rowb)];
+        for (int64_t b = 0; b < L / 128 && bad < 4; ++b) {
+            float sc = 0.0f;
+            std::memcpy(&sc, row + L + 4 * b, 4);
+            if (sc != (t == 0 ? want : 1.0f)) {
+                if (!bad) first = fmt("t%lld block %lld scale %g, want %g", (long long)t,
+                                      (long long)b, (double)sc, (double)(t == 0 ? want : 1.0f));
+                ++bad;
+            }
+        }
+        for (int64_t i = 0; i < L && bad < 4; ++i) {
+            const int8_t code = (int8_t)row[i];
+            const int wantc = t == 0 && i % 128 == 0 ? 127 : 0;
+            if ((int)code != wantc) {
+                if (!bad) first = fmt("t%lld code %lld is %d, want %d", (long long)t, (long long)i,
+                                      (int)code, wantc);
+                ++bad;
+            }
+        }
+        for (int64_t i = 0; i < R && bad < 4; ++i) {
+            uint16_t got16 = 0;
+            std::memcpy(&got16, row + L + 4 * (L / 128) + 2 * i, 2);
+            const uint16_t want16 = t == 0 ? h_to_bf16(2.0f) : h_to_bf16(0.0f);
+            if (got16 != want16) {
+                if (!bad) first = fmt("t%lld rope column %lld is %04x, want %04x", (long long)t,
+                                      (long long)i, got16, want16);
+                ++bad;
+            }
+        }
+    }
+    int touched = 0;
+    for (int64_t s = 2; s < bs; ++s)
+        for (int64_t b = 0; b < rowb; ++b) touched += got[(size_t)(s * rowb + b)] != 0x7f;
+    ok(name, bad == 0 && touched == 0,
+       bad ? first : fmt("the latent row's codes, scales and rope decode exactly; %d bytes of the "
+                          "other slots touched", touched));
+}
+
 /* kv_store, both widths, against an exactly representable set so the check is equality: halves
  * and integers up to 8 survive E4M3 (three mantissa bits) and bf16 unchanged, so `h_e4m3` or
  * `h_bf16` of what landed must equal what went in.
@@ -37095,6 +37192,7 @@ static void device_phase(const Plugin& pl) {
     kv_store_case(pl, "kv_store_bf16", "bf16", true);
     kv_store_case(pl, "kv_store_fp8",  "fp8_e4m3", false, false);
     kv_store_i8_case(pl);
+    kv_store_i8_latent_case(pl);
 
     /* --- attention --- */
     attn_numeric_case(pl, "attn_prefill_h256_gqa6_i8", 256, 6, 32, "i8", 0, 256);
