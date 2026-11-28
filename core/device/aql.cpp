@@ -771,7 +771,7 @@ inline uint64_t steady_ns() {
                std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
-void report_running(int card);
+void report_running(int card, uintptr_t fault);
 
 /* A queue the runtime stopped stays stopped, and `faulted` ends every wait in the process, so
  * nothing can serve after this: the report, then the exit a GPU memory fault takes. */
@@ -785,7 +785,7 @@ void on_queue_error(hsa_status_t st, hsa_queue_t*, void* data) {
     G().faulted.store(true, std::memory_order_release);
     hsa_signal_store_screlease(G().fault, 1);
     RAD_ERR("device %d: the AQL queue faulted: %s", s->ord, m ? m : "?");
-    report_running(s->ord);
+    report_running(s->ord, 0);
     fatal("a queue on device %d stopped for good (the report is above); exiting so a restart can "
           "bring the server back", s->ord);
 }
@@ -943,6 +943,31 @@ std::string rec_str(const AllocRec& r, uintptr_t a) {
                humanb(r.bytes).c_str(), r.base, humanb((int64_t)(a - r.base)).c_str());
 }
 
+/* The live range an address lies in, numbered by the alloc record's sequence: equal for two
+ * addresses in one allocation, which is what the fault report compares an operand's range with the
+ * fault address's (karg_report.h). Called with g_alloc_mu held. */
+KargRange live_range_at(uintptr_t a) {
+    KargRange r;
+    auto it = g_live.upper_bound(a);
+    if (it == g_live.begin()) return r;
+    const AllocRec& rec = std::prev(it)->second;
+    if (a >= rec.base + (uintptr_t)rec.bytes) return r;
+    r.rec = rec.seq;
+    r.lo = rec.base;
+    r.hi = rec.base + (uintptr_t)rec.bytes;
+    return r;
+}
+
+/* The live range a fault address is nearest to: the one it lies in, else the one that ends just
+ * before it (a read that ran off the end of a buffer is the ordinary case), else the one that
+ * starts just after it. 0 when this process knows of none -- which is what #337's fault address
+ * printed as, "in no range this process holds or recently freed". Called with g_alloc_mu held. */
+uint64_t fault_range_at(uintptr_t a) {
+    auto it = g_live.upper_bound(a);
+    if (it != g_live.begin()) return std::prev(it)->second.seq;
+    return it != g_live.end() ? it->second.seq : 0;
+}
+
 /* Where address `a` lies: inside a live range, inside a freed one (newest first; a reallocated
  * range also holds it live), or in neither, with the live ranges on either side. Called with
  * g_alloc_mu held. */
@@ -1011,7 +1036,7 @@ hsa_status_t on_system_event(const hsa_amd_event_t* e, void*) {
         RAD_ERR("device %d: GPU memory fault at %#" PRIxPTR " (%s ): %s; %s", card, va,
                 why.empty() ? " ?" : why.c_str(), where_is(va).c_str(), runtime_view(va).c_str());
     }
-    report_running(card);
+    report_running(card, va);
     fatal("a GPU memory fault on device %d stopped its queue for good (the report is above); "
           "exiting so a restart can bring the server back", card);
 }
@@ -1022,8 +1047,10 @@ hsa_status_t on_system_event(const hsa_amd_event_t* e, void*) {
  * and `where_is` names the operand that got a stale or short buffer. A kernel object with no
  * metadata (a library's own code object, say) prints the pointer-shaped words of the slot, as the
  * dump always did. The slot's bytes past the launch's segment belong to whatever used the slot
- * before, and are not printed. */
-void report_one(Stream* s, uint64_t idx, const char* note) {
+ * before, and are not printed. `fault` is the address the memory-fault event named, or 0 for a
+ * queue the runtime stopped for another reason: with it, a parameter that points into the same live
+ * range the fault address is nearest to says so, which names the launch that read off that range. */
+void report_one(Stream* s, uint64_t idx, const char* note, uintptr_t fault) {
     auto* p = static_cast<hsa_kernel_dispatch_packet_t*>(s->q->base_address) + (idx & s->mask);
     const uint16_t h = __atomic_load_n(&p->header, __ATOMIC_ACQUIRE);
     if (((h >> HSA_PACKET_HEADER_TYPE) & 0xff) != HSA_PACKET_TYPE_KERNEL_DISPATCH) {
@@ -1046,9 +1073,12 @@ void report_one(Stream* s, uint64_t idx, const char* note) {
     std::lock_guard<std::mutex> lk(g_alloc_mu);
     /* Every line names one parameter of this launch, in the code object's order: an address with
      * the location it lies in, a value as the number it is. */
+    KargSlot ks{slot, kKargSlot, lay.kernarg_size, lay.chained, &lay.args};
+    ks.fault = fault;
+    ks.fault_rec = fault ? fault_range_at(fault) : 0;
+    ks.range_of = [](uintptr_t a) { return live_range_at(a); };
     const std::vector<std::string> lines =
-        karg_lines(KargSlot{slot, kKargSlot, lay.kernarg_size, lay.chained, &lay.args},
-                   [](uintptr_t a) { return where_is(a); });
+        karg_lines(ks, [](uintptr_t a) { return where_is(a); });
     if (!lines.empty()) {
         for (const std::string& l : lines) RAD_ERR("  %s", l.c_str());
         return;
@@ -1083,7 +1113,7 @@ constexpr size_t kReportRuns = 6;
  * shows up there first. A queue with nothing recorded as unfinished -- every packet kept its
  * barrier bit -- prints the packet at the read index, as the dump always did. Only card `card`'s
  * queues; the host reads the arguments at the packet's kernarg_address. */
-void report_running(int card) {
+void report_running(int card, uintptr_t fault) {
     std::lock_guard<std::mutex> sl(G().streams_mu);
     for (Stream* s : G().streams) {
         if (s->ord != card) continue;
@@ -1104,7 +1134,7 @@ void report_running(int card) {
             RAD_ERR("device %d: queue %p packet %" PRIu64 " (of %" PRIu64 " written): no"
                     " dispatch is recorded as unfinished, so the packet at the read index is"
                     " printed", card, (void*)s->q, rd, wr);
-            report_one(s, rd, "ran");
+            report_one(s, rd, "ran", fault);
             continue;
         }
         RAD_ERR("device %d: queue %p packet %" PRIu64 " (of %" PRIu64 " written): %zu"
@@ -1113,7 +1143,7 @@ void report_running(int card) {
                 (void*)s->q, rd, wr, run.size(), (size_t)kReportRuns);
         for (uint64_t idx : run) {
             const uint64_t need = slot_need_at(s, idx);
-            report_one(s, idx, "may have run");
+            report_one(s, idx, "may have run", fault);
             if (need)
                 RAD_ERR("device %d:   packet %" PRIu64 " is chained: it waits for the queue's"
                         " counter to reach %" PRIu64 ", which the card is at %" PRIu64 " (the host"

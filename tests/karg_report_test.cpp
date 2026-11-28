@@ -302,6 +302,63 @@ TEST(past_the_slot_is_reported) {
     CHECK(find_line(lines, "argument M") == nullptr);
 }
 
+/* The parameter that points into the same live range the fault address is nearest to says so, and
+ * no other line does: that parameter names the launch the fault address points at, which is the
+ * question the ring's order cannot answer (#337). */
+TEST(the_parameter_nearest_the_fault_address_is_named) {
+    const std::vector<KernelArg> layout = i8_kpar_layout();
+    std::vector<unsigned char> slot = hy4_slot();
+
+    /* The activation arena of #337's report: c (+32) is inside it, the fault address just past its
+     * end, and the two weight operands are in another range. */
+    const uintptr_t c = 0x7ca0371ca300ull;
+    const uintptr_t arena_lo = 0x7ca036d84000ull, arena_hi = 0x7ca038000000ull;
+    auto ranges = [&](uintptr_t a) {
+        KargRange r;
+        if (a >= arena_lo && a < arena_hi) { r.rec = 12; r.lo = arena_lo; r.hi = arena_hi; }
+        else if (a >= 0x7cc1d6c36000ull && a < 0x7cc1d7837000ull) {
+            r.rec = 7; r.lo = 0x7cc1d6c36000ull; r.hi = 0x7cc1d7837000ull;
+        }
+        return r;
+    };
+    KargSlot ks{slot.data(), (uint32_t)slot.size(), 96, true, &layout};
+    ks.fault = arena_hi + 0x800;
+    ks.fault_rec = 12;
+    ks.range_of = ranges;
+    const std::vector<std::string> lines = karg_lines(ks, fake_where);
+    const std::string* hit = find_line(lines, "argument c ");
+    CHECK(hit != nullptr);
+    CHECK(hit && hit->find("the fault address is 2.00 KiB past the end of this same range") !=
+                       std::string::npos);
+    /* Every activation operand of the launch lies in that one arena, so all three say it, and the
+     * weight operands in another range do not. */
+    int said = 0;
+    for (const std::string& l : lines)
+        if (l.find("this same range") != std::string::npos) ++said;
+    CHECK_EQ(said, 3);
+    const std::string* wq = find_line(lines, "argument wq ");
+    CHECK(wq && wq->find("this same range") == std::string::npos);
+
+    /* The fault address before the range's start, and inside it, are said as such. */
+    ks.fault = arena_lo - 0x10;
+    CHECK(find_line(karg_lines(ks, fake_where), "16 B before the start of this same range") !=
+          nullptr);
+    ks.fault = c;
+    CHECK(find_line(karg_lines(ks, fake_where), "the fault address is inside this same range") !=
+          nullptr);
+
+    /* A stall dump (no fault address) says nothing about one, and neither does a fault address
+     * whose nearest range the caller does not know. */
+    ks.fault = 0;
+    ks.fault_rec = 12;
+    for (const std::string& l : karg_lines(ks, fake_where))
+        CHECK(l.find("this same range") == std::string::npos);
+    ks.fault = arena_hi + 0x800;
+    ks.fault_rec = 0;
+    for (const std::string& l : karg_lines(ks, fake_where))
+        CHECK(l.find("this same range") == std::string::npos);
+}
+
 /* No layout (a kernel object the backend did not read metadata for): nothing to say, and the
  * caller keeps its old dump. */
 TEST(no_layout_means_no_lines) {

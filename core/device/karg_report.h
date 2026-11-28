@@ -31,6 +31,14 @@
 namespace rad {
 namespace aql {
 
+/* The live range an address lies in, as the caller knows them: a record number that is equal for
+ * two addresses in one range, and the range's bounds. `rec` 0 means no range holds the address. */
+struct KargRange {
+    uint64_t  rec = 0;
+    uintptr_t lo = 0;
+    uintptr_t hi = 0;
+};
+
 /* One launch's argument slot. `kernarg_size` is the launch's own segment length: its parameters
  * end there, and the bytes after it in the slot belong to whichever launch used the slot before. */
 struct KargSlot {
@@ -39,7 +47,17 @@ struct KargSlot {
     uint32_t                      kernarg_size = 0; /* this launch's segment */
     bool                          chained = false;  /* the code object reads the record at +992 */
     const std::vector<KernelArg>* args = nullptr;   /* the code object's layout, in order */
+
+    /* The fault address this dump is about, and the live range it is nearest to (the caller numbers
+     * the ranges it knows; 0 means none). With `range_of`, a parameter that points into that same
+     * range gets the distance named on its line -- that parameter is the launch the fault address
+     * points at, which the ring's order can only guess at (issue #337). Zero and empty for a stall
+     * dump, which has no fault address. */
+    uintptr_t                     fault = 0;
+    uint64_t                      fault_rec = 0;
+    std::function<KargRange(uintptr_t)> range_of;
 };
+
 
 /* The lines for that launch: one per parameter of the segment, then the record's line (this launch
  * waited on it, it was not chained, or no record is valid). `where` locates an address (the dump's

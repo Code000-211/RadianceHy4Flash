@@ -64,11 +64,30 @@ std::vector<std::string> karg_lines(const KargSlot& slot,
             out.push_back(head);
         } else if (is_address(a)) {
             const uint64_t v = load(slot.base + a.offset, a.size);
-            if (v == 0)
+            if (v == 0) {
                 out.push_back(head + " = 0 (null)");
-            else
-                out.push_back(head + fmt(" = 0x%" PRIx64 ": ", v) +
-                              (where ? where((uintptr_t)v) : std::string("not located")));
+            } else {
+                std::string line = head + fmt(" = 0x%" PRIx64 ": ", v) +
+                                   (where ? where((uintptr_t)v) : std::string("not located"));
+                /* Does this parameter point into the range the fault address is nearest to? Then
+                 * this launch is the one the fault address points at: the read ran off the end of
+                 * a buffer this launch reads, or into one it wrote. That is worth a line of its
+                 * own, because the ring's order cannot say which launch faulted (#337). */
+                if (slot.fault && slot.range_of && slot.fault_rec) {
+                    const KargRange r = slot.range_of((uintptr_t)v);
+                    if (r.rec && r.rec == slot.fault_rec) {
+                        const uintptr_t f = slot.fault;
+                        line += f < r.lo ? fmt("; the fault address is %s before the start of this"
+                                               " same range",
+                                               humanb((int64_t)(r.lo - f)).c_str())
+                              : f >= r.hi ? fmt("; the fault address is %s past the end of this"
+                                                " same range",
+                                                humanb((int64_t)(f - r.hi)).c_str())
+                                          : "; the fault address is inside this same range";
+                    }
+                }
+                out.push_back(line);
+            }
         } else {
             out.push_back(head + fmt(" = %" PRIu64, load(slot.base + a.offset, a.size)));
         }
