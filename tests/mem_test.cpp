@@ -268,6 +268,84 @@ TEST(a_refused_backing_allocation_says_it_was_refused_and_why) {
     CHECK(!p.configured());
 }
 
+/* RADIANCE_HOST_POOL_PAGES=4k asks the AQL backend for 4 KiB pages on the host pool's own range,
+ * so the pool's page size can be A/B-ed without a second build. Only the spellings the switch
+ * documents ask for it: unset, empty or anything else keeps MADV_HUGEPAGE, the default, so a typo
+ * cannot quietly move an A/B's arm. */
+TEST(the_host_pool_page_switch_takes_only_its_documented_spellings) {
+    CHECK(!host_pool_small_pages(nullptr));
+    CHECK(!host_pool_small_pages(""));
+    CHECK(host_pool_small_pages("4k"));
+    CHECK(host_pool_small_pages("4096"));
+    CHECK(host_pool_small_pages("small"));
+    CHECK(!host_pool_small_pages("4K"));       /* the spelling the docs do not give */
+    CHECK(!host_pool_small_pages("2m"));
+    CHECK(!host_pool_small_pages("no"));
+}
+
+/* The switch reaches the host pool's allocation and no other: the weights and the KV slab keep huge
+ * pages, because the flag is set for that one allocation and cleared again after it -- nothing that
+ * comes later in bring-up (the mover's staging ranges, a pool grown on demand) inherits it. A
+ * recording allocator stands in for the device one and notes what the flag held at each allocation. */
+TEST(the_host_pool_page_switch_reaches_the_host_pool_only) {
+    struct Records final : MemAllocator {
+        struct Alloc { int kind; int small_pages; };
+        std::vector<Alloc> seen;
+        void* alloc(int64_t bytes, int kind) override {
+            seen.push_back({kind, g_pin_small_pages.load()});
+            if (bytes <= 0) return nullptr;
+            const int64_t n = (bytes + (int64_t)RAD_ALIGN_POOL - 1) & ~((int64_t)RAD_ALIGN_POOL - 1);
+            return ::aligned_alloc((size_t)RAD_ALIGN_POOL, (size_t)n);
+        }
+        void  free(void* p, int) override { ::free(p); }
+        const char* name() const override { return "records"; }
+    };
+    struct Env {
+        explicit Env(const char* v) {
+            if (v) ::setenv("RADIANCE_HOST_POOL_PAGES", v, 1);
+            else   ::unsetenv("RADIANCE_HOST_POOL_PAGES");
+        }
+        ~Env() { ::unsetenv("RADIANCE_HOST_POOL_PAGES"); }
+    };
+
+    /* The allocations a pool bring-up makes, with the flag each saw, and the flag once it is done. */
+    auto bring_up = [](const char* v, std::vector<Records::Alloc>& out) {
+        Env env(v);
+        Records rec;
+        Config c = small_config();
+        c.host_pool_mib = 1;          /* the pool the switch is about */
+        Pools p;
+        CHECK_OK(p.configure(c, 0, &rec, &rec));
+        CHECK_EQ(g_pin_small_pages.load(), 0);   /* cleared: no later range inherits it */
+        out = rec.seen;
+    };
+    auto host_allocs = [](const std::vector<Records::Alloc>& v) {
+        std::vector<Records::Alloc> h;
+        for (const auto& a : v) if (a.kind == RAD_MEM_HOST_MAPPED) h.push_back(a);
+        return h;
+    };
+
+    std::vector<Records::Alloc> thp, small, bogus;
+    bring_up(nullptr, thp);
+    bring_up("4k", small);
+    bring_up("thp", bogus);       /* spelled out: the default, so the same as unset */
+
+    REQUIRE_EQ((long long)host_allocs(thp).size(), 1ll);    /* the host pool is one mapped range */
+    REQUIRE_EQ((long long)host_allocs(small).size(), 1ll);
+    CHECK_EQ(host_allocs(thp)[0].small_pages, 0);
+    CHECK_EQ(host_allocs(small)[0].small_pages, 1);
+    CHECK_EQ(host_allocs(bogus)[0].small_pages, 0);
+    /* Every other range keeps huge pages in both arms. */
+    REQUIRE_EQ((long long)thp.size(), (long long)small.size());
+    for (size_t i = 0; i < thp.size(); ++i) {
+        CHECK_EQ(thp[i].kind, small[i].kind);
+        if (thp[i].kind != RAD_MEM_HOST_MAPPED) {
+            CHECK_EQ(thp[i].small_pages, 0);
+            CHECK_EQ(small[i].small_pages, 0);
+        }
+    }
+}
+
 /* ================================================================== the derived budget */
 
 TEST(a_device_with_no_capacity_sizes_its_pools_from_the_program) {

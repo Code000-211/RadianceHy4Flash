@@ -4880,7 +4880,12 @@ void* pin_pieces(int64_t bytes) {
     char* const p = (char*)at;
 
     prefer_numa_node(p, len, current_card_numa_node());
-    if (len >= ((int64_t)2 << 20)) {
+    if (rad::g_pin_small_pages.load(std::memory_order_relaxed)) {
+        /* RADIANCE_HOST_POOL_PAGES=4k: this range only, so the pool's bytes sit on 4 KiB pages.
+         * The advice comes before prefault, so the pages fault in small rather than splitting
+         * later. A range below 2 MiB cannot hold a huge page and keeps whatever it got. */
+        if (len >= ((int64_t)2 << 20)) (void)::madvise(p, (size_t)len, MADV_NOHUGEPAGE);
+    } else if (len >= ((int64_t)2 << 20)) {
         ::madvise(p, (size_t)len, MADV_HUGEPAGE);
         warn_if_no_huge_pages();
     }

@@ -8,6 +8,16 @@
 
 namespace rad {
 
+/* RADIANCE_HOST_POOL_PAGES: unset (or "huge"/"thp") keeps MADV_HUGEPAGE, the default and the
+ * behaviour before the switch existed. "4k" (also "4096", "small") asks pin_pieces for 4 KiB pages
+ * for the host pool's own range: a host whose THP is a single huge-page stream per card on the
+ * link (notes/backlog/measurements/pcie-h2d.md) can then be A/B-ed without a second build. Engram's
+ * table file and every other pinned range keep their own advice. */
+bool host_pool_small_pages(const char* v) {
+    if (!v || !*v) return false;
+    return !strcmp(v, "4k") || !strcmp(v, "4096") || !strcmp(v, "small");
+}
+
 /* ------------------------------------------------------------------ allocators */
 
 namespace {
@@ -219,12 +229,24 @@ int Pools::configure(const Config& cfg, int64_t vram_capacity,
      * Without virtual memory management init_elastic() allocates the range whole. */
     if ((s = kv_.init_elastic("vram_kv", std::max(kv, cfg.kv_reserve), RAD_MEM_DEVICE, device)) < 0)
         st = s;
+    /* RADIANCE_HOST_POOL_PAGES=4k puts this pool, and only this pool, on 4 KiB pages: the advice
+     * reaches the AQL backend's pin_pieces through the process-wide flag, set for this one
+     * allocation and cleared right after, so no later pinned range inherits it. The default is
+     * THP, the path the engine took before the switch existed. */
+    const char* const pages = std::getenv("RADIANCE_HOST_POOL_PAGES");
+    const bool small_pages = host_pool_small_pages(pages);
+    if (pages && *pages && !small_pages && strcmp(pages, "thp") && strcmp(pages, "huge"))
+        RAD_WARN("RADIANCE_HOST_POOL_PAGES=%s is not a page size I know (\"4k\" or \"thp\"); "
+                 "keeping huge pages", pages);
+    g_pin_small_pages.store(small_pages ? 1 : 0, std::memory_order_relaxed);
+    if (small_pages) RAD_INFO("host pool: 4 KiB pages (RADIANCE_HOST_POOL_PAGES)");
     /* Mapped, not merely pinned. The host pool holds the mover's staging buffers and O_DIRECT
      * landing zone, and the zero-copy execution site (spec §5.1), where kernels read weights over
      * the link and so need a kernel-addressable base: with hipHostMallocDefault,
      * rad_dev_device_ptr returns null in Mover::init and Site::DeviceZeroCopy experts get an
      * unusable pointer. On the host backend all memory kinds are the same aligned pages. */
     if ((s = host_   .init("host_pool",   hp, RAD_MEM_HOST_MAPPED, host)) < 0) st = s;
+    g_pin_small_pages.store(0, std::memory_order_relaxed);
 
     fit_report_  = weights_.report();
     fit_report_ += kv_.report();
