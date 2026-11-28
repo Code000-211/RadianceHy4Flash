@@ -17,15 +17,6 @@ uint64_t load(const unsigned char* p, uint32_t n) {
     return v;
 }
 
-/* Whether a parameter's bytes are an address or a number. The metadata reader decides it once, from
- * the value_kind, into `KernelArg::address` (aql_code.cpp: kind_is_address); the report reads that
- * flag instead of spelling the kinds a second time, where the two lists could drift apart. A number
- * shown as "in no range this process holds" is the line this report exists to remove, so a kind
- * nobody named is printed as the number it may be. */
-bool is_address(const KernelArg& a) {
-    return a.address;
-}
-
 }  /* namespace */
 
 std::vector<std::string> karg_lines(const KargSlot& slot,
@@ -62,27 +53,30 @@ std::vector<std::string> karg_lines(const KargSlot& slot,
         }
         if (a.hidden == Hidden::Pad || a.size == 0) {
             out.push_back(head);
-        } else if (is_address(a)) {
+        } else if (a.address) {
+            /* An address, as the metadata reader decided it once from the value_kind
+             * (aql_code.cpp: kind_is_address); the report reads that flag rather than spelling the
+             * kinds a second time. A number printed as "in no range this process holds" is the line
+             * this report exists to remove, so a kind nobody named is printed as a number below. */
             const uint64_t v = load(slot.base + a.offset, a.size);
             if (v == 0) {
                 out.push_back(head + " = 0 (null)");
             } else {
                 std::string line = head + fmt(" = 0x%" PRIx64 ": ", v) +
                                    (where ? where((uintptr_t)v) : std::string("not located"));
-                /* Does this parameter point into the range the fault address is nearest to? Then
-                 * this launch is the one the fault address points at: the read ran off the end of
-                 * a buffer this launch reads, or into one it wrote. That is worth a line of its
-                 * own, because the ring's order cannot say which launch faulted (#337). */
+                /* Does this parameter point into the range the fault address ran off the end of
+                 * (aql.cpp's fault_range_at: the same range, or the one just below it that it left
+                 * by no more than that range's length)? Then this launch is the one the fault
+                 * address points at: the read ran off the end of a buffer this launch reads, or into
+                 * one it wrote. That is worth a line of its own, because the ring's order cannot say
+                 * which launch faulted (#337). */
                 if (slot.fault && slot.range_of && slot.fault_rec) {
                     const KargRange r = slot.range_of((uintptr_t)v);
                     if (r.rec && r.rec == slot.fault_rec) {
                         const uintptr_t f = slot.fault;
-                        line += f < r.lo ? fmt("; the fault address is %s before the start of this"
-                                               " same range",
-                                               humanb((int64_t)(r.lo - f)).c_str())
-                              : f >= r.hi ? fmt("; the fault address is %s past the end of this"
-                                                " same range",
-                                                humanb((int64_t)(f - r.hi)).c_str())
+                        line += f >= r.hi ? fmt("; the fault address is %s past the end of this"
+                                                 " same range",
+                                                 humanb((int64_t)(f - r.hi)).c_str())
                                           : "; the fault address is inside this same range";
                     }
                 }
