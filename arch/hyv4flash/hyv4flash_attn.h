@@ -150,9 +150,10 @@ struct Attn {
     rad_op op_gate = 0, op_post_norm = 0, op_ar = 0;
     rad_op op_expand_gate = 0;   /* the expansion with the gate folded in, where a library has it */
     /* G-3c: the expansion, the gate and the rotated int8 codes attn_output reads, in one launch, for
-     * decode-class steps (at most kFuseRows rows, every row absorbed); `out` then issues no quantiser. */
+     * every step whose rows are all absorbed -- a decode step's few and a prefill chunk's many alike
+     * (K-50b), the kernel taking four token tiles a workgroup from 64 rows up; `out` then issues no
+     * quantiser. */
     rad_op op_expand_quant = 0;
-    static constexpr int64_t kFuseRows = 64;
     Tap t_in_norm{}, t_q_resid{}, t_kv_latent{}, t_kv_rope{}, t_gate{}, t_o_proj{}, t_out{};
 
     /* G-3b: maps the three linears that read the attention norm's output (q_a, kv_a, the gate) and
@@ -523,7 +524,7 @@ struct Attn {
             calib_dir() == nullptr && rad_op_declared(b, "mla_expand_gate_had_quant_i8g")) {
             op_expand_quant =
                 mk(b, "mla_expand_gate_had_quant_i8g",
-                   { RAD_RANGE("M", 1, std::min<int64_t>(T, kFuseRows)), RAD_INT("heads", H),
+                   { RAD_RANGE("M", 1, T), RAD_INT("heads", H),
                      RAD_INT("k_dim", N), RAD_INT("v_dim", a.v), RAD_INT("latent_dim", L),
                      RAD_INT("group", RAD_FP8_BLOCK), RAD_STR("dtype", "bf16") },
                    { kv_b }, { w.lat, w.gate }, { out.q8, out.s8 });
@@ -745,8 +746,10 @@ struct Attn {
         };
         const bool selecting = !sliding && p.select;
         const int64_t abs_rows = selecting ? T : p.nonabs ? p.DT : T;
-        /* G-3c: every row of a small step is absorbed, so one launch gives o_proj its codes. */
-        const bool fused_q = op_expand_quant && abs_rows == T && T > 0 && T <= kFuseRows;
+        /* G-3c: every row of the step is absorbed, so one launch gives o_proj its codes -- at any
+         * height the fused expansion's kernel takes (one token tile a workgroup below 64 rows, four
+         * above it). */
+        const bool fused_q = op_expand_quant && abs_rows == T && T > 0;
         if (abs_rows > 0) {
             RAD_ISSUE_N(c, op_absorb, abs_rows, brows(w.q_nope, abs_rows), RAD_W(kv_b),
                         brows(w.q_lat, abs_rows));
