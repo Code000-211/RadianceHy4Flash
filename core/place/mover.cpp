@@ -1178,7 +1178,7 @@ void Mover::release_slot(int32_t unit) {
 int Mover::issue(const Swap& s, HeatEngine* heat) {
     if (!plan_ || !plan_->dynamic) return RAD_OK;
 
-    auto one = [&](int32_t unit, bool promote) -> bool {
+    auto one = [&](int32_t unit, bool promote, bool probation = false) -> bool {
         if (unit < 0) return false;
         UnitState& us = unit_[(size_t)unit];
         if (us.klass < 0) return false;
@@ -1218,7 +1218,9 @@ int Mover::issue(const Swap& s, HeatEngine* heat) {
         }
 
         if (promote) {
-            const int64_t slot = cp.slab.take();
+            /* A 2Q admission takes a lent slot: the area is lent slots, whose eviction is an
+             * address change. On a class whose loan is gone it starves like any other move. */
+            const int64_t slot = probation ? cp.slab.take_at_least(cp.n_fixed) : cp.slab.take();
             if (slot < 0) {
                 ++stats_.starved_slab;
                 /* The slots kept free were too few for this step's swaps: all of them, for a
@@ -1256,7 +1258,7 @@ int Mover::issue(const Swap& s, HeatEngine* heat) {
         return true;
     };
 
-    const bool up = one(s.promote, true);
+    const bool up = one(s.promote, true, s.probation);
     const bool down = one(s.demote, false);
     /* A half-issued swap is legal: the halves supply each other, so the missing one goes out on
      * a later dispatch. A unit no move will publish must not stay busy, or the heat engine would
@@ -1761,17 +1763,20 @@ int Mover::balance(HeatEngine* heat, bool turnover) {
                 if (us.klass != (int32_t)c || us.slab_slot < 0 || !cp.is_flex(us.slab_slot)) continue;
                 if (us.tier != Tier::VRAM || us.site != Site::Device || us.pool_slot < 0) continue;
                 if (heat && heat->busy(u)) continue;
-                drop_cand_.push_back({ heat ? heat->heat(u) : 0.0f, u });
+                drop_cand_.push_back({ heat ? heat->heat(u) : 0.0f, u,
+                                       (uint8_t)(heat && heat->probation(u) ? 1 : 0) });
             }
-            /* The coldest first, and on a tie the lower unit, so the choice is the same every run. */
-            auto colder = [](const std::pair<float, int32_t>& a, const std::pair<float, int32_t>& b) {
-                return a.first != b.first ? a.first < b.first : a.second < b.second;
+            /* The probation area first (it is the churn area; the main set keeps its residents),
+             * then the coldest, and on a tie the lower unit, so the choice is the same every run. */
+            auto colder = [](const DropCand& a, const DropCand& b) {
+                if (a.prob != b.prob) return a.prob > b.prob;
+                return a.heat != b.heat ? a.heat < b.heat : a.unit < b.unit;
             };
             const size_t k = std::min(drop_cand_.size(), (size_t)short_by);
             std::partial_sort(drop_cand_.begin(), drop_cand_.begin() + (ptrdiff_t)k, drop_cand_.end(),
                               colder);
             for (size_t i = 0; i < k; ++i) {
-                if (drop(drop_cand_[i].second, heat) < 0) break;
+                if (drop(drop_cand_[i].unit, heat) < 0) break;
                 drained = true;
                 --short_by;
             }

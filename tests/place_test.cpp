@@ -2224,6 +2224,23 @@ TEST(a_read_ahead_never_takes_a_pooled_unit_of_the_layer_about_to_run) {
     std::remove(path.c_str());
 }
 
+/* 2Q (X2): an admission is a half-swap into a lent (flex) slot. take() would hand it the
+ * lowest free slot, which after a shrink is a budgeted one the main set still holds; the
+ * admission asks for a slot at or past n_fixed and waits a dispatch instead. */
+TEST(an_admission_takes_a_lent_slot_and_leaves_a_budgeted_one_free) {
+    SlotPool slab;
+    slab.init(6, 4096, 6);
+    slab.set_target(6);
+    slab.add_free(2);                          /* budgeted: below n_fixed */
+    slab.add_free(4);                          /* lent */
+    slab.add_free(5);                          /* lent */
+    CHECK_EQ(slab.take_at_least(4), (int64_t)4);
+    CHECK_EQ(slab.take_at_least(4), (int64_t)5);
+    CHECK_EQ(slab.take_at_least(4), (int64_t)-1);   /* out of lent slots: retry, do not take 2 */
+    CHECK_EQ(slab.n_free(), (int64_t)1);
+    CHECK_EQ(slab.take(), (int64_t)2);              /* the paired path still takes it */
+}
+
 TEST(mover_promotes_and_demotes_through_the_shadow_slots) {
     HeatFixture hf;
     HeatEngine h;
@@ -2290,6 +2307,72 @@ TEST(mover_promotes_and_demotes_through_the_shadow_slots) {
         work.run(compute);
     }
     for (int32_t u = 0; u < (int32_t)hf.plan.units.size(); ++u) CHECK(!h.busy(u));
+
+    rad_stream_destroy(compute);
+}
+
+/* 2Q (X2): a unit the engine admitted keeps its host copy, so handing its lent slot back copies
+ * nothing off the card -- and it is handed back before a colder settled resident, because the
+ * main set is not asked to trade for the area's traffic. */
+TEST(a_probation_unit_is_returned_before_a_colder_resident) {
+    HeatFixture hf;
+    HeatEngine h;
+    CHECK_OK(h.init(hf.plan, HeatParams{}));   /* 2Q on */
+
+    Mover m;
+    CHECK_OK(m.init(hf.f.prog, hf.plan, MoverConfig{}));
+    RadStream compute = nullptr;
+    CHECK_OK(rad_stream_create(&compute, 0));
+    CHECK_OK(m.bind_compute_stream(compute));
+    ComputeWork work;
+
+    const int32_t settled = hf.unit_of_expert(4);   /* promoted out of the area, then cold */
+    const int32_t hot     = hf.unit_of_expert(5);   /* admitted with far more heat */
+    const int32_t third   = hf.unit_of_expert(6);   /* fills the free lent slots */
+
+    int d = 0;
+    auto dispatch = [&](int32_t unit, int32_t count) {
+        CHECK_OK(m.begin_dispatch(d, &h));
+        work.run(compute);
+        h.observe_ids(0, &unit, &count, 1);
+        std::vector<Swap> sw;
+        CHECK_OK(h.step(&sw));
+        for (const Swap& s : sw) m.issue(s, &h);
+        ++d;
+    };
+    auto settle = [&]() {
+        for (Deadline dl; any_busy(h, hf.plan) && !dl.passed();) {
+            CHECK_OK(m.begin_dispatch(d, &h));
+            work.run(compute);
+            ++d;
+        }
+    };
+
+    dispatch(settled, 1);                      /* a first miss: admitted into a lent slot */
+    settle();
+    CHECK(h.probation(settled));
+    CHECK_EQ(m.stats().demotions, (uint64_t)0);
+    CHECK_EQ(m.stats().d2h_bytes, (uint64_t)0);
+
+    dispatch(settled, 1);                      /* routed again: promoted where it is */
+    settle();
+    CHECK(!h.probation(settled));
+    CHECK(h.tier(settled) == Tier::VRAM);
+
+    dispatch(hot, 50);
+    settle();
+    CHECK(h.probation(hot));
+    CHECK_EQ(m.stats().d2h_bytes, (uint64_t)0);
+
+    dispatch(third, 1);                        /* the class now holds more than it keeps free */
+    settle();
+    const uint64_t d2h = m.stats().d2h_bytes;
+    CHECK_OK(m.balance(&h));
+    CHECK(m.stats().dropped >= 1);             /* given back: an address change, no copy */
+    CHECK_EQ(m.stats().d2h_bytes, d2h);
+    /* `settled` is the coldest resident and the LFU order would have taken it; the area goes
+     * first, so it is still on the card. */
+    CHECK(h.tier(settled) == Tier::VRAM);
 
     rad_stream_destroy(compute);
 }

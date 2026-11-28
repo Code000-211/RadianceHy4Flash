@@ -912,8 +912,10 @@ private:
      * records. The prefill stager asks about every pooled unit it stages, and the record count
      * grows with the move budget. */
     std::vector<uint16_t>   copying_;
-    /* balance()'s drop candidates, (heat, unit), kept between calls so a step allocates nothing. */
-    std::vector<std::pair<float, int32_t>> drop_cand_;
+    /* balance()'s drop candidates, kept between calls so a step allocates nothing. `prob` marks a
+     * 2Q probation unit: the area turns over before the main set does (HeatEngine::probation). */
+    struct DropCand { float heat; int32_t unit; uint8_t prob; };
+    std::vector<DropCand> drop_cand_;
     bool hold_turnover_ = false;
     /* The running mean of swaps proposed a step (swap_demand), and the steps left for which a
      * promotion that found no free slab slot keeps every turnover slot free. */
