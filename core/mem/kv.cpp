@@ -164,8 +164,9 @@ int KVManager::plan_groups(const std::vector<KVGroupInfo>& groups, const Config&
             /* One page covers every layer bound to the group. */
             p.bytes_per_block = g.bytes_per_block > 0
                 ? g.bytes_per_block
-                : p.block_size * g.decl.n_head_kv * rad_kv_row_elems(g.decl.dtype, g.decl.head_dim) *
-                  elt * p.n_layers;
+                : p.block_size * g.decl.n_head_kv *
+                      rad_kv_group_row_elems(g.decl.dtype, g.decl.head_dim, g.decl.row_bytes) *
+                      elt * p.n_layers;
             if (p.bytes_per_block <= 0) {
                 RAD_ERR("KV group '%s': page size computes to 0 (n_head_kv=%lld head_dim=%lld)",
                         p.name.c_str(), (long long)g.decl.n_head_kv, (long long)g.decl.head_dim);
