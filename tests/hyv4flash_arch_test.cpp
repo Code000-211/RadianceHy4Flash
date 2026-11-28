@@ -1942,6 +1942,56 @@ TEST(w2_splits_a_decode_passes_routed_layer_into_the_resident_launches_and_a_tai
         for (const RadOperand& o : i.opd) CHECK(!is_w2(o));
 }
 
+/* Issue #324: W2 only where the routed GEMMs read its operands. Above their decode band
+ * (rad_w2_in_band: 2 x rows x top_k <= 3 x n_expert; the preset's 4 experts at top-2 hold 3 rows)
+ * the GEMMs take a prefill form, which runs every expert on the first launch and again on the tail:
+ * the whole routed layer twice, which cost a DFly2 c16 verify pass (64-96 rows of Hy4-flash's 512
+ * experts at top-16, a band of 48) a fifth of its rate. Such a pass does not ask for the form, and
+ * issues the switch-off step; the band's last row still takes it. */
+TEST(w2_leaves_a_pass_above_the_routed_gemms_decode_band_to_the_one_launch_form) {
+    Declared d(+[](RadBuilder* b) {
+        bf16_encs(b);
+        b->encs[0].second = enc_trellis(RAD_U4, true);
+        b->encs[1].second = enc_nl64(6);
+    });
+    REQUIRE_EQ(d.rc, RAD_OK);
+    static char block[sizeof(RadW2Layer)];
+    auto is_w2 = [&](const RadOperand& o) {
+        return o.kind == RAD_OPK_RAW && o.raw == (void*)block && o.dtype == RAD_U8 &&
+               o.rows == (int64_t)sizeof(RadW2Layer);
+    };
+    CHECK(rad_w2_in_band(3 * 2, 4));
+    CHECK(!rad_w2_in_band(4 * 2, 4));
+
+    /* the band's last row: the form, a tail a routed layer */
+    auto k3 = kit(d.b, { 1, 1, 1 }, {}, 0);
+    RadCtx edge{ .b = &d.b, .batch = &k3->b };
+    edge.w2 = block;
+    hyv4flash::step(&edge, &k3->b);
+    CHECK(edge.step_fail.empty());
+    CHECK(edge.w2_asked >= 2);
+    CHECK_EQ(edge.w2_tails.size(), (size_t)2);
+
+    /* a row past it: not asked, no tail, no W2 operand, the switch-off step's issues */
+    auto k4 = kit(d.b, { 1, 1, 1, 1 }, {}, 0);
+    REQUIRE_EQ(k4->b.phase, (int)RAD_PHASE_DECODE);
+    RadCtx off{ .b = &d.b, .batch = &k4->b };
+    hyv4flash::step(&off, &k4->b);
+    CHECK(off.step_fail.empty());
+    RadCtx wide{ .b = &d.b, .batch = &k4->b };
+    wide.w2 = block;
+    hyv4flash::step(&wide, &k4->b);
+    CHECK(wide.step_fail.empty());
+    CHECK_EQ(wide.w2_asked, 0);
+    CHECK(wide.w2_tails.empty());
+    REQUIRE_EQ(wide.issues.size(), off.issues.size());
+    for (size_t x = 0; x < wide.issues.size(); ++x) {
+        CHECK_EQ(wide.issues[x].op, off.issues[x].op);
+        REQUIRE_EQ(wide.issues[x].opd.size(), off.issues[x].opd.size());
+        for (const RadOperand& o : wide.issues[x].opd) CHECK(!is_w2(o));
+    }
+}
+
 TEST(the_moe_gather_reads_the_sorts_inverse_table) {
     struct Case {
         const char* what;

@@ -1927,8 +1927,10 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
     const bool rfused = op_router_fused && rows <= router_fused_rows;
     const bool sfused = op_sigmoid_scatter && rows <= sigmoid_scatter_rows;
     /* W2: the layer's control block where this pass takes the form (the router's fused launch
-     * plans in it, the quantised GEMMs read it), else null. */
-    void* const w2p = w2_pass && sfused && r0 == 0 && rows == T && !c.expert_bf16 && !w_gu.empty()
+     * plans in it, the quantised GEMMs read it), else null. Only inside the routed GEMMs' decode
+     * band (rad_w2_in_band): above it they run every expert on both launches (issue #324). */
+    void* const w2p = w2_pass && sfused && r0 == 0 && rows == T && !c.expert_bf16 && !w_gu.empty() &&
+                              rad_w2_in_band(rows * k, n_reg)
                           ? rad_expert_w2(c_, layer, w_gu.data(), n_reg, rows) : nullptr;
     const RadOperand w2o = w2p ? praw(w2p, RAD_U8, (int64_t)sizeof(RadW2Layer)) : RAD_NONE;
     if (sfused && w2p) {

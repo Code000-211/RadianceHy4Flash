@@ -8,7 +8,9 @@
  *   RADIANCE_W2_MIN_ROWS  the lowest pass height that takes the form (default 16: the verify
  *                         passes of several sequences; one sequence's passes and a no-drafter
  *                         decode stay on the one-launch form, whose tail launches would cost them
- *                         more than their short window returns);
+ *                         more than their short window returns); the highest is the routed
+ *                         GEMMs' decode band (rad_w2_in_band), which the MoE block checks, since
+ *                         above it every expert would run twice (issue #324);
  *   RADIANCE_W2_KMAX      the most units a layer's list copies (default RAD_W2_MAX_COPY; the
  *                         budget by distinct routed experts applies below it);
  *   RADIANCE_W2_WIN_US0 / RADIANCE_W2_WIN_US_EXPERT   the window's line (rad_w2_window_us);

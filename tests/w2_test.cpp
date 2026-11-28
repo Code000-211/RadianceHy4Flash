@@ -1,10 +1,10 @@
 /* w2_test.cpp -- "Weg 2" (abi/rad_w2.h, core/runtime/w2.h; issue #309), the parts that need no card:
  * the copy budget from the measured whole-unit list times, the window by distinct routed experts,
  * the switch and its knobs, the budget table a layer's control block carries, the post's sum, the
- * tail grid's bound, and the switch-off contract of the runtime entry (null: the block issues the
- * layer as it always did). The plan in the router's launch is tests/r4d_emu/test_moefuse.cpp's, the
- * tail split's issue order tests/hyv4flash_arch_test.cpp's, the split launches' bytes
- * r4d_selftest's (r4d_selftest_w2.h). */
+ * tail grid's bound, the decode band the form keeps inside (issue #324), and the switch-off
+ * contract of the runtime entry (null: the block issues the layer as it always did). The plan in
+ * the router's launch is tests/r4d_emu/test_moefuse.cpp's, the tail split's issue order
+ * tests/hyv4flash_arch_test.cpp's, the split launches' bytes r4d_selftest's (r4d_selftest_w2.h). */
 #include "rad_test.h"
 
 #include "rad_runtime.h"
@@ -197,6 +197,21 @@ TEST(the_tails_grid_holds_every_tile_its_experts_can_make) {
         CHECK(worst <= cap);
         CHECK(cap <= e + T / 16);
     }
+}
+
+/* Issue #324: the form only inside the routed GEMMs' decode band (2 T <= 3 n_expert, libr4d's
+ * r4d_moe_decode_band), whose grid alone reads a W2 operand. Hy4-flash routes 512 experts at top-16:
+ * a verify pass of 48 rows (DFly2 c8 at depth 5, or c16 at depth 2) is the band's last, and c16 at
+ * depth 3-5 (64-96 rows) is past it, where both launches of each GEMM ran every expert. */
+TEST(the_form_stays_inside_the_routed_gemms_decode_band) {
+    CHECK(rad_w2_in_band(768, 512));
+    CHECK(!rad_w2_in_band(769, 512));
+    CHECK(rad_w2_in_band(48 * 16, 512));                    /* c8 x (1 + 5), c16 x (1 + 2) */
+    CHECK(!rad_w2_in_band(49 * 16, 512));
+    for (int64_t rows : { 64, 80, 96 }) CHECK(!rad_w2_in_band(rows * 16, 512));   /* c16, depth 3-5 */
+    CHECK(rad_w2_in_band(16 * 16, 512));                    /* the lowest height that takes the form */
+    for (int64_t n : { 4, 8, 256, 512 })
+        for (int64_t T = 1; T <= 2 * n; ++T) CHECK_EQ(rad_w2_in_band(T, n) != 0, 2 * T <= 3 * n);
 }
 
 TEST(with_no_context_or_the_switch_off_the_runtime_hands_out_no_control_block) {
