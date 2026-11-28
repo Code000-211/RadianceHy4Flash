@@ -814,9 +814,44 @@ TEST(queue_scratch_backend_selection_flats_a_backend_without_metadata) {
     CHECK_EQ(rad_dev_resident_scratch_bytes(nullptr, 3).bytes, 0);
 }
 
+TEST(queue_scratch_resolve_drives_both_metadata_branches) {
+    /* Both metadata branches of rad_dev_resident_scratch_bytes now live in this pure helper, so a
+     * card-less test reaches them: the backend vtable cannot be swapped, but its read result -- rc
+     * plus the four scan outputs -- is the helper's argument. */
+    const char* name = "hyv4flash_dfly2_coupled_verify";
+
+    /* total==0: the backend read the code objects but none was registered at the plan. Hold the
+     * flat bound, keep metadata=true so the receipt names this case, and carry no kernel. */
+    const ScratchCharge noobj = queue_scratch_resolve(0, 0, 0, 0, "", 96, 64, 3);
+    CHECK(noobj.metadata);
+    CHECK_EQ(noobj.bytes, queue_scratch_flat_bytes(96));
+    CHECK_EQ(noobj.total, 0);
+    CHECK_EQ(noobj.declared, 0);
+    CHECK_EQ(noobj.largest_private, 0u);
+    CHECK_EQ(noobj.kernel, std::string());
+
+    /* total>0: the largest private segment, charged once per queue, with the kernel named. */
+    const ScratchCharge meta = queue_scratch_resolve(0, 18256, 2, 40, name, 96, 64, 3);
+    CHECK(meta.metadata);
+    CHECK_EQ(meta.bytes, queue_scratch_card_bytes(18256, 96, 64, 3));
+    CHECK_EQ(meta.total, 40);
+    CHECK_EQ(meta.declared, 2);
+    CHECK_EQ(meta.largest_private, 18256u);
+    CHECK_EQ(meta.kernel, std::string(name));
+
+    /* rc<0: the backend cannot read code objects -- the flat bound, metadata=false. */
+    const ScratchCharge flat = queue_scratch_resolve(RAD_E_UNSUPPORTED, 0, 0, 0, "", 96, 64, 3);
+    CHECK(!flat.metadata);
+    CHECK_EQ(flat.bytes, queue_scratch_flat_bytes(96));
+    CHECK_EQ(flat.largest_private, 0u);
+    CHECK_EQ(flat.kernel, std::string());
+}
+
 TEST(the_queue_scratch_receipt_names_which_answer_it_shows) {
-    auto report = [](bool metadata, int64_t bytes, int plan, int kernels, uint32_t priv,
-                     const char* kernel) {
+    /* Feed the receipt from the resolver's output, mapped into VramFacts exactly as
+     * engine_bringup.cpp does, so the test covers the real path from a backend read to its label
+     * rather than a hand-made tuple. */
+    auto report = [](const ScratchCharge& q) {
         Config c = small_config();
         c.vram_weights_mib = 0;
         c.vram_kv_mib      = 0;
@@ -828,31 +863,31 @@ TEST(the_queue_scratch_receipt_names_which_answer_it_shows) {
         f.experts     = 200LL << 30;
         f.kv_ceiling  = 100LL << 30;
         f.n_queues    = 2; f.queue_bytes = 33LL << 20;
-        f.queue_scratch     = bytes;
-        f.scratch_metadata  = metadata;
-        f.scratch_plan      = plan;
-        f.scratch_kernels   = kernels;
-        f.scratch_private   = priv;
-        f.scratch_kernel    = kernel;
+        f.queue_scratch    = q.bytes;
+        f.scratch_metadata = q.metadata;
+        f.scratch_plan     = q.total;
+        f.scratch_kernels  = q.declared;
+        f.scratch_private  = q.largest_private;
+        f.scratch_kernel   = q.kernel;
         VramBudget b;
         CHECK_OK(vram_budget_resolve(c, { f }, &b));
         return b.report;
     };
-    /* no code object registered yet: the real total==0 path from rad_dev_resident_scratch_bytes
-     * returns metadata=true (the backend read the code objects) with the flat bound held, so the
-     * receipt must name that case, not claim the backend cannot read code objects. */
-    const std::string noobj = report(true, 160LL << 20, 0, 0, 0, "");
+    /* no code object registered yet: the real total==0 path from the resolver returns
+     * metadata=true with the flat bound held, so the receipt names that case, not claim the
+     * backend cannot read code objects. */
+    const std::string noobj = report(queue_scratch_resolve(0, 0, 0, 0, "", 96, 64, 3));
     CHECK(noobj.find("no code object registered yet") != std::string::npos);
     CHECK(noobj.find("flat") != std::string::npos);
     CHECK(noobj.find("does not read code objects") == std::string::npos);
-    /* metadata, nothing declares a segment */
-    CHECK(report(true, 0, 12, 0, 0, "").find("none of the 12 kernels") != std::string::npos);
-    /* the flat bound: the backend does not read code objects */
-    const std::string flat = report(false, 160LL << 20, 0, 0, 0, "");
+    /* metadata, nothing declares a segment: total>0 with no private segment */
+    CHECK(report(queue_scratch_resolve(0, 0, 0, 12, "", 96, 64, 3)).find("none of the 12 kernels") != std::string::npos);
+    /* the flat bound: rc<0, the backend does not read code objects */
+    const std::string flat = report(queue_scratch_resolve(RAD_E_UNSUPPORTED, 0, 0, 0, "", 96, 64, 3));
     CHECK(flat.find("the flat 5 MiB a CU bound") != std::string::npos);
     CHECK(flat.find("does not read code objects") != std::string::npos);
     /* metadata with a segment: the heaviest kernel is named */
-    const std::string meta = report(true, 112LL << 20, 40, 3, 18256, "hyv4flash_dfly2_coupled_verify");
+    const std::string meta = report(queue_scratch_resolve(0, 18256, 3, 40, "hyv4flash_dfly2_coupled_verify", 96, 64, 3));
     CHECK(meta.find("hyv4flash_dfly2_coupled_verify") != std::string::npos);
     CHECK(meta.find("3 of the 40 kernels") != std::string::npos);
 }

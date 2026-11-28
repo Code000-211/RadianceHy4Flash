@@ -935,27 +935,17 @@ RadQueueScratch rad_dev_resident_scratch_bytes(const RadDeviceProps* p, int n_qu
     int rc = RAD_E_UNSUPPORTED;
     if (dev()->kernel_scratch_max)
         rc = dev()->kernel_scratch_max(p->device_id, &largest, &declared, &total, &name);
-    if (rc >= 0) {
-        out.largest_private = largest;
-        out.declared = declared;
-        out.total = total;
-        out.metadata = true;
-        out.kernel = std::move(name);
-        if (out.total == 0) {
-            /* The backend read the code objects successfully but none is registered yet: the
-             * modules load later and their queues keep what they take then. The flat bound is
-             * held until then, but metadata stays true -- this backend CAN read code objects;
-             * the receipt names this case rather than claiming the backend cannot. */
-            out.bytes = queue_scratch_flat_bytes(p->n_cu);
-            out.kernel.clear();
-            return out;
-        }
-        out.bytes = queue_scratch_card_bytes(largest, p->n_cu, p->warp_size, n_queues);
-        return out;
-    }
-    /* No metadata: the bound the flat term always was, and the receipt says so (metadata stays
-     * false, so vram_budget.cpp prints the flat-bound label). */
-    out.bytes = queue_scratch_flat_bytes(p->n_cu);
+    /* Both metadata branches -- backend read code objects with none registered yet (total==0),
+     * and with a heaviest segment (total>0) -- and the no-metadata fallback are resolved by the
+     * pure helper, which the card-less tests drive directly (M-09 review). */
+    const ScratchCharge c = queue_scratch_resolve(rc, largest, declared, total, name,
+                                                  p->n_cu, p->warp_size, n_queues);
+    out.bytes          = c.bytes;
+    out.largest_private = c.largest_private;
+    out.declared        = c.declared;
+    out.total           = c.total;
+    out.metadata        = c.metadata;
+    out.kernel          = std::move(c.kernel);
     return out;
 }
 

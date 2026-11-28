@@ -67,6 +67,46 @@ inline int64_t queue_scratch_flat_bytes(int n_cu) {
     return (int64_t)n_cu * (5LL * 1024 * 1024);
 }
 
+/* The charge once the backend's code-object scan has been read. Split out of
+ * rad_dev_resident_scratch_bytes so BOTH metadata branches are testable without a card: the backend
+ * vtable is selected once and cannot be swapped in a test, so the branches are driven through this
+ * pure helper instead. `rc` is what DeviceBackend::kernel_scratch_max returned -- >= 0 means it read
+ * the code objects and filled largest/declared/total/name; < 0 means no metadata, so the flat bound
+ * stands. `name` is already stripped of its ".kd" suffix by queue_scratch_take. (M-09 review.) */
+struct ScratchCharge {
+    int64_t     bytes = 0;
+    uint32_t    largest_private = 0;
+    int         declared = 0;
+    int         total = 0;
+    bool        metadata = false;      /* the charge came from code objects, not the flat bound */
+    std::string kernel;
+};
+inline ScratchCharge queue_scratch_resolve(int rc, uint32_t largest_private, int declared,
+                                           int total, const std::string& name, int n_cu, int wave,
+                                           int n_queues) {
+    ScratchCharge out;
+    if (rc < 0) {
+        /* The backend cannot read code objects: the flat bound, labelled as such. */
+        out.bytes = queue_scratch_flat_bytes(n_cu);
+        return out;
+    }
+    out.largest_private = largest_private;
+    out.declared = declared;
+    out.total = total;
+    out.metadata = true;
+    out.kernel = name;
+    if (total == 0) {
+        /* The backend read the code objects but none was registered at the plan: hold the flat
+         * bound, but keep metadata=true so the receipt names this case rather than claiming the
+         * backend cannot read code objects. */
+        out.bytes = queue_scratch_flat_bytes(n_cu);
+        out.kernel.clear();
+        return out;
+    }
+    out.bytes = queue_scratch_card_bytes(largest_private, n_cu, wave, n_queues);
+    return out;
+}
+
 /* One kernel's private segment, folded into the scan's running answer. `private_size` 0 means the
  * kernel declares no segment and only counts towards the total; the largest wins, and a name the
  * runtime keeps as "<kernel>.kd" is reported without the suffix. Split out of the AQL backend so
