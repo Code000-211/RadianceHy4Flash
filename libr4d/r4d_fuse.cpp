@@ -1027,7 +1027,9 @@ extern "C" int r4d_fuse_ar_rmsnorm_quant_fp8(const RadParam* p, int n_p, uint64_
  * the reduced sum and folds it in; its MLP's sum is folded in and the next layer's input norm
  * reads the stream). Every step's arithmetic is the unfused row's, so the chain the oracle runs
  * against this op is the chain it replaces. The chain writes `a` only in its first step (the
- * reduction's own store); both elementwise steps write `x` and `y`, as the kernel does, never `a`.
+ * reduction's own store) and no later step reads it back; both elementwise steps write `x` and `y`,
+ * as the kernel does, never `a`. The kernel keeps that store because it is the unfused op's own
+ * traffic, so the row's writes compare exactly.
  */
 extern "C" int r4d_fuse_ar_add_rmsnorm(const RadParam* p, int n_p, uint64_t present, int step,
                                        RadFuseStep* out) {
@@ -1035,7 +1037,10 @@ extern "C" int r4d_fuse_ar_add_rmsnorm(const RadParam* p, int n_p, uint64_t pres
     (void)present;
     if (!out) return RAD_E_INVAL;
     const int64_t M = pi(p, n_p, "M"), n = pi(p, n_p, "n");
-    const int64_t world = pi(p, n_p, "world_size"), mode = pi(p, n_p, "mode", 1);
+    const int64_t world = pi(p, n_p, "world_size");
+    /* `mode` is RAD_REQUIRED in the schema: a call that omits it must not take an order. */
+    const int64_t mode = pi(p, n_p, "mode", -1);
+    if (mode < 0) return RAD_E_INVAL;
     if (world != 2 || n <= 0 || M <= 0) return RAD_E_UNSUPPORTED;
     /* n whole 16B words: a block pushes its rows as words. */
     if (n % 8) return RAD_E_UNSUPPORTED;
