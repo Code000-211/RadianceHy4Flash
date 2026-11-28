@@ -11,3 +11,6 @@ __pycache__/
 
 # per-user tool state (gh, etc.) must never be committed
 .local/
+
+# the RDNA4 ISA suite a review clones to lint kernels (AGENTS.md); never part of the tree
+/.radisa/
