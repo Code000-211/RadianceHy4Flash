@@ -3777,14 +3777,23 @@ struct EngineArenaTestAccess {
     struct Shape {
         int64_t top, stage_off, stage_bytes, low_off;
         int64_t lent_256, lent_1024, ring_lent;
+        /* Larger levels under the full plan, where a test wants them: the span's shared level
+         * (which lends `ring_lent`, keeping the second place) and one above it. */
+        int64_t full = 2048, span = 0, lent_above = 0;
     };
     static int rank(Engine& e, const Program& prog, const Plan& plan, char* arena, const Shape& s) {
         auto r = std::make_unique<Engine::Rank>();
         CtxDesc d;
         d.program = &r->program;
         RAD_TRY(r->ctx.init(d));              /* binds the (empty) arena: level 0's template */
-        for (int64_t rows : { 256, 1024 })
-            if (const int lv = r->ctx.add_level(rows, {}, {}); lv < 0) return lv;
+        std::vector<int64_t> rows = { 256, 1024 };
+        std::vector<int64_t> lent = { 0, s.lent_256, s.lent_1024 };
+        if (s.span > 0) {
+            rows.push_back(s.span);     lent.push_back(s.ring_lent);
+            rows.push_back(2 * s.span); lent.push_back(s.lent_above);
+        }
+        for (int64_t n : rows)
+            if (const int lv = r->ctx.add_level(n, {}, {}); lv < 0) return lv;
         HeatParams hp;
         RAD_TRY(r->heat.init(plan, hp));
         MoverConfig mc;
@@ -3797,17 +3806,25 @@ struct EngineArenaTestAccess {
         st.unit_bytes = 1;
         st.unit_tokens = 1;
         RAD_TRY(r->mover.lend_from(Mover::kLendArena, { st }));
-        r->arena_lent = { 0, s.lent_256, s.lent_1024 };
+        r->arena_lent = lent;
         r->arena_low_off = s.low_off;
         r->arena_ring_lent = s.ring_lent;
+        /* min_rows: one past every level that lends the ring (the span's own does not). */
         RAD_TRY(r->stager.init(prog, plan, &r->mover, arena + s.stage_off, arena + s.low_off,
-                               s.stage_bytes, 1025, 640));
+                               s.stage_bytes, (s.span > 0 ? 2 * s.span : 1024) + 1, 640));
         e.ranks_.push_back(std::move(r));
-        e.arena_rows_ = { 2048, 256, 1024 };
+        e.arena_rows_ = { s.full };
+        e.arena_rows_.insert(e.arena_rows_.end(), rows.begin(), rows.end());
+        e.arena_span_rows_ = s.span;
         return RAD_OK;
     }
+    /* The dispatch behind a step's pass, as the rank thread runs it. */
+    static void dispatch(Engine& e, int step) { e.tiering_dispatch(*e.ranks_[0], step); }
+    static int  back_step(const Engine& e) { return e.arena_back_step_; }
+    static uint64_t floor_ns(const Engine& e) { return e.arena_floor_ns_; }
     static int  step(Engine& e, const RadBatch* b) { return e.arena_step(b, /*ahead=*/false); }
     static void tick(Engine& e, uint64_t now_ns) { e.arena_tick(now_ns); }
+    static void collected(Engine& e, int step, bool latest) { e.arena_collected(step, latest); }
     static Mover&         mover(Engine& e) { return e.ranks_[0]->mover; }
     static HeatEngine&    heat(Engine& e) { return e.ranks_[0]->heat; }
     static PrefillStager& stager(Engine& e) { return e.ranks_[0]->stager; }
@@ -3828,13 +3845,15 @@ struct EngineArenaTestAccess {
  *   a decode step                         no ring; the loan grows to the 256-token level's
  *   a lone 256-row prompt, a 300-row turn no ring; the 1024-token level's loan for the turn
  *   a lone 723-row prompt, the loan out   the second place, recalled for it; the loan held
- *   the next such turn                    the second place again, nothing more recalled
- *   decode, then two seconds              the loan grows back
+ *   the next such turn, issued ahead      the second place again, nothing more recalled
+ *   decode behind them                    the place goes back to the slab once they are collected
+ *   such a prompt and nothing behind it   held while it copies, then lent as behind it unstaged
+ *   a full-plan chunk issued ahead of it  the floor stays at the full plan
  *   a full-plan chunk                     the region; nothing lent
- *   the 720-row last chunk behind it      the region still; nothing recalled; the loan held
+ *   the 720-row last chunk behind it      the region still; nothing recalled; the chunk's floor
  *   a 300-row chunk, layers staged ahead  the region, to take them from
  *   decode rows, layers staged ahead      no ring */
-TEST(the_engine_hands_a_smaller_step_the_ring_and_holds_the_loan_back_behind_it) {
+TEST(the_engine_hands_a_smaller_step_the_ring_and_keeps_the_loan_off_it_while_it_copies) {
     if (!rad::device_is_host()) SKIP("builds an engine rank by hand on the host backend");
     using A = rad::EngineArenaTestAccess;
     StagerRig rig;
@@ -3850,10 +3869,16 @@ TEST(the_engine_hands_a_smaller_step_the_ring_and_holds_the_loan_back_behind_it)
     Config cfg = base_config();
     rad::Engine engine(cfg);
     rad::EngineScope owner(engine.owner(), "arena-step-test");
+    /* Before it has an arena with levels there is nothing to collect and nothing to lend. */
+    A::collected(engine, 0, /*latest=*/true);
+    A::tick(engine, rad_mono_ns());
+    CHECK_EQ(A::floor(engine), (int64_t)0);
     REQUIRE_EQ(A::rank(engine, rig.f.prog, rig.plan, arena.p, sh), RAD_OK);
     Mover& m = A::mover(engine);
     PrefillStager& st = A::stager(engine);
     REQUIRE(st.enabled());
+    /* How often the dispatch behind a pass asked the heat engine for swaps. */
+    const auto swap_asks = [&] { return A::heat(engine).stats().steps; };
     CHECK(st.ring_full() == arena.p + sh.stage_off);
     CHECK(st.ring_low() == arena.p + sh.low_off);
     const auto loan = [&] { return m.loan(Mover::kLendArena); };
@@ -3883,6 +3908,13 @@ TEST(the_engine_hands_a_smaller_step_the_ring_and_holds_the_loan_back_behind_it)
     CHECK(st.ring() == nullptr);
     CHECK(!A::ring_step(engine));
     CHECK_EQ(loan(), (int64_t)0);
+    /* Unstaged, the dispatch behind it proposes swaps. */
+    CHECK(!st.begin_pass(&dec));
+    {
+        const uint64_t asks = swap_asks();
+        A::dispatch(engine, 1);
+        CHECK_EQ(swap_asks(), asks + 1);
+    }
     A::tick(engine, rad_mono_ns());
     CHECK_EQ(A::floor(engine), (int64_t)256);
     CHECK_EQ(loan(), sh.lent_256);
@@ -3911,7 +3943,8 @@ TEST(the_engine_hands_a_smaller_step_the_ring_and_holds_the_loan_back_behind_it)
     CHECK_EQ(loan(), sh.lent_1024);
 
     /* A lone 723-row prompt (tail2560) with the loan out: the second place, taken back from the
-     * slab for the step, and the floor is the full plan's behind it. */
+     * slab for the step, and the floor is the full plan's while it may be copying. */
+    p723.step = 10;
     REQUIRE_EQ(A::step(engine, &p723), RAD_OK);
     CHECK(st.ring() == st.ring_low());
     CHECK(A::ring_step(engine));
@@ -3919,21 +3952,44 @@ TEST(the_engine_hands_a_smaller_step_the_ring_and_holds_the_loan_back_behind_it)
     CHECK(held() <= sh.ring_lent);
     CHECK(clear_of(sh.low_off, sh.low_off + sh.stage_bytes));
     CHECK_EQ(A::floor(engine), (int64_t)2048);
+    CHECK_EQ(A::back_step(engine), 10);
     CHECK(st.begin_pass(&p723));
     CHECK(st.staged());
+    CHECK(st.staged_below_min());
     CHECK_OK(st.end_pass(A::stream(engine)));
-    /* While it is the latest step the floor does not fall, however long it runs. */
+    /* Staged only by the arm floor: the dispatch behind it still proposes its swaps. */
+    {
+        const uint64_t asks = swap_asks();
+        A::dispatch(engine, 10);
+        CHECK_EQ(swap_asks(), asks + 1);
+    }
+    /* Until the loop has collected it the floor does not fall, however long it runs. */
     A::tick(engine, rad_mono_ns() + 10 * kHold);
+    CHECK(A::ring_step(engine));
     CHECK_EQ(A::floor(engine), (int64_t)2048);
     CHECK_EQ(loan(), sh.ring_lent);
 
-    /* The next turn of that size finds the place still out of the loan: nothing to recall. */
+    /* The next turn of that size, issued ahead of the first one's collection, finds the place
+     * still out of the loan: nothing to recall. The first is then collected, and the floor stays
+     * where the second pinned it. */
+    t700.step = 11;
     REQUIRE_EQ(A::step(engine, &t700), RAD_OK);
     CHECK(st.ring() == st.ring_low());
     CHECK(A::ring_step(engine));
     CHECK_EQ(loan(), sh.ring_lent);
+    CHECK_EQ(A::back_step(engine), 11);
+    A::collected(engine, 10, /*latest=*/false);
+    CHECK(A::ring_step(engine));
+    CHECK_EQ(A::back_step(engine), 11);
+    A::tick(engine, rad_mono_ns() + 10 * kHold);
+    CHECK_EQ(A::floor(engine), (int64_t)2048);
+    CHECK_EQ(loan(), sh.ring_lent);
 
-    /* Decode behind it: no ring; the loan stays back for the floor's time, then grows. */
+    /* Decode issued ahead of the second one's collection: no ring, and nothing changes while that
+     * step may still be copying. Collected, it gives the place back: the floor is the one the
+     * first staged step found (its own level's, as unstaged), and the tick lends the place again.
+     * Two seconds on, the loan grows to the decode step's. */
+    dec.step = 12;
     REQUIRE_EQ(A::step(engine, &dec), RAD_OK);
     CHECK(st.ring() == nullptr);
     CHECK(!A::ring_step(engine));
@@ -3941,29 +3997,109 @@ TEST(the_engine_hands_a_smaller_step_the_ring_and_holds_the_loan_back_behind_it)
     A::tick(engine, rad_mono_ns());
     CHECK_EQ(A::floor(engine), (int64_t)2048);
     CHECK_EQ(loan(), sh.ring_lent);
+    A::collected(engine, 11, /*latest=*/false);
+    CHECK_EQ(A::back_step(engine), -1);
+    CHECK_EQ(A::floor(engine), (int64_t)1024);
+    A::tick(engine, rad_mono_ns());
+    CHECK_EQ(A::floor(engine), (int64_t)1024);
+    CHECK_EQ(loan(), sh.lent_1024);
     A::tick(engine, rad_mono_ns() + 2 * kHold);
     CHECK_EQ(A::floor(engine), (int64_t)256);
     CHECK_EQ(loan(), sh.lent_256);
 
-    /* A full-plan chunk: everything back, the ring in the region. */
+    /* The same prompt with nothing behind it (a request that ends at its prefill). The step is
+     * collected and none is issued ahead: its copies have landed, the slab has the place back
+     * at the next tick, and the server idles as it would behind the same prompt unstaged. */
+    p723.step = 13;
+    REQUIRE_EQ(A::step(engine, &p723), RAD_OK);
+    CHECK(st.ring() == st.ring_low());
+    CHECK(A::ring_step(engine));
+    CHECK_EQ(loan(), sh.ring_lent);
+    CHECK(st.begin_pass(&p723));
+    CHECK_OK(st.end_pass(A::stream(engine)));
+    A::tick(engine, rad_mono_ns() + 10 * kHold);            /* not collected yet: held */
+    CHECK(A::ring_step(engine));
+    CHECK_EQ(A::floor(engine), (int64_t)2048);
+    CHECK_EQ(loan(), sh.ring_lent);
+    A::collected(engine, 13, /*latest=*/true);
+    CHECK(!A::ring_step(engine));
+    CHECK_EQ(A::back_step(engine), -1);
+    CHECK_EQ(A::floor(engine), (int64_t)1024);
+    A::tick(engine, rad_mono_ns());
+    CHECK_EQ(loan(), sh.lent_1024);
+
+    /* A full-plan chunk issued ahead of such a step's collection reached the floor itself: the
+     * collection leaves the floor at the full plan and nothing is lent under the chunk. */
+    p723.step = 14;
+    REQUIRE_EQ(A::step(engine, &p723), RAD_OK);
+    CHECK(st.ring() == st.ring_low());
+    CHECK(st.begin_pass(&p723));
+    CHECK_OK(st.end_pass(A::stream(engine)));
+    full.step = 15;
+    REQUIRE_EQ(A::step(engine, &full), RAD_OK);
+    CHECK_EQ(loan(), (int64_t)0);
+    CHECK_EQ(A::back_step(engine), 14);
+    A::collected(engine, 14, /*latest=*/false);
+    CHECK_EQ(A::back_step(engine), -1);
+    CHECK_EQ(A::floor(engine), (int64_t)2048);
+    A::tick(engine, rad_mono_ns());
+    CHECK_EQ(loan(), (int64_t)0);
+    A::collected(engine, 15, /*latest=*/true);
+    dec.step = 16;
+    REQUIRE_EQ(A::step(engine, &dec), RAD_OK);
+    A::tick(engine, rad_mono_ns() + 2 * kHold);
+    CHECK_EQ(A::floor(engine), (int64_t)256);
+    CHECK_EQ(loan(), sh.lent_256);
+
+    /* A full-plan chunk: everything back, the ring in the region; staged, it proposes no swaps. */
     REQUIRE_EQ(A::step(engine, &full), RAD_OK);
     CHECK(st.ring() == st.ring_full());
     CHECK(!A::ring_step(engine));
     CHECK_EQ(loan(), (int64_t)0);
     CHECK_EQ(held(), (int64_t)0);
     CHECK_EQ(A::floor(engine), (int64_t)2048);
+    CHECK(st.begin_pass(&full));
+    CHECK(st.staged());
+    CHECK(!st.staged_below_min());
+    CHECK_OK(st.end_pass(A::stream(engine)));
+    {
+        const uint64_t asks = swap_asks();
+        A::dispatch(engine, 20);
+        CHECK_EQ(swap_asks(), asks);
+    }
 
-    /* The 720-row last chunk behind it (pf6's): the region still, nothing recalled, and it holds
-     * the floor as the full-plan chunk did. */
+    /* The 720-row last chunk behind it (pf6's): the region still, nothing recalled, and the floor
+     * pinned while it may be copying. */
+    const uint64_t full_ns = A::floor_ns(engine);
+    tail.step = 21;
     REQUIRE_EQ(A::step(engine, &tail), RAD_OK);
     CHECK(st.ring() == st.ring_full());
     CHECK(A::ring_step(engine));
+    CHECK_EQ(A::back_step(engine), 21);
+    CHECK(A::floor_ns(engine) != full_ns);
     CHECK_EQ(loan(), (int64_t)0);
     A::tick(engine, rad_mono_ns() + 10 * kHold);
     CHECK_EQ(A::floor(engine), (int64_t)2048);
     CHECK_EQ(loan(), (int64_t)0);
+    /* Collected, it leaves the floor as the full-plan chunk left it, the chunk's time included:
+     * the loan stays back for what is left of the chunk's two seconds, not for two more. */
+    A::collected(engine, 21, /*latest=*/true);
+    CHECK(!A::ring_step(engine));
+    CHECK_EQ(A::back_step(engine), -1);
+    CHECK_EQ(A::floor(engine), (int64_t)2048);
+    CHECK_EQ(A::floor_ns(engine), full_ns);
+    A::tick(engine, rad_mono_ns());
+    CHECK_EQ(A::floor(engine), (int64_t)2048);
+    CHECK_EQ(loan(), (int64_t)0);
+    /* Two seconds on the floor falls to its level and the loan grows. */
+    A::tick(engine, rad_mono_ns() + 2 * kHold);
+    CHECK_EQ(A::floor(engine), (int64_t)1024);
+    CHECK_EQ(loan(), sh.lent_1024);
 
-    /* A 300-row turn behind that: the region is free, and the turn is still not staged. */
+    /* A 300-row turn behind a full-plan chunk: the region is free, and the turn is still not
+     * staged. */
+    REQUIRE_EQ(A::step(engine, &full), RAD_OK);
+    CHECK_EQ(loan(), (int64_t)0);
     REQUIRE_EQ(A::step(engine, &turn), RAD_OK);
     CHECK(st.ring() == nullptr);
     CHECK(!A::ring_step(engine));
@@ -3998,6 +4134,143 @@ TEST(the_engine_hands_a_smaller_step_the_ring_and_holds_the_loan_back_behind_it)
     CHECK(st.ring() == nullptr);
     CHECK(!A::ring_step(engine));
     CHECK(!st.begin_pass(&dec));
+    CHECK_OK(rad_stream_sync(m.transfer_stream()));
+    CHECK_OK(rad_stream_sync(A::stream(engine)));
+}
+
+/* Backlog M-19 (a), under --prefill-span with a level above the span's (256, 1024, a 2048-token
+ * span level and 4096 under an 8192-token full plan). The second place is above the 4096-token
+ * level, so that level lends it and the span's level, which stages every step there, does not.
+ * A prompt chunk of 3000 rows is staged in the place and, collected, leaves the floor at its own
+ * level, which lends the place again. A span-level step inside the floor's time takes it back,
+ * and the tick behind the step before it -- the span step issued ahead, still copying -- must
+ * not lend it on the floor's word: the loan never grows past what the latest step keeps. */
+TEST(the_arena_tick_lends_no_more_than_the_latest_step_keeps) {
+    if (!rad::device_is_host()) SKIP("builds an engine rank by hand on the host backend");
+    using A = rad::EngineArenaTestAccess;
+    StagerRig rig;
+    REQUIRE(rig.build_plan() >= 0);
+    A::Shape sh = { 40 * MiB, 24 * MiB, 16 * MiB, 8 * MiB, 38 * MiB, 36 * MiB, 16 * MiB };
+    sh.full = 8192;
+    sh.span = 2048;
+    sh.lent_above = 32 * MiB;                  /* the 4096-token level: the place and the region */
+    struct Mem {
+        char* p = (char*)rad_dev_alloc(40 * MiB, RAD_MEM_DEVICE);
+        ~Mem() { if (p) rad_dev_free(p, RAD_MEM_DEVICE); }
+    } arena;
+    REQUIRE(arena.p != nullptr);
+    Config cfg = base_config();
+    rad::Engine engine(cfg);
+    rad::EngineScope owner(engine.owner(), "arena-span-test");
+    REQUIRE_EQ(A::rank(engine, rig.f.prog, rig.plan, arena.p, sh), RAD_OK);
+    Mover& m = A::mover(engine);
+    PrefillStager& st = A::stager(engine);
+    REQUIRE(st.enabled());
+    CHECK_EQ(st.min_rows(), (int64_t)4097);
+    const auto loan = [&] { return m.loan(Mover::kLendArena); };
+
+    RadBatch dec = chunk_of(8, RAD_PHASE_DECODE), big = chunk_of(3000), span = chunk_of(1500);
+    REQUIRE_EQ(A::step(engine, &dec), RAD_OK);
+    A::collected(engine, 0, /*latest=*/true);
+    A::tick(engine, rad_mono_ns());
+    CHECK_EQ(loan(), sh.lent_256);
+
+    /* The 3000-row chunk: the 4096-token level, the second place, the floor pinned. */
+    big.step = 1;
+    REQUIRE_EQ(A::step(engine, &big), RAD_OK);
+    CHECK(st.ring() == st.ring_low());
+    CHECK(A::ring_step(engine));
+    CHECK_EQ(loan(), sh.ring_lent);
+    CHECK_EQ(A::floor(engine), (int64_t)8192);
+    CHECK(st.begin_pass(&big));
+    CHECK(st.staged_below_min());
+    CHECK_OK(st.end_pass(A::stream(engine)));
+    A::tick(engine, rad_mono_ns());                    /* uncollected: nothing lent */
+    CHECK_EQ(loan(), sh.ring_lent);
+    A::collected(engine, 1, /*latest=*/true);
+    CHECK_EQ(A::floor(engine), (int64_t)4096);
+    A::tick(engine, rad_mono_ns());
+    CHECK_EQ(loan(), sh.lent_above);                   /* the place is the slab's again */
+
+    /* A span-level step inside the floor's time: its level keeps the place, without a pin. */
+    span.step = 2;
+    REQUIRE_EQ(A::step(engine, &span), RAD_OK);
+    CHECK(st.ring() == st.ring_low());
+    CHECK(!A::ring_step(engine));
+    CHECK_EQ(loan(), sh.ring_lent);
+    CHECK_EQ(A::floor(engine), (int64_t)4096);
+    /* The tick behind the step before it, while this one copies: the floor's level would lend
+     * the place; the step's own allowance does not. */
+    A::tick(engine, rad_mono_ns());
+    CHECK_EQ(loan(), sh.ring_lent);
+    /* Collected, it still keeps what its level keeps. */
+    A::collected(engine, 2, /*latest=*/true);
+    A::tick(engine, rad_mono_ns());
+    CHECK_EQ(loan(), sh.ring_lent);
+    /* Decode behind it, and two seconds: the loan grows to the decode step's. */
+    dec.step = 3;
+    REQUIRE_EQ(A::step(engine, &dec), RAD_OK);
+    A::collected(engine, 3, /*latest=*/true);
+    A::tick(engine, rad_mono_ns() + 2 * rad::kArenaFloorNs);
+    CHECK_EQ(A::floor(engine), (int64_t)256);
+    CHECK_EQ(loan(), sh.lent_256);
+    CHECK_OK(rad_stream_sync(m.transfer_stream()));
+    CHECK_OK(rad_stream_sync(A::stream(engine)));
+}
+
+/* Backlog M-19 (a), where the 1024-token level's buffers reach the region, so the ring's second
+ * place is the region itself and nothing is lent above it. A lone 723-row prompt takes the whole
+ * loan back, and a 720-row chunk issued ahead of its collection then finds the region unlent and
+ * stays in it. That chunk is still copying when the prompt is collected: it has taken over the
+ * floor the prompt would have put back, so nothing is lent under it, and the floor goes back
+ * when the chunk itself is collected. */
+TEST(a_staged_step_set_behind_one_in_the_second_place_takes_over_the_floor_it_puts_back) {
+    if (!rad::device_is_host()) SKIP("builds an engine rank by hand on the host backend");
+    using A = rad::EngineArenaTestAccess;
+    StagerRig rig;
+    REQUIRE(rig.build_plan() >= 0);
+    const A::Shape sh = { 40 * MiB, 24 * MiB, 16 * MiB, 24 * MiB, 38 * MiB, 16 * MiB, 0 };
+    struct Mem {
+        char* p = (char*)rad_dev_alloc(40 * MiB, RAD_MEM_DEVICE);
+        ~Mem() { if (p) rad_dev_free(p, RAD_MEM_DEVICE); }
+    } arena;
+    REQUIRE(arena.p != nullptr);
+    Config cfg = base_config();
+    rad::Engine engine(cfg);
+    rad::EngineScope owner(engine.owner(), "arena-takeover-test");
+    REQUIRE_EQ(A::rank(engine, rig.f.prog, rig.plan, arena.p, sh), RAD_OK);
+    Mover& m = A::mover(engine);
+    PrefillStager& st = A::stager(engine);
+    REQUIRE(st.enabled());
+    const auto loan = [&] { return m.loan(Mover::kLendArena); };
+    const uint64_t kHold = rad::kArenaFloorNs;
+
+    RadBatch dec = chunk_of(8, RAD_PHASE_DECODE), p723 = chunk_of(723), tail = chunk_of(720);
+    REQUIRE_EQ(A::step(engine, &dec), RAD_OK);
+    A::collected(engine, 0, /*latest=*/true);
+    A::tick(engine, rad_mono_ns());
+    CHECK_EQ(loan(), sh.lent_256);
+
+    p723.step = 1;
+    REQUIRE_EQ(A::step(engine, &p723), RAD_OK);
+    CHECK(A::ring_step(engine));
+    CHECK_EQ(loan(), (int64_t)0);                      /* nothing is above the place */
+    CHECK_EQ(A::back_step(engine), 1);
+    tail.step = 2;
+    REQUIRE_EQ(A::step(engine, &tail), RAD_OK);        /* issued ahead: the region, unlent */
+    CHECK(st.ring() == st.ring_full());
+    CHECK(A::ring_step(engine));
+    CHECK_EQ(A::back_step(engine), 2);
+    A::collected(engine, 1, /*latest=*/false);
+    CHECK_EQ(A::back_step(engine), 2);
+    CHECK_EQ(A::floor(engine), (int64_t)2048);
+    A::tick(engine, rad_mono_ns() + 10 * kHold);
+    CHECK_EQ(loan(), (int64_t)0);                      /* the chunk is still copying */
+    A::collected(engine, 2, /*latest=*/true);
+    CHECK_EQ(A::back_step(engine), -1);
+    CHECK_EQ(A::floor(engine), (int64_t)1024);
+    A::tick(engine, rad_mono_ns());
+    CHECK_EQ(loan(), sh.lent_1024);
     CHECK_OK(rad_stream_sync(m.transfer_stream()));
     CHECK_OK(rad_stream_sync(A::stream(engine)));
 }

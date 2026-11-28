@@ -2460,11 +2460,11 @@ TEST(a_smaller_step_finds_the_region_only_while_the_slab_holds_none_of_the_arena
     /* nothing lent yet, and no full-plan step behind it either (a server's first step) */
     CHECK(!rad::arena_ring_kept(0, 2048, 0, 0, 0));
     CHECK(!rad::arena_ring_kept(1024, 2048, 0, 0, 0));
-    /* the floor holds, and the slab still reaches into the arena */
+    /* the floor is the full plan's, and the slab still reaches into the arena */
     CHECK(!rad::arena_ring_kept(2048, 2048, 1, 0, 0));
     CHECK(!rad::arena_ring_kept(2048, 2048, 0, 1, 0)); /* recalled, a slot not yet given back */
     CHECK(!rad::arena_ring_kept(2048, 2048, 0, 700 * MiB, 0));
-    /* behind a step staged in the second place: the floor holds, and above that place is lent */
+    /* a step staged in the second place, not collected: the floor pinned, above that place lent */
     CHECK(!rad::arena_ring_kept(2048, 2048, 694 * MiB, 694 * MiB, 0));
     /* stated against what the full plan lends, were that ever more than nothing */
     CHECK(rad::arena_ring_kept(2048, 2048, 4 * MiB, 4 * MiB, 4 * MiB));
@@ -2474,9 +2474,10 @@ TEST(a_smaller_step_finds_the_region_only_while_the_slab_holds_none_of_the_arena
 
 /* The arena's floor falls to the latest step's size, and the loan grows, only once that step is
  * under the floor and the floor was last reached more than two seconds ago -- and never while the
- * latest step is one that was staged below the full plan: its copies are in arena memory the loan
- * would grow over, as a full-plan step's are, however long ago the floor was reached. */
-TEST(the_arena_floor_holds_while_the_latest_step_is_staged_below_the_full_plan) {
+ * latest step is one staged below the full plan that the loop has not collected: its copies are
+ * going into arena memory the loan would grow over, however long ago the floor was reached. Once
+ * it is collected it holds the floor for the two seconds and no longer. */
+TEST(the_arena_floor_holds_while_a_step_staged_below_the_full_plan_may_still_be_copying) {
     const uint64_t hold = rad::kArenaFloorNs;
     CHECK_EQ(hold, (uint64_t)2000000000ull);
     /* a decode step behind a full-plan chunk: after the hold, not before */
@@ -2486,14 +2487,43 @@ TEST(the_arena_floor_holds_while_the_latest_step_is_staged_below_the_full_plan) 
     /* a step at the floor never lowers it */
     CHECK(!rad::arena_floor_falls(2048, 2048, false, hold + 1));
     CHECK(!rad::arena_floor_falls(4096, 2048, false, 10 * hold));
-    /* a staged 720-row chunk: under the floor in rows, and the floor stays */
+    /* a staged 720-row chunk not yet collected: under the floor in rows, and the floor stays */
     CHECK(!rad::arena_floor_falls(1024, 2048, true, hold + 1));
     CHECK(!rad::arena_floor_falls(1024, 2048, true, 100 * hold));
-    /* the same step unstaged falls as any small step does */
+    /* collected, its copies landed: it held the floor for the hold, and then the floor falls,
+     * as behind the same step unstaged */
+    CHECK(!rad::arena_floor_falls(1024, 2048, false, hold));
     CHECK(rad::arena_floor_falls(1024, 2048, false, hold + 1));
 }
 
-/* Where the ring is for a step, what the step leaves lent and whether it holds the loan back
+/* A step at least as large as the floor reaches it and restarts its time; a smaller one leaves
+ * it. The engine applies this to the floor and, while a step staged in the second place pins the
+ * floor, to the one it will put back. */
+TEST(a_step_reaches_the_arena_floor_when_it_is_at_least_as_large) {
+    const rad::ArenaFloor f0 = { 1024, 7000 };
+    rad::ArenaFloor f = rad::arena_floor_reach(f0, 256, 9000);     /* decode: the floor stays */
+    CHECK_EQ(f.rows, (int64_t)1024);
+    CHECK_EQ(f.since_ns, (uint64_t)7000);
+    f = rad::arena_floor_reach(f0, 1024, 9000);                    /* the same level: its time */
+    CHECK_EQ(f.rows, (int64_t)1024);
+    CHECK_EQ(f.since_ns, (uint64_t)9000);
+    f = rad::arena_floor_reach(f0, 2048, 9000);                    /* a full-plan chunk */
+    CHECK_EQ(f.rows, (int64_t)2048);
+    CHECK_EQ(f.since_ns, (uint64_t)9000);
+    f = rad::arena_floor_reach({ 0, 0 }, 256, 5);                  /* the first step */
+    CHECK_EQ(f.rows, (int64_t)256);
+    CHECK_EQ(f.since_ns, (uint64_t)5);
+}
+
+/* A pass the stager staged from min_rows() proposes no swaps; a pass staged only by the arm floor
+ * does, as every unstaged step does (Engine::tiering_dispatch). */
+TEST(a_pass_staged_only_by_the_arm_floor_still_proposes_its_swaps) {
+    CHECK(rad::stage_swaps(false, false));    /* unstaged: decode, a 300-row turn */
+    CHECK(!rad::stage_swaps(true, false));    /* a staged 1984-row chunk, a span-level chunk */
+    CHECK(rad::stage_swaps(true, true));      /* the 720-row last chunk, a lone 723-row prompt */
+}
+
+/* Where the ring is for a step, what the step leaves lent and whether it pins the floor
  * (Engine::arena_step's decision), on the served shape's numbers: the full plan lends nothing,
  * the 1024-token level 1219 MiB, the 256-token level 1739 MiB, and 694 MiB is above the ring's
  * second place. */
@@ -2534,9 +2564,9 @@ TEST(the_arena_step_decides_where_the_ring_is_and_what_stays_lent) {
         CHECK_EQ(r.allow, 694 * MiB);
         CHECK(r.holds);
     }
-    /* the next such turn within the floor's time: the floor is the full plan's now, what is above
-     * the second place is still lent, so the region is not free -- the second place again, and
-     * nothing more to recall */
+    /* the next such turn issued ahead of that one's collection: the floor is pinned at the full
+     * plan, what is above the second place is still lent, so the region is not free -- the second
+     * place again, and nothing more to recall */
     {
         const rad::ArenaStepRing r = rad::arena_step_ring(step(true, 1219 * MiB, 2048, 694 * MiB));
         CHECK(r.ring == ArenaRing::Low);

@@ -139,9 +139,16 @@ bool arena_ring_kept(int64_t floor_rows, int64_t full_rows, int64_t loan, int64_
     return floor_rows >= full_rows && loan <= full_lent && loan_held <= full_lent;
 }
 
-bool arena_floor_falls(int64_t last_rows, int64_t floor_rows, bool ring_step, uint64_t since_ns) {
-    return last_rows < floor_rows && !ring_step && since_ns > kArenaFloorNs;
+bool arena_floor_falls(int64_t last_rows, int64_t floor_rows, bool ring_going, uint64_t since_ns) {
+    return last_rows < floor_rows && !ring_going && since_ns > kArenaFloorNs;
 }
+
+ArenaFloor arena_floor_reach(ArenaFloor floor, int64_t rows, uint64_t now_ns) {
+    if (rows >= floor.rows) return { rows, now_ns };
+    return floor;
+}
+
+bool stage_swaps(bool staged, bool below_min) { return !staged || below_min; }
 
 ArenaStepRing arena_step_ring(const ArenaStep& s) {
     if (s.full_plan) return { ArenaRing::Top, s.level_lent, false };

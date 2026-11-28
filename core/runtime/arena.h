@@ -116,19 +116,44 @@ constexpr uint64_t kArenaFloorNs = 2000000000ull;
 
 /* Whether a step below the full plan still finds the prefill stager's ring in the region at the
  * top of the arena (place/stager.h, "a smaller step behind a staged one"). The arena's floor is
- * still the full plan's (`floor_rows` against `full_rows`: a step that large ran, or one that was
- * staged, and the loan has stayed back since), and the expert slab holds no more of the arena than
- * the full plan leaves it (`full_lent`, which is nothing), neither as the loan's target (`loan`)
- * nor in slots it has yet to give back (`loan_held`). Every loan is counted from the top down and
+ * still the full plan's (`floor_rows` against `full_rows`: a step that large ran inside the floor's
+ * time, or a staged step is not collected yet), and the expert slab holds no more of the arena
+ * than the full plan leaves it (`full_lent`, which is nothing), neither as the loan's
+ * target (`loan`) nor in slots it has yet to give back (`loan_held`). Every loan is counted from the top down and
  * the region is the top, so any byte lent past the full plan's is a byte of it. */
 bool arena_ring_kept(int64_t floor_rows, int64_t full_rows, int64_t loan, int64_t loan_held,
                      int64_t full_lent);
 
 /* Whether the arena's floor falls to the latest step's size, so that the loan may grow
- * (Engine::arena_tick): that step is under the floor, it is not one that was staged below the
- * full plan (`ring_step`; its copies are in arena memory the loan would grow over, as a full-plan
- * step's are), and the floor was last reached more than kArenaFloorNs ago (`since_ns`). */
-bool arena_floor_falls(int64_t last_rows, int64_t floor_rows, bool ring_step, uint64_t since_ns);
+ * (Engine::arena_tick): that step is under the floor, the floor was last reached more than
+ * kArenaFloorNs ago (`since_ns`), and the step is not one staged below the full plan that may
+ * still be copying (`ring_going`: the copies go into arena memory the loan would grow over, and
+ * a step issued ahead is not through them when the step before it ends). Once such a step has
+ * been collected the floor is the one the steps would have left without it
+ * (Engine::arena_collected). */
+bool arena_floor_falls(int64_t last_rows, int64_t floor_rows, bool ring_going, uint64_t since_ns);
+
+/* The arena's floor, and when it was last reached. */
+struct ArenaFloor {
+    int64_t  rows = 0;
+    uint64_t since_ns = 0;
+};
+
+/* The floor after a step of `rows` (its level's rows) is set at `now_ns`: a step at least as
+ * large as the floor reaches it, and the floor's time starts again; a smaller one leaves it
+ * (Engine::arena_step). The engine keeps two of these while a step staged below the full plan
+ * pins the floor there: the pinned one, and the one the steps would have left without the pin,
+ * which it puts back once that step is collected (Engine::arena_collected). */
+ArenaFloor arena_floor_reach(ArenaFloor floor, int64_t rows, uint64_t now_ns);
+
+/* Whether a step proposes swaps behind its pass (Engine::tiering_dispatch). A pass the stager
+ * staged from min_rows() does not, as before: it is bound by its own copies on the mover's
+ * transfer stream, and its histograms are credited for the next step that swaps. A pass staged
+ * only by the arm floor (`below_min`: a prompt chunk of arm_rows() or more in a pass under
+ * min_rows(), PrefillStager::staged_below_min) does, as that pass did before the stager armed
+ * for it: with those two steps silent, resumed turns of 252-379 rows behind them in the same
+ * server ran 6-12 ms slower (notes/backlog/measurements/M-19.md). An unstaged step always does. */
+bool stage_swaps(bool staged, bool below_min);
 
 /* Where the stager's ring is for a step, on one rank. */
 enum class ArenaRing {
@@ -154,8 +179,8 @@ struct ArenaStep {
 };
 
 /* The decision: where the ring is, what the step may leave lent (the loan is recalled to it
- * before the step where it is higher), and whether the step holds the loan back behind it as a
- * full-plan step does (`holds`: it is staged below the full plan).
+ * before the step where it is higher), and whether the step pins the floor at the full plan
+ * while it may be copying (`holds`: it is staged below the full plan).
  *
  *   the full plan               the region; it lends nothing
  *   the span's shared level     the second place, which the level never lends

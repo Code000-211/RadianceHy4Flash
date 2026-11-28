@@ -53,8 +53,11 @@
  * still unlent. Such a step keeps the ring where it is, in the region, instead of moving it to
  * the second place: nothing is taken back from the slab, and the first layers the pass before
  * staged for it (below) are adopted where they lie rather than withdrawn with the move. A step
- * staged below the full plan holds the loan back behind it as a full-plan step does, so a run of
- * such chunks and turns keeps finding the ring where the last one left it.
+ * staged below the full plan keeps the loan off its ring while it copies and no longer: behind
+ * it the loan is what it would be had the step run unstaged (Engine::arena_collected). The
+ * region therefore serves the chunks and turns that arrive while the full-plan step before them
+ * still holds the loan back, and a step staged in the second place gives the place back to the
+ * slab once it is collected; the next such step takes it again.
  *
  * Layers staged ahead also outlive a next chunk that turns out too small to arm. While the ring
  * is still where they are, that pass takes them as they are -- it waits on their copies, reads
@@ -182,6 +185,10 @@ public:
     /* Whether the last trunk pass armed (copied its pooled experts through the ring). A draft
      * pass leaves it unchanged. */
     bool    staged() const { return staged_; }
+    /* ... and only because it carried a prompt chunk of arm_rows() or more: a pass under
+     * min_rows(), which nothing staged before M-19. The engine proposes swaps behind such a pass
+     * as it did then (stage_swaps). */
+    bool    staged_below_min() const { return staged_below_min_; }
     static constexpr int32_t lead() { return kLead; }
 
     bool begin_pass(const RadBatch* b) override;
@@ -247,6 +254,7 @@ private:
     /* Whether the last trunk pass armed to stage, as its begin_pass decided; end_pass leaves it,
      * since the engine asks after the pass has ended. */
     bool     staged_ = false;
+    bool     staged_below_min_ = false;
     bool     next_prefill_ = false;
     bool     first_op_ = false;        /* the pass has issued nothing yet */
     int32_t  next_ = 0;                /* the next layer to stage this pass */

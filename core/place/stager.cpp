@@ -126,6 +126,7 @@ bool PrefillStager::begin_pass(const RadBatch* b) {
     if (!b || b->draft_pass != 0) return false;
     armed_ = want_ != nullptr && enabled() && (b->n_tok >= min_rows_ || arms_for(b));
     staged_ = armed_;
+    staged_below_min_ = staged_ && b->n_tok < min_rows_;
     take_only_ = !armed_ && want_ != nullptr && want_ == base_ && enabled() && adopts(b);
     armed_ = armed_ || take_only_;
     if (!armed_) {
