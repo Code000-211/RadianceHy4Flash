@@ -2311,72 +2311,6 @@ TEST(mover_promotes_and_demotes_through_the_shadow_slots) {
     rad_stream_destroy(compute);
 }
 
-/* 2Q (X2): a unit the engine admitted keeps its host copy, so handing its lent slot back copies
- * nothing off the card -- and it is handed back before a colder settled resident, because the
- * main set is not asked to trade for the area's traffic. */
-TEST(a_probation_unit_is_returned_before_a_colder_resident) {
-    HeatFixture hf;
-    HeatEngine h;
-    CHECK_OK(h.init(hf.plan, HeatParams{}));   /* 2Q on */
-
-    Mover m;
-    CHECK_OK(m.init(hf.f.prog, hf.plan, MoverConfig{}));
-    RadStream compute = nullptr;
-    CHECK_OK(rad_stream_create(&compute, 0));
-    CHECK_OK(m.bind_compute_stream(compute));
-    ComputeWork work;
-
-    const int32_t settled = hf.unit_of_expert(4);   /* promoted out of the area, then cold */
-    const int32_t hot     = hf.unit_of_expert(5);   /* admitted with far more heat */
-    const int32_t third   = hf.unit_of_expert(6);   /* fills the free lent slots */
-
-    int d = 0;
-    auto dispatch = [&](int32_t unit, int32_t count) {
-        CHECK_OK(m.begin_dispatch(d, &h));
-        work.run(compute);
-        h.observe_ids(0, &unit, &count, 1);
-        std::vector<Swap> sw;
-        CHECK_OK(h.step(&sw));
-        for (const Swap& s : sw) m.issue(s, &h);
-        ++d;
-    };
-    auto settle = [&]() {
-        for (Deadline dl; any_busy(h, hf.plan) && !dl.passed();) {
-            CHECK_OK(m.begin_dispatch(d, &h));
-            work.run(compute);
-            ++d;
-        }
-    };
-
-    dispatch(settled, 1);                      /* a first miss: admitted into a lent slot */
-    settle();
-    CHECK(h.probation(settled));
-    CHECK_EQ(m.stats().demotions, (uint64_t)0);
-    CHECK_EQ(m.stats().d2h_bytes, (uint64_t)0);
-
-    dispatch(settled, 1);                      /* routed again: promoted where it is */
-    settle();
-    CHECK(!h.probation(settled));
-    CHECK(h.tier(settled) == Tier::VRAM);
-
-    dispatch(hot, 50);
-    settle();
-    CHECK(h.probation(hot));
-    CHECK_EQ(m.stats().d2h_bytes, (uint64_t)0);
-
-    dispatch(third, 1);                        /* the class now holds more than it keeps free */
-    settle();
-    const uint64_t d2h = m.stats().d2h_bytes;
-    CHECK_OK(m.balance(&h));
-    CHECK(m.stats().dropped >= 1);             /* given back: an address change, no copy */
-    CHECK_EQ(m.stats().d2h_bytes, d2h);
-    /* `settled` is the coldest resident and the LFU order would have taken it; the area goes
-     * first, so it is still on the card. */
-    CHECK(h.tier(settled) == Tier::VRAM);
-
-    rad_stream_destroy(compute);
-}
-
 /* Expert streaming X1 (a): a promotion whose copy has landed is published by publish_landed,
  * before the next pass is issued, not only by the next dispatch's retire. */
 TEST(a_landed_promotion_is_published_before_the_next_pass) {
@@ -2623,6 +2557,68 @@ struct LoanRig {
     }
 };
 }  /* namespace */
+
+/* 2Q (X2): a unit the engine admitted keeps its host copy, so handing its lent slot back copies
+ * nothing off the card -- and it is handed back before a colder settled resident, because the
+ * main set is not asked to trade for the area's traffic.
+ *
+ * The dispatches skip balance(), which is what fills the spare slots: a fill would promote the
+ * coldest pooled unit straight into a lent slot and hide the area's own admission. One balance()
+ * at the end asks the class for a slot, as a full class does every step. */
+TEST(a_probation_unit_is_returned_before_a_colder_resident) {
+    LoanRig r;
+    r.turnover = 2;                                  /* the reserve: min(2, shadow * 3) slots */
+    CHECK_OK(r.build());
+    CHECK_OK(r.m.set_loan(Mover::kLendKV, Loan::kAll));
+    CHECK(r.m.flex_offered_bytes() > 0);
+
+    const int32_t settled = r.hf.unit_of_expert(4);   /* promoted out of the area, then cold */
+    const int32_t hot     = r.hf.unit_of_expert(5);   /* admitted with far more heat */
+    const int32_t third   = r.hf.unit_of_expert(6);   /* hotter than `settled`, colder than `hot` */
+
+    auto dispatch = [&](int32_t expert, int32_t count) {
+        CHECK_OK(r.m.begin_dispatch(r.d++, &r.h));
+        r.work.run(r.compute);
+        r.h.observe_ids(0, &expert, &count, 1);
+        std::vector<Swap> sw;
+        CHECK_OK(r.h.step(&sw));
+        for (const Swap& s : sw) CHECK_OK(r.m.issue(s, &r.h));
+    };
+    auto settle = [&]() {
+        for (Deadline dl; any_busy(r.h, r.hf.plan) && !dl.passed();) {
+            CHECK_OK(r.m.begin_dispatch(r.d++, &r.h));
+            r.work.run(r.compute);
+        }
+    };
+
+    dispatch(4, 1);                            /* a first miss: admitted into a lent slot */
+    settle();
+    CHECK(r.h.probation(settled));
+    CHECK(r.h.tier(settled) == Tier::VRAM);
+    CHECK_EQ(r.m.stats().demotions, (uint64_t)0);
+    CHECK_EQ(r.m.stats().d2h_bytes, (uint64_t)0);
+
+    dispatch(4, 1);                            /* routed again: promoted where it is */
+    settle();
+    CHECK(!r.h.probation(settled));
+    CHECK(r.h.tier(settled) == Tier::VRAM);
+    CHECK_EQ(r.m.stats().d2h_bytes, (uint64_t)0);
+
+    dispatch(5, 50);                           /* a hotter first miss */
+    settle();
+    CHECK(r.h.probation(hot));
+    CHECK_EQ(r.m.stats().d2h_bytes, (uint64_t)0);
+
+    dispatch(6, 20);                           /* now the class holds more than it keeps free */
+    settle();
+    CHECK_OK(r.m.balance(&r.h));
+    CHECK_EQ(r.m.stats().dropped, (uint64_t)1);  /* given back: an address change, no copy */
+    CHECK_EQ(r.m.stats().d2h_bytes, (uint64_t)0);
+    /* One of the two area units went, whichever the order reached first. Both are hotter than
+     * `settled`, which the LFU order would have taken first and kept the traffic for. */
+    CHECK(r.h.tier(third) == Tier::HostPinned || r.h.tier(hot) == Tier::HostPinned);
+    CHECK(r.h.tier(settled) == Tier::VRAM);
+}
 
 TEST(the_lent_slots_hold_nothing_until_a_loan_covers_them) {
     LoanRig r;
