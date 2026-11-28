@@ -1015,7 +1015,8 @@ if(RAD_PYTHON3)
   set_tests_properties(rad_export_test PROPERTIES LABELS "unit;fast" TIMEOUT ${RAD_TEST_TIMEOUT})
   # tools/hf_logits_to_kld.py: HF logits -> a radiance KL reference (numpy only)
   add_test(NAME hf_logits_to_kld_test COMMAND ${RAD_PYTHON3} ${CMAKE_CURRENT_SOURCE_DIR}/hf_logits_to_kld_test.py)
-  set_tests_properties(hf_logits_to_kld_test PROPERTIES LABELS "unit;fast" TIMEOUT ${RAD_TEST_TIMEOUT})
+  set_tests_properties(hf_logits_to_kld_test PROPERTIES LABELS "unit;fast" SKIP_RETURN_CODE 77
+                       TIMEOUT ${RAD_TEST_TIMEOUT})
   add_test(NAME spark25_validation_test
            COMMAND ${RAD_PYTHON3} ${CMAKE_CURRENT_SOURCE_DIR}/spark25_validation_test.py)
   set_tests_properties(spark25_validation_test PROPERTIES LABELS "unit;fast" TIMEOUT ${RAD_TEST_TIMEOUT})

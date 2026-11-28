@@ -303,6 +303,10 @@ TEST(a_prefill_step_issues_one_gram_a_site_and_stays_lint_clean) {
 TEST(calib_st2gram_writes_a_radgram2_file_under_each_weight_stem) {
 #ifdef RAD_CALIB_ST2GRAM
     namespace fs = std::filesystem;
+    /* The script needs numpy, which a host may not have (the image's build stage installs none): a
+     * missing interpreter dependency, like a missing card or decoder, skips rather than fails. */
+    if (std::system("python3 -I -c 'import numpy' > /dev/null 2>&1") != 0)
+        SKIP("python3 -I -c 'import numpy' fails: tools/calib_st2gram.py needs it");
     char tmpl[] = "/tmp/hy4_calib_XXXXXX";
     REQUIRE(mkdtemp(tmpl) != nullptr);
     const std::string dir = tmpl;

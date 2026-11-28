@@ -2,7 +2,11 @@
 """tools/hf_logits_to_kld.py writes what core/kld.h documents: file sizes, the manifest, log-probabilities, the head
 (descending, a tie keeping the lower id), rows.f32 (NLL, entropy, tail mass)."""
 import json, os, subprocess, sys, tempfile
-import numpy as np
+
+try:
+    import numpy as np
+except ImportError:
+    sys.exit(77)  # numpy is optional, as for vhead_test.py; ctest reads 77 as a skip
 
 TOOL = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tools", "hf_logits_to_kld.py")
 
