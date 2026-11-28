@@ -501,6 +501,8 @@ struct FakePC : IPrefixCache {
     }
     const std::vector<int32_t>& cached_groups() const override { return groups; }
     void set_drafter_floor(int64_t tokens) override { drafter_floor = tokens; }
+    ExactKeys exact{};           /* set_exact_keys's last value, grid 0 never called */
+    void set_exact_keys(const ExactKeys& x) override { exact = x; }
 
     /* What the scheduler published and asked to be evicted, recorded rather than acted on: these
      * tests check that the scheduler publishes before it frees and evicts before it preempts, not

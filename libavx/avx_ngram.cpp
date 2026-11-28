@@ -1271,6 +1271,33 @@ int avx::row_gather(const RowGather& q, RowDecode decode) {
         }
         RowCache* rc = row_cache(tfile, q.row_bytes);
         if (!rc) return RAD_E_NOMEM;
+        /* Prefetch, and nothing else (M-18b: hyv4flash's step-start Engram reads). The ahead operand
+         * names the ids themselves -- that alias is the signal. Hand them to the reader now and read
+         * nothing here: the layer's own gather, issued behind this one for the same ids, finds the
+         * rows claimed or ready and the issue thread never blocks on the drive. The ids go to the
+         * reader through their own queue entry, not through the stream read_ahead tracks: the layer's
+         * own ahead list arrives at a later issue and its continuity match would otherwise drop the
+         * unprocessed half of these jobs, and both ranks handing the same ids costs only a claim
+         * each, since find_or_claim is the dedup the stream was only approximating. */
+        if (q.ahead == q.ids && q.n_ahead == q.M) {
+            const long long base = tfile->off + (long long)(q.tab - tfile->lo);
+            const long long na   = q.n_ahead < kAheadRows ? q.n_ahead : kAheadRows;
+            const int32_t*  w    = q.ahead;
+            AheadReader*    r    = ahead_reader();
+            std::lock_guard<std::mutex> lk(r->mu);
+            AheadJob j;
+            j.tf = tfile; j.rc = rc; j.n = q.row_bytes;
+            j.keys.reserve(kJobRows);
+            for (long long m = 0; m < na; ++m) {
+                const long long id = (long long)w[m] - q.voff;
+                if (id < 0 || id >= q.n_vocab) continue;   /* the caller refused these */
+                j.keys.push_back((uint64_t)(base + id * q.row_bytes));
+                if (j.keys.size() == kJobRows) { r->q.push_back(j); j.keys.clear(); }
+            }
+            if (!j.keys.empty()) r->q.push_back(std::move(j));
+            r->cv.notify_one();
+            return RAD_OK;
+        }
         const long long ws    = q.world_size > 1 ? q.world_size : 1;
         const long long first = q.rank > 0 && q.rank < ws ? q.M * q.rank / ws : 0;
         const int rs = gather_rows(*tfile, *rc, *rr, q, first, decode, lut);

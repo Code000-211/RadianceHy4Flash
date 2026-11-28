@@ -94,8 +94,8 @@ and draft-pass graph capture were never built or never timed where they would pa
    against today's one of two is +3% over the pipeline already built (see the section below for the
    numbers, the absorbed penalty it has to earn back, and the `row0` argument already in libr4d);
    the cross-layer handoff that would hide the fourth is another +3% at most and needs the layers to
-   overlap. **Built so far: the libr4d `row0` argument only** -- see the section below for where it
-   stopped and what the measured power envelope says about the ceiling.
+   overlap. **The within-layer split is built** (P-17, `RADIANCE_HY4_PIPE_ATTN=1`, no absorbed form
+   needed) -- see the section below; the cross-layer handoff is not.
 2. **The dense pipelined prefill at four ranks** for `qwen35_fp8` / `qwen35_w8a8`: their declare
    gates on `g.world == 2`. Two traps are now known and cheap to avoid (the whole-step junction
    must not run beside its pieces; every collective, exposed pieces included, has to ride one
@@ -296,9 +296,19 @@ too. Worked out and started, not finished:
   token prompt stays on the two-piece path). Then the within-layer schedule: `front(0)+front(1)`,
   the indexer whole, `core(0)`, `core(1)` beside `j_mid(0)`, `body(0)` beside `j_mid(1)`,
   `body(1)` beside `j_end(0)`, `j_end(1)` exposed.
-  **Where it stopped:** the libr4d argument is in and built, the arch side is not started, and the
-  `row0` selftest case (a piece launch against the whole-step launch's rows `[r0, R)`) is unwritten.
-  The argument is inert until then: nothing passes it, so every launch is the launch it was.
+  **Built (P-17, `RADIANCE_HY4_PIPE_ATTN=1`, off by default):** `Attn::core_piece` runs the core
+  over rows `[0, n0)`, then piece 0's attention junction on lane 1 beside `core_piece(1)`; the rest
+  of the schedule is the pipeline's. Two findings changed the plan above. The split does *not* need
+  the absorbed form: `attn_kv_sink` already takes more keys than queries (a query at key
+  `n - m + i`), and `front` stores and keeps every row first, so piece 1 attends keys `[0, T)` and
+  the fresh prompt's sliding layers split in the default prefill mode; the absorbed penalty is
+  never paid. And the bounds cannot be the `row0` argument: one program serves every step height
+  (the arena declares it again at smaller steps), so a per-step cut has to live on the device.
+  The trunk writes them once a step into an eight-int plane (`fill`, then `sub_i32`: `n0` from the
+  step's positions, `n1 = T - n0`, each cache group's `seqused - n1` for piece 0's paged form).
+  `row0` stays inert; `r4d_selftest` checks that both bounds (`seqused - n1` and `row0 = -n1`) give
+  the whole launch's bytes. Every piece is the whole step's bytes, so the greedy output is too.
+  Measured in `notes/backlog/measurements/P-17.md`. The cross-layer handoff is not built.
 
 ## Why the next +36% is not a scheduling question
 
@@ -334,4 +344,5 @@ link-bound long before it is FLOP-bound.
 - `RADIANCE_HY4_PIPE=1` the pipelined prefill, `=0` off; `RADIANCE_HY4_PIPE_LANE=0` issues the same
   pieces on lane 0 (the piece cost without the overlap), `RADIANCE_HY4_PIPE_ROWS=<n>` moves the cut
   and `RADIANCE_HY4_PIPE_MIN=<n>` the floor a piece must clear. A `hyv4flash: pipelined prefill, N +
-  M rows` line on stderr names the shape that took it.
+  M rows` line on stderr names the shape that took it. `RADIANCE_HY4_PIPE_ATTN=1` adds the attention
+  core's split (P-17, below); `hyv4flash: pipelined prefill, attention in pieces` says it ran.

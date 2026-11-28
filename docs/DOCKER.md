@@ -115,8 +115,11 @@ The options:
 - `--ulimit memlock=-1`: where no device kernel gathers the n-gram table (a run on the host
   backend), `ngram-placement: ram` locks a copy of it in RAM (47.7 GiB for Qwen3.8-Flash-Next, far
   past Docker's default memlock limit). Without the limit raised, `auto` reads the table from the
-  container and `ram` refuses the start. On the cards the copy is pinned memory the cards read,
-  which the limit does not count. The compose files set it.
+  container and `ram` refuses the start. On the cards, every pinned range the cards read (the
+  host pool, the prefix cache's host tier, the copied tables) is also locked against swap when the
+  limit allows: the cards map it without pinning its pages, so a swapped-out page evicts every
+  queue of the process on every card until it is read back. Under a smaller limit the start goes
+  on and the report warns (`pinned-unlocked`). The compose files set it.
 - `--network host`: the server binds the host's addresses directly, IPv4 and IPv6, with no NAT in
   front of it.
 - `-v /srv/radiance-ngram:/srv/radiance-ngram:ro` where `ngram-placement` is `ram=DIR`: the tmpfs
