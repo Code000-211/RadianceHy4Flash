@@ -10,15 +10,22 @@
  * past the blocks, at one token and at five.
  *
  * Also DFly2's chain (D-02, #88): one gather_rows and one rmsnorm over every round's rows against
- * a launch of each a round (hoist()). */
+ * a launch of each a round (hoist()).
+ *
+ * Also X-07 (#136), the int8 latent row: the three stores that write it, held to the chain above
+ * byte for byte and then, for the 656 bytes' worth of row, to libref's own int8 store row, loaded
+ * from RADIANCE_HOME (the CPU reference plugin, so the case needs no card). */
 #include "ref_host.h"
 #include "r4d_plugin.h"
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <dlfcn.h>
 #include <random>
 #include <string>
+#include <unistd.h>
 #include <vector>
 
 namespace {
@@ -237,57 +244,45 @@ Cfg base() {
  * and the three launch shapes that write it must write the same row: the fused
  * mla_row_norm_rope_store into an int8 cache, kv_store's int8 form fed the row it just wrote, and
  * kv_store_streamed's into a mirror and a ring. Held byte for byte, against the chain the fused op
- * stands for (rmsnorm, rope, kv_store), with slots that are padding (a negative one, one past the
- * blocks) and a block whose slots none of them names. The row's byte count is a multiple of 16 at
- * these geometries, so every row of a 16-byte-aligned cache starts 16-byte aligned: the test also
- * checks that, since a row is what a wave's 16-byte loads read. */
-/* libref's row_i8_put (libref/ref_attn.cpp) restated over one block of a row's latent columns, the
- * way ref_select restates ref_qsa_select: the block is rotated by an explicit Hadamard matrix
- * built from the row's normaliser and multiplied in double, so this reference shares no summation
- * order with the kernel's wave butterfly; the tree's quantiser after it (unnormalised absmax / 127,
- * nearest even, the clamp) is the same arithmetic the kernel runs, and the stored scale carries the
- * normaliser. A block whose absmax is zero or not finite is scale 1 and codes 0. */
-struct RowRef {
-    double rot[128];      /* R x_b: what a decoded column `scale * code` is held to */
-    int8_t code[128];
-    float scale = 1.0f;
-    float amax = 0.0f;    /* the unnormalised block's max |v|, which is a full code step */
-};
-
-void ref_row_block(const float* x, RowRef& r) {
-    constexpr float kRot = 0.08838834764831845f;   /* 1 / sqrt(128) */
-    struct Rot {
-        double m[128 * 128];
-        Rot() {
-            const double k = (double)kRot;
-            for (int i = 0; i < 128; ++i)
-                for (int j = 0; j < 128; ++j)
-                    m[i * 128 + j] = (__builtin_popcount((unsigned)(i & j)) & 1) ? -k : k;
+ * stands for (rmsnorm, rope, kv_store), and its latent columns held to libref's own int8 store row
+ * at one code step, with slots that are padding (a negative one, one past the blocks) and a block
+ * whose slots none of them names. The row's byte count is a multiple of 16 at these geometries, so
+ * every row of a 16-byte-aligned cache starts 16-byte aligned: the test also checks that, since a
+ * row is what a wave's 16-byte loads read. */
+/* libref's own store row (libref/ref_attn.cpp: `ref_kv_store` with `kv_dtype` "i8" and a
+ * `rope_dim`), loaded the way tests/r4d_emu/test_mla_kv.cpp loads the plugin: the CPU reference
+ * library, so this runs without a card. It is the latent columns' oracle, and this file does not
+ * restate its form: libref builds the block's rotation as an explicit Hadamard matrix in double and
+ * normalises it before the quantiser, so it shares no summation order with the kernel's wave
+ * butterfly, and a change to either library shows up here. RADIANCE_HOME is looked at first, and
+ * then the build tree this test runs out of (`<exe>/../radiance_home/kernels/libref.so`), since the
+ * ctest case sets no environment of its own for this target. */
+static const RadKernelInfo* libref_op(const char* op) {
+    static void* h = nullptr;
+    if (!h) {
+        std::vector<std::string> where;
+        if (const char* home = std::getenv("RADIANCE_HOME"); home && *home)
+            where.push_back(std::string(home) + "/kernels/libref.so");
+        char exe[4096];
+        const ssize_t n = readlink("/proc/self/exe", exe, sizeof exe - 1);
+        if (n > 0) {
+            exe[n] = '\0';
+            std::string dir(exe);
+            dir = dir.substr(0, dir.find_last_of('/'));
+            where.push_back(dir + "/../radiance_home/kernels/libref.so");
         }
-    };
-    static const Rot rot;
-    float v[128];
-    float amax = 0.0f;
-    for (int i = 0; i < 128; ++i) {
-        double y = 0.0;
-        for (int j = 0; j < 128; ++j) y += rot.m[i * 128 + j] * (double)x[j];
-        r.rot[i] = y;
-        v[i] = (float)(y / (double)kRot);
-        amax = std::fmax(amax, std::fabs(v[i]));
+        for (const std::string& path : where)
+            if ((h = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL))) break;
+        if (!h) return nullptr;
+        auto open = (int (*)(void))dlsym(h, "rad_plugin_open");
+        if (open && open() < 0) return nullptr;
     }
-    r.amax = amax;
-    if (!(amax > 0.0f) || !std::isfinite(amax)) {
-        r.scale = 1.0f;
-        std::memset(r.code, 0, sizeof r.code);
-        return;
-    }
-    const float qs = amax * (1.0f / 127.0f);
-    const float inv = 1.0f / qs;
-    r.scale = qs * kRot;
-    for (int i = 0; i < 128; ++i) {
-        const float q = v[i] * inv;
-        r.code[i] = (int8_t)(int)std::nearbyint(std::fmin(std::fmax(q, -127.0f), 127.0f));
-    }
+    auto cnt = (int (*)(void))dlsym(h, "rad_kernel_count");
+    auto at = (const RadKernelInfo* (*)(int))dlsym(h, "rad_kernel_at");
+    if (!cnt || !at) return nullptr;
+    for (int i = 0; i < cnt(); ++i)
+        if (at(i)->op && !std::strcmp(at(i)->op, op)) return at(i);
+    return nullptr;
 }
 
 struct I8Cfg {
@@ -296,6 +291,34 @@ struct I8Cfg {
     double theta = 5000000.0, eps = 1e-6, scale = 1.0;
     uint32_t seed = 7;
 };
+
+/* libref's int8 store's bytes for the rows in `k` and `v` ([M, pitch] bf16, a head_dim columns
+ * each), over the cache filler `kv0` the kernel's runs started from. */
+static bool libref_store(const uint16_t* k, const uint16_t* v, int64_t pitch, int64_t M,
+                         int64_t hd, int64_t R, int64_t bs, int64_t blocks, int64_t rowb,
+                         const std::vector<int32_t>& slot, const std::vector<uint8_t>& kv0,
+                         std::vector<uint8_t>& out, std::string& why) {
+    static const RadKernelInfo* ref = libref_op("kv_store");
+    if (!ref) {
+        why = "libref's kv_store not loadable (set RADIANCE_HOME)";
+        return false;
+    }
+    out = kv0;
+    std::vector<int32_t> sm = slot;
+    std::vector<RadTensor> t{ tens(const_cast<uint16_t*>(k), RAD_BF16, { M, hd }, { pitch, 1 }),
+                              tens(const_cast<uint16_t*>(v), RAD_BF16, { M, hd }, { pitch, 1 }),
+                              tens(sm.data(), RAD_I32, { M }),
+                              tens(out.data(), RAD_I8, { blocks, 1, bs, rowb }) };
+    std::vector<RadParam> p{ pi("M", M), pi("head_dim", hd), pi("n_head_kv", 1),
+                             pi("block_size", bs), ps("kv_dtype", "i8"), pi("rope_dim", R) };
+    RadArgs a = mk(t, p);
+    const int rc = ref->launch(&a, nullptr);
+    if (rc != RAD_OK) {
+        why = "libref's kv_store refused (" + std::to_string(rc) + ")";
+        return false;
+    }
+    return true;
+}
 
 int i8(const I8Cfg& c) {
     const int W = c.L + c.R, L = c.L, R = c.R, hd = W / 2;
@@ -464,13 +487,31 @@ int i8(const I8Cfg& c) {
                 }
             }
     }
+    /* libref's own store row over the same tokens, slots and cache filler: the oracle the latent
+     * columns are held to, in place of a form restated here. The two stores disagree on two slot
+     * values and write neither of them: this kernel treats slot <= 0 as null (block 0 is the
+     * padding block), and skips a slot past the id space as padding, while libref writes every
+     * slot >= 0 and refuses one past the blocks. So the oracle is given those tokens as the
+     * padding slot -1, which is the row for them both: the filler, untouched. */
+    std::vector<int32_t> slotL = slot;
+    for (int32_t& s : slotL)
+        if (s <= 0 || s >= c.blocks * c.bs) s = -1;
+    std::vector<uint8_t> kvL;
+    {
+        std::string why;
+        if (!libref_store(rowF.data(), rowF.data() + hd, c.pitch, c.M, hd, R, c.bs, c.blocks, rowb,
+                          slotL, kv0, kvL, why)) {
+            std::printf("row i8 L%d R%d: %s\n", L, R, why.c_str());
+            return 1;
+        }
+    }
     /* The row's columns: L codes, L/128 f32 scales, R rope columns. The rope columns are the row's
      * own bf16 (no rotation, no rounding), which is the one column group an oracle can name
      * without the quantiser. The latent columns are checked against the chain above, and then
-     * against the reference form, which is what X-07b's reader has to make sense of. */
+     * against libref's store, which is what X-07b's reader has to make sense of. */
     for (int m = 0; m < c.M; ++m) {
         const int s = slot[(size_t)m];
-        if (s < 0 || s >= c.blocks * c.bs) continue;
+        if (s <= 0 || s >= c.blocks * c.bs) continue;   /* the store writes no row for it */
         const int64_t base = ((int64_t)(s / c.bs) * c.bs + (s % c.bs)) * rowb;
         if (base % 16) {
             if (!bad) std::printf("row i8 L%d R%d: slot %d starts at %lld, not 16-byte aligned\n", L,
@@ -487,36 +528,67 @@ int i8(const I8Cfg& c) {
                 ++bad;
             }
         }
-        /* The store's own bytes against that reference form. Two things are held per block: the
-         * scale (to 1e-6 relative -- the kernel divides in f32, the reference in double), and
-         * every decoded column `scale * code`, within half a code step of the block's rotated
-         * value (absmax / 254) plus the kernel's own f32 rotation, whose error over a sum of 128
-         * products stays below 1e-6 of the absmax. The second term is kept apart on purpose: the
-         * half step is the quantiser's loss, the rotation has none, and a butterfly in the wrong
-         * order would show up in it. A code may differ by one where the exact ratio sits on a
-         * rounding boundary (the kernel rounds in f32, the reference in double), so the decoded
-         * bound is the contract, not the code byte. */
+        /* libref copies the same bf16 columns, so its rope columns are this row's, byte for byte. */
+        if (std::memcmp(row + L + 4 * (L / 128), kvL.data() + base + L + 4 * (L / 128),
+                        (size_t)(2 * R)) != 0) {
+            if (!bad) std::printf("row i8 L%d R%d: token %d rope columns are not libref's\n", L, R, m);
+            ++bad;
+        }
+        /* The store's own bytes against libref's: the same row, the same slots, the same cache
+         * filler, through libref's int8 store. Three things are held per block. The scale, to 4e-6
+         * relative: both divide the block's absmax by 127 and multiply by the normaliser, one in
+         * f32 and one in f32 after a double rotation, so the two absmaxes differ by the kernel's
+         * rotation error. And, column by column, the code (equal, or one apart where the ratio sits
+         * on a rounding boundary) and the decoded value `scale * code`, within one code step
+         * (absmax / 127) plus that rotation error -- each store is within half a step of the rotated
+         * column, so two honest stores of the same block are within one step of each other, and this
+         * is the tightest bound that does not assume the two rotations round alike. The half step
+         * itself is checked exactly where the rotation is (i8_edge's one-hot block, and
+         * r4d_selftest's constant row on the card): there both stores must write the same codes. A
+         * block libref calls dead is the design note's scale 1 / codes 0, and the kernel's must be
+         * that block exactly. */
         const int8_t* const codes = (const int8_t*)row;
         const float* const scales = (const float*)(row + L);
+        const int8_t* const ref_codes = (const int8_t*)(kvL.data() + base);
+        const float* const ref_scales = (const float*)(kvL.data() + base + L);
         for (int b = 0; b < L / 128; ++b) {
-            float x[128];
-            for (int i = 0; i < 128; ++i) x[i] = b2f(rowF[(size_t)m * c.pitch + (size_t)(b * 128 + i)]);
-            RowRef r;
-            ref_row_block(x, r);
-            const float sc = scales[b];
-            if (!(std::fabs(sc - r.scale) <= r.scale * 1e-6f)) {
-                if (!bad) std::printf("row i8 L%d R%d: token %d block %d scale %g, the reference %g\n",
-                                      L, R, m, b, (double)sc, (double)r.scale);
+            const float sc = scales[b], rsc = ref_scales[b];
+            if (rsc == 1.0f) {   /* libref's dead block: scale 1 and codes 0 */
+                if (sc != rsc) {
+                    if (!bad) std::printf("row i8 L%d R%d: token %d block %d scale %g, libref's dead block's %g\n",
+                                          L, R, m, b, (double)sc, (double)rsc);
+                    ++bad;
+                }
+                for (int i = 0; i < 128; ++i)
+                    if (codes[b * 128 + i] != 0) {
+                        if (!bad) std::printf("row i8 L%d R%d: token %d block %d is live (code %d), "
+                                              "libref's block is dead\n", L, R, m, b,
+                                              (int)codes[b * 128 + i]);
+                        ++bad;
+                        break;
+                    }
+                continue;
+            }
+            if (!(std::fabs(sc - rsc) <= rsc * 4e-6f)) {
+                if (!bad) std::printf("row i8 L%d R%d: token %d block %d scale %g, libref's %g\n",
+                                      L, R, m, b, (double)sc, (double)rsc);
                 ++bad;
                 continue;
             }
-            const double half = r.amax / 254.0 * 1.0001 + r.amax * 1e-6;
+            /* libref stores (absmax / 127) * 1/sqrt(128), so the block's absmax is in its scale. */
+            const double amax = (double)rsc * 127.0 / 0.08838834764831845;
+            const double step = amax / 127.0 * 1.0001 + amax * 1e-6;
             for (int i = 0; i < 128; ++i) {
-                const double dec = (double)sc * (double)codes[b * 128 + i];
-                if (std::fabs(dec - r.rot[i]) > half) {
+                const int ck = codes[b * 128 + i], cl = ref_codes[b * 128 + i];
+                if (std::abs(ck - cl) > 1) {
+                    if (!bad) std::printf("row i8 L%d R%d: token %d block %d column %d is code %d, "
+                                          "libref's %d\n", L, R, m, b, i, ck, cl);
+                    ++bad;
+                }
+                const double dec = (double)sc * (double)ck, rdec = (double)rsc * (double)cl;
+                if (std::fabs(dec - rdec) > step) {
                     if (!bad) std::printf("row i8 L%d R%d: token %d block %d column %d decodes to %g, "
-                                          "the rotated value is %g (half step %g)\n",
-                                          L, R, m, b, i, dec, r.rot[i], half);
+                                          "libref's %g (step %g)\n", L, R, m, b, i, dec, rdec, step);
                     ++bad;
                 }
             }
@@ -560,6 +632,27 @@ int i8_edge() {
         }
     }
     int bad = 0;
+    /* The same rows through libref's own store: at these blocks the rotation is exact, so the two
+     * stores must write the same bytes, not the same bytes within a tolerance -- the one place the
+     * row's quantiser is checked against libref with nothing between them. */
+    {
+        std::vector<uint8_t> kvL;
+        std::string why;
+        std::vector<int32_t> sm = slot;
+        if (!libref_store(k.data(), v.data(), hd, M, hd, R, bs, blocks, rowb, sm, kv, kvL, why)) {
+            std::printf("row i8 edge: %s\n", why.c_str());
+            return 1;
+        }
+        if (std::memcmp(kvL.data(), kv.data(), kv.size()) != 0) {
+            for (size_t i = 0; i < kv.size(); ++i)
+                if (kvL[i] != kv[i]) {
+                    std::printf("row i8 edge: byte %zu is %02x, libref's %02x\n", i, kv[i], kvL[i]);
+                    break;
+                }
+            std::printf("row i8 edge: the store's bytes are not libref's\n");
+            return 1;
+        }
+    }
     const float onehot = (1.0f / 127.0f) * kRot;   /* amax 1, so the scale is exact */
     for (int m = 0; m < M; ++m) {
         const int s = slot[(size_t)m];
@@ -610,7 +703,6 @@ int i8_edge() {
     std::printf("row i8 edge (power of two, zero and inf blocks): %s\n", bad ? "FAIL" : "ok");
     return bad ? 1 : 0;
 }
-
 
 /* D-02 (#88): DFly2's chain reads rows k + 1 of every sequence's block of the final norm in round
  * k. The plugin now gathers every round's rows in one launch and normalises them in one launch,
@@ -746,7 +838,7 @@ int main() {
     {   /* X-07 (#136): the int8 latent row -- the served geometry, three tokens into two blocks,
          * one of them not resident in the ring, and a fourth that is padding both ways. */
         I8Cfg c;
-        c.slot = { 0, 9, -1, c.blocks * c.bs };
+        c.slot = { 3, 9, -1, c.blocks * c.bs };
         c.pos = { 3, 7, 11, 5 };
         c.M = 4;
         c.res = { -1, 0, -1 };
