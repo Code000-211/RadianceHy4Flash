@@ -69,7 +69,9 @@
 #include <vector>
 
 #include "aql.h"
+#include "aql_inflight.h"
 #include "directio.h"
+#include "karg_report.h"
 #include "kfd_evict.h"
 #include "rad_format.h"
 #include "../rad_internal.h"
@@ -530,6 +532,16 @@ bool module_load(Module* m, int ord, const ModuleImage& im, std::string* why) {
 std::mutex g_names_mu;
 std::unordered_map<uint64_t, std::string> g_names;
 
+/* The argument layout of each kernel object, for the queue dump's per-launch lines
+ * (karg_report.h): the launch's own segment length and its parameters in the code object's order,
+ * so the dump names each operand and each size instead of guessing at pointer-shaped words. */
+struct KargLayout {
+    uint32_t kernarg_size = 0;
+    bool chained = false;          /* the code object is the chained form: it reads the record */
+    std::vector<KernelArg> args;
+};
+std::unordered_map<uint64_t, KargLayout> g_klayout;
+
 KernelRec* resolve(Func* fn, int ord) {
     if (KernelRec* k = fn->rec[ord].load(std::memory_order_acquire)) return k;
     Module* m = fn->mod;
@@ -593,6 +605,7 @@ KernelRec* resolve(Func* fn, int ord) {
     {
         std::lock_guard<std::mutex> nl(g_names_mu);
         g_names[k->object] = k->name;
+        g_klayout[k->object] = KargLayout{k->kernarg_size, k->chained, meta->args};
     }
     KernelRec* out = k.release();
     fn->rec[ord].store(out, std::memory_order_release);
@@ -690,6 +703,13 @@ struct Stream {
     void unlock() { busy.store(false, std::memory_order_release); }
 };
 
+/* What the packet at ring index `i` needs before its ring position may be rewritten: the completion
+ * counter value the chained dispatch in that slot waits for, 0 for a packet that is not chained
+ * (there is no slot_need table when the backend has no chain). */
+inline uint64_t slot_need_at(const Stream* s, uint64_t i) {
+    return s->slot_need.empty() ? 0 : s->slot_need[i & s->mask];
+}
+
 /* Every live queue, by an id that is never reused, so "packet i of queue n" stays meaningful after
  * the queue is destroyed: queue_of answers null for a destroyed queue's id, and everything it held
  * has been consumed. At most kMaxQueues are live at once; a destroyed queue's slot is taken again
@@ -751,7 +771,7 @@ inline uint64_t steady_ns() {
                std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
-void report_running(int card);
+void report_running(int card, uintptr_t fault);
 
 /* A queue the runtime stopped stays stopped, and `faulted` ends every wait in the process, so
  * nothing can serve after this: the report, then the exit a GPU memory fault takes. */
@@ -765,7 +785,7 @@ void on_queue_error(hsa_status_t st, hsa_queue_t*, void* data) {
     G().faulted.store(true, std::memory_order_release);
     hsa_signal_store_screlease(G().fault, 1);
     RAD_ERR("device %d: the AQL queue faulted: %s", s->ord, m ? m : "?");
-    report_running(s->ord);
+    report_running(s->ord, 0);
     fatal("a queue on device %d stopped for good (the report is above); exiting so a restart can "
           "bring the server back", s->ord);
 }
@@ -806,7 +826,7 @@ void (*g_dump_lanes)() = nullptr;
  * the report is: the thread that holds it may be the one that is stuck. */
 std::string chain_line(Stream* s, uint64_t rd) {
     const uint64_t ctr = s->chain_ctr ? *reinterpret_cast<volatile uint64_t*>(s->chain_ctr) : 0;
-    const uint64_t need = s->slot_need.empty() ? 0 : s->slot_need[rd & s->mask];
+    const uint64_t need = slot_need_at(s, rd);
     return fmt("chain: issued %" PRIu64 ", counter reads %" PRIu64 " (largest read %" PRIu64
                "), the slot at the read index needs %" PRIu64 ", flush %s for %" PRIu64
                "; gates %d, last packet %s, plain in flight %d, collective in flight %d",
@@ -923,15 +943,42 @@ std::string rec_str(const AllocRec& r, uintptr_t a) {
                humanb(r.bytes).c_str(), r.base, humanb((int64_t)(a - r.base)).c_str());
 }
 
+/* The live allocation with the greatest base at or below `a`, or nullptr when there is none: the
+ * one range that can hold `a` or that `a` ran off the end of. Called with g_alloc_mu held. */
+const AllocRec* rec_below(uintptr_t a) {
+    auto it = g_live.upper_bound(a);
+    return it == g_live.begin() ? nullptr : &std::prev(it)->second;
+}
+
+/* The live range an address lies in, numbered by the alloc record's sequence: equal for two
+ * addresses in one allocation, which is what the fault report compares an operand's range with the
+ * fault address's (karg_report.h). Called with g_alloc_mu held. */
+KargRange live_range_at(uintptr_t a) {
+    KargRange r;
+    const AllocRec* rec = rec_below(a);
+    if (!rec || a >= rec->base + (uintptr_t)rec->bytes) return r;
+    r.rec = rec->seq;
+    r.hi = rec->base + (uintptr_t)rec->bytes;
+    return r;
+}
+
+/* The live range a fault address ran off the end of: the one it lies in, or the one below it that
+ * it left by no more than that range's own length (aql_inflight.h's fault_ran_off says why the
+ * bound is there). 0 when no range explains the address -- #337's fault address was in no range
+ * this process held, and the range below it, 108 TiB down, was not its. Called with g_alloc_mu
+ * held. */
+uint64_t fault_range_at(uintptr_t a) {
+    const AllocRec* rec = rec_below(a);
+    if (!rec) return 0;
+    return fault_ran_off(rec->base, rec->bytes, a) ? rec->seq : 0;
+}
+
 /* Where address `a` lies: inside a live range, inside a freed one (newest first; a reallocated
  * range also holds it live), or in neither, with the live ranges on either side. Called with
  * g_alloc_mu held. */
 std::string where_is(uintptr_t a) {
-    auto it = g_live.upper_bound(a);
-    if (it != g_live.begin()) {
-        const AllocRec& r = std::prev(it)->second;
-        if (a < r.base + (uintptr_t)r.bytes) return "inside live " + rec_str(r, a);
-    }
+    if (const AllocRec* r = rec_below(a))
+        if (a < r->base + (uintptr_t)r->bytes) return "inside live " + rec_str(*r, a);
     const uint64_t now = mono_ns();
     for (auto f = g_freed.rbegin(); f != g_freed.rend(); ++f)
         if (a >= f->base && a < f->base + (uintptr_t)f->bytes)
@@ -939,16 +986,15 @@ std::string where_is(uintptr_t a) {
                        (double)(now - f->freed_ns) * 1e-9);
     if (const std::string paged = dev_fault_where((const void*)a); !paged.empty()) return "in " + paged;
     std::string s = "in no range this process holds or recently freed";
-    if (it != g_live.begin()) {
-        const AllocRec& r = std::prev(it)->second;
+    if (const AllocRec* r = rec_below(a))
         s += fmt("; %s past the end of #%" PRIu64 " %s %s at %#" PRIxPTR,
-                 humanb((int64_t)(a - (r.base + (uintptr_t)r.bytes))).c_str(), r.seq,
-                 mem_kind(r.kind), humanb(r.bytes).c_str(), r.base);
-    }
-    if (it != g_live.end())
+                 humanb((int64_t)(a - (r->base + (uintptr_t)r->bytes))).c_str(), r->seq,
+                 mem_kind(r->kind), humanb(r->bytes).c_str(), r->base);
+    auto up = g_live.upper_bound(a);
+    if (up != g_live.end())
         s += fmt("; %s before #%" PRIu64 " %s %s at %#" PRIxPTR,
-                 humanb((int64_t)(it->second.base - a)).c_str(), it->second.seq,
-                 mem_kind(it->second.kind), humanb(it->second.bytes).c_str(), it->second.base);
+                 humanb((int64_t)(up->second.base - a)).c_str(), up->second.seq,
+                 mem_kind(up->second.kind), humanb(up->second.bytes).c_str(), up->second.base);
     return s;
 }
 
@@ -991,41 +1037,126 @@ hsa_status_t on_system_event(const hsa_amd_event_t* e, void*) {
         RAD_ERR("device %d: GPU memory fault at %#" PRIxPTR " (%s ): %s; %s", card, va,
                 why.empty() ? " ?" : why.c_str(), where_is(va).c_str(), runtime_view(va).c_str());
     }
-    report_running(card);
+    report_running(card, va);
     fatal("a GPU memory fault on device %d stopped its queue for good (the report is above); "
           "exiting so a restart can bring the server back", card);
 }
 
-/* The running kernel and its arguments. A queue's read index stays on a packet until it
- * completes, so the packet there is in flight. Every pointer-shaped argument word is located
- * like the address, which names the operand that got a stale or short buffer. Only card
- * `card`'s queues; the host reads the arguments at the packet's kernarg_address. */
-void report_running(int card) {
+/* One dispatch packet of a queue, printed the way the fault report prints a launch: the packet's
+ * index and `note`, its kernel by name, and every parameter by the name, size and kind its code
+ * object gives it -- an address located exactly like the fault address, so the two lines compare,
+ * and `where_is` names the operand that got a stale or short buffer. A kernel object with no
+ * metadata (a library's own code object, say) prints the pointer-shaped words of the slot, as the
+ * dump always did. The slot's bytes past the launch's segment belong to whatever used the slot
+ * before, and are not printed. `fault` is the address the memory-fault event named, or 0 for a
+ * queue the runtime stopped for another reason: with it, a parameter that points into the same live
+ * range the fault address ran off says so, which names the launch that read off that range. */
+void report_one(Stream* s, uint64_t idx, const char* note, uintptr_t fault) {
+    auto* p = static_cast<hsa_kernel_dispatch_packet_t*>(s->q->base_address) + (idx & s->mask);
+    const uint16_t h = __atomic_load_n(&p->header, __ATOMIC_ACQUIRE);
+    if (((h >> HSA_PACKET_HEADER_TYPE) & 0xff) != HSA_PACKET_TYPE_KERNEL_DISPATCH) {
+        RAD_ERR("device %d:   packet %" PRIu64 " %s: the ring holds no kernel dispatch there",
+                s->ord, idx, note);
+        return;
+    }
+    std::string name;
+    KargLayout lay;
+    {
+        std::lock_guard<std::mutex> nl(g_names_mu);
+        auto it = g_names.find(p->kernel_object);
+        name = it != g_names.end() ? it->second : fmt("%#" PRIx64, p->kernel_object);
+        auto li = g_klayout.find(p->kernel_object);
+        if (li != g_klayout.end()) lay = li->second;
+    }
+    RAD_ERR("device %d:   packet %" PRIu64 " %s kernel %s", s->ord, idx, note, name.c_str());
+    const unsigned char* slot = static_cast<const unsigned char*>(p->kernarg_address);
+    if (!slot) return;
+    std::lock_guard<std::mutex> lk(g_alloc_mu);
+    /* Every line names one parameter of this launch, in the code object's order: an address with
+     * the location it lies in, a value as the number it is. */
+    KargSlot ks{slot, kKargSlot, lay.kernarg_size, lay.chained, &lay.args};
+    ks.fault = fault;
+    ks.fault_rec = fault ? fault_range_at(fault) : 0;
+    ks.range_of = [](uintptr_t a) { return live_range_at(a); };
+    const std::vector<std::string> lines =
+        karg_lines(ks, [](uintptr_t a) { return where_is(a); });
+    if (!lines.empty()) {
+        for (const std::string& l : lines) RAD_ERR("  %s", l.c_str());
+        return;
+    }
+    const uint64_t* ka = static_cast<const uint64_t*>(p->kernarg_address);
+    for (uint32_t i = 0; i < kKargMax / 8; ++i) {
+        const uint64_t w = ka[i];
+        if (!looks_like_pointer(w)) continue;
+        RAD_ERR("  argument +%u = %#" PRIx64 ": %s", i * 8, w, where_is((uintptr_t)w).c_str());
+    }
+}
+
+/* How many dispatches a stopped queue's report prints in full. One chained plan keeps a handful in
+ * the card at a time, and a fault is in one of the last few launches to go out -- not in the oldest
+ * packet the ring still holds, which is a lap old. */
+constexpr size_t kReportRuns = 6;
+
+/* The launches a stopped queue may have faulted in, and their parameters (issue #337).
+ *
+ * The read index is not a completion mark: the packet processor moves it on when it has read a
+ * packet, and a chained kernel loses its barrier bit (the chain plan), so the launch that runs can
+ * be many packets behind it -- reserve() below says so, and frontier_open records when a packet
+ * went out without its bit. Issue #337's dump printed the packet at the read index and called it
+ * the kernel that ran; every parameter of it pointed into a live range, which is what a later
+ * launch of the same kernel looks like, and the faulting address was in none of them, so the
+ * report sent readers after a launch that had not faulted.
+ *
+ * So the report names the dispatches that may still be running (aql_inflight.h) -- the newest
+ * few, since the ring is long and the launch that faulted is one of the last to go out -- oldest
+ * first among those, because the queue stops at the first launch that faults: that is the launch
+ * to read first. With a fault address, the operand that points into the live range that address ran
+ * off says so, and that line names the launch outright instead of leaving it to the order
+ * (report_one). The chain record each one waited on is printed with it, because a stale slot
+ * shows up there first. A queue with nothing recorded as unfinished -- every packet kept its
+ * barrier bit -- prints the packet at the read index, as the dump always did. Only card `card`'s
+ * queues; the host reads the arguments at the packet's kernarg_address. */
+void report_running(int card, uintptr_t fault) {
     std::lock_guard<std::mutex> sl(G().streams_mu);
     for (Stream* s : G().streams) {
         if (s->ord != card) continue;
         const uint64_t rd = hsa_queue_load_read_index_scacquire(s->q);
         const uint64_t wr = hsa_queue_load_write_index_scacquire(s->q);
         if (rd >= wr) continue;
-        auto* p = static_cast<hsa_kernel_dispatch_packet_t*>(s->q->base_address) + (rd & s->mask);
-        const uint16_t h = __atomic_load_n(&p->header, __ATOMIC_ACQUIRE);
-        if (((h >> HSA_PACKET_HEADER_TYPE) & 0xff) != HSA_PACKET_TYPE_KERNEL_DISPATCH) continue;
-        std::string name;
-        {
-            std::lock_guard<std::mutex> nl(g_names_mu);
-            auto it = g_names.find(p->kernel_object);
-            name = it != g_names.end() ? it->second : fmt("%#" PRIx64, p->kernel_object);
+        const bool open = s->frontier_open || s->plain_inflight || s->peer_inflight;
+        /* The counter as the card has it now, not the host's last read: that read lags, so a
+         * chained dispatch it names unfinished may have counted long ago (chain_line above reads
+         * it the same way). A wrong candidate in front of the right one sends the reader after a
+         * launch that is done, which is the defect this report exists to not have. */
+        const uint64_t counter = s->chain_ctr ? *reinterpret_cast<volatile uint64_t*>(s->chain_ctr)
+                                             : s->chain_seen;
+        const std::vector<uint64_t> run =
+            aql::still_running(rd, wr, s->mask + 1, counter, open,
+                               [s](uint64_t i) { return slot_need_at(s, i); }, kReportRuns);
+        if (run.empty()) {
+            RAD_ERR("device %d: queue %p packet %" PRIu64 " (of %" PRIu64 " written): no"
+                    " dispatch is recorded as unfinished, so the packet at the read index is"
+                    " printed", card, (void*)s->q, rd, wr);
+            report_one(s, rd, "ran", fault);
+            continue;
         }
-        RAD_ERR("device %d: queue %p packet %" PRIu64 " (of %" PRIu64 " written) ran kernel %s", card,
-                (void*)s->q, rd, wr, name.c_str());
-        const uint64_t* ka = static_cast<const uint64_t*>(p->kernarg_address);
-        if (!ka) continue;
-        std::lock_guard<std::mutex> lk(g_alloc_mu);
-        for (uint32_t i = 0; i < kKargMax / 8; ++i) {
-            const uint64_t w = ka[i];
-            if (!looks_like_pointer(w)) continue;
-            RAD_ERR("  argument +%u = %#" PRIx64 ": %s", i * 8, w, where_is((uintptr_t)w).c_str());
+        RAD_ERR("device %d: queue %p packet %" PRIu64 " (of %" PRIu64 " written): %zu"
+                " dispatch(es) may still be running, oldest first of the newest %zu written; the"
+                " queue stops at the first launch that faults, so read them from the top", card,
+                (void*)s->q, rd, wr, run.size(), (size_t)kReportRuns);
+        for (uint64_t idx : run) {
+            const uint64_t need = slot_need_at(s, idx);
+            report_one(s, idx, running_state(need, counter), fault);
+            if (need)
+                RAD_ERR("device %d:   packet %" PRIu64 " is chained: it waits for the queue's"
+                        " counter to reach %" PRIu64 ", which the card is at %" PRIu64 " (the host"
+                        " has read %" PRIu64 ")",
+                        card, idx, need, counter, s->chain_seen);
         }
+        if (run.size() >= kReportRuns)
+            RAD_ERR("device %d:   (stopped at %zu; the ring holds more)", card, run.size());
+        RAD_ERR("device %d:   packet %" PRIu64 " (the read index) is written and not read yet",
+                card, rd);
     }
 }
 
@@ -1162,7 +1293,7 @@ inline void full_nap() {
  * a row, so a kernel can still be running (and re-read its arguments after its wait, and its
  * record at its end) when the read index is far past it. Its blocks all having counted does. */
 inline bool slot_free(Stream* s, uint64_t idx) {
-    const uint64_t need = s->slot_need[idx & s->mask];
+    const uint64_t need = slot_need_at(s, idx);
     if (need <= s->chain_seen) return true;
     const uint64_t c = *reinterpret_cast<volatile uint64_t*>(s->chain_ctr);
     s->chain_seen = std::max(s->chain_seen, c > s->test_lag ? c - s->test_lag : 0);

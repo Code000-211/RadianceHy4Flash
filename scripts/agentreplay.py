@@ -12,6 +12,10 @@ with an earlier one. With --rewrite a parent's prompt ends with a notes block th
 replaces, as a client that rewrites its last message does, so each turn leaves the previous one's
 chain before its end.
 
+With --tools N each turn is a chat turn that carries N tool definitions, and the call the reply asks
+for is answered by a `tool` message before the next turn, the way an agent client drives a session;
+without it a turn is a plain completion.
+
 The text is slices of this repository's sources and documents, so the token mix is a coding
 agent's. Replies are --reply tokens with end-of-text ignored, and the slices follow --seed, so two
 servers are sent the same conversations.
@@ -58,6 +62,25 @@ COUNTERS = (
     "radiance:prefix_cache_evictions_total",
     "radiance:linear_checkpoints_written_total",
 )
+
+
+# The tool set an agent client sends with every turn. The names and the shape are a Hermes-style
+# client's: one function per capability, a JSON schema, and the call it asks for answered before the
+# next turn (issue #337's session had 12 tools).
+TOOL_NAMES = ("read_file", "write_file", "edit_file", "list_dir", "grep", "run_shell", "fetch_url",
+              "search_web", "send_message", "create_ticket", "update_ticket", "think")
+
+
+def tools(n):
+    """`n` function definitions, as the client sends them (at most one per name in TOOL_NAMES)."""
+    return [{"type": "function",
+             "function": {"name": TOOL_NAMES[k],
+                          "description": "the session's %s tool" % TOOL_NAMES[k],
+                          "parameters": {"type": "object",
+                                         "properties": {"path": {"type": "string"},
+                                                        "text": {"type": "string"}},
+                                         "required": ["path"]}}}
+            for k in range(min(n, len(TOOL_NAMES)))]
 
 
 def corpus():
@@ -118,6 +141,20 @@ class Server:
                 u.get("prompt_tokens_details", {}).get("cached_tokens", 0), t.get("ttft_ms"))
 
 
+    def chat(self, model, messages, reply, toolset):
+        """One turn the way an agent client sends it: the whole transcript, the tools, temperature 0.
+        Returns the reply's text, the tool calls it asked for, and the usage and timings."""
+        body = {"model": model, "messages": messages, "max_tokens": reply, "temperature": 0,
+                "tools": toolset, "stream": False}
+        r = json.loads(self._req("/v1/chat/completions", body))
+        m = r["choices"][0]["message"]
+        u = r.get("usage", {})
+        t = r.get("timings", {})
+        return (m.get("content") or "", m.get("tool_calls") or [],
+                u.get("prompt_tokens", 0),
+                u.get("prompt_tokens_details", {}).get("cached_tokens", 0), t.get("ttft_ms"))
+
+
 def counter(m, name):
     """A counter by name; a bare name also matches its series that carry only the model label."""
     if name in m:
@@ -138,40 +175,64 @@ def parent(i, a, srv, model, text, system, log, lock):
         at = rng.randrange(0, len(text) - n)
         return text[at:at + n]
 
-    def turn(kind, convo, prompt, prev):
-        reply, n_prompt, cached, ttft = srv.complete(model, prompt, a.reply)
+    # One transcript per conversation, in the shape the client sends it: with --tools the turn goes
+    # to /v1/chat/completions as messages, the tools go with it, and the call the reply asks for is
+    # answered by a `tool` message before the next turn, the way a Hermes client drives a session.
+    chats = {}
+
+    def turn(kind, convo, prompt, prev, added):
+        calls = []
+        if a.tools:
+            msgs = chats.get(convo)
+            if msgs is None:
+                msgs = chats[convo] = [{"role": "system", "content": system},
+                                      {"role": "user", "content": added}]
+            else:
+                msgs.append({"role": "user", "content": added})
+            reply, calls, n_prompt, cached, ttft = srv.chat(model, msgs, a.reply, a.toolset)
+            msgs.append({"role": "assistant", "content": reply, "tool_calls": calls} if calls
+                        else {"role": "assistant", "content": reply})
+            for c in calls:
+                msgs.append({"role": "tool", "tool_call_id": c.get("id", ""),
+                             "content": chunk(rng.randint(*a.turn))})
+        else:
+            reply, n_prompt, cached, ttft = srv.complete(model, prompt, a.reply)
         rec = {"conversation": convo, "kind": kind, "prompt_tokens": n_prompt,
                "cached_tokens": cached, "ttft_ms": ttft, "prev_prompt_tokens": prev,
-               "t": time.time()}
+               "tool_calls": len(calls), "t": time.time()}
         with lock:
             log.append(rec)
             if a.out:
                 a.out.write(json.dumps(rec) + "\n")
                 a.out.flush()
-        return reply, n_prompt
+        return reply, n_prompt, calls
 
     # The transcript is `kept`, which every later turn sends again, and under --rewrite a last
     # message `tail`, which the next turn replaces.
     kept = system + "\n\nUser (session %d): %s\n" % (i, chunk(200))
     tail = "\nNotes:\n" + chunk(rng.randint(*a.turn) // 2) + "\n" if a.rewrite else ""
+    added = kept[len(system) + 1:]            # this turn's message, in the chat shape
     prev, turns, kind = 0, 0, KINDS[0]
     while prev + a.turn[1] < a.context and (not a.turns or turns < a.turns):
-        reply, prev = turn(kind, "p%d" % i, kept + tail, prev)
+        reply, prev, _ = turn(kind, "p%d" % i, kept + tail, prev, added)
         kind = KINDS[0]
         if not a.rewrite:
             kept += tail
         kept += "\nAssistant: " + reply + "\nTool result:\n" + chunk(rng.randint(*a.turn)) + "\n"
         if a.rewrite:
             tail = "\nNotes:\n" + chunk(rng.randint(*a.turn) // 2) + "\n"
+        added = tail or "\nContinue from the tool result.\n"
         turns += 1
         if a.sub_every and turns % a.sub_every == 0:
-            sub = system + "\n\nTask from session %d: %s\n" % (i, chunk(300))
-            sprev = 0
+            task = "\nTask from session %d: %s\n" % (i, chunk(300))
+            sub = system + "\n" + task
+            sprev, sadd = 0, task
             for k in range(a.sub_turns):
-                sreply, sprev = turn(KINDS[2] if k == 0 else KINDS[3], "p%d.s%d" % (i, turns),
-                                     sub, sprev)
+                sreply, sprev, _ = turn(KINDS[2] if k == 0 else KINDS[3], "p%d.s%d" % (i, turns),
+                                        sub, sprev, sadd)
                 sub += "\nAssistant: " + sreply + "\nTool result:\n" + \
                     chunk(rng.randint(*a.turn) // 2) + "\n"
+                sadd = "\nContinue from the tool result.\n"
             kept += "\nSubagent answer:\n" + sreply + "\n"
             kind = KINDS[1]
 
@@ -182,6 +243,72 @@ def run_parent(i, a, srv, model, text, system, log, lock, errors):
     except Exception as e:      # a failed request invalidates the run; main reports it
         with lock:
             errors.append("parent %d: %s" % (i, e))
+
+
+def selftest():
+    """The turn loop against a fake server, without a card: a turn with --tools goes to
+    /v1/chat/completions with the tools, the call the reply asks for is answered by a `tool` message
+    before the next turn, and every turn is recorded. `python3 scripts/agentreplay.py --selftest`,
+    and ctest runs it. """
+    class Fake:
+        def __init__(self):
+            self.seen, self.replies = [], 0
+
+        def model(self):
+            return "fake"
+
+        def metrics(self):
+            return {}
+
+        def complete(self, model, prompt, reply):
+            self.seen.append(("completions", len(prompt), 0))
+            return "text", len(prompt) // 4, 0, 1.0
+
+        def chat(self, model, messages, reply, toolset):
+            self.seen.append(("chat", [m["role"] for m in messages], len(toolset)))
+            self.replies += 1
+            call = {"id": "call_%d" % self.replies, "type": "function",
+                    "function": {"name": TOOL_NAMES[0], "arguments": "{\"path\": \"a\"}"}}
+            return "thinking", [call], 40 * len(messages), 20 * len(messages), 2.0
+
+    text = "the session's text, one line of it\n" * 4000
+    base = dict(parents=1, context=100000, system=200, turn=(100, 200), turns=3, reply=16,
+                sub_every=0, sub_turns=0, rewrite=False, seed=7, out=None)
+    log, lock = [], threading.Lock()
+    fake = Fake()
+    parent(0, argparse.Namespace(tools=12, toolset=tools(12), **base), fake, "fake", text,
+           "a system prompt", log, lock)
+    if len(log) != 3 or not all(r["tool_calls"] == 1 for r in log):
+        sys.exit("agentreplay --selftest: %r" % (log,))
+    first = ("chat", ["system", "user"], 12)
+    second = ("chat", ["system", "user", "assistant", "tool", "user"], 12)
+    if fake.seen[:2] != [first, second]:
+        sys.exit("agentreplay --selftest: the tool round-trip is not in the transcript: %r"
+                 % (fake.seen[:2],))
+    pts = [r["prompt_tokens"] for r in log]
+    if pts != sorted(set(pts)) or len(pts) != 3:
+        sys.exit("agentreplay --selftest: the prompt does not grow: %r" % (log,))
+
+    # Without --tools the turn is a plain completion, recorded with no tool call.
+    plain, fake = [], Fake()
+    parent(0, argparse.Namespace(tools=0, toolset=tools(0), **base), fake, "fake", text,
+           "a system prompt", plain, lock)
+    if any(r["tool_calls"] for r in plain) or fake.seen[0][0] != "completions":
+        sys.exit("agentreplay --selftest: the plain path changed: %r" % (plain,))
+    print("agentreplay: selftest ok (%d turns with 12 tools, %d without)" % (len(log), len(plain)))
+
+
+def probe(url, timeout=2.0):
+    """True when `url` answers with a 2xx, false for everything else: a refused connection, a
+    timeout, a 503 from a server whose model is not ready. This is the whole of the server-up wait
+    of scripts/repro-337.sh, and it asks with python3 because the harness needs python3 anyway -- a
+    box without curl must not stop the wait (iks has none, and the wait then ran 900 sleeps while
+    the server was up). """
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as r:
+            return 200 <= r.status < 300
+    except Exception:           # refused, timed out, HTTPError: all of them are "not up"
+        return False
 
 
 def main():
@@ -206,8 +333,21 @@ def main():
     p.add_argument("--seed", type=int, default=1)
     p.add_argument("--timeout", type=float, default=1800, help="seconds a request may take")
     p.add_argument("--out", help="write one JSON line per turn here")
+    p.add_argument("--tools", type=int, default=0,
+                   help="send every turn as a chat turn carrying this many tools, and answer the"
+                        " call the reply asks for before the next one (0: plain completions)")
+    p.add_argument("--selftest", action="store_true",
+                   help="check the turn loop against a fake server, without a card")
+    p.add_argument("--probe", metavar="URL",
+                   help="exit 0 when URL answers 2xx, 1 when it does not (the server-up wait)")
     a = p.parse_args()
+    if a.selftest:
+        selftest()
+        return
+    if a.probe:
+        sys.exit(0 if probe(a.probe) else 1)
     a.turn = tuple(int(x) for x in a.turn.split(","))
+    a.toolset = tools(a.tools)
     key = None
     if a.api_key_file:
         with open(a.api_key_file) as h:
