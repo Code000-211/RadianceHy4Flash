@@ -19,6 +19,7 @@
 #include "plugin/registry.h"
 #include "runtime/tierexec.h"
 #include "sched/mem_iface.h"
+#include "engine_priv.h"           /* pcache_page_in_request */
 #include "rad_internal.h"
 
 /* Only FakeKV: this binary runs on the real device layer. */
@@ -7663,6 +7664,110 @@ TEST(the_bindings_keys_carry_the_requests_adapter_load) {
     CHECK_EQ(b.lookup(via(turn(11, next, {}), 5), nullptr, nullptr).n_attn_tokens, 0);
 }
 
+/* --prefix-resume exact (#236): a prefill writes a token's KV beside the rest of its chunk, so a
+ * block is a cold run's only where it was computed in the same chunk. The binding keys every block
+ * with its cold chunk (exact_keys); the fixture's interval is 64 and its block 16, and the grid
+ * below is a span of 2: chunks [0, 64), [64, 192), [192, 320), ... */
+static ExactKeys exact_grid(int64_t span_min = -1) {
+    ExactKeys x;
+    x.grid = 128;
+    x.origin = 64;
+    x.span_min = span_min;
+    return x;
+}
+
+/* Two conversations open with the same 20 tokens (a chat template's head) and differ after. Each
+ * computed those tokens in a chunk with its own rows, so each next turn resumes on its own chain:
+ * without the chunk keys, the second conversation's chain started with the first's head blocks. */
+TEST(exact_keys_a_head_shared_inside_a_chunk_stays_each_conversations_own) {
+    Fixture f;
+    REQUIRE_EQ(f.build(/*with_linear=*/true, /*ckpt_slots=*/4), RAD_OK);
+    PCBinding<PrefixCache> b(&f.pc);
+    b.exact = exact_grid();
+    const auto head = tok_run(1, 20);
+    const Request a = turn(7, cat(head, tok_run(1000, 280)), tok_run(9000, 8));
+    const Request c = turn(8, cat(head, tok_run(2000, 280)), tok_run(9100, 8));
+    const int32_t sa = serve_turn(f, b, a, 192);
+    const int32_t sc = serve_turn(f, b, c, 192);
+    REQUIRE(sa >= 0);
+    REQUIRE(sc >= 0);
+    std::vector<std::vector<int32_t>> fa, fc;
+    const CacheHit ha = b.lookup(turn(9, cat(cat(a.prompt, a.output), tok_run(3000, 100)), {}),
+                                 &fa, nullptr);
+    const CacheHit hc = b.lookup(turn(10, cat(cat(c.prompt, c.output), tok_run(3000, 100)), {}),
+                                 &fc, nullptr);
+    CHECK_EQ(ha.n_linear_tokens, 192);
+    CHECK_EQ(ha.checkpoint_slot, sa);
+    CHECK_EQ(hc.n_linear_tokens, 192);
+    CHECK_EQ(hc.checkpoint_slot, sc);
+    for (size_t g = 0; g < fa.size(); ++g) {
+        REQUIRE(!fa[g].empty() && !fc[g].empty());
+        CHECK(fa[g][0] != fc[g][0]);               /* the head: each its own block */
+    }
+    /* Neither shares an entry with the other: the head ends inside the first chunk. Nor is it a
+     * branch two prompts left (CacheHit::branch_at), whose snapshot would cut a third prompt's first
+     * chunk off the grid (Request::checkpoint_at) and so its cold run too. */
+    const CacheHit only_head = b.lookup(turn(11, cat(head, tok_run(4000, 280)), {}), nullptr, nullptr);
+    CHECK_EQ(only_head.n_attn_tokens, 0);
+    CHECK_EQ(only_head.branch_at, 0);
+}
+
+/* A prompt that shares whole chunks with another still shares them, and a prompt's own reply
+ * (written by decode) never stands in for a longer prompt's prefill of the same tokens. */
+TEST(exact_keys_share_whole_chunks_and_never_a_reply) {
+    Fixture f;
+    REQUIRE_EQ(f.build(/*with_linear=*/true, /*ckpt_slots=*/4), RAD_OK);
+    PCBinding<PrefixCache> b(&f.pc);
+    b.exact = exact_grid();
+    const auto sys = tok_run(1, 192);                  /* two whole chunks */
+    const Request a = turn(7, cat(sys, tok_run(1000, 100)), tok_run(9000, 8));
+    serve_turn(f, b, a, 192);
+    const CacheHit h = b.lookup(turn(8, cat(sys, tok_run(2000, 100)), {}), nullptr, nullptr);
+    CHECK_EQ(h.n_attn_tokens, 192);
+    CHECK_EQ(h.n_linear_tokens, 192);
+    /* A prompt that ends where a chunk ends: its reply fills the next chunk's first blocks, and a
+     * prompt that carries those tokens in its prompt does not take them. */
+    const Request e = turn(9, tok_run(5000, 192), tok_run(6000, 64));
+    serve_turn(f, b, e, 192);
+    const CacheHit he = b.lookup(turn(10, cat(cat(e.prompt, e.output), tok_run(7000, 100)), {}),
+                                 nullptr, nullptr);
+    CHECK_EQ(he.n_attn_tokens, 192);
+    CHECK_EQ(he.n_linear_tokens, 192);
+}
+
+/* A lone prefill spans by its whole length (Scheduler::span_now_): a first turn under the bound
+ * cuts [64, 192) at the interval, its next turn over the bound spans it. Their blocks there differ,
+ * so the next turn resumes at the origin; both over the bound, or no span at all, it resumes deep. */
+TEST(exact_keys_carry_the_span_a_prompts_length_decides) {
+    struct Case { int64_t span_min; int32_t attn; };
+    for (const Case k : { Case{ 400, 64 }, Case{ 200, 192 }, Case{ -1, 192 }, Case{ 0, 192 } }) {
+        Fixture f;
+        REQUIRE_EQ(f.build(/*with_linear=*/true, /*ckpt_slots=*/4), RAD_OK);
+        PCBinding<PrefixCache> b(&f.pc);
+        b.exact = exact_grid(k.span_min);
+        const Request first = turn(7, tok_run(100, 300), tok_run(9000, 8));   /* 300 tokens */
+        serve_turn(f, b, first, 192);
+        const Request next = turn(8, cat(cat(first.prompt, first.output), tok_run(3000, 200)), {});
+        const CacheHit h = b.lookup(next, nullptr, nullptr);                 /* 508 tokens */
+        CHECK_EQ(h.n_attn_tokens, k.attn);
+    }
+}
+
+/* Without exact, the binding's keys are media_keys' alone: nearest hashes as it always did. */
+TEST(exact_keys_add_nothing_without_exact) {
+    Fixture f;
+    REQUIRE_EQ(f.build(/*with_linear=*/true, /*ckpt_slots=*/4), RAD_OK);
+    PCBinding<PrefixCache> b(&f.pc);
+    const Request r = turn(7, tok_run(100, 300), {}, one_picture(32, 48, 0xc0ffee));
+    std::vector<MMContentKey> mine, plain;
+    b.request_keys(r, 0, &mine);
+    media_keys(r, &plain, 0);
+    CHECK(mine == plain);
+    b.exact = exact_grid();
+    b.request_keys(r, 0, &mine);
+    CHECK_EQ(mine.size(), plain.size() + 3);          /* [0, 64), [64, 192), [192, 300) */
+}
+
 /* ================================================================== retention policies */
 
 /* A retention policy is a documented extension point and nothing requires its keep set in any
@@ -8823,6 +8928,56 @@ TEST(a_restarted_cache_pages_a_conversation_back_byte_for_byte) {
     CHECK_OK(pc_flush_cache(y.f.pc, y.t, &y.f.ck, st, all_admit(), &f));
     CHECK_EQ(f.written_items, 0ll);
     CHECK_EQ(f.kept_items, 21ll);
+}
+
+/* --prefix-resume exact with --prefix-cache-dir (#236): a conversation published under the exact
+ * grid's chunk keys goes to disk, and a restarted server's page-in (Engine::pcache_page_in, through
+ * pcache_page_in_request) reads its chain back keyed by the binding (IPrefixCache::request_keys),
+ * so the restore and lookup that follow find it. Keyed by media_keys alone, as before the binding
+ * carried the chunk keys, the page-in reads nothing and the next turn resumes from zero. */
+TEST(exact_keys_a_restarted_cache_pages_in_what_the_binding_looks_up) {
+    const std::string dir = radtest::tmp_path("pcache_exact_page_in");
+    (void)std::system(("rm -rf '" + dir + "'").c_str());
+    const Request first = turn(7, tok_run(100, 300), tok_run(9000, 8));
+    const Request next = turn(8, cat(cat(first.prompt, first.output), tok_run(3000, 100)), {});
+    PrefixStore::Config sc;
+    {
+        TierFixture x;
+        CHECK_OK(x.build(/*with_linear=*/true, /*ckpt_slots=*/4));
+        PCBinding<PrefixCache> b(&x.f.pc);
+        b.exact = exact_grid();
+        REQUIRE(serve_turn(x.f, b, first, 192) >= 0);
+        REQUIRE(!copy_now(x.t).empty());
+        sc = store_cfg(dir, x);
+        PrefixStore st;
+        CHECK_OK(st.open(sc));
+        PcFlush fl;
+        CHECK_OK(pc_flush_cache(x.f.pc, x.t, &x.f.ck, st, all_admit(), &fl));
+        CHECK(fl.written_items > 0);
+    }
+    TierFixture y;
+    CHECK_OK(y.build(true, 4));
+    PrefixStore st;
+    CHECK_OK(st.open(sc));
+    int64_t ns = 0;
+    REQUIRE(pc_import(y.f.pc, st, &ns) > 0);
+    PCBinding<PrefixCache> b(&y.f.pc);
+    b.exact = exact_grid();
+    /* The engine's own path, through the interface: no binding means media keys alone. */
+    PcPageIn plain;
+    CHECK_OK(pcache_page_in_request(nullptr, y.f.pc, y.t, &y.f.ck, st, next, 0, &plain));
+    CHECK_EQ(plain.entries, 0ll);
+    CHECK(!plain.snap);
+    const IPrefixCache& keys = b;
+    PcPageIn r;
+    CHECK_OK(pcache_page_in_request(&keys, y.f.pc, y.t, &y.f.ck, st, next, 0, &r));
+    /* The first turn's chunks [0, 64) and [64, 192) are whole in the next turn too: 12 blocks of
+     * 16. Its [192, 300) was the prompt's last, partial chunk, keyed apart from the next turn's
+     * whole [192, 320), so the chain stops at 192, where the snapshot is. */
+    CHECK_EQ(r.entries, 12ll);
+    CHECK_EQ(r.failed, 0ll);
+    CHECK(r.snap);
+    CHECK_EQ((int64_t)b.restore_plan(next, 0).size(), 12ll);
 }
 
 /* A snapshot the store holds gives up its slot to a newer one without being lost, and a host

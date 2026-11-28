@@ -1287,6 +1287,71 @@ static void exact_fixture(Fixture& f, int kind) {
     f.cfg.prefix_exact = true;
 }
 
+/* #236: the prefix cache keys a block by its cold chunk (exact_keys), so it must be told the grid
+ * and the span rule this scheduler cuts by -- the span_min a lone prefill spans from, -1 where
+ * nothing spans -- at start and whenever the engine resolves --prefill-span-min. Nearest tells it
+ * nothing, so its keys stay those of a build without exact. */
+TEST(exact_resume_hands_the_prefix_cache_its_grid_and_span_rule) {
+    {
+        Fixture f;
+        exact_fixture(f, 2);                       /* span 2: grid 512 from 256 */
+        REQUIRE_EQ(f.start(), RAD_OK);
+        CHECK_EQ(f.pc.exact.grid, 512);
+        CHECK_EQ(f.pc.exact.origin, 256);
+        CHECK_EQ(f.pc.exact.span_min, 0);         /* every lone prefill spans until told */
+        f.sch.set_span_min(3000);
+        CHECK_EQ(f.pc.exact.span_min, 3000);
+        f.sch.set_span_min(0);
+        CHECK_EQ(f.pc.exact.span_min, 0);
+    }
+    {
+        Fixture f;
+        exact_fixture(f, 0);                       /* no span: nothing a prompt's length cuts */
+        REQUIRE_EQ(f.start(), RAD_OK);
+        CHECK_EQ(f.pc.exact.grid, 256);
+        CHECK_EQ(f.pc.exact.origin, 0);
+        CHECK_EQ(f.pc.exact.span_min, -1);
+        f.sch.set_span_min(3000);
+        CHECK_EQ(f.pc.exact.span_min, -1);
+    }
+    {
+        Fixture f;
+        exact_fixture(f, 2);
+        f.cfg.prefix_exact = false;
+        REQUIRE_EQ(f.start(), RAD_OK);
+        f.sch.set_span_min(3000);
+        CHECK_EQ(f.pc.exact.grid, 0);
+    }
+}
+
+/* With --prefill-span-min set, the engine hands set_span_min the deployment's bound; the cache's
+ * span rule must be the one chunks are then cut by. A prompt under the bound takes one interval a
+ * step, one over it spans [256, 768) as one chunk, and the cache's rule (exact_keys: span_min 0
+ * spans all, else a prompt of span_min or longer) says the same of each. Pushed before the bound
+ * is set, the cache keeps the start's 0 ("every prefill spans") and calls the short prompt spanned. */
+TEST(exact_resume_span_rule_is_the_bound_a_set_prefill_span_min_cuts_by) {
+    Fixture f;
+    exact_fixture(f, 2);                           /* span 2: grid 512 from 256 */
+    f.cfg.prefill_span_min = 2048;
+    REQUIRE_EQ(f.start(), RAD_OK);
+    f.sch.set_span_min(f.cfg.prefill_span_min);    /* as Engine::serve resolves it */
+    CHECK_EQ(f.pc.exact.span_min, 2048);
+    for (const int len : { 1500, 3000 }) {
+        const uint64_t id = f.submit(len, 2);
+        int wide = 0;
+        for (int k = 0; k < 40; ++k) {
+            if (!f.sch.step()) break;
+            for (const StepEntry& e : f.sch.plan().e)
+                if (e.seq == id && e.is_prefill) wide += e.n_tokens > 256;
+            f.commit_plain();
+        }
+        const int64_t m = f.pc.exact.span_min;
+        const bool cache_says = m == 0 || (m > 0 && len >= m);
+        CHECK_EQ(wide > 0, cache_says);
+        CHECK_EQ(wide > 0, len >= 2048);
+    }
+}
+
 TEST(exact_resume_grid_is_the_chunk_an_idle_prefill_cuts) {
     struct Want { int kind; int64_t interval, grid, origin; };
     for (const Want w : { Want{ 0, 256, 256, 0 }, Want{ 1, 1024, 512, 0 }, Want{ 2, 256, 512, 256 },

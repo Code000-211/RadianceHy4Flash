@@ -244,14 +244,23 @@ int64_t Engine::pcache_activity() const {
     return lead.tiers.stats().to_host + lead.prefix.ckpt_commits() + lead.tiers.stats().paged_in;
 }
 
+int pcache_page_in_request(const IPrefixCache* keys, PrefixCache& pc, IdleTiers& t, HostArena* ck,
+                           PrefixStore& st, const Request& req, uint64_t salt, PcPageIn* out) {
+    std::vector<MMContentKey> mm;
+    /* The binding's keys, the exact grid's chunks included (IPrefixCache::request_keys), so a
+     * page-in finds what lookups do. Without a binding, a request's media keys alone. */
+    if (keys) keys->request_keys(req, salt, &mm);
+    else media_keys(req, &mm, salt);
+    return pc_page_in(pc, t, ck, st, req.prompt, mm, out);
+}
+
 void Engine::pcache_page_in(const Request& req) {
     if (!pstore_) return;
     Rank& lead = *ranks_[0];
-    std::vector<MMContentKey> mm;
-    media_keys(req, &mm, cvec_salt_for(req.sp.use_control_vector));
     PcPageIn r;
-    (void)pc_page_in(lead.prefix, lead.tiers, ck_store_.enabled() ? &ck_store_ : nullptr, *pstore_,
-                     req.prompt, mm, &r);
+    (void)pcache_page_in_request(pc_iface_.get(), lead.prefix, lead.tiers,
+                                 ck_store_.enabled() ? &ck_store_ : nullptr, *pstore_, req,
+                                 cvec_salt_for(req.sp.use_control_vector), &r);
     if (r.entries > 0) {
         pstore_m_.paged_in += r.entries;
         pcache_publish_metrics();
