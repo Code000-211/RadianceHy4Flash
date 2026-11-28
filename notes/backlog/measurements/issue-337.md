@@ -13,7 +13,8 @@ here can justify one. What it has is the three things that were actually missing
    without curl), and the fix that lets it run at all (section 1);
 2. the arm that did run, with its numbers and its raw lines (section 2);
 3. the reading of the reporter's own queue dump, which answers the issue's question 2 — the
-   argument block in the report does not belong to the kernel the packet names (section 3).
+   launch the report names is one launch, self-consistent, and inside every buffer it reads
+   (section 3).
 
 ## 1. No arm could run: the wait for the server asked with `curl`
 
@@ -131,7 +132,7 @@ harness has all three as knobs — `RADIANCE_W2=0 bash scripts/repro-337.sh <tag
 `SPEC=0 COUPLING=off …`, `TP=1` / `TP=4` on iks — so they are one command each on a box where the
 fault repeats, and that box is the reporter's.
 
-## 3. Question 2: the argument block and the kernel do not agree
+## 3. Question 2: the launch the report names is self-consistent
 
 The issue asks: "Is `gemm_i8_kpar_kernel` with `r4dchain` expected to be issued against a 2.24 GiB
 activation arena at all, or is there a bound on `M` that this session crossed?"
@@ -152,29 +153,44 @@ grows `M` past 16 for `NT = 1`**: a 112k-token session sends many 16-row tiles, 
 What the report's arguments are. The stopped packet's name is
 `_ZN12_GLOBAL__N_119gemm_i8_kpar_kernelILj4ELj256ELj1E8r4dchainEEvPKhPKtPKaPKfPtjjjjj`, i.e.
 `<KW=4, sb=256, NT=1, r4dchain>`, which the launcher emits only for K ≥ 1024 and M ≤ 16. The report
-prints the kernarg slot's 8-byte words that look like pointers, so at `e3834473` the layout shows as
-pairs: `+40 = 0x100000000c00` is `(N, K) = (3072, 256)`, `+48 = 0x100000000006` is `(M, a_ld) =
-(6, 256)`, and `sa_ld` at `+56` (= 1) is not printed. `M = 6` agrees with `NT = 1`; `K = 256` does
-not agree with `KW = 4` — it selects `<1, 256, 1>`. The five pointers (+0, +8 in one sealed 24.37 GiB
-pageable range; +16, +24, +32 in one 2.24 GiB range) are a self-consistent set for that other launch:
-`a_ld = 256 = K` and `sa_ld = 1 = K / 256`.
+prints the kernarg slot's 8-byte words that look like pointers, so at `e3834473` the five `uint32_t`
+arguments show as pairs: `+40 = 0x100000000c00` is `rows = 3072` (low half) and `cols = 4096` (high
+half), `+48 = 0x100000000006` is `M = 6` and `a_ld = 4096`, and `sa_ld` at `+56` (= 16) is not
+printed because it is not pointer-shaped. `+64 = 0x1000000c0` is the last one printed and is the
+first hidden argument pair: `block_count_x = 192`, `block_count_y = 1`.
 
-So the kernel and its arguments in that packet come from two different launches of the same entry
-point: the packet names the K ≥ 1024 instantiation while its argument block holds a K = 256 dispatch's
-values. That is not a shape the session crossed; it is a launch that ran with arguments that did not
-belong to it, and an argument read as a size or a pointer from the wrong launch is what an address
-"in no range this process holds" looks like (run 2's fault address `0xebbcff295000`, page-not-present)
-far better than any tile bound is. On the activation arena: the `+16/+24/+32` pointers sit in the
-pass's activation arena, whose **whole size** the report prints (2.24 GiB on the reporter's box,
-1.73 GiB on iks for this config) — that is the arena, not the tile's buffer, so "issued against a
-2.24 GiB arena" is expected and says nothing about the tile's bounds.
+The halves are not a guess: the dump prints, for the value that is "in no range", the distance to the
+next range it does hold, `108.63 TiB before #298 … at 0x7ca0fb000000`. That address is 124.62 TiB, and
+124.62 − 16.00 = 108.63, so the word is 2^44 + 3072 = 16.00 TiB and its high half is `0x1000`. (The
+`+64` word, 0.0039 TiB, gives the 124.62 TiB line the dump prints for it.) Read as 2^40 + 3072 =
+1.00 TiB the distance would have printed 123.63, which the log does not say.
 
-What to hunt next is therefore the argument path, not the shapes: a packet whose `kernarg_address`
-holds another dispatch's arguments means a slot reused across dispatches, or a packet written against
-a block that was already rewritten, in the chained-launch path of `core/device/aql.cpp` (`chain_record`,
-the per-play argument copy at a play, and whatever frees or reuses a tape's argument block). With the
-report change of this tree the same fault prints each argument's parameter name and type, so the next
-report names the field that was wrong instead of leaving it to be decoded.
+Those arguments agree with the kernel's name on every field: `K = 4096` → `ngrp = 4096/256 = 16 ≥ 4`
+→ `KW = 4`; `M = 6 ≤ 16` → `NT = 1`; `a_ld = 4096 = K`; `sa_ld = 16 = K/256`; `block_count_x = 192 =
+N/16 = 3072/16`. So the packet named in the report is one launch, self-consistent, and no bound of the
+shape was crossed. **The launch is also inside every buffer it reads**, which is what makes an
+over-read unlikely to be the fault: the weight read is `kgrid × ksuper × kTileBytes = 192 × 64 × 1024
+= 12,582,912 = N·K` bytes, ending exactly at the weight's last byte; the scale plane index
+`(rt·ngrp + g)·16 + acc_row` peaks at 49,024 of `N·ngrp = 49,152` bf16; the token rows are `tok ≤
+M−1 = 5` with `a_ld = 4096`; the store is `≤ M·N = 18,432` bf16.
+
+So this dump does not indict the kernel's shapes and does not indict its arguments either: the earlier
+reading of it ("the packet names one instantiation and points at another launch's arguments") came
+from taking the high half of the printed word as `0x100` (2^40) instead of `0x1000` (2^44). What the
+dump does show is its other flaw, which this tree fixes: it printed the packet at the queue's read
+index, and for a chained launch that dropped its barrier bit the packet processor fetches on past it,
+so the packet there need not be the launch that faulted (`core/device/aql_inflight.{h,cpp}` now
+reports the launches that may still be running, oldest first, with each one's arguments and chain
+record). On the activation arena: the `+16/+24/+32` pointers sit in the pass's activation arena,
+whose **whole size** the report prints (2.24 GiB on the reporter's box, 1.73 GiB on iks for this
+config) — that is the arena, not the tile's buffer, so "issued against a 2.24 GiB arena" is expected
+and says nothing about the tile's bounds.
+
+What to hunt next is therefore neither the shapes nor the argument block of the launch this dump
+names: it is whichever launch actually faulted, which the next report from this tree names, and the
+lifetime of the buffers a launch reads (the pool's sealed chunks, the arena, the weights W2 copies
+into its ring). The test `tests/karg_report_test.cpp` now pins the decode above byte for byte, so the
+next reader does not have to redo the arithmetic.
 
 ## 4. Question 1: types in the fault report
 
@@ -182,7 +198,7 @@ Answered by the report change carried in this tree (`core/device/karg_report.{h,
 `core/device/aql.cpp`): each argument line now prints the parameter's name, its offload-metadata
 `value_kind`, and — for a kind that is not an address — its numeric value, so an integer argument is
 no longer printed as "in no range this process holds". In the dump above that would have shown
-`+40 cols=256 (by_value)`, which is the line that decides section 3's reading in one look.
+`+40 cols=4096 (by_value)`, which is the line that decides section 3's reading in one look.
 
 ## 5. What is owed to close the issue
 
