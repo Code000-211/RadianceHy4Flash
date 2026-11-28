@@ -4094,8 +4094,9 @@ int Engine::load_weights() {
         /* The heat engine, bound to the same plan. On a static plan (all_vram, --deterministic) it
          * returns RAD_OK with `enabled() == false`. */
         /* Expert streaming X0.3: the heat engine's parameters from the environment, for replay
-         * and A/B runs (RADIANCE_HEAT_DECAY, _HYSTERESIS, _MIN_GAIN, _MOVES, _CREDIT_CAP); the
-         * startup line of HeatEngine::init says what is in force. */
+         * and A/B runs (RADIANCE_HEAT_DECAY, _HYSTERESIS, _MIN_GAIN, _MOVES, _CREDIT_CAP,
+         * _PROBATION, _PROBATION_STEPS, _WIDTH_REF, _WIDTH_SCALE, _ADMIT_ROWS); the startup line
+         * of HeatEngine::init says what is in force. */
         HeatParams hp{};
         {
             auto envf = [](const char* k, float* v) {
@@ -4113,6 +4114,22 @@ int Engine::load_weights() {
             float mv = (float)hp.moves_per_step;
             envf("RADIANCE_HEAT_MOVES", &mv);
             hp.moves_per_step = (int)mv;
+            /* Expert streaming X2's 2Q admission and the width-following move budget. */
+            float pv = (float)hp.probation_slots;
+            envf("RADIANCE_HEAT_PROBATION", &pv);
+            hp.probation_slots = (int)pv;
+            float ps = (float)hp.probation_steps;
+            envf("RADIANCE_HEAT_PROBATION_STEPS", &ps);
+            hp.probation_steps = (int)ps;
+            float wr = (float)hp.width_ref;
+            envf("RADIANCE_HEAT_WIDTH_REF", &wr);
+            hp.width_ref = (int)wr;
+            float ws = (float)hp.width_scale;
+            envf("RADIANCE_HEAT_WIDTH_SCALE", &ws);
+            hp.width_scale = (int)ws;
+            float ar = (float)hp.admit_rows_wide;
+            envf("RADIANCE_HEAT_ADMIT_ROWS", &ar);
+            hp.admit_rows_wide = (int)ar;
         }
         RAD_TRY(r->heat.init(r->plan, hp));
 

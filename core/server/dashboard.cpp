@@ -541,6 +541,10 @@ HttpResponse Server::handle_stats(const HttpRequest&) {
             e["readmit_128"]  = s.experts.readmit_128;
             e["readmit_1024"] = s.experts.readmit_1024;
             e["heat_steps"]   = s.experts.heat_steps;
+            e["probation_admitted"] = s.experts.probation_admitted;
+            e["probation_promoted"] = s.experts.probation_promoted;
+            e["probation_expired"]  = s.experts.probation_expired;
+            e["probation_refused"]  = s.experts.probation_refused;
             e["routed"]      = s.experts.routed;
             e["routed_res"]  = s.experts.routed_resident;
             e["dispatches"]  = s.experts.dispatches;
