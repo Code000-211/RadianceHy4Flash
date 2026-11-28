@@ -1315,6 +1315,10 @@ struct Dfly {
             if (d.op_add2)   /* 0 where the last layer's add moved into the final norm (D-01) */
                 RAD_ISSUE_N(c, d.op_add2, M, brows(x, M), brows(y, M), brows(x, M));
             d.t_resid.step(c, brows(x, M), M);
+            /* A draft layer's end is a mark too (M-06): the pass reads its head from VRAM only, so
+             * the promotions a step held cross the link under it instead of waiting for the trunk
+             * pass (rad_expert_pace_mark; a no-op where pacing is off). */
+            (void)rad_expert_pace_mark(c);
         }
         /* E */
         if (op_final_add)

@@ -210,6 +210,9 @@ struct RadCtx {
     int                   w2_asked = 0;
     /* rad_expert_w2_tail: the issue index each call came in front of. */
     std::vector<size_t>   w2_tails;
+    /* rad_expert_pace_mark (M-06): the issue index each paced-copy mark came in front of, one a
+     * layer (and one a draft layer), never a packet of its own. */
+    std::vector<size_t>   pace_marks;
 };
 
 /* -------------------------------------------------------------------- the declare-side ABI */
@@ -663,6 +666,13 @@ extern "C" int rad_expert_prefetch(RadCtx* c, const RadPrefetchNext* next, rad_b
 }
 extern "C" int rad_expert_prefetch_mark(RadCtx* c) { (void)c; return RAD_OK; }
 extern "C" int rad_expert_prefetch_step(RadCtx* c, int layer) { (void)c; (void)layer; return RAD_OK; }
+/* The pacing is the mover's, not this fake's; the call is only recorded, so a test can see where
+ * a pass makes its marks. */
+extern "C" int rad_expert_pace_mark(RadCtx* c) {
+    if (!c) return RAD_E_INVAL;
+    c->pace_marks.push_back(c->issues.size());
+    return RAD_OK;
+}
 extern "C" void rad_expert_w2_tail(RadCtx* c) {
     if (c) c->w2_tails.push_back(c->issues.size());
 }

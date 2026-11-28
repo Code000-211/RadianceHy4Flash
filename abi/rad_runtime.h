@@ -1069,6 +1069,13 @@ int rad_expert_prefetch_mark(RadCtx* c);
 /* Ahead of `layer`'s routed GEMMs, on every routed layer of every pass. */
 int rad_expert_prefetch_step(RadCtx* c, int layer);
 
+/* The paced promotions' mark (expert streaming X1 b, M-06): at the end of a layer, behind its
+ * post-FFN junction and in front of the next layer's attention, on every layer of every pass
+ * including a drafter's. What a step's promotions left held then rides behind the next layer's
+ * first dispatch -- its attention, which reads no expert over the link -- and crosses it in no
+ * more bytes than that stretch carries. A no-op where pacing is off. */
+int rad_expert_pace_mark(RadCtx* c);
+
 /* "Weg 2" (rad_w2.h): the routed layer's control block for a pass of `rows` rows, a device
  * pointer the block hands to the router (which plans in it), to the first routed GEMMs as `w2` and
  * to the tail's as `w2_tail`; or null, and the block issues the layer as it always did -- the

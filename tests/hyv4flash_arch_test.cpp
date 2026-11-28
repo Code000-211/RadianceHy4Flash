@@ -3291,6 +3291,9 @@ TEST(the_pipelined_prefill_pieces_are_the_whole_steps_junctions) {
         }
         CHECK(lane1 > 0);
         CHECK(pieces > 0);
+        /* M-06: a pace mark a layer, the pipelined prefill's rows as much as a whole step's, so no
+         * held copy waits for the pass's end (a row that runs whole marks too). */
+        CHECK_EQ(cp.pace_marks.size(), (size_t)mk.meta()->n_layers);
         /* Every buffer a junction declares it writes is an operand of every piece's issue (the
          * whole step's issue passes them all; the reads may differ, the chain's add having taken
          * `b`). At four ranks the whole step runs the same op, so its operands are compared too
@@ -3329,6 +3332,7 @@ TEST(the_pipelined_prefill_pieces_are_the_whole_steps_junctions) {
         }
         CHECK_EQ(l96, 0);
         CHECK_EQ(short96, 0);
+        CHECK_EQ(v96[0]->pace_marks.size(), (size_t)mk.meta()->n_layers);
     }
     unsetenv("RADIANCE_HY4_PIPE_MIN");
     unsetenv("RADIANCE_HY4_PIPE_ROWS");
@@ -3729,7 +3733,8 @@ TEST(the_probe_keeps_a_suffix_chain_inside_dfly2s_block) {
 /* §3.3 / §6: one engine step -- the trunk step (with its snapshots), the empty context pass, the
  * query pass at depth 5, 3 and 1 -- is lint clean as a whole; the context pass issues nothing; the
  * query pass none of the trunk's key-side, selection, Engram or hyper-connection ops; and it
- * stores every block row before its attention. */
+ * stores every block row before its attention. Every layer of every pass marks its end with the
+ * paced-copies mark (M-06), a draft layer too. */
 TEST(an_engine_step_with_dfly2_is_lint_clean_and_the_query_pass_touches_no_trunk_state) {
     for (int depth : { 5, 3, 1 }) {
         DeclDfly d(depth);
@@ -3776,6 +3781,17 @@ TEST(an_engine_step_with_dfly2_is_lint_clean_and_the_query_pass_touches_no_trunk
         }
         CHECK_EQ(snap, 0);
         CHECK_EQ(sels, 1);
+
+        /* M-06: one paced-copies mark a layer, at the layer's end (behind its post-FFN junction,
+         * in front of the next layer's attention), and one a draft layer of the query pass, so a
+         * drafter's step does not hold its promotions for the whole trunk pass. */
+        CHECK_EQ(ps[0]->pace_marks.size(), m.layers.size());
+        CHECK_EQ(ps[1]->pace_marks.size(), (size_t)0);
+        CHECK_EQ(ps[2]->pace_marks.size(), df.lay.size());
+        for (size_t i = 1; i < ps[0]->pace_marks.size(); ++i)
+            CHECK(ps[0]->pace_marks[i] > ps[0]->pace_marks[i - 1]);
+        for (size_t i = 0; i < ps[0]->pace_marks.size(); ++i)
+            CHECK(ps[0]->pace_marks[i] <= ps[0]->issues.size());
     }
 }
 

@@ -1568,6 +1568,9 @@ int rad_expert_prefetch_mark(RadCtx* c) {
 int rad_expert_prefetch_step(RadCtx* c, int layer) {
     return c ? static_cast<rad::Ctx*>(c)->xp_step(layer) : RAD_E_INVAL;
 }
+int rad_expert_pace_mark(RadCtx* c) {
+    return c ? static_cast<rad::Ctx*>(c)->pace_mark() : RAD_E_INVAL;
+}
 
 void* rad_expert_w2(RadCtx* c, int layer, const rad_weight* first, int64_t n_place, int64_t rows) {
     return c ? static_cast<rad::Ctx*>(c)->w2_layer(layer, first, n_place, rows) : nullptr;

@@ -4172,13 +4172,26 @@ int Engine::load_weights() {
          * holds nearly all its experts gets the idle ones back as residents. */
         mc.turnover_adaptive = true;
         /* Expert streaming X1 (b), kernels/experts-streaming.md: RADIANCE_XS_PACE -1 spreads a
-         * step's promotion copies over the next pass's routed layers, N > 0 sends N a layer, 0
+         * step's promotion copies over the next pass's layers' marks, N > 0 sends N a mark, 0
          * sends them as one list behind the pass. Bytes do not change. Default: spread without a
          * drafter (Hy4-flash TP2, eight distinct streams: +2-3 % decode, the in-place reads of
          * the first routed layers no longer share the link with the copies); off with one, where
-         * verify passes measured 3-7 % slower with it (notes/xs-1.md). */
+         * verify passes measured 3-7 % slower with it (notes/xs-1.md). M-06 lets a draft pass
+         * carry marks too, so with a drafter a held copy now crosses under the draft pass that
+         * follows instead of waiting a whole step; whether that turns the default on is for the
+         * lane to measure (RADIANCE_XS_PACE=-1 with DFly2). */
         mc.pace_units = drafter_.kind == RAD_DRAFT_NONE ? -1 : 0;
         if (const char* e = std::getenv("RADIANCE_XS_PACE"); e && *e) mc.pace_units = std::atoi(e);
+        /* A share is capped in bytes (M-06): what a mark sends must fit the pass's PCIe-free
+         * stretch, the attention behind the post-FFN junction, and a unit's size differs by class,
+         * so a count does not express it. 27 GB/s is the measured h2d uplink of a lane
+         * (notes/backlog/refs/kernels/levers-tp2.md: 27.6 GB/s); 150 us of it is 4,050,000 B, ~2.7
+         * of Hy4-flash's 1,499,904 B rank slices a rank -- above the ~1 a layer X1 b paced, so the
+         * cap binds on a burst and not on the usual share, as E-M2 asks. RADIANCE_XS_PACE_BYTES
+         * sets it directly; 0 leaves the count alone. */
+        mc.pace_bytes = 150 * 27000;
+        if (const char* e = std::getenv("RADIANCE_XS_PACE_BYTES"); e && *e)
+            mc.pace_bytes = std::atoll(e);
         RAD_TRY(r->mover.init(r->program, r->plan, mc, &r->pools));
         /* What the mover took, before the first copy. Its slabs are allocated in init, so the pool
          * is as full as it will get; a load stopping with zero free is a placement failure, not
@@ -5548,17 +5561,23 @@ int Engine::start() {
             const int n = r->mover.pool_ranges(lo, hi, st, RAD_W2_MAX_POOLS);
             if (n > 0) r->ctx.w2_open(w2c, lo, hi, st, n);
         }
-    /* Expert streaming X1 (b): the mover's paced copies go out from the routed layers' marks
-     * (Ctx::xp_mark), which recorded passes then carry. Not beside the TP1 prefetch, which rides
-     * on the same dispatch. */
+    /* Expert streaming X1 (b) and M-06: the mover's paced copies go out from the layers' own
+     * marks (Ctx::pace_mark, rad_expert_pace_mark at the end of a layer, behind its second
+     * junction), which recorded passes then carry. Not where the TP1 prefetch is on: pacing there
+     * was measured to gain nothing (notes/xs-1.md), and an arch that does not mark its layers
+     * would still pace inside the prefetch's host step. */
     for (auto& r : ranks_)
         if (r->mover.pacing() && r->heat.enabled() && !r->ctx.xp_on()) {
             Rank* rp = r.get();
             r->ctx.set_pace_hook([rp](RadStream cs) { return rp->mover.pace_mark(cs); });
-            if (r->index == 0)
-                RAD_INFO("expert streaming: promotion copies paced over the routed layers (%s)",
+            if (r->index == 0) {
+                const std::string cap = r->mover.pace_bytes() > 0
+                    ? fmt(", at most %s a mark", humanb(r->mover.pace_bytes()).c_str()) : std::string();
+                RAD_INFO("expert streaming: promotion copies paced behind the second junction (%s%s)",
                          r->mover.pace_units() < 0 ? "spread over the pass"
-                                                   : fmt("%d a layer", r->mover.pace_units()).c_str());
+                                                   : fmt("%d a layer", r->mover.pace_units()).c_str(),
+                         cap.c_str());
+            }
         }
     if (const char* e = std::getenv("RADIANCE_XS_EARLY_PUBLISH"); e && *e)
         xs_early_publish_ = std::atoi(e) != 0;

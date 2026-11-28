@@ -343,11 +343,30 @@ int Ctx::xp_predict(const RadPrefetchNext* nx, rad_buf h, int64_t r0, int64_t ro
 }
 
 int Ctx::xp_mark() {
-    if (!xp_ && !pace_hook_) return RAD_OK;
+    if (!xp_ && (!pace_hook_ || pace_marked_)) return RAD_OK;
     if (!rec_) return xp_mark_run();
     TapeStep st;
     st.kind = kTapeXpMark;
     return tape_host(st, [&] { return xp_mark_run(); });
+}
+
+/* The paced copies' own mark (M-06), at the end of a layer: behind its post-FFN junction and in
+ * front of the next layer's attention, which reads no expert over the link. Its own host step of
+ * a recorded pass, so a played pass sends the shares where the recorded one did. The first such
+ * mark latches: from then on the older mark in the prefetch's step (xp_mark_run) leaves the pacing
+ * to it, so a layer sends one share. */
+int Ctx::pace_mark() {
+    if (!pace_hook_) return RAD_OK;
+    pace_marked_ = true;
+    if (!rec_) return pace_mark_run();
+    TapeStep st;
+    st.kind = kTapePaceMark;
+    return tape_host(st, [&] { return pace_mark_run(); });
+}
+
+int Ctx::pace_mark_run() {
+    if (!pace_hook_) return RAD_OK;
+    return pace_hook_(cur_stream());
 }
 
 int Ctx::xp_step(int layer) {
@@ -432,8 +451,9 @@ int Ctx::xp_predict_run(const RadPrefetchNext& nx, rad_buf h, int64_t r0, int64_
 }
 
 int Ctx::xp_mark_run() {
-    /* The mover's paced copies first: they ride on the same next dispatch. */
-    if (pace_hook_) RAD_TRY(pace_hook_(cur_stream()));
+    /* The mover's paced copies first (X1 b): they ride on the same next dispatch. An arch that
+     * marks its layers' ends has moved them there (Ctx::pace_mark). */
+    if (pace_hook_ && !pace_marked_) RAD_TRY(pace_hook_(cur_stream()));
     if (!xp_) return RAD_OK;
     XpState& x = *xp_;
     if (!x.pend.valid) return RAD_OK;

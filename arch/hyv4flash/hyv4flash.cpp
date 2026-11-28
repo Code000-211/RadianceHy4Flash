@@ -1635,6 +1635,9 @@ static void step(RadCtx* c, const RadBatch* batch) {
             pipe_join(c);
             for (int64_t k = 0; k < m.proj_rank; ++k) l.proj[k].step(c, batch, 0, rows.n);
             l.t_cvec.step(c, brows(m.tr.h, rows.n), rows.n);
+            /* A mark a layer, the pipelined prefill's rows as much as a whole step's (M-06), so
+             * the pass carries its marks and the held copies do not wait for its end. */
+            (void)rad_expert_pace_mark(c);
             entered = je && l.j_end.tail;
             continue;
         }
@@ -1648,6 +1651,12 @@ static void step(RadCtx* c, const RadBatch* batch) {
         for (int64_t k = 0; k < m.proj_rank; ++k) l.proj[k].step(c, batch, 0, rows.n);
         l.t_cvec.step(c, brows(m.tr.h, rows.n), rows.n);
         l.t_resid.step(c, brows(m.tr.h, rows.n), rows.n);
+        /* The paced promotions' mark (M-06): behind this layer's post-FFN junction and in front of
+         * the next layer's attention, which reads no expert over the link, so what the step's
+         * promotions left held crosses the link there rather than under the routed GEMMs. A no-op
+         * where pacing is off. Once a layer marks its end, the older mark inside the prefetch's
+         * host step stops pacing, so a layer sends one share (Ctx::pace_mark). */
+        (void)rad_expert_pace_mark(c);
         entered = je && l.j_end.tail;
     }
     if (!entered) m.hc_head.pre(c, m.tr.h, m.tr.x, 0, rows.n);

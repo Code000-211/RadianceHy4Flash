@@ -335,12 +335,20 @@ struct MoverConfig {
      * the DMA engine as one list right behind the pass, and the card runs them under the in-place
      * reads of the next pass's first routed layers, which share the upstream link with them. On,
      * the promotions of the step (Engine::tiering_dispatch) are held on the host and sent from the
-     * next pass's routed layers' marks (pace_mark, behind each routed down GEMM), so they cross
-     * the link between the routed GEMMs: -1 spreads them evenly over the pass's marks, N > 0 sends
-     * at most N a mark. What a pass did not send goes out unpaced at the next dispatch. Demotions
-     * and every other move are never held. Bytes and their destinations do not change. The
-     * engine turns it on (-1) where no drafter runs (engine_bringup.cpp, RADIANCE_XS_PACE). */
+     * next pass's marks (pace_mark), so they cross the link behind the layer's post-FFN junction,
+     * under the next layer's attention, which reads no expert (M-06): -1 spreads them evenly
+     * over the pass's marks, N > 0 sends at most N a mark. What a pass did not send goes out
+     * unpaced at the next dispatch. Demotions and every other move are never held. Bytes
+     * and their destinations do not change. The engine turns it on (-1) where no drafter runs
+     * (engine_bringup.cpp, RADIANCE_XS_PACE). */
     int pace_units = 0;
+    /* Bytes a mark may send (M-06), whatever `pace_units` allows: the copies a share carries then
+     * fit the layer's PCIe-free stretch, which no unit count expresses, because unit sizes differ
+     * by class (Hy4-flash 1,499,904 B a rank slice, a wider expert several of those). The engine
+     * sets it to the stretch's link time, 150 us of the 27 GB/s uplink by default, and
+     * RADIANCE_XS_PACE_BYTES sets it directly; 0 = the count alone. One copy always goes, so a cap
+     * under the smallest copy cannot stop a mark. */
+    int64_t pace_bytes = 0;
 };
 
 /* ------------------------------------------------------------------ the loan */
@@ -533,16 +541,24 @@ public:
      *
      * Pacing (MoverConfig::pace_units): pace_collect(true) around a step's issue/balance holds
      * their promotion copies; pace_begin before the next pass sets the share a mark sends, from
-     * the marks the last pass made (`marks_hint` before any); pace_mark at each routed layer's
-     * mark sends the next share behind a ride on the compute stream `cs` (the stream waits for
-     * nothing). pace_flush sends what is left, unpaced; every other flush sends held copies too,
+     * the marks the last pass made (`marks_hint` before any); pace_mark at each layer's end
+     * (rad_expert_pace_mark) sends the next share, no more bytes than MoverConfig::pace_bytes,
+     * behind a ride on the compute stream `cs` (the stream waits for nothing). pace_flush sends
+     * what is left, unpaced; every other flush sends held copies too,
      * so a drain or a recall never waits on a copy that was not sent. */
     int  publish_landed(HeatEngine* heat);
     bool pacing() const { return cfg_.pace_units != 0; }
     int  pace_units() const { return cfg_.pace_units; }
+    int64_t pace_bytes() const { return cfg_.pace_bytes; }
     void pace_collect(bool on) { pace_collect_ = on && pacing(); }
     void pace_begin(int marks_hint);
     int  pace_mark(RadStream cs);
+
+    /* How many of `n` held copies a mark of `cap` bytes sends, at least one and at most `n`
+     * (MoverConfig::pace_bytes): the first copy always goes, so a cap under the smallest copy
+     * still paces, a copy a mark, and a mark always makes progress. Copies differ in size by
+     * class, so the prefix stops at the first copy that no longer fits. */
+    static size_t pace_fit(const int64_t* bytes, size_t n, int64_t cap);
     int  pace_flush();
     size_t pace_held() const { return held_.size() - held_next_; }
 
@@ -904,6 +920,7 @@ private:
     int                     pace_marks_ = 0;      /* marks seen this pass */
     int                     pace_marks_last_ = 0; /* marks the last pass made */
     std::vector<RadCopySeg> pace_segs_;
+    std::vector<int64_t>    pace_bytes_;   /* the bytes of the copies a mark may send */
     int  send_held(size_t n);
     std::vector<ClassPools> pools_;
     std::vector<UnitState>  unit_;
