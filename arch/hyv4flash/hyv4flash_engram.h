@@ -112,10 +112,13 @@ struct EngramWire {
             before = decl_b(b, nm.f("eg.before"), RAD_BF16, { T, s.hc * s.n_embd }, RAD_BUF_PERSIST);
             m1 = decl_b(b, nm.f("eg.minus_one"), RAD_BF16, { T, s.hc * s.n_embd }, RAD_BUF_PERSIST);
         }
-        return ids && ahead && mask && raw && e && key && val &&
-                       (!taps_on() || (before && m1))
-                   ? RAD_OK
-                   : RAD_E_INVAL;
+        if (!(ids && ahead && mask && raw && e && key && val && (!taps_on() || (before && m1))))
+            return RAD_E_INVAL;
+        /* A layer writes these before reading them, so their bytes are free between layers
+         * (P-11). The taps' scratch is PERSIST. Left out: `eg.ids` and `eg.mask`, which the
+         * model writes once a step for every layer's engram to read. The round trip's planes are
+         * marked where Engram::declare declares them. */
+        return wire_full_write(b, { ahead, raw, e, key, val });
     }
 };
 
@@ -233,6 +236,8 @@ struct Engram {
             w.qs = decl_b(b, nm.f("eg.rows.s"), RAD_F32, { T * H, 1 });
             w.rt = decl_b(b, nm.f("eg.rows.rt"), RAD_BF16, { T, W });
             if (!w.q || !w.qs || !w.rt) return RAD_E_INVAL;
+            /* Written before read in every layer, like the wire's other planes (P-11). */
+            RAD_ARCH_TRY(wire_full_write(b, { w.q, w.qs, w.rt }));
             wire = w;
         }
 

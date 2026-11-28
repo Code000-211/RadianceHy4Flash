@@ -1139,9 +1139,10 @@ TEST(scratch_users_on_two_lanes_are_ordered_one_behind_the_other) {
 /* A program that declares a second lane gets a scratch region per lane, so scratch users on two
  * lanes get disjoint bytes and neither waits for the other. The pointer each launch saw is the
  * check: a shared region would put both at the same address. */
-static void* g_scr_seen[2] = { nullptr, nullptr };
+static void* g_scr_seen[3] = { nullptr, nullptr, nullptr };
 static int k_scr_seen0(const RadArgs* a, RadStream s) { g_scr_seen[0] = a->scratch; return record("s0", a, s); }
 static int k_scr_seen1(const RadArgs* a, RadStream s) { g_scr_seen[1] = a->scratch; return record("s1", a, s); }
+static int k_scr_seen2(const RadArgs* a, RadStream s) { g_scr_seen[2] = a->scratch; return record("s2", a, s); }
 
 TEST(a_declared_second_lane_has_its_own_scratch_region) {
     Fixture f;
@@ -1197,6 +1198,88 @@ TEST(a_second_lane_scratch_request_past_its_region_is_refused_by_name) {
     });
     CHECK_EQ(s, RAD_E_SCRATCH);
     CHECK(std::strstr(f.ctx.step_error(), "rad_buf_concurrent") != nullptr);
+}
+
+/* rad_buf_full_write: the plan lends such a buffer's bytes to another buffer between its runs, so
+ * an op reading bytes its run never wrote (they came from an earlier run, whose bytes are gone) is
+ * refused by name. The same read inside a run that wrote it is served, and a new step begins the
+ * run again. */
+TEST(a_full_write_buffer_read_of_bytes_its_run_never_wrote_is_refused_by_name) {
+    Fixture f;
+    rad_weight w = f.add_weight("blk.0.w", RAD_BF16, 8, 4, g_weight_bytes);
+    rad_buf    x = f.add_buffer("x", RAD_BF16, 64, 4, 0);      /* 512 bytes, rows 64 x 4 */
+    rad_buf    y = f.add_buffer("y", RAD_BF16, 64, 8, 1024);
+    rad_op wr = f.add_op("gemm_nt", "M", { 8192 }, { k_scr_seen0 }, { "s0" },
+                         &g_gemm_schema, { w });
+    rad_op rd = f.add_op("gemm_nt", "M", { 8192 }, { k_scr_seen1 }, { "s1" },
+                         &g_gemm_schema, { w });
+    rad_op rd2 = f.add_op("gemm_nt", "M", { 8192 }, { k_scr_seen2 }, { "s2" },
+                          &g_gemm_schema, { w });
+    /* Two runs: ops 1..2 (a write, then its reader) and op 3 (a reader of its own). */
+    f.P.buffers[x].full_write = true;
+    f.P.buffers[x].first_def  = (int32_t)wr;
+    f.P.buffers[x].last_use   = (int32_t)rd2;
+    f.P.buffers[x].runs.push_back(rad::BufRun{ (int32_t)wr, (int32_t)rd });
+    f.P.buffers[x].runs.push_back(rad::BufRun{ (int32_t)rd2, (int32_t)rd2 });
+    CHECK_OK(f.start());
+
+    /* 4 rows written, then all 64 read: the other 60 rows hold an earlier run's bytes. */
+    const int s1 = f.step(4, 0, [&](Ctx& c) {
+        RadOperand wo[3] = { RAD_B(y), RAD_W(w), RAD_B(x) };   /* writes x */
+        wo[2].rows = 4;
+        CHECK_OK(c.issue(wr, wo, 3, 4));
+        RadOperand ro[3] = { RAD_B(x), RAD_W(w), RAD_B(y) };
+        c.issue(rd, ro, 3, 4);
+    });
+    CHECK_EQ(s1, RAD_E_STATE);
+    CHECK(std::strstr(f.ctx.step_error(), "rad_buf_full_write") != nullptr);
+
+    /* The same rows read as written: served, twice over, because a step begins the run again. */
+    for (int step_no = 1; step_no < 3; ++step_no) {
+        const int ok = f.step(4, step_no, [&](Ctx& c) {
+            RadOperand wo[3] = { RAD_B(y), RAD_W(w), RAD_B(x) };   /* writes x */
+            wo[2].rows = 4;
+            CHECK_OK(c.issue(wr, wo, 3, 4));
+            RadOperand ro[3] = { RAD_B(x), RAD_W(w), RAD_B(y) };
+            ro[0].rows = 4;
+            CHECK_OK(c.issue(rd, ro, 3, 4));
+        });
+        CHECK_EQ(ok, RAD_OK);
+    }
+    /* A later run that reads without writing first: nothing of its own run has written the
+     * bytes, so they may belong to another buffer. */
+    const int s2 = f.step(4, 3, [&](Ctx& c) {
+        RadOperand ro[3] = { RAD_B(x), RAD_W(w), RAD_B(y) };
+        ro[0].rows = 4;
+        c.issue(rd2, ro, 3, 4);
+    });
+    CHECK_EQ(s2, RAD_E_STATE);
+    CHECK(std::strstr(f.ctx.step_error(), "rad_buf_full_write") != nullptr);
+}
+
+/* A buffer nobody promised stays as it was: no coverage is tracked, so the read of a byte range a
+ * writer never touched is served (the arena keeps such a buffer alive over its whole interval). */
+TEST(a_buffer_without_the_promise_is_not_tracked) {
+    Fixture f;
+    rad_weight w = f.add_weight("blk.0.w", RAD_BF16, 8, 4, g_weight_bytes);
+    rad_buf    x = f.add_buffer("x", RAD_BF16, 64, 4, 0);
+    rad_buf    y = f.add_buffer("y", RAD_BF16, 64, 8, 1024);
+    rad_op wr = f.add_op("gemm_nt", "M", { 8192 }, { k_scr_seen0 }, { "s0" },
+                         &g_gemm_schema, { w });
+    rad_op rd = f.add_op("gemm_nt", "M", { 8192 }, { k_scr_seen1 }, { "s1" },
+                         &g_gemm_schema, { w });
+    f.P.buffers[x].first_def = (int32_t)wr;
+    f.P.buffers[x].last_use  = (int32_t)rd;
+    f.P.buffers[x].runs.push_back(rad::BufRun{ (int32_t)wr, (int32_t)rd });
+    CHECK_OK(f.start());
+
+    CHECK_OK(f.step(4, 0, [&](Ctx& c) {
+        RadOperand wo[3] = { RAD_B(y), RAD_W(w), RAD_B(x) };   /* writes x */
+        wo[2].rows = 4;
+        CHECK_OK(c.issue(wr, wo, 3, 4));
+        RadOperand ro[3] = { RAD_B(x), RAD_W(w), RAD_B(y) };
+        CHECK_OK(c.issue(rd, ro, 3, 4));
+    }));
 }
 
 /* The second lane's window holds at issue: an op on lane 1 outside it fails the step by name; inside

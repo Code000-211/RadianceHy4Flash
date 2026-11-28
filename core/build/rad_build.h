@@ -148,6 +148,9 @@ public:
     int op_reads (rad_op h, const rad_buf* b, int n);
     int op_writes(rad_op h, const rad_buf* b, int n);
     int buf_concurrent(rad_buf b);
+    int buf_full_write(rad_buf b);
+    /* BufferInfo::runs for one buffer, from the op lists and its rad_buf_full_write promise. */
+    void build_runs(rad_buf h);
     int lane1_window(bool end);
     int weight_shard_span(rad_weight w, int64_t lo, int64_t hi);
     int weight_shard_span_parts(rad_weight w, const int64_t* lo, const int64_t* hi,
@@ -235,7 +238,6 @@ private:
     std::set<rad_buf> concurrent_bufs_;
     /* The second lane's window (rad_lane1_window_begin), first and last op handle; -1 when none. */
     int32_t lane1_w0_ = -1, lane1_w1_ = -1;
-
     /* Parallel to prog_.kv_groups: where in the op list the group was declared, and the op found
      * to consume it. Declaration order is the only link between an op and a group; see
      * find_kv_consumer(). */

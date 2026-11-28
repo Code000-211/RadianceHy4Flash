@@ -873,6 +873,20 @@ private:
     std::vector<int64_t>   buf_numel_;
     std::vector<int64_t>   w_numel_;
     std::vector<int32_t>   buf_live0_, buf_live1_;   /* BufferInfo::first_def / last_use */
+    /* The same life as runs (BufferInfo::runs), flat: run k of buffer i is
+     * (buf_runs_[2k], buf_runs_[2k + 1]) for k in [buf_run_at_[i], buf_run_at_[i + 1]). The
+     * issue guard uses these, not the envelope: bytes between two runs may hold another buffer. */
+    std::vector<int32_t>   buf_runs_;
+    std::vector<int32_t>   buf_run_at_;
+    /* rad_buf_full_write: what the current run of each such buffer has written so far, in bytes,
+     * as merged ascending ranges (issue.cpp's guard checks a read against it; run_step clears it).
+     * Empty and untouched for every other buffer. */
+    struct BufWritten {
+        int32_t run = -1;                              /* the run index the ranges belong to */
+        std::vector<std::pair<int64_t, int64_t>> at;   /* [lo, hi) byte ranges, merged */
+    };
+    std::vector<BufWritten> buf_written_;              /* one per buffer handle */
+    std::vector<int32_t>    buf_written_handles_;      /* the rad_buf_full_write buffers, to clear */
     void refresh_buf_numel();
     /* Every level's templates; `buf_tmpl_` is a copy of the active one. */
     std::vector<std::vector<RadTensor>> level_tmpl_;

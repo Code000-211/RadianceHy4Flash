@@ -399,6 +399,19 @@ says so with `RAD_ARCH_SERVES_IMPORTS(0)` (`qwen35_w8a8` does), and imports keep
   graphs and steps are the ones the core plans; the runtime (`Ctx::issue`) is what refuses a lane-1
   op outside the window. Both calls are ABI 27 exports; a plugin that does not call them is
   unaffected.
+- **Say which buffers a stretch of ops writes before it reads.** A wire that a layer writes from one
+  end to the other and then reads — layer after layer, the same buffer — is dead between its
+  stretches of uses, and `rad_buf_full_write(b, buf)` at declare tells the planner so: it ends a run
+  of liveness at every write and packs the runs, so an attention scratch and a MoE scratch that
+  never coexist inside a layer share one arena region instead of each holding bytes for the whole
+  step. The promise is that a run writes every byte it reads of the buffer, in whatever pieces and
+  at whatever offsets the layer's ops write it: a read of a byte the run never wrote may hold
+  another buffer's data. `Ctx::issue` holds the plugin to it by refusing such a read by name
+  (`RAD_E_STATE`), and `tests/arch_test.cpp`'s builder applies the same rule to the declared graph,
+  so an architecture whose promise does not hold hears about it in CI. Buffers without the call
+  keep one interval, from their first declaring op to their last; a PERSIST, DERIVED or concurrent
+  buffer keeps one run, so the call changes nothing there. It is an additive ABI export (no version
+  change).
 - **A block drafter may serve a shorter block.** `rad_drafter_short_block(b, block)`, called once
   after `rad_declare_drafter`, says the plugin declared its query pass at `block` rows a sequence as
   well as at `RadDrafterDecl::block`, with the same anchor convention, so the core may stage a step

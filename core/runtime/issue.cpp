@@ -850,23 +850,105 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
                                           program_->buffers[bh].name.c_str(),
                                           tensor_shape_str(tt).c_str(), (long long)o.offset,
                                           tensor_shape_str(buf_tmpl_[bh]).c_str()));
-            /* The op must lie inside the buffer's planned lifetime. The plan is computed from the
-             * opt-in rad_op_reads/rad_op_writes; a buffer nothing declared lives for the whole
-             * program. An op touching a declared buffer outside [first_def, last_use] may see
+            /* The op must lie inside one of the buffer's planned runs. The plan is computed from
+             * the opt-in rad_op_reads/rad_op_writes; a buffer nothing declared lives for the whole
+             * program. An op touching a declared buffer outside a run of its liveness may see
              * bytes the arena reused for another buffer, typically because the op gained a read
              * its declaration never mentioned. Refused, not warned: the failure is silent and
-             * depends on the plan's packing. The bounds are the bind-time snapshot
-             * (buf_live0_/buf_live1_); the name for the refusal still comes from BufferInfo. */
-            if (buf_live0_[bh] >= 0 && (at_op < buf_live0_[bh] || at_op > buf_live1_[bh]))
+             * depends on the plan's packing. A buffer declared rad_buf_full_write has one run per
+             * stretch of uses, and the bytes between two of them belong to another buffer, so the
+             * envelope (buf_live0_/buf_live1_) is not enough for it: its runs are checked too.
+             * The bounds are the bind-time snapshot; the name for the refusal still comes from
+             * BufferInfo. */
+            bool in_life = buf_live0_[bh] >= 0 && at_op >= buf_live0_[bh] && at_op <= buf_live1_[bh];
+            if (in_life && buf_run_at_[bh + 1] - buf_run_at_[bh] > 1) {
+                in_life = false;
+                for (int32_t k = buf_run_at_[bh]; k < buf_run_at_[bh + 1]; ++k)
+                    if (buf_runs_[2 * k] <= at_op && at_op <= buf_runs_[2 * k + 1]) { in_life = true; break; }
+            }
+            if (!in_life && buf_live0_[bh] >= 0) {
+                std::string life;
+                int32_t n_run = buf_run_at_[bh + 1] - buf_run_at_[bh];
+                for (int32_t k = buf_run_at_[bh]; k < buf_run_at_[bh + 1] && k < buf_run_at_[bh] + 4; ++k) {
+                    if (!life.empty()) life += ", ";
+                    life += fmt("%d..%d", buf_runs_[2 * k], buf_runs_[2 * k + 1]);
+                }
+                if (n_run > 4) life += fmt(", and %d more", n_run - 4);
                 return abort_step_msg(h, RAD_E_STATE,
                                       fmt("operand %d names buffer '%s', which this op never "
-                                          "declared: the plan gives it ops %d..%d and this is "
+                                          "declared: the plan gives it ops %s and this is "
                                           "op %u, so the arena may have reused those bytes. "
                                           "Call rad_op_reads/rad_op_writes for it at declare",
                                           i,
-                                          program_->buffers[bh].name.c_str(),
-                                          (int)buf_live0_[bh], (int)buf_live1_[bh],
+                                          program_->buffers[bh].name.c_str(), life.c_str(),
                                           (unsigned)h));
+            }
+            /* rad_buf_full_write: between the runs above the plan lends this buffer's bytes to
+             * another buffer, so every byte an op reads must have been written since its run
+             * began -- a piece of a value left over from an earlier run is already gone. Checked
+             * per buffer and run, on the operand's element span (first to last element it
+             * reaches, stride gaps included, so the check errs towards allowing the read): a
+             * write adds its span, an INOUT operand reads before it writes. Refused by name,
+             * because the bytes may then hold another buffer's data. An arch test issues every op
+             * at every level, so a plugin that breaks the promise hears about it there too
+             * (tests/arch_fakes.h applies the same rule to the declared graph). */
+            if (program_->buffers[bh].full_write && at_op > 0 &&
+                buf_run_at_[bh + 1] - buf_run_at_[bh] > 1) {
+                const RadOpSchema* sc = p.info ? p.info->schema : nullptr;
+                const int role = (sc && i < (int)sc->n_operands) ? sc->operands[i].role : RAD_OPD_IN;
+                const bool wr = role == RAD_OPD_OUT || role == RAD_OPD_INOUT;
+                const bool rd = role == RAD_OPD_IN || role == RAD_OPD_INOUT;
+                int32_t run = -1;
+                for (int32_t k = buf_run_at_[bh]; k < buf_run_at_[bh + 1]; ++k)
+                    if (buf_runs_[2 * k] <= at_op && at_op <= buf_runs_[2 * k + 1]) { run = k; break; }
+                int64_t elem_lo = o.offset, elem_hi = o.offset;
+                for (uint32_t d = 0; d < tt.rank; ++d) {
+                    if (tt.shape[d] <= 0) { elem_hi = elem_lo; break; }
+                    elem_hi += (tt.shape[d] - 1) * tt.stride[d];
+                }
+                const int64_t esz = std::max<int64_t>(1, rad_dtype_bits(tt.dtype) / 8);
+                const int64_t lo = elem_lo * esz, hi = (elem_hi + 1) * esz;
+                Ctx::BufWritten& cw = buf_written_[bh];
+                if (wr && cw.run != run) {           /* a new run starts at every write */
+                    cw.run = run;
+                    cw.at.clear();
+                }
+                if (rd && run >= 0) {
+                    bool cov = false;
+                    if (cw.run == run)
+                        for (const auto& r : cw.at)
+                            if (r.first <= lo && hi <= r.second) { cov = true; break; }
+                    if (!cov)
+                        return abort_step_msg(h, RAD_E_STATE,
+                                              fmt("operand %d reads bytes %lld..%lld of buffer "
+                                                  "'%s', which its run (ops %d..%d) never wrote "
+                                                  "there: the plan lends the buffer's bytes to "
+                                                  "another buffer between its runs, so a write of "
+                                                  "it must cover what the run reads "
+                                                  "(rad_buf_full_write)",
+                                                  i, (long long)lo, (long long)hi,
+                                                  program_->buffers[bh].name.c_str(),
+                                                  (int)buf_runs_[2 * run],
+                                                  (int)buf_runs_[2 * run + 1]));
+                }
+                if (wr) {
+                    /* Merged byte ranges, ascending: a layer writes its planes in chunks. */
+                    std::vector<std::pair<int64_t, int64_t>>& v = cw.at;
+                    auto pos = std::partition_point(
+                        v.begin(), v.end(), [&](const std::pair<int64_t, int64_t>& r) {
+                            return r.second < lo;
+                        });
+                    v.insert(pos, std::make_pair(lo, hi));
+                    for (size_t k = 1; k < v.size();) {
+                        if (v[k].first <= v[k - 1].second) {
+                            v[k - 1].second = std::max(v[k - 1].second, v[k].second);
+                            v.erase(v.begin() + (long)k);
+                        } else {
+                            ++k;
+                        }
+                    }
+                }
+            }
             break;
         }
 

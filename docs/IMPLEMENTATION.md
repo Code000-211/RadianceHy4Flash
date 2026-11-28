@@ -101,6 +101,20 @@ to bisect it (`spec.md` §17).
 **No allocation and no synchronisation on the step path.** The arena is sized at declare. A
 `malloc` needed inside `rad_arch_step` or the scheduler's per-step work is a declare-phase bug.
 
+**Liveness is a list of runs per buffer, one interval unless the plugin says otherwise.** A
+buffer's bytes are free between two of its runs, which is what lets an attention scratch and a MoE
+scratch that never coexist inside a layer share one arena region instead of each holding bytes for
+the whole step. The plugin opts in with `rad_buf_full_write` (additive ABI export), promising that a
+stretch of ops writes every byte it reads of the buffer: `Builder::build_runs`
+(`core/build/rad_builder.cpp`) ends a run at every write, `plan_buffers` packs runs rather than
+envelopes, and `Ctx::issue` holds the plugin to the promise by refusing, by name, a read of bytes
+the run never wrote (`RAD_E_STATE`), tracking the byte ranges each run wrote as its ops issue.
+A run's write may come in pieces at row offsets — the coverage is what is checked, not the shape of
+the write. `BufferInfo::first_def` / `last_use` remain the
+envelope of the runs, so everything that wants one interval still has it. Startup logs the plan's
+peak live beside the arena it planned (`activation arena: ... peak live ...`, the
+`BufPlanReport::peak_live` a perfect packer would reach).
+
 **Kernel scratch is per lane, each region sized by what its lane may issue.** In-order launch lets
 every op on one stream share one scratch region; a second lane is a second stream and gets a second
 region once the architecture names any buffer to `rad_buf_concurrent` (`Program::scratch_regions`).

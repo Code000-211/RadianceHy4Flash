@@ -562,6 +562,28 @@ int rad_op_writes(RadBuilder* b, rad_op h, const rad_buf* bufs, int n);
  * A no-op for a PERSIST or DERIVED buffer, which is live everywhere already. */
 int rad_buf_concurrent(RadBuilder* b, rad_buf buf);
 
+/* A buffer whose every stretch of uses writes across it before reading it: the stretch may write it
+ * in pieces and at row offsets, as long as the reads inside the stretch stay inside what it wrote.
+ * The planner takes that promise to mean the bytes hold nothing a later op needs once the buffer's
+ * declared uses run out, so it may lend them to another buffer until the next op that writes this
+ * one — multi-interval liveness.
+ *
+ * The gain is a buffer rewritten every layer: an attention scratch and a MoE scratch that never
+ * coexist inside a layer share one arena region instead of each keeping one for the whole step
+ * (P-11: ~0.3 GiB a rank on a large model). Without the call a buffer keeps one interval, from its
+ * first declaring op to its last, and the bytes between its layers stay its own.
+ *
+ * The promise is that a run writes every byte it reads of the buffer, in however many pieces and
+ * at whatever offsets the layer's ops write it; a read of a byte the run never wrote may hold
+ * another buffer's data. It is checked, not assumed: Ctx::issue tracks the byte ranges each run has
+ * written and refuses, by name, a read outside them (core/runtime/issue.cpp), and every
+ * architecture's arch test applies the same rule to the declared graph (tests/arch_fakes.h), so a
+ * plugin that breaks it hears about it in CI rather than in a served step. The ranges are bounding
+ * intervals, stride gaps counted as written, so the check errs towards allowing the read.
+ *
+ * A no-op for a PERSIST or DERIVED buffer, which is live everywhere and never shared. */
+int rad_buf_full_write(RadBuilder* b, rad_buf buf);
+
 /* ---- appended in ABI 27 (the second lane's window) */
 /* The second lane's window: every op the architecture issues on lane 1 is declared between
  * rad_lane1_window_begin and rad_lane1_window_end. With a window a rad_buf_concurrent buffer is live

@@ -110,6 +110,18 @@ inline rad_op mk_list(RadBuilder* b, const char* name, const std::vector<RadPara
     return rw(b, h, reads, writes);
 }
 
+/* P-11: tell the planner the wire planes whose layers write them from one end to the other before
+ * the layer's readers look at them, so the buffer's bytes are free between the stretches of ops
+ * that use them and an attention and a MoE scratch that never coexist share one arena region
+ * (rad_buf_full_write, spec §3.1). The promise is that each stretch of uses writes what it reads
+ * there; Ctx::issue refuses, by name, a read of bytes the stretch never wrote, and the arch test
+ * applies the same rule to the declared graph. A zero handle is skipped. */
+inline int wire_full_write(RadBuilder* b, std::initializer_list<rad_buf> bufs) {
+    for (rad_buf h : bufs)
+        if (h) RAD_ARCH_TRY(rad_buf_full_write(b, h));
+    return RAD_OK;
+}
+
 /* An op that must resolve: a graph with a hole would look servable. */
 #define HY4_NEED(h, what)                                                                      \
     do {                                                                                       \

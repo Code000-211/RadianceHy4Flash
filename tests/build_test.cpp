@@ -345,6 +345,115 @@ TEST(liveness_packing) {
     CHECK_EQ(rep.n_unknown_live, 0);
 }
 
+/* Multi-interval liveness (rad_buf_full_write): a buffer whose every run writes the bytes that run
+ * reads is dead between the runs, so a buffer live only in a gap takes its bytes. This is the P-11
+ * shape: an attention scratch used in ops 1..2 and again in 5..6, and a MoE scratch used in 3..4,
+ * which never coexist. */
+TEST(multi_interval_liveness_lends_the_bytes_between_runs) {
+    Program p;
+    p.buffers.emplace_back();
+    p.ops.resize(7);
+
+    BufferInfo attn = make_buf("attn", 1024, RAD_BUF_TRANSIENT, -1, -1);
+    attn.full_write = true;
+    attn.runs = { BufRun{ 1, 2 }, BufRun{ 5, 6 } };
+    attn.first_def = 1;
+    attn.last_use = 6;
+    p.buffers.push_back(attn);
+    p.buffers.push_back(make_buf("moe", 1024, RAD_BUF_TRANSIENT, 3, 4));
+
+    BufPlanReport rep;
+    CHECK_OK(plan_buffers(p, &rep));
+    CHECK_EQ(p.buffers[1].arena_offset, p.buffers[2].arena_offset);
+    CHECK_EQ(rep.transient_bytes, 1024);
+    /* The bytes are live at one of the three stretches at a time, never at two. */
+    CHECK_EQ(rep.peak_live, 1024);
+    CHECK_EQ(rep.n_unknown_live, 0);
+
+    /* A second buffer whose life covers op 2 overlaps the first run, so it cannot take the bytes
+     * even though the gap at ops 3..4 is free. */
+    Program q;
+    q.buffers.emplace_back();
+    q.ops.resize(7);
+    q.buffers.push_back(p.buffers[1]);
+    q.buffers.push_back(make_buf("wide", 1024, RAD_BUF_TRANSIENT, 2, 4));
+    CHECK_OK(plan_buffers(q));
+    CHECK(q.buffers[1].arena_offset != q.buffers[2].arena_offset);
+    CHECK_EQ(q.arena_bytes, 2048);
+}
+
+/* rad_buf_full_write: every write of the buffer ends the run before it, so a buffer rewritten at
+ * the start of every layer gets one run a layer; without it the single interval spans the step. */
+TEST(a_full_write_buffer_gets_one_run_per_stretch_of_uses) {
+    NEED_PLUGIN(reg)
+    Builder b(reg, make_meta(), make_ctx());
+    RadBufDecl bd{};
+    bd.dtype = RAD_I8;
+    bd.rank = 1;
+    bd.shape[0] = 4096;
+    bd.kind = RAD_BUF_TRANSIENT;
+    bd.domain = RAD_DOMAIN_DEVICE;
+    const rad_buf plain = b.decl_buffer("plain", &bd);
+    const rad_buf whole = b.decl_buffer("whole", &bd);
+    const rad_weight w = decl_w(b, "w0");
+    /* Two layers: write, read, write, read. */
+    rad_op o1 = decl_gemm(b, w), o2 = decl_gemm(b, w);
+    rad_op o3 = decl_gemm(b, w), o4 = decl_gemm(b, w);
+    CHECK_OK(b.op_writes(o1, &whole, 1));
+    CHECK_OK(b.op_reads (o2, &whole, 1));
+    CHECK_OK(b.op_writes(o3, &whole, 1));
+    CHECK_OK(b.op_reads (o4, &whole, 1));
+    CHECK_OK(b.op_writes(o1, &plain, 1));
+    CHECK_OK(b.op_reads (o4, &plain, 1));
+    CHECK_OK(b.buf_full_write(whole));
+    CHECK_OK(b.finish());
+    const BufferInfo* pw = b.program().buffer(whole);
+    const BufferInfo* pp = b.program().buffer(plain);
+    REQUIRE(pw != nullptr);
+    REQUIRE(pp != nullptr);
+    CHECK(pw->full_write);
+    CHECK_EQ(pw->runs.size(), (size_t)2);
+    CHECK_EQ(pw->runs[0].lo, (int32_t)o1);
+    CHECK_EQ(pw->runs[0].hi, (int32_t)o2);
+    CHECK_EQ(pw->runs[1].lo, (int32_t)o3);
+    CHECK_EQ(pw->runs[1].hi, (int32_t)o4);
+    /* The envelope is the same life, so everything that reads first_def / last_use is unchanged. */
+    CHECK_EQ(pw->first_def, (int32_t)o1);
+    CHECK_EQ(pw->last_use, (int32_t)o4);
+    /* Without the call the buffer keeps one interval over the whole stretch. */
+    CHECK(!pp->full_write);
+    CHECK_EQ(pp->runs.size(), (size_t)1);
+    CHECK_EQ(pp->runs[0].lo, (int32_t)o1);
+    CHECK_EQ(pp->runs[0].hi, (int32_t)o4);
+}
+
+/* A PERSIST buffer is live everywhere and never shared, so the promise changes nothing (and the
+ * builder records it without moving the buffer out of the fixed region). */
+TEST(full_write_on_a_persistent_buffer_is_a_no_op) {
+    NEED_PLUGIN(reg)
+    Builder b(reg, make_meta(), make_ctx());
+    RadBufDecl bd{};
+    bd.dtype = RAD_I8;
+    bd.rank = 1;
+    bd.shape[0] = 4096;
+    bd.kind = RAD_BUF_PERSIST;
+    bd.domain = RAD_DOMAIN_DEVICE;
+    const rad_buf keep = b.decl_buffer("keep", &bd);
+    const rad_weight w = decl_w(b, "w0");
+    rad_op o1 = decl_gemm(b, w), o2 = decl_gemm(b, w);
+    CHECK_OK(b.op_writes(o1, &keep, 1));
+    CHECK_OK(b.op_reads (o2, &keep, 1));
+    CHECK_OK(b.buf_full_write(keep));
+    CHECK_OK(b.finish());
+    const BufferInfo* k = b.program().buffer(keep);
+    REQUIRE(k != nullptr);
+    CHECK_EQ(k->arena_offset, 0);
+    CHECK_EQ(k->first_def, 0);
+    CHECK_EQ(k->runs.size(), (size_t)1);
+    CHECK_EQ(k->runs[0].lo, 0);
+    CHECK_EQ(k->runs[0].hi, k->last_use);
+}
+
 /* A smaller step's plan: the same buffers with rows scaled, the fixed region untouched and the
  * transients packed lower, so a step that small never touches the arena past `end`. */
 TEST(a_smaller_step_packs_its_transients_lower_and_keeps_the_fixed_region) {
@@ -2299,7 +2408,9 @@ TEST(a_second_lane_window_must_be_closed) {
  * two live activations with no crash. Over random programs: same-domain buffers live at once never
  * share bytes, the fixed region holds every persistent buffer below every transient, offsets keep
  * the sub-block alignment, the arena covers the live peak, and planning is deterministic. A
- * smaller step's level keeps the same guarantees inside the full arena. */
+ * transient declared rad_buf_full_write carries several runs, and the packer must keep every one of
+ * them apart from the buffers alive then, not just the envelope. A smaller step's level keeps the
+ * same guarantees inside the full arena. */
 TEST(the_buffer_plan_never_aliases_two_live_buffers) {
     const uint64_t seed = 0x243f6a8885a308d3ull;
     uint64_t x = seed;
@@ -2328,16 +2439,36 @@ TEST(the_buffer_plan_never_aliases_two_live_buffers) {
             if (b.decl.kind == RAD_BUF_TRANSIENT && rnd(10) != 0) {
                 b.first_def = 1 + (int32_t)rnd((uint64_t)n_ops);
                 b.last_use = b.first_def + (int32_t)rnd((uint64_t)(n_ops - b.first_def + 1));
+                /* One transient in three is declared rad_buf_full_write and carries one run per
+                 * stretch of uses: the packer must keep every run apart, not the envelope. */
+                if (rnd(3) == 0) {
+                    b.full_write = true;
+                    int32_t t = b.first_def;
+                    while (t <= b.last_use) {
+                        int32_t e = std::min<int32_t>(b.last_use, t + (int32_t)rnd(20));
+                        b.runs.push_back(BufRun{ t, e });
+                        t = e + 1 + (int32_t)rnd(40);   /* the gap is the dead stretch */
+                    }
+                }
             } else if (b.decl.kind == RAD_BUF_PERSIST) {
                 b.first_def = 0;                    /* as the builder sets every persistent buffer */
                 b.last_use = n_ops;
+                b.runs.assign(1, BufRun{ 0, n_ops });
             }
             p.buffers.push_back(b);
         }
         BufPlanReport rep;
         if (plan_buffers(p, &rep) != RAD_OK) { bad(it, "plan_buffers refused"); continue; }
 
-        struct Span { int32_t lo, hi; int64_t off, end; int dom; bool persist; };
+        struct Span {
+            int32_t lo, hi; int64_t off, end; int dom; bool persist;
+            std::vector<BufRun> runs;
+            bool covers(int32_t t) const {
+                for (const BufRun& r : runs)
+                    if (r.lo <= t && t <= r.hi) return true;
+                return false;
+            }
+        };
         auto spans = [&](const Program& q, const std::vector<int64_t>* offs,
                          const std::vector<RadBufDecl>* decl) {
             std::vector<Span> v;
@@ -2347,6 +2478,8 @@ TEST(the_buffer_plan_never_aliases_two_live_buffers) {
                 Span s;
                 s.lo = b.first_def < 0 ? 0 : b.first_def;
                 s.hi = b.first_def < 0 ? n_ops : b.last_use;
+                s.runs = b.runs;
+                if (s.runs.empty()) s.runs.assign(1, BufRun{ s.lo, s.hi });
                 s.off = offs ? (*offs)[i] : b.arena_offset;
                 s.end = s.off + align_up(buffer_bytes(d), (int64_t)RAD_ALIGN_SUB);
                 s.dom = d.domain;
@@ -2361,7 +2494,11 @@ TEST(the_buffer_plan_never_aliases_two_live_buffers) {
                     const Span& a = v[i];
                     const Span& b = v[j];
                     if (a.dom != b.dom) continue;
-                    const bool live = a.persist || b.persist || (a.lo <= b.hi && b.lo <= a.hi);
+                    bool live = a.persist || b.persist;
+                    for (const BufRun& ra : a.runs) {
+                        for (const BufRun& rb : b.runs)
+                            if (ra.lo <= rb.hi && rb.lo <= ra.hi) live = true;
+                    }
                     if (live && a.off < b.end && b.off < a.end) return true;
                 }
             return false;
@@ -2382,7 +2519,7 @@ TEST(the_buffer_plan_never_aliases_two_live_buffers) {
         for (int32_t t = 0; t <= n_ops; ++t) {
             int64_t live = 0;
             for (const Span& a : s)
-                if (a.dom == RAD_DOMAIN_DEVICE && !a.persist && a.lo <= t && t <= a.hi) live += a.end - a.off;
+                if (a.dom == RAD_DOMAIN_DEVICE && !a.persist && a.covers(t)) live += a.end - a.off;
             peak = std::max(peak, live);
         }
         if (p.arena_bytes < p.arena_fixed_bytes + peak) bad(it, "the arena is below the live peak");

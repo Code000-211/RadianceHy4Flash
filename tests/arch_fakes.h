@@ -140,6 +140,9 @@ struct RadBuilder {
 
     /* The buffers named to rad_buf_concurrent: the ones a second lane touches. */
     std::vector<rad_buf> concurrent;
+    /* The buffers named to rad_buf_full_write: each run of one writes the bytes that run reads, so
+     * liveness gives them one run per stretch of uses and the bytes between two runs are free. */
+    std::vector<rad_buf> full_write;
     /* The second lane's window (rad_lane1_window_begin), first and last op index; -1 when none. */
     int32_t lane1_w0 = -1, lane1_w1 = -1;
 
@@ -422,6 +425,13 @@ extern "C" int rad_lora_alias(RadBuilder* b, const char* native, const char* fro
 extern "C" int rad_buf_concurrent(RadBuilder* b, rad_buf buf) {
     if (!b || !buf) return RAD_E_INVAL;
     b->concurrent.push_back(buf);
+    return RAD_OK;
+}
+/* Recorded: a buffer whose runs write the bytes they read (multi-interval liveness), applied by
+ * liveness() and checked by lint_step as the real builder and runtime check it. */
+extern "C" int rad_buf_full_write(RadBuilder* b, rad_buf buf) {
+    if (!b || !buf) return RAD_E_INVAL;
+    b->full_write.push_back(buf);
     return RAD_OK;
 }
 /* Recorded: the second lane's window (qwen35_fp8, gemma3), applied by liveness() as the real builder
@@ -951,12 +961,21 @@ namespace rad_fake {
 
 /* One buffer's planned lifetime. `planned` is false for a buffer live over the whole program
  * (PERSIST, DERIVED, rad_buf_concurrent without a second-lane window, or no declared use), which
- * shares bytes with nothing. */
+ * shares bytes with nothing. `runs` is the life as runs, one per stretch of uses for a buffer named
+ * to rad_buf_full_write and a single [lo, hi] otherwise; lo and hi are their envelope. */
 struct Live {
     int32_t lo = 0, hi = 0;
+    std::vector<std::pair<int32_t, int32_t>> runs;
     bool    planned = false;
     bool    transient = false;
+    bool    concurrent = false;   /* rad_buf_concurrent: one run across the second lane's window */
     int     domain = RAD_DOMAIN_DEVICE;
+    bool    covers(int32_t t) const {
+        if (!planned) return true;
+        for (const auto& r : runs)
+            if (r.first <= t && t <= r.second) return true;
+        return false;
+    }
 };
 
 /* Liveness by the rule of Builder::finish_buffer_liveness (core/build/rad_builder.cpp). Op handle
@@ -974,27 +993,60 @@ std::vector<Live> liveness(const RadBuilder& b) {
                 last[h] = (int32_t)(i + 1);
             }
     std::set<rad_buf> conc(b.concurrent.begin(), b.concurrent.end());
+    std::set<rad_buf> full(b.full_write.begin(), b.full_write.end());
     std::vector<Live> L(nb + 1);
     for (size_t h = 1; h <= nb; ++h) {
         const RadBufDecl& d = b.bufs[h - 1].d;
         Live& l = L[h];
         l.transient = d.kind == RAD_BUF_TRANSIENT;
         l.domain    = d.domain;
+        l.concurrent = conc.count((rad_buf)h) > 0;
         if (!l.transient || first[h] < 0 || (conc.count((rad_buf)h) && b.lane1_w1 < 0)) {
             l.lo = 0;
             l.hi = last_op;
+            l.runs.assign(1, { 0, last_op });
             continue;
         }
         if (conc.count((rad_buf)h)) {   /* under the window: across it and over its own uses */
             l.planned = true;
             l.lo = std::min(first[h], b.lane1_w0);
             l.hi = std::max(last[h], b.lane1_w1);
+            l.runs.assign(1, { l.lo, l.hi });
             continue;
         }
         l.planned = true;
         l.lo = first[h];
         l.hi = last[h];
         if ((rad_buf)h == b.logits || (rad_buf)h == b.pooled) l.hi = last_op;
+        /* One run per stretch of declared uses when each run writes the bytes it reads: no value
+         * has to survive a gap, so the buffer is dead from its last read to the next run's first
+         * write. */
+        if (full.count((rad_buf)h)) {
+            int32_t lo = -1, hi = -1;
+            bool read_since = false;
+            for (size_t i = 0; i < b.ops.size(); ++i) {
+                const int32_t t = (int32_t)(i + 1);
+                const auto& wv = b.ops[i].writes;
+                const auto& rv = b.ops[i].reads;
+                const bool w = std::find(wv.begin(), wv.end(), (rad_buf)h) != wv.end();
+                const bool r = std::find(rv.begin(), rv.end(), (rad_buf)h) != rv.end();
+                if (!w && !r) continue;
+                /* A read-write pair is an in-place update, and a write no read precedes may be a
+                 * second piece of the plane: neither ends the run (Builder::build_runs). */
+                if (w && !r && read_since && lo >= 0) {
+                    l.runs.emplace_back(lo, hi);
+                    lo = -1;
+                    read_since = false;
+                }
+                if (lo < 0) lo = t;
+                hi = t;
+                if (r) read_since = true;
+            }
+            if (lo >= 0) l.runs.emplace_back(lo, hi);
+            if (!l.runs.empty() && l.runs.back().second < l.hi) l.runs.back().second = l.hi;
+        } else {
+            l.runs.assign(1, { l.lo, l.hi });
+        }
     }
     return L;
 }
@@ -1018,6 +1070,23 @@ bool operand_fits(const int64_t* shape, uint32_t rank, const RadOperand& o) {
     return span < numel;
 }
 
+/* The element range operand `o` reaches in a buffer of `shape`: [lo, hi], stride gaps counted as
+ * covered, the way issue.cpp's rad_buf_full_write guard computes it. */
+std::pair<int64_t, int64_t> operand_span(const int64_t* shape, uint32_t rank, const RadOperand& o) {
+    int64_t sh[RAD_MAX_RANK] = {}, st[RAD_MAX_RANK] = {};
+    for (uint32_t d = 0; d < rank; ++d) sh[d] = shape[d];
+    int64_t s = 1;
+    for (int d = (int)rank - 1; d >= 0; --d) { st[d] = s; s *= sh[d]; }
+    if (o.rows > 0 && rank >= 1) sh[0] = o.rows;
+    if (o.cols > 0 && rank >= 1) sh[rank - 1] = o.cols;
+    int64_t lo = o.offset, hi = o.offset;
+    for (uint32_t d = 0; d < rank; ++d) {
+        if (sh[d] <= 0) return { lo, lo - 1 };
+        hi += (sh[d] - 1) * st[d];
+    }
+    return { lo, hi };
+}
+
 bool in(const std::vector<rad_buf>& v, rad_buf h) {
     return std::find(v.begin(), v.end(), h) != v.end();
 }
@@ -1025,13 +1094,43 @@ bool in(const std::vector<rad_buf>& v, rad_buf h) {
 std::vector<std::string> lint_step(const RadBuilder& b, const std::vector<const RadCtx*>& passes) {
     std::vector<std::string> bad;
     const std::vector<Live> L = liveness(b);
+    /* rad_buf_full_write, per buffer: the run whose bytes this step has written so far and the
+     * merged element ranges it wrote there (issue.cpp keeps the same state in bytes and refuses
+     * the same read). */
+    struct Cov {
+        int32_t run = -1;
+        int64_t first_pos = 0;   /* issue position of the write that began this run */
+        std::vector<std::pair<int64_t, int64_t>> at;
+    };
     const size_t nb = b.bufs.size();
     auto name = [&](rad_buf h) { return h && h <= nb ? b.bufs[h - 1].name : std::string("?"); };
     auto shares = [&](rad_buf x, rad_buf y) {
         const Live& p = L[x];
         const Live& q = L[y];
-        return p.planned && q.planned && p.domain == q.domain && (p.hi < q.lo || q.hi < p.lo);
+        if (!p.planned || !q.planned || p.domain != q.domain) return false;
+        for (const auto& a : p.runs)
+            for (const auto& c : q.runs)
+                if (a.first <= c.second && c.first <= a.second) return false;
+        return true;
     };
+    auto life_str = [&](rad_buf h) {
+        std::string s;
+        for (const auto& r : L[h].runs) {
+            if (!s.empty()) s += ", ";
+            s += std::to_string(r.first) + ".." + std::to_string(r.second);
+        }
+        return s;
+    };
+    auto run_of = [&](const Live& l, int32_t t) {
+        for (int32_t k = 0; k < (int32_t)l.runs.size(); ++k)
+            if (l.runs[(size_t)k].first <= t && t <= l.runs[(size_t)k].second) return k;
+        return (int32_t)-1;
+    };
+    auto life_str_run = [&](const Live& l, int32_t k) {
+        if (k < 0 || k >= (int32_t)l.runs.size()) return std::string("?");
+        return std::to_string(l.runs[(size_t)k].first) + ".." + std::to_string(l.runs[(size_t)k].second);
+    };
+    std::map<rad_buf, Cov> cov;   /* one step (one pass) of coverage state */
     std::set<std::pair<int, rad_kvgroup>> bound(b.binds.begin(), b.binds.end());
     std::vector<int64_t> last_write(nb + 1, -1);
     int64_t pos = 0;
@@ -1039,6 +1138,7 @@ std::vector<std::string> lint_step(const RadBuilder& b, const std::vector<const 
     for (size_t pi = 0; pi < passes.size(); ++pi) {
         const RadCtx& c = *passes[pi];
         size_t next_copy = 0;
+        cov.clear();   /* a step begins every run again */
         for (size_t ii = 0; ii < c.issues.size(); ++ii, ++pos) {
             for (; next_copy < c.copies.size() && c.copies[next_copy].first <= ii; ++next_copy)
                 last_write[c.copies[next_copy].second] = pos;
@@ -1064,12 +1164,51 @@ std::vector<std::string> lint_step(const RadBuilder& b, const std::vector<const 
                                       std::to_string(od.rows) + ", cols " +
                                       std::to_string(od.cols) + ")");
                     const Live& l = L[h];
-                    if (l.planned && ((int32_t)is.op < l.lo || (int32_t)is.op > l.hi))
+                    if (!l.covers((int32_t)is.op))
                         bad.push_back(at + ": undeclared use of '" + name(h) + "' (planned ops " +
-                                      std::to_string(l.lo) + ".." + std::to_string(l.hi) + ")");
+                                      life_str(h) + ")");
                     const bool r = in(o->reads, h), w = in(o->writes, h);
                     if (r || !w) rd.push_back(h);
                     if (w || !r) wr.push_back(h);
+                    /* rad_buf_full_write: the plan lends this buffer's bytes to another buffer
+                     * between its runs, so a run must write every byte it reads. Checked per
+                     * buffer and run, as issue.cpp checks it at run time. */
+                    /* Only where the promise has an effect: a transient with no second-lane
+                     * window, whose runs the planner packs (plan_buffers keeps one run for a
+                     * concurrent, PERSIST or DERIVED buffer, where the call changes nothing). */
+                    if (l.planned && !l.concurrent &&
+                        std::find(b.full_write.begin(), b.full_write.end(), h) != b.full_write.end()) {
+                        const int32_t run = run_of(l, (int32_t)is.op);
+                        const auto span = operand_span(d.shape, d.rank, od);
+                        Cov& cv = cov[h];
+                        if (w && cv.run != run) { cv.run = run; cv.first_pos = pos; cv.at.clear(); }
+                        if (r && span.second >= span.first) {
+                            bool ok = false;
+                            if (cv.run == run)
+                                for (const auto& g : cv.at)
+                                    if (g.first <= span.first && span.second <= g.second) { ok = true; break; }
+                            if (!ok)
+                                bad.push_back(at + ": reads bytes " + std::to_string(span.first) +
+                                              ".." + std::to_string(span.second) + " of '" +
+                                              name(h) + "', which its run (ops " +
+                                              life_str_run(l, run) + ") never wrote there, but the "
+                                              "buffer is declared rad_buf_full_write");
+                        }
+                        if (w && span.second >= span.first) {
+                            auto it2 = std::partition_point(
+                                cv.at.begin(), cv.at.end(),
+                                [&](const std::pair<int64_t, int64_t>& g) { return g.second < span.first; });
+                            cv.at.insert(it2, span);
+                            for (size_t z = 1; z < cv.at.size();) {
+                                if (cv.at[z].first <= cv.at[z - 1].second) {
+                                    cv.at[z - 1].second = std::max(cv.at[z - 1].second, cv.at[z].second);
+                                    cv.at.erase(cv.at.begin() + (long)z);
+                                } else {
+                                    ++z;
+                                }
+                            }
+                        }
+                    }
                     /* A GEMM's input is read as contiguous rows: libr4d refuses a column slice
                      * narrower than its buffer. */
                     const int64_t width = d.rank ? d.shape[d.rank - 1] : 0;
@@ -1118,9 +1257,10 @@ std::vector<std::string> lint_step(const RadBuilder& b, const std::vector<const 
                      * classified by the op's declared sets like a buffer operand. */
                     if (const rad_buf h = fake_buf_of(od.raw, nb)) {
                         const Live& l = L[h];
-                        if (l.planned && ((int32_t)is.op < l.lo || (int32_t)is.op > l.hi))
+                        if (!l.covers((int32_t)is.op))
                             bad.push_back(at + ": undeclared use of '" + name(h) +
-                                          "' through a raw pointer");
+                                          "' through a raw pointer (planned ops " + life_str(h) +
+                                          ")");
                         const bool r = in(o->reads, h), w = in(o->writes, h);
                         if (r || !w) rd.push_back(h);
                         if (w || !r) wr.push_back(h);
@@ -1135,12 +1275,17 @@ std::vector<std::string> lint_step(const RadBuilder& b, const std::vector<const 
                                   "' before any issue of this step wrote it");
                     continue;
                 }
+                /* Where a run's own writes cover the read (a rad_buf_full_write buffer), only a
+                 * write inside that run can take its bytes: an earlier run's bytes are another
+                 * buffer's, and the read is refused by the coverage rule above. */
+                int64_t w0 = w;
+                if (const auto it3 = cov.find(h); it3 != cov.end() && it3->second.run >= 0)
+                    w0 = it3->second.first_pos;
                 for (size_t x = 1; x <= nb; ++x)
-                    if (x != h && last_write[x] > w && shares(h, (rad_buf)x))
+                    if (x != h && last_write[x] > w0 && shares(h, (rad_buf)x))
                         bad.push_back(std::string(where) + ": reads '" + name(h) + "' (ops " +
-                                      std::to_string(L[h].lo) + ".." + std::to_string(L[h].hi) +
-                                      ") after a write of '" + name((rad_buf)x) + "' (ops " +
-                                      std::to_string(L[x].lo) + ".." + std::to_string(L[x].hi) +
+                                      life_str(h) + ") after a write of '" + name((rad_buf)x) +
+                                      "' (ops " + life_str((rad_buf)x) +
                                       "), which may share its bytes");
             }
             for (rad_buf h : wr) last_write[h] = pos;
@@ -1482,8 +1627,8 @@ namespace rad_fake {
 
 /* A 64-bit FNV-1a fingerprint of everything a declare recorded: ops with their parameters,
  * weights, read and write sets and resolution; buffers, weights, KV groups, bindings, name maps,
- * the logits / pooled / drafter / generator declarations and the concurrent list. Two declares
- * give one value only if the core would build the same program from them. */
+ * the logits / pooled / drafter / generator declarations, the concurrent and full-write lists. Two
+ * declares give one value only if the core would build the same program from them. */
 struct Fnv {
     uint64_t h = 1469598103934665603ull;
     Fnv& raw(const void* p, size_t n) {
@@ -1528,6 +1673,7 @@ uint64_t graph_hash(const RadBuilder& b) {
      .i(b.drafter.block).i(b.drafter.proposal).i(b.drafter.mask_token).i(b.drafter_shared)
      .s(b.encoder_name).s(b.audio_encoder_name).s(b.generator_name);
     for (rad_buf x : b.concurrent) f.i(x);
+    for (rad_buf x : b.full_write) f.i(x);
     return f.h;
 }
 

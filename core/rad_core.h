@@ -257,6 +257,16 @@ inline bool weight_file_direct(const WeightInfo& w, int world_size) {
            (w.decl.shard == RAD_SHARD_NONE || world_size <= 1);
 }
 
+/* One run of a buffer's liveness: the ops lo..hi, inclusive, over which its bytes must hold a
+ * value. A buffer has one run unless it was declared rad_buf_full_write, in which case each run
+ * writes the bytes that run reads (abi/rad_builder.h) and the buffer is dead between its runs —
+ * the plan may lend its bytes to another buffer in the gaps (spec §3.1, multi-interval
+ * liveness). */
+struct BufRun {
+    int32_t lo = 0, hi = -1;
+    bool covers(int32_t t) const { return lo <= t && t <= hi; }
+};
+
 struct BufferInfo {
     std::string name;
     RadBufDecl  decl{};
@@ -266,6 +276,12 @@ struct BufferInfo {
      * Two transients whose lives do not overlap share storage (spec §3.1). */
     int32_t     first_def = -1;
     int32_t     last_use  = -1;
+    /* The same life as runs, always at least one (a buffer live from the start of the program
+     * has the single run [0, last_op]). first_def / last_use are the envelope of these. */
+    std::vector<BufRun> runs;
+    /* rad_buf_full_write: every run of this buffer writes the bytes that run reads, so its bytes
+     * are free between the runs. */
+    bool        full_write = false;
     int64_t     arena_offset = -1;
     void*       ptr = nullptr;
     /* A transient no op of the declared list names as an operand: the plan charges it for the whole
@@ -495,6 +511,9 @@ public:
      * arena of the buffer's declared domain. Both are sized for max_tok, the worst step (spec
      * §3.1). */
     int64_t arena_bytes = 0;         /* RAD_DOMAIN_DEVICE */
+    /* What a perfect packer would have reached for the device transients (BufPlanReport::peak_live),
+     * logged at bringup beside the arena size: the headroom the greedy packer left. */
+    int64_t arena_peak_live = 0;
     /* Start of the device arena's transients. PERSIST and DERIVED buffers sit below, at the same
      * offset at every step size; above is what a smaller step packs smaller
      * (core/build/rad_bufplan.cpp, plan_level). */
