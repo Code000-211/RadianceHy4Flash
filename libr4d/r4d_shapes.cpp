@@ -1580,6 +1580,38 @@ extern "C" int r4d_shape_ar_rmsnorm_quant_fp8(const RadParam* p, int n_p, int op
     R4D_PICK(l);
 }
 
+/* The exact all-reduce with the two ops after it in one kernel: `a` is the message and inout, `x`
+ * the residual stream and inout, `w` the gain (f32 or bf16; the shim reads the operand's own), `y`
+ * the norm. Same four shapes in both modes: mode 0 norms `a` and adds into `x`, mode 1 adds into `x`
+ * and norms it.
+ *
+ * The gain is f32 unless the geometry says `w_dtype` bf16: every architecture plugin's norm gains
+ * are RAD_F32 (the family note above), so an absent `w_dtype` describes the operand the graph has,
+ * and a caller that hands the row a bf16 gain names it. r4d_ar_entry.hip's launcher reads the same
+ * parameter, so the description and the accepted buffer cannot disagree. */
+extern "C" int r4d_shape_ar_add_rmsnorm(const RadParam* p, int n_p, int operand,
+                                        RadOpdDesc* out) {
+
+    const int64_t M = pi(p, n_p, "M");
+    const int64_t n = pi(p, n_p, "n");
+    const uint32_t W = dt_par(p, n_p, "w_dtype");
+    const uint32_t wdt = W == (uint32_t)RAD_DT_INVALID ? (uint32_t)RAD_F32 : W;
+    if (wdt != (uint32_t)RAD_F32 && wdt != (uint32_t)RAD_BF16) return RAD_E_UNSUPPORTED;
+    /* `wire` 6 is the coded push: whole 256-value waves, and two ranks (the slot layout is the
+     * two-rank one). A row that asks for it and does not fit is refused here, where the graph is
+     * built, rather than at the launch. */
+    const int64_t w6 = pi(p, n_p, "wire", 0);
+    if (w6 != 0 && w6 != 6) return RAD_E_INVAL;
+    if (w6 == 6 && (n % 256 || pi(p, n_p, "world_size") != 2)) return RAD_E_UNSUPPORTED;
+    const RadOpdDesc l[] = {
+        opd((uint32_t)RAD_BF16, M, n),
+        opd((uint32_t)RAD_BF16, M, n),
+        opd(wdt, n),
+        opd((uint32_t)RAD_BF16, M, n),
+    };
+    R4D_PICK(l);
+}
+
 extern "C" int r4d_shape_ar_rmsnorm_had_quant_i8g(const RadParam* p, int n_p, int operand,
                                                   RadOpdDesc* out) {
 
