@@ -496,8 +496,10 @@ private:
     uint64_t route_dropped_ = 0;
 
     /* Handle-to-pointer resolution for the issue path and rad_weight_ptr. Waits on a pending mover
-     * event on the stream, never on the host. */
-    void* resolve_weight(rad_weight w);
+     * event on the stream, never on the host. `defer_in_flight` reports a transfer that has not
+     * landed through `*in_flight` instead of ordering the stream behind it here: at the head of a
+     * pass that wait belongs with the op that reads the table (wtab_patch_pass). */
+    void* resolve_weight(rad_weight w, bool defer_in_flight = false, bool* in_flight = nullptr);
 
     /* ---- weight tables (RAD_OPK_WTAB), issued by routed mixture-of-experts layers.
      *
@@ -561,6 +563,28 @@ private:
     WtabPatch wtab_acc_;
     bool      wtab_gather_ = false;
     int  wtab_flush();
+    /* Every table's queued entries, patched at the head of a pass (ctx.cpp, run_step): the
+     * residency sync that opens a pass already carries every change of the step, since the mover
+     * publishes landed promotions before the pass (engine.cpp), so the entries go out in the one
+     * dispatch a block carries them, ahead of everything that reads a table, instead of one
+     * dispatch at each op that finds its tables stale. A staged pass keeps the per-op path above:
+     * its stager publishes mid-pass (stager.h, before_op). An entry whose transfer has not landed
+     * yet also keeps it, so its stream wait stays where the op that reads it can carry it. The
+     * patches go out on lane 0; a pass that patched orders lane 1 behind them with one join, so an
+     * op on either lane that reads a table sees it patched (wtab_patch_pass). */
+    int  wtab_patch_pass();
+    /* Resolves entry `e` of `t` into `*out`, or fails the step naming the entry when the load phase
+     * bound it no pointer. The first issue of a table (table_refresh) and the patch of its moved
+     * entries (wtab_entry) both resolve through here, so that diagnostic is one text. */
+    int  wtab_resolve(const WeightTable& t, int64_t e, rad_op h, int operand, bool defer_in_flight,
+                      void** out);
+    /* Resolves one queued entry of `t` and, when its pointer differs from the one the device array
+     * holds, appends the write to `pt`, dispatching it when the block fills (table_refresh,
+     * wtab_patch_pass). `h` and `operand` name the table in a diagnostic. `defer_in_flight` leaves an
+     * entry whose transfer has not landed unpatched and says so through `*in_flight`, for a
+     * caller that hands it back to the op. */
+    int  wtab_entry(WeightTable& t, int64_t e, rad_op h, int operand, WtabPatch& pt,
+                    int64_t* walked, bool defer_in_flight = false, bool* in_flight = nullptr);
     /* ------------------------------------------------------------------ recorded passes
      *
      * A decode pass repeats step after step: same kernels, arguments and queues. The host work

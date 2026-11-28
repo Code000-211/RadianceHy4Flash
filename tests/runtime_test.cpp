@@ -716,6 +716,222 @@ TEST(an_ops_weight_tables_are_patched_in_one_dispatch) {
     }
 }
 
+/* Two routed GEMMs, a table of two experts each: the fixture for the per-pass patch below. */
+constexpr int kPassTabE = 2;
+static int k_tab_a(const RadArgs* a, RadStream s) { return record("tab_a", a, s); }
+static int k_tab_b(const RadArgs* a, RadStream s) { return record("tab_b", a, s); }
+
+/* A stager that arms every pass and stages nothing: the pass is issued live, so it keeps the
+ * per-op table path (runtime/ctx.h, wtab_patch_pass). */
+struct ArmedStager final : rad::OpStager {
+    bool begin_pass(const RadBatch*) override { return true; }
+    int  before_op(rad_op, RadStream, bool* resync) override { *resync = false; return RAD_OK; }
+    int  end_pass(RadStream) override { return RAD_OK; }
+};
+
+/* A pass over two routed GEMMs, a table each, with one entry moved in each table: every residency
+ * change of the step is queued when the pass opens (run_step's sync_residency, the mover's
+ * publish_landed behind it), so a pass no stager armed for patches both tables in one dispatch at
+ * its head instead of one dispatch at each op that finds its table stale. A staged pass keeps the
+ * per-op path: one dispatch for each op that moves an entry. `in_flight` marks the two moved
+ * entries as behind a copy that has not landed, which keeps the per-op path too (its wait is worth
+ * no less at the head, but the pass would stall on a copy it does not need yet). `want_patches` is
+ * what the pass at step 1 dispatches, and the tables it leaves behind are the same either way. */
+static void two_tables_one_pass(rad::OpStager* stager, int64_t want_patches, bool in_flight = false) {
+    constexpr int kE = kPassTabE;
+    static uint16_t home[2][kE][8], away[2][kE][8];
+    Fixture f;
+    std::vector<rad_weight> w[2];
+    for (int t = 0; t < 2; ++t)
+        for (int e = 0; e < kE; ++e)
+            w[t].push_back(f.add_weight(
+                ("pp." + std::to_string(t) + ".e" + std::to_string(e)).c_str(), RAD_BF16, 8, 4,
+                home[t][e]));
+    rad_buf x = f.add_buffer("x", RAD_BF16, 64, 4, 0);
+    rad_buf y = f.add_buffer("y", RAD_BF16, 64, 8, 1024);
+    rad_op  op[2] = { f.add_op("patch_pass_a", "M", { 8192 }, { k_tab_a }, { "tab_a" },
+                               &g_moe_schema, w[0]),
+                     f.add_op("patch_pass_b", "M", { 8192 }, { k_tab_b }, { "tab_b" },
+                               &g_moe_schema, w[1]) };
+    f.P.ops[op[0]].weight_opd.assign((size_t)kE, 1);
+    f.P.ops[op[1]].weight_opd.assign((size_t)kE, 1);
+
+    TableResidency res;
+    res.slot.assign(f.P.weights.size(), rad::WeightSlot{});
+    for (int t = 0; t < 2; ++t)
+        for (int e = 0; e < kE; ++e) res.slot[(size_t)w[t][(size_t)e]].ptr = home[t][e];
+    if (stager) f.ctx.set_stager(stager);
+    CHECK_OK(f.start(&res));
+
+    auto issue = [&](int step_no) {
+        g_rec.clear();
+        CHECK_OK(f.step(4, step_no, [&](Ctx& c) {
+            RadOperand a[3] = { RAD_B(x), RAD_WTAB(w[0][0], kE), RAD_B(y) };
+            CHECK_OK(c.issue(op[0], a, 3, RAD_N_BATCH));
+            RadOperand b[3] = { RAD_B(x), RAD_WTAB(w[1][0], kE), RAD_B(y) };
+            CHECK_OK(c.issue(op[1], b, 3, RAD_N_BATCH));
+        }));
+        REQUIRE_EQ(g_rec.size(), (size_t)2);
+    };
+    /* The table as the kernel reads it, behind the step's stream, in issue order. */
+    auto table = [&](int t) {
+        std::vector<void*> v((size_t)kE, nullptr);
+        CHECK_OK(rad_memcpy_async(v.data(), g_rec[(size_t)t].t[1].data, kE * sizeof(void*),
+                                  f.ctx.stream()));
+        CHECK_OK(rad_stream_sync(f.ctx.stream()));
+        return v;
+    };
+
+    /* The first issue uploads both tables whole: nothing to patch. */
+    issue(0);
+    CHECK_EQ(f.ctx.wtab_patches(), (int64_t)0);
+    for (int t = 0; t < 2; ++t)
+        for (int e = 0; e < kE; ++e) CHECK(table(t)[e] == (void*)home[t][e]);
+
+    /* One entry moved in each table. */
+    res.move(w[0][1], away[0][1]);
+    res.move(w[1][0], away[1][0]);
+    RadEvent ev = RAD_NULL_HANDLE;
+    if (in_flight) {
+        CHECK_OK(rad_event_create(&ev));
+        CHECK_OK(rad_event_record(ev, f.ctx.stream()));
+        res.slot[(size_t)w[0][1]].ready = ev;
+        res.slot[(size_t)w[1][0]].ready = ev;
+    }
+    issue(1);
+    CHECK_EQ(f.ctx.wtab_patches(), want_patches);
+    CHECK(table(0)[0] == (void*)home[0][0]);
+    CHECK(table(0)[1] == (void*)away[0][1]);
+    CHECK(table(1)[0] == (void*)away[1][0]);
+    CHECK(table(1)[1] == (void*)home[1][1]);
+
+    /* Nothing moved: nothing is dispatched. */
+    issue(2);
+    CHECK_EQ(f.ctx.wtab_patches(), want_patches);
+    if (in_flight) {
+        res.slot[(size_t)w[0][1]].ready = RAD_NULL_HANDLE;
+        res.slot[(size_t)w[1][0]].ready = RAD_NULL_HANDLE;
+        rad_event_destroy(ev);
+    }
+}
+
+TEST(a_pass_patches_its_weight_tables_once_at_its_head) { two_tables_one_pass(nullptr, 1); }
+TEST(a_staged_pass_patches_each_ops_weight_tables_at_the_op) {
+    ArmedStager stager;
+    two_tables_one_pass(&stager, 2);
+}
+TEST(a_table_whose_copy_is_in_flight_is_patched_at_the_op_that_reads_it) {
+    two_tables_one_pass(nullptr, 2, true);
+}
+
+/* An entry the load phase bound no pointer (the placement left it nowhere, which is not a copy
+ * still going) is a load-phase bug, and the head walk names it: the step fails, and the pass is
+ * not issued against an array that still holds the entry's old pointer. The per-op path reports
+ * the same entry in the same words, from the one resolve both walk through (wtab_resolve). */
+TEST(a_table_entry_with_no_pointer_fails_the_step_at_the_pass_head) {
+    constexpr int kE = kPassTabE;
+    static uint16_t home[kE][8];
+    Fixture f;
+    std::vector<rad_weight> w;
+    for (int e = 0; e < kE; ++e)
+        w.push_back(f.add_weight(("np.e" + std::to_string(e)).c_str(), RAD_BF16, 8, 4, home[e]));
+    rad_buf x = f.add_buffer("x", RAD_BF16, 64, 4, 0);
+    rad_buf y = f.add_buffer("y", RAD_BF16, 64, 8, 1024);
+    rad_op  op = f.add_op("patch_pass_np", "M", { 8192 }, { k_tab_a }, { "tab_a" },
+                          &g_moe_schema, w);
+    f.P.ops[op].weight_opd.assign((size_t)kE, 1);
+
+    TableResidency res;
+    res.slot.assign(f.P.weights.size(), rad::WeightSlot{});
+    for (int e = 0; e < kE; ++e) res.slot[(size_t)w[(size_t)e]].ptr = home[e];
+    CHECK_OK(f.start(&res));
+
+    auto issue = [&](int step_no) {
+        g_rec.clear();
+        return f.step(4, step_no, [&](Ctx& c) {
+            RadOperand a[3] = { RAD_B(x), RAD_WTAB(w[0], kE), RAD_B(y) };
+            CHECK_OK(c.issue(op, a, 3, RAD_N_BATCH));
+        });
+    };
+    /* The first issue uploads the table whole: nothing queued, nothing to name. */
+    CHECK_OK(issue(0));
+    CHECK_EQ(f.ctx.wtab_patches(), (int64_t)0);
+
+    /* The mover takes entry 1 and lands nothing: no pointer at issue. */
+    res.move(w[1], nullptr);
+    CHECK(issue(1) < 0);
+    CHECK(g_rec.empty());                   /* no launch against the stale array */
+    CHECK(std::strstr(f.ctx.step_error(), "weight 'np.e1'") != nullptr);
+    CHECK(std::strstr(f.ctx.step_error(), "has no pointer at issue") != nullptr);
+}
+
+/* A pass with an op on each lane, both reading one table: the head patch goes out on lane 0, and
+ * a pass that patched joins lane 1 behind it, so the op on lane 1 reads the moved entries too
+ * (before this a table was patched at the op, on the op's own lane). The first step builds lane 1
+ * mid-pass, behind lane 0 (lane_init); the second finds it built and is the one this pins. */
+TEST(a_two_lane_pass_reads_its_patched_table_on_both_lanes) {
+    constexpr int kE = kPassTabE;
+    static uint16_t home[kE][8], away[kE][8];
+    Fixture f;
+    std::vector<rad_weight> w;
+    for (int e = 0; e < kE; ++e)
+        w.push_back(f.add_weight(("ln.e" + std::to_string(e)).c_str(), RAD_BF16, 8, 4, home[e]));
+    rad_buf x = f.add_buffer("x", RAD_BF16, 64, 4, 0);
+    rad_buf y = f.add_buffer("y", RAD_BF16, 64, 8, 1024);
+    rad_op  op = f.add_op("patch_pass_lane", "M", { 8192 }, { k_tab_a }, { "tab_a" },
+                          &g_moe_schema, w);
+    f.P.ops[op].weight_opd.assign((size_t)kE, 1);
+
+    TableResidency res;
+    res.slot.assign(f.P.weights.size(), rad::WeightSlot{});
+    for (int e = 0; e < kE; ++e) res.slot[(size_t)w[(size_t)e]].ptr = home[e];
+    CHECK_OK(f.start(&res));
+
+    auto issue = [&](int step_no) {
+        g_rec.clear();
+        CHECK_OK(f.step(4, step_no, [&](Ctx& c) {
+            RadOperand a[3] = { RAD_B(x), RAD_WTAB(w[0], kE), RAD_B(y) };
+            CHECK_OK(c.issue(op, a, 3, RAD_N_BATCH));
+            CHECK_OK(c.set_lane(1));
+            CHECK_OK(c.issue(op, a, 3, RAD_N_BATCH));
+            CHECK_OK(c.set_lane(0));
+        }));
+        REQUIRE_EQ(g_rec.size(), (size_t)2);
+        CHECK(g_rec[1].stream != g_rec[0].stream);   /* the second op ran on lane 1 */
+    };
+    /* The table as that op's kernel reads it, behind that op's own stream. */
+    auto entries = [&](size_t i) {
+        std::vector<void*> v((size_t)kE, nullptr);
+        CHECK_OK(rad_memcpy_async(v.data(), g_rec[i].t[1].data, kE * sizeof(void*),
+                                  g_rec[i].stream));
+        CHECK_OK(rad_stream_sync(g_rec[i].stream));
+        return v;
+    };
+    auto both_lanes_see = [&](void* e0, void* e1) {
+        for (size_t i = 0; i < 2; ++i) {
+            const std::vector<void*> v = entries(i);
+            CHECK(v[0] == e0);
+            CHECK(v[1] == e1);
+        }
+    };
+
+    /* The first issue uploads the table whole, and lane 1 starts behind lane 0: nothing patched. */
+    issue(0);
+    CHECK_EQ(f.ctx.wtab_patches(), (int64_t)0);
+    both_lanes_see((void*)home[0], (void*)home[1]);
+
+    /* Entry 1 moves: one dispatch at the head serves both lanes. */
+    res.move(w[1], away[1]);
+    issue(1);
+    CHECK_EQ(f.ctx.wtab_patches(), (int64_t)1);
+    both_lanes_see((void*)home[0], (void*)away[1]);
+
+    /* Nothing moved: neither lane needs a patch. */
+    issue(2);
+    CHECK_EQ(f.ctx.wtab_patches(), (int64_t)1);
+    both_lanes_see((void*)home[0], (void*)away[1]);
+}
+
 /* A table's run is fixed by the declaration. The weights declared at a table position (OpInfo::
  * weight_opd) are bound as one table before the first step. A declared run with a gap is refused
  * there (the kernel strides from one base, so a gap reads the wrong expert), and an issue naming
