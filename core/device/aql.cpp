@@ -1109,7 +1109,9 @@ constexpr size_t kReportRuns = 6;
  * So the report names the dispatches that may still be running (aql_inflight.h) -- the newest
  * few, since the ring is long and the launch that faulted is one of the last to go out -- oldest
  * first among those, because the queue stops at the first launch that faults: that is the launch
- * to read first. The chain record each one waited on is printed with it, because a stale slot
+ * to read first. With a fault address, the operand that points into the range that address is
+ * nearest to says so, and that line names the launch outright instead of leaving it to the order
+ * (report_one). The chain record each one waited on is printed with it, because a stale slot
  * shows up there first. A queue with nothing recorded as unfinished -- every packet kept its
  * barrier bit -- prints the packet at the read index, as the dump always did. Only card `card`'s
  * queues; the host reads the arguments at the packet's kernarg_address. */

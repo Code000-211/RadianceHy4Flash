@@ -58,7 +58,6 @@ struct KargSlot {
     std::function<KargRange(uintptr_t)> range_of;
 };
 
-
 /* The lines for that launch: one per parameter of the segment, then the record's line (this launch
  * waited on it, it was not chained, or no record is valid). `where` locates an address (the dump's
  * own lookup: a pageable chunk, a live range, a pinned piece, "in no range ..."). Empty when there
