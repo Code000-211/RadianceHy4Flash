@@ -117,6 +117,109 @@ class OtherClones(unittest.TestCase):
         self.assertEqual(recipe.par(d, "n"), recipe.par(c, "n") + 1024)
 
 
+def trunk_cases(op, M):
+    """The committed fixture's cases of `op` at M, one per recorded point."""
+    if not FIXTURE.exists():
+        raise unittest.SkipTest("data/kernels_hy4.rkb is not in this tree")
+    return [c for c in recipe.load(str(FIXTURE))["cases"] if c["op"] == op and c["m"] == M]
+
+
+def shapes(c):
+    return [o["shape"] for o in c["opd"]]
+
+
+def point(c):
+    """A case's geometry and parameters, the part of it a clone decides -- its data and reference are
+    drawn afresh, so they are not part of the point."""
+    return (c["op"], c["m"], c["band"], repr(c["params"]),
+            repr([(o["role"], o["dtype"], o["shape"], o["idx_max"], o["idx_const"], o["flags"],
+                   o["absent"]) for o in c["opd"]]))
+
+
+class VerifyHeights(unittest.TestCase):
+    """D-10's M 24 / 40 / 48 rows: a clone is that row at that height, so every operand sits at the
+    extent a launch at that height has. `m_clone` moves the M rows and leaves the rest, which is right
+    only for a row whose every operand is M tall: `kv_store`'s cache and `qsa_work`'s work list are
+    sized by the height through the derivation their reference makes, and the state, block table and
+    count of `qsa_work` by the sequences the batch holds."""
+
+    HEIGHTS = (24, 40, 48)
+
+    def test_the_kv_store_clone_fills_a_cache_the_height_needs(self):
+        cases = trunk_cases("kv_store", 8)
+        self.assertTrue(cases, "the fixture lost its kv_store case at M 8")
+        for c in cases:
+            bs = recipe.par(c, "block_size")
+            for M in self.HEIGHTS:
+                d = recipe.t04_clone(c, M, SALT)
+                nb = (M + bs - 1) // bs + 2      # ref_kv_store_shape: ceil(M / block_size) + 2 blocks
+                (cache,) = [o for o in d["opd"] if len(o["shape"]) == 4]
+                (slots,) = [o for o in d["opd"] if len(o["shape"]) == 1]
+                self.assertEqual(cache["shape"][0], nb, f"block size {bs} M {M}")
+                self.assertEqual(slots["idx_max"], nb * bs, f"block size {bs} M {M}")
+                # the key and value rows are the batch's, and nothing else moved
+                self.assertIn([M, recipe.par(c, "n_head_kv"), recipe.par(c, "head_dim")], shapes(d))
+                self.assertEqual([o["dtype"] for o in d["opd"]], [o["dtype"] for o in c["opd"]])
+
+    def test_the_committed_fixture_stores_into_a_cache_at_the_height(self):
+        for M in self.HEIGHTS:
+            cases = trunk_cases("kv_store", M)
+            self.assertEqual(len(cases), 2, f"the fixture lost its kv_store cases at M {M}")
+            for c in cases:
+                bs = recipe.par(c, "block_size")
+                nb = (M + bs - 1) // bs + 2
+                (cache,) = [o for o in c["opd"] if len(o["shape"]) == 4]
+                (slots,) = [o for o in c["opd"] if len(o["shape"]) == 1]
+                self.assertEqual(cache["shape"][0], nb, f"block size {bs} M {M}")
+                self.assertEqual(slots["idx_max"], nb * bs, f"block size {bs} M {M}")
+
+    def qsa_work(self, M):
+        c = trunk_cases("qsa_work", M)[0]
+        r, seqs = recipe.par(c, "ratio"), recipe.par(c, "seqs")
+        work = (M + r - 1) // r + seqs     # hyv4flash_common.h: work = ceil(T / ratio) + max_seqs
+        S = min(seqs, M)                   # ref_qsa_work_shape: one row a sequence
+        return c, work, S
+
+    def test_the_qsa_work_clone_keeps_a_sequence_a_row_and_sizes_its_list_by_the_height(self):
+        cases = trunk_cases("qsa_work", 8)
+        self.assertTrue(cases, "the fixture lost its qsa_work case at M 8")
+        (c,) = cases
+        r, seqs = recipe.par(c, "ratio"), recipe.par(c, "seqs")
+        n, ring = recipe.par(c, "n"), recipe.par(c, "ring")
+        for M in self.HEIGHTS:
+            d = recipe.t04_clone(c, M, SALT)
+            work, S = (M + r - 1) // r + seqs, min(seqs, M)
+            self.assertEqual(recipe.par(d, "work"), work, f"M {M}")
+            self.assertEqual(recipe.par(d, "M"), M)
+            self.assertEqual(shapes(d), [[M, n], [M], [S + 1], [S, 1, ring, n], [S, 1], [S, 2], [],
+                                         [work * r, n], [work], [work], [S]], f"M {M}")
+            self.assertEqual([o["idx_max"] for o in d["opd"]], [0, 0, 0, 0, S, 1 << 16, 0, 0, 0, 0, 0],
+                             f"M {M}")
+            self.assertEqual([o["role"] for o in d["opd"]], [o["role"] for o in c["opd"]])
+
+    def test_the_committed_fixture_holds_the_qsa_work_rows_at_the_height(self):
+        for M in self.HEIGHTS:
+            c, work, S = self.qsa_work(M)
+            self.assertEqual(recipe.par(c, "work"), work, f"M {M}")
+            self.assertEqual(shapes(c)[:7], [[M, recipe.par(c, "n")], [M], [S + 1],
+                                             [S, 1, recipe.par(c, "ring"), recipe.par(c, "n")],
+                                             [S, 1], [S, 2], []], f"M {M}")
+            self.assertEqual(shapes(c)[7:], [[work * recipe.par(c, "ratio"), recipe.par(c, "n")],
+                                             [work], [work], [S]], f"M {M}")
+
+    def test_the_committed_verify_heights_are_what_the_recipe_clones(self):
+        if not FIXTURE.exists():
+            raise unittest.SkipTest("data/kernels_hy4.rkb is not in this tree")
+        cases = recipe.load(str(FIXTURE))["cases"]
+        clones = [c for c in cases if c["m"] in self.HEIGHTS]
+        self.assertTrue(clones, "the fixture lost D-10's verify heights")
+        for c in clones:
+            band, M = c["band"].rsplit(" M ", 1)
+            src = [s for s in cases if s["op"] == c["op"] and s["m"] == 8 and s["band"] == band]
+            self.assertTrue(src, f"no M 8 case under '{c['band']}'")
+            self.assertIn(point(c), {point(recipe.t04_clone(s, int(M), SALT)) for s in src}, c["band"])
+
+
 class GemmQA(unittest.TestCase):
     """`gemm_nt_q` at q_a's (N 1024, K 3072), M 2048 -- the Verify pair K-51 and audit F7.1 name."""
 

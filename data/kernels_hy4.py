@@ -385,12 +385,15 @@ def g3(out, src='data/kernels_hy4.rkb'):
 # The trunk's own rows (docs/ARCHITECTURES.md, `hyv4flash`: one layer's chain), which D-10 wants at the
 # verify heights: the embed / engram lines, the junction, the attention linears and their norms, the
 # indexer, the MLA absorb / sink / sel / expand, the MoE router and the lm_head. The M clone keeps the
-# encodings the container recorded with a case's operands -- it resizes the M rows and nothing else, so
-# the weights are still the container's, and a quantised row handed plain weights answers something
-# else than the reference (tests/kbench_recipe_test.py). The routed arm is not here because it is not in
-# this fixture at all: gpu-mini declares no expert arm, kernels_moe.rkb is Qwen's 256-expert geometry, and
-# a Hy4 case for `moe_gemm_q`'s rows needs a container that declares the routed arm (its u5-trellis expert
-# weights), not a clone. D-10's 47 % gate_up is a recording of its own.
+# encodings the container recorded with a case's operands -- it resizes the extents a launch at the new
+# height has and nothing else, so the weights are still the container's, and a quantised row handed plain
+# weights answers something else than the reference (tests/kbench_recipe_test.py). Those extents are not
+# all M: `T04_ROW_AXIS` holds the row axes that sit elsewhere in an operand and `T04_M_RULE` the two ops
+# whose other extents their own reference derives from the height and the sequences the batch holds, so a
+# clone is the row a launch at that height really runs, not the M 8 operands M tall. The routed arm is not
+# here because it is not in this fixture at all: gpu-mini declares no expert arm, kernels_moe.rkb is
+# Qwen's 256-expert geometry, and a Hy4 case for `moe_gemm_q`'s rows needs a container that declares the
+# routed arm (its u5-trellis expert weights), not a clone. D-10's 47 % gate_up is a recording of its own.
 TRUNK = ('embed_lookup', 'cast', 'engram_norm', 'engram_gate', 'grid_embed_sf', 'iota', 'sub_i32',
          'ihc_pre', 'ihc_post', 'rmsnorm', 'rmsnorm_ihc_junction', 'gemm_nt_q', 'gemm_nt', 'gemm_nt_f32',
          'gemm_nt_bias', 'rope', 'rope_rows', 'kv_store', 'gate_mul', 'mla_kv_split', 'attn_kv_sink',
@@ -425,16 +428,61 @@ def t04b_sel(src):
 # The row axes that do not sit in shape[0], by op: `(operand, axis, ratio)`, and whether the operand's
 # index range follows the axis. A cu histogram is M + 1 long (the `flags & 4` rule in `t04_clone`), the
 # Engram grid's and the rope's position table are [components, M], and the indexer's pooling reads one
-# row per M * ratio -- one place for the rule instead of a branch per op.
+# row per M * ratio -- one place for the rule instead of a branch per op. An op whose operands are not all
+# M tall names a rule of its own, `(d, c, M2)`, because no single axis describes it: `kv_store` and
+# `qsa_work` are sized by their reference's derivation, below.
 T04_ROW_AXIS = {'grid_embed_sf': (2, 1, False, False), 'rope': (1, 1, False, True),
                 'rope_rows': (1, 1, False, True), 'idx_pool_gated': (0, 0, True, False)}
 
+def t04_kv_store(d, c, M2):
+    """`kv_store`: the cache the store scatters into is `ceil(M / block_size) + 2` blocks deep and the
+    slot table is drawn over every slot of it -- the reference's own derivation, `ref_kv_store_shape`, and
+    the depth a launch at this height has. A clone that keeps the M 8 cache scatters a whole height's
+    tokens onto the handful of slots that height needed."""
+    bs = int(par(c, 'block_size'))
+    nb = (M2 + bs - 1) // bs + 2
+    for o in d['opd']:
+        if o['absent'] or not o['shape']: continue
+        if len(o['shape']) == 4: o['shape'][0] = nb          # the cache: [blocks, kv heads, block, row]
+        elif len(o['shape']) == 1: o['idx_max'] = nb * bs     # the slot table: an id a token, over it all
+
+def t04_qsa_work(d, c, M2):
+    """`qsa_work`: its operands are sized by two different counts, neither of them M. The work list holds
+    `ceil(M / ratio) + seqs` groups -- the arch's `work` at a graph declared for this height
+    (`hyv4flash_common.h`) -- so the stage, the page list and the position list follow it, and its rows are
+    one a sequence, `min(seqs, M)` of them, so the tail, the slot index, the block table and the counts
+    follow those (`ref_qsa_work_shape` derives both). `m_clone` makes every one of them M tall: a tail ring,
+    a block table and a count at a sequence count no launch has."""
+    r, seqs = int(par(c, 'ratio')), int(par(c, 'seqs'))
+    work, S = (M2 + r - 1) // r + seqs, min(seqs, M2)
+    s0, w0 = min(seqs, c['m']), int(par(c, 'work'))
+    n, ring = int(par(c, 'n')), int(par(c, 'ring'))
+    for o, s in zip(d['opd'], c['opd']):
+        sh = tuple(s['shape'])
+        if s['absent'] or not sh: continue
+        if s['role'] == 0 and sh in ((c['m'], n), (c['m'],)): continue   # k and pos: M tall, already moved
+        if sh == (s0 + 1,): o['shape'] = [S + 1]                # cu: one entry a sequence, and the 0
+        elif sh == (s0, 1, ring, n): o['shape'] = [S, 1, ring, n]   # the tail: a ring row a sequence
+        elif sh == (s0, 1): o['shape'] = [S, 1]; o['idx_max'] = S  # the slot index, one a sequence
+        elif sh == (s0, 2): o['shape'] = [S, 2]                 # the block table
+        elif sh == (s0,): o['shape'] = [S]                      # the count: one a sequence
+        elif sh == (w0 * r, n): o['shape'] = [work * r, n]      # the stage: a row a group of the list
+        elif sh == (w0,): o['shape'] = [work]                   # the page and position lists
+        else: raise SystemExit(f'qsa_work: operand {s["shape"]} is not one of the shapes this rule knows')
+    setp(d, 'work', work)
+
+T04_M_RULE = {'kv_store': t04_kv_store, 'qsa_work': t04_qsa_work}
+
 def t04_clone(c, M2, salt):
-    """`m_clone`, plus the row axes that do not sit in shape[0] (`T04_ROW_AXIS`). `m_clone` moves shape[0]
-    and leaves the rest, which is the right clone only for a row whose every operand has M first."""
+    """`m_clone`, plus the row axes that do not sit in shape[0] (`T04_ROW_AXIS`) and the two ops sized by
+    their reference's derivation rather than by M (`T04_M_RULE`). `m_clone` moves shape[0] and leaves the
+    rest, which is the right clone only for a row whose every operand has M first."""
     d = m_clone(c, M2, salt)
     for o in d['opd']:
         if o['flags'] & 4 and o['shape'] and o['shape'][0] == c['m'] + 1: o['shape'][0] = M2 + 1
+    rule = T04_M_RULE.get(c['op'])
+    if rule is not None:
+        rule(d, c, M2); return d
     rule = T04_ROW_AXIS.get(c['op'])
     if rule is not None:
         idx, axis, ratio, follows = rule
